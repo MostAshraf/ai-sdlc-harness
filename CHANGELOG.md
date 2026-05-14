@@ -4,10 +4,6 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ---
 
-## [Unreleased]
-
----
-
 ## [1.2.0] — 2026-05-15
 
 ### Features
