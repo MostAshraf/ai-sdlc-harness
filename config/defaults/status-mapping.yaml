@@ -1,0 +1,23 @@
+# Shipped defaults: harness-milestone -> provider-status projection
+# (design.md piece 4). Keyed by work-item type; `default` applies to any type
+# without its own entry. Users override per type — including custom work-item
+# types — in .claude/context/status-mapping.yaml.
+#
+# Write-back is deliberately CONSERVATIVE by default (dev-start + done only) —
+# the original only ever wrote status once; multi-milestone write-back is
+# opt-in so work-item history doesn't fill with churn.
+
+write_back:
+  on_develop_start: true
+  on_in_review: false
+  on_done: true
+
+# Empty by default: each provider adapter ships its own STATUS_DEFAULTS
+# (github: closed, ado: Closed, jira: Done, …); resolution is
+# `user override ?? provider default`. Add entries (keyed by work-item type,
+# `default` for any type) only to override:
+#   status_mapping:
+#     default: {done: "Released"}
+#     Incident: {done: "Mitigated"}
+status_mapping:
+  default: {}

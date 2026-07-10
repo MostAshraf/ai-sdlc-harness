@@ -1,0 +1,24 @@
+{
+  "provider": "gitlab",
+  "op": "create-pr",
+  "cli": "glab",
+  "argv": [
+    "mr",
+    "create",
+    "--title",
+    "fix: #1 Fix null crash in parser",
+    "--description",
+    "Return None on empty input instead of crashing.\n\nCloses #1\n",
+    "--source-branch",
+    "fix/1-live-forge",
+    "--target-branch",
+    "main",
+    "--yes"
+  ],
+  "returncode": 1,
+  "stdout": "",
+  "stderr": "Failed to create merge request. Created recovery file: /home/USER/Library/Application Support/glab-cli/recover/OWNER/REPO/mr.json\nRun the command again with the '--recover' option to retry.\n          \n   ERROR  \n          \n  1 error occurred:                                                                                                   \n      * OWNER/REPO: 404 Not Found                                                                  \n                                                                                                                      \n  .                                                                                                                   \n\n",
+  "captured_via": "harness git_providers.create_pr (gitlab) — real glab mr create, live instance",
+  "status": "BLOCKED",
+  "note": "Valid subcommand (glab mr create --source-branch/--target-branch/--yes), reached execution and wrote a recovery file; failed at instance-level project resolution (%2F block). 'Closes #1' link emulation present in --description."
+}

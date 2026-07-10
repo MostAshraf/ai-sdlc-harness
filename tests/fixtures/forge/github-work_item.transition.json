@@ -1,0 +1,17 @@
+{
+  "provider": "github",
+  "op": "work_item.transition",
+  "cli": "gh",
+  "argv": [
+    "issue",
+    "close",
+    "1",
+    "--repo",
+    "OWNER/REPO"
+  ],
+  "returncode": 0,
+  "stdout": "",
+  "stderr": "✓ Closed issue OWNER/REPO#1 (Fix null crash in parser)\n",
+  "captured_via": "harness provider --op work_item.transition --id 1 --to done (gh issue close). NB: confirmation prints to STDERR; stdout is empty.",
+  "status": "PASS"
+}

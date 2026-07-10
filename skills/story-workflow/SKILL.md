@@ -1,101 +1,76 @@
 ---
 name: story-workflow
 description: >
-  Refine, analyze, improve, and groom user stories / issues with structured templates and
-  codebase-aware technical analysis. Supports ADO, Jira, GitLab, GitHub, and local markdown
-  files as work item sources via provider adapters. Use this skill whenever the user mentions
-  story refinement, story grooming, story analysis, story improvement, acceptance criteria,
-  user story quality, sprint readiness, or commands like /story-improve, /story-refine,
-  /story-analyze, or /story-groom. Also trigger when the user references work item or issue
-  IDs (or local .md file paths) in the context of improving or reviewing story quality.
-  This skill is never invoked autonomously — it only runs when explicitly requested by a human user.
-allowed-tools: Read, Write, Edit, Bash, Grep, Glob, Agent, mcp__azure-devops__*, mcp__jira__*, mcp__gitlab__*, mcp__github__*, mcp__zoho__*
-argument-hint: "<command> [work-item-id-or-filepath]"
+  Refine, analyze, improve, and groom user stories / work items for quality —
+  readiness reports, template restructuring, adaptive gap-filling, and
+  codebase-aware technical grooming. USER-ENTRY and HUMAN-ONLY — invoke only
+  when the user explicitly runs /story-workflow <command>; never autonomously
+  from conversation, never from a subagent (guard-enforced). Distinct from the
+  /dev-workflow pipeline: this shapes the story itself, it does not build it.
 ---
 
-# Story Workflow Skill
+# story-workflow — story-quality refinement (PO-facing)
 
-A skill for improving user story / issue quality through structured refinement, readiness
-analysis, and codebase-aware technical grooming. Integrates with the configured work item
-provider (ADO, Jira, GitLab, GitHub, or local markdown file) via MCP or the filesystem
-to read and post back to work items.
+Improves work-item quality through four commands. Read-mostly: it fetches a
+work item, helps shape it, and — only with the user's consent — posts the
+result back as a comment. It never starts a dev run and never touches
+`ai/<run>/` run state.
 
-## Provider Resolution
-
-Before executing any command, **read `.claude/context/provider-config.md`** to determine
-the active work item provider. Then read the corresponding adapter from
-`skills/providers/<provider>/work-items.md` for exact tool names, parameter mappings,
-and field extraction logic.
-
-**For `local-markdown`:** The work item ID is a file path (absolute or relative), not a
-numeric or key-style ID. No MCP call is needed — use the `Read` tool directly on the path.
-Verify the file exists before proceeding; if it does not, inform the user and stop.
+Every harness call is `${CLAUDE_PLUGIN_ROOT}/bin/harness <verb> …` — the full
+path, run by you via Bash (a bare `harness` is not on PATH, and shell variables
+set in one Bash call do not persist to the next). Non-zero exit = refused; read
+the JSON error and act on it.
 
 ## Usage
 
 ```
-/story-workflow <command> [work-item-id] [extra-args...]
+/story-workflow <command> <work-item-id> [session-notes…]
 ```
 
-**Examples:**
-- `/story-workflow improve 123456` (ADO)
-- `/story-workflow improve PROJ-123` (Jira)
-- `/story-workflow improve 42` (GitLab / GitHub)
-- `/story-workflow improve 123456 "Team decided to limit scope to admin users only, defer integrations"`
-- `/story-workflow improve ./stories/auth-story.md` (local-markdown)
-- `/story-workflow analyze 123456`
-- `/story-workflow analyze ./stories/auth-story.md` (local-markdown)
-- `/story-workflow refine PROJ-123`
-- `/story-workflow groom 42`
-- `/story-workflow groom ./stories/auth-story.md` (local-markdown)
+`<command>` is one of `analyze`, `refine`, `improve`, `groom`. `<work-item-id>`
+is whatever the configured provider uses — a number (ADO / GitHub / GitLab), a
+key (`PROJ-123`, Jira), or, for `local-markdown`, the story's **id** (the file
+stem inside `provider.stories_dir`, e.g. `WORK-7` for `WORK-7.md` — not a
+path). Any trailing tokens are session notes, passed through to `improve` and
+`refine`.
 
-## Argument Parsing
+## Routing
 
-Parse `$ARGUMENTS` to extract the command and its arguments:
+| command | file | one-line |
+|---|---|---|
+| `improve` | `commands/improve.md` | adaptive single-pass: assess → gap-fill → draft (the recommended default) |
+| `analyze` | `commands/analyze.md` | standalone readiness report with flags |
+| `refine`  | `commands/refine.md`  | slow, section-by-section interactive restructure |
+| `groom`   | `commands/groom.md`   | codebase-aware per-repo technical notes |
 
-- **First token** (required): The command name — one of `improve`, `analyze`, `refine`, `groom`.
-- **Second token** (required): The Work Item / Issue ID (format depends on provider).
-- **Remaining tokens**: Passed through as extra arguments (e.g., session notes for `improve` or `refine`).
+Parse `$ARGUMENTS`: the first token is the command, the second is the work-item
+id, the rest are notes. If the command is missing or unknown, print the usage
+line plus the table above and stop — do not guess. If the id is missing, ask
+for it — never proceed without one. Then read the one matching command file and
+follow it (context economy: load a single command file, not all four).
 
-If the first token is missing or doesn't match a known command, show the usage line above
-and list the four commands with one-line descriptions. Do not guess.
+## Before routing
 
-## Command Routing
+1. Confirm the workspace is bootstrapped: `.claude/context/provider.yaml` must
+   exist. If it doesn't, `/init-workspace` never ran — send the user there and
+   stop. The active provider is resolved from config by the harness; you never
+   hand-pick it.
+2. The recipe for fetching a work item and posting a result back — for every
+   provider and both transports — lives once in `shared/provider-io.md`. Read
+   it; the commands cite it instead of repeating it.
+3. Domain and convention context (for `improve` and `groom`) lives once in
+   `shared/context.md`.
 
-Route to the matching command file based on the first token:
+## Guardrails (all four commands)
 
-| Command | File | Requires Work Item ID |
-|---------|------|-----------------------|
-| `improve` | `commands/improve.md` | Yes |
-| `analyze` | `commands/analyze.md` | Yes |
-| `refine` | `commands/refine.md` | Yes |
-| `groom` | `commands/groom.md` | Yes |
-
-Read the command file and follow its instructions. Pass the work item ID and any extra
-arguments to the command.
-
-**Validation before routing:**
-1. If no work item ID was provided, ask for it — do not proceed without one.
-2. Check that `.claude/context/provider-config.md` exists. If missing, remind the user to run `/init-workspace` first.
-3. For `local-markdown`: verify the file at the given path exists and is readable. If not, report the resolved absolute path and stop.
-
-## Prerequisites
-
-- Work item provider MCP tools available (as configured in `provider-config.md`)
-- Team repos cloned locally (for `groom` command)
-- Run `/init-workspace` before using story commands (one-time setup)
-
-## Templates
-
-Story templates and output formats live in `templates/`. Commands reference them as needed.
-Do not modify templates during command execution.
-
-## Context Files
-
-Generated by the standalone `/init-workspace` skill. Each developer generates their own
-set by running `/init-workspace`. Files live at `.claude/context/` (git-ignored):
-
-- `.claude/context/provider-config.md` — Provider settings, tool mappings, and field mappings.
-- `.claude/context/repos-metadata.md` — Describes each repo's purpose, stack, and domain.
-- `.claude/context/repos-paths.md` — Maps repo names to local filesystem paths.
-- `.claude/context/conventions.md` — Team coding patterns and architectural conventions.
+- On a remote provider, never edit the item's Description or Acceptance-Criteria
+  fields — post back as a **comment** only. The single exception is a
+  `local-markdown` story the user explicitly asks you to rewrite in place; see
+  `shared/provider-io.md`.
+- Never invent business requirements. A gap is a question for the human, not an
+  assertion of what "should" be there.
+- Mirror the user's domain language; don't rename their "platform" to "system".
+- Files in `templates/` are read-only references — don't modify them while a
+  command runs.
+- If a story is already well-formed, say so. "This looks ready" is a valid,
+  valuable outcome — don't manufacture flags or questions to look busy.

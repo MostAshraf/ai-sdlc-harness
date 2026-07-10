@@ -1,0 +1,251 @@
+# pipeline/manifest.yaml — THE pipeline source of truth (design.md piece 1 + RC2).
+#
+# Read by BOTH the orchestrator (what to do next) and harness/set-state + guards
+# (what to enforce). Neither hardcodes any of this.
+#
+# Declarative only (piece 1, risk #3): ordered sequences, spawn-sets, structured
+# predicates, declared edges. NO imperative logic, NO expression strings.
+#
+# Fixed vocabulary (RC2 + RC4):
+#   steps.<id>.owner          orchestrator-run step (no subagent)
+#   steps.<id>.spawns         set of {shape, mode} this step may legally spawn
+#   steps.<id>.preconditions  artifacts that must exist before the step runs;
+#                             the validator proves, per mode, that every one has
+#                             an earlier producer in that mode's sequence
+#   steps.<id>.produces       artifacts this step creates
+#   steps.<id>.gate           human gate; produces token artifact `gate.<id>`;
+#                             the step FOLLOWING a gate implicitly requires its
+#                             token (gate-precedence rule, enforced by set-state)
+#   steps.<id>.when           structured predicate — gate/step is skipped unless
+#                             {value: <produced artifact>, at_least: {config: key}}
+#   steps.<id>.on_reject      declared re-entry target on gate rejection (B10)
+#   steps.<id>.returns_to     declared return edge for an off-sequence side-step
+#   steps.<id>.selects_mode   the single declared classify branch (fetch only),
+#                             schema-validated AND runtime-interpreted:
+#                             workflow.classify() returns the quick_eligible
+#                             VERDICT; workflow.select_mode() resolves it to a
+#                             mode name through this mapping — retargeting the
+#                             branch (e.g. at a new mode) is a data change
+#   groups.<id>               on-demand repeatable step-group with re-entry
+#   escalations               declared cross-mode edges (RC4)
+#   always_legal_spawns       cross-cutting spawns legal at any cursor
+
+version: 1
+
+# Both modes start at `entry`; sharing one step definition makes the
+# identical-prefix requirement (RC4 assumption) structural, not conventional.
+entry: fetch
+
+steps:
+  fetch:
+    owner: orchestrator
+    # Fetch work item -> work-item.json; resolve change_type; run the
+    # eligibility classifier; seed state.yaml (from-nothing transition) with a
+    # single task. In quick mode that seed IS the task list.
+    produces: [work-item, change-type, tasks]
+    selects_mode:
+      from: classify.quick_eligible
+      "true": quick
+      "false": full
+
+  intake:
+    spawns: [{shape: planner, mode: intake}]
+    preconditions: [work-item]
+    produces: [requirements-summary]
+
+  plan:
+    # Plan content contract (coverage decisions): edge-case enumeration, risk
+    # annotation, self-adversarial pass, per-task test-intents (B1), two-
+    # altitude approach selection - top-level Solution Approaches when a
+    # fork exists, plus per-task options (B2), [API: lib vX] annotations
+    # (B8), <=2 bounded test-pattern hints per task (B7), and 4 diagrams
+    # (class/type, flowchart, sequence, dependency graph). Full contract:
+    # skills/dev-workflow/steps/plan-task.md. Replaces the fetch seed task
+    # list.
+    spawns: [{shape: planner, mode: plan}]
+    preconditions: [requirements-summary]
+    produces: [plan, test-intents, tasks]
+    # The cursor cannot leave `plan` while the task list is still the
+    # fetch-seeded provisional placeholder (adversarial-review finding:
+    # nothing forced `plan-register` to run, so a forgotten registration
+    # let the gate approve a plan the run would then ignore — develop ran
+    # on the placeholder task with empty test_intents).
+    requires_tasks_registered: true
+
+  approve-plan:
+    gate: true
+    presents: plan
+    on_reject: plan
+
+  preflight:
+    owner: orchestrator
+    # work-item is genuinely consumed (the branch name renders the item's
+    # id + title slug) — declared so the flow-completeness proof covers it,
+    # not just the transitive luck of fetch being the shared entry.
+    preconditions: [change-type, work-item]
+    produces: [branches]
+
+  develop:
+    # Inner loop per task: developer (TDD for tasks with declared
+    # test_intents: verify-red -> impl -> set-state runs verify-green +
+    # red-proof check; activation is per-task data, not a mode check — quick
+    # mode is exempt because its seed task declares no intents) then
+    # per-task review.
+    spawns:
+      - {shape: developer, mode: develop}
+      - {shape: reviewer, mode: review}
+    preconditions: [branches, tasks]
+    produces: [task-commits]
+    # Fail-closed at the sync point (design.md: "fail-closed at sync points,
+    # gates/pre-pr/create-pr require all lanes complete") — mechanically
+    # enforced, not just a documented lane-policy convention: the cursor
+    # cannot leave develop while any task is still pending/in-progress/
+    # in-review, even in a single-repo run.
+    requires_tasks_terminal: true
+
+  approve-impl:
+    gate: true
+    presents: task-commits
+    on_reject: develop
+
+  harden:
+    # Coverage top-up; tests are green-from-birth -> no red-proof machinery.
+    spawns:
+      - {shape: developer, mode: harden}
+      - {shape: reviewer, mode: review}
+    preconditions: [task-commits]
+    produces: [coverage-report]
+
+  security:
+    owner: orchestrator
+    preconditions: [task-commits]
+    produces: [security-report, security.max_severity]
+
+  approve-security:
+    gate: true
+    presents: security-report
+    when: {value: security.max_severity, at_least: {config: security.gate_threshold}}
+    dispositions: [fix-now, waive, defer]   # defer -> work_item.create (B9)
+    forward_on: [waive, defer]              # these decisions continue the pipeline
+    on_reject: develop                       # fix-now routes back to develop
+
+  quick-recheck:
+    # Quick mode only: post-develop diff-pattern re-check (RC3 small). A dirty
+    # verdict triggers the declared escalation edge below.
+    owner: orchestrator
+    preconditions: [task-commits]
+    produces: [recheck-verdict]
+
+  pre-pr:
+    spawns: [{shape: reviewer, mode: pre-pr}]
+    preconditions: [task-commits]
+    produces: [pre-pr-report]
+
+  pre-pr-fixes:
+    # Off-sequence side-step, reachable only via approve-pre-pr.on_reject.
+    # Post-squash fixes: harness commit --fixup + merge-task --autosquash (B10).
+    spawns: [{shape: developer, mode: fixup}]
+    preconditions: [pre-pr-report]
+    produces: [fixup-commits]
+    returns_to: pre-pr
+
+  approve-pre-pr:
+    gate: true
+    presents: pre-pr-report
+    on_reject: pre-pr-fixes
+
+  create-pr:
+    owner: orchestrator
+    # `branches` is a real runtime read (the PR's head/base come from the
+    # preflight-recorded branch entry) — previously undeclared, so the
+    # validator's reordering proof silently didn't cover it (composability
+    # round: a mode reordered past preflight would have validated clean and
+    # failed only at runtime).
+    preconditions: [pre-pr-report, branches]
+    produces: [pr]
+
+  analyze-comments:
+    spawns: [{shape: reviewer, mode: analyze-comments}]
+    preconditions: [pr]
+    produces: [comment-analysis]
+
+  select-comments:
+    gate: true
+    presents: comment-analysis
+    # A multi-pick gate, not an approve/reject binary — `harness gate
+    # --decide --multi` parses a comma-separated numbered selection (or the
+    # literal `NONE` sentinel, for zero) into a list decision. Any parsed
+    # selection is forward-legal (no forward_on/on_reject: picking zero or
+    # more comments isn't a rejection).
+    select: true
+
+  apply-fixes:
+    spawns: [{shape: developer, mode: fixup}]
+    preconditions: [gate.select-comments]
+    produces: [fix-commits]
+    # Group exit (adversarial-review finding): without this, the only legal
+    # cursor move from here is back into analyze-comments (repeatable
+    # group re-entry) forever. returns_to is the same declared vocabulary
+    # pre-pr-fixes already uses for its off-sequence side-step — the
+    # orchestrator gets BOTH candidates (reenter on new comments, or
+    # proceed once done) and picks based on real state, never guesses.
+    returns_to: reconcile
+
+  reconcile:
+    owner: orchestrator
+    preconditions: [pr]
+    produces: [reconciled]
+
+  metrics:
+    owner: orchestrator
+    produces: [metrics-report]
+
+modes:
+  full:
+    - fetch
+    - intake
+    - plan
+    - approve-plan
+    - preflight
+    - develop
+    - approve-impl
+    - harden
+    - security
+    - approve-security
+    - pre-pr
+    - approve-pre-pr
+    - create-pr
+    - reconcile
+    - metrics
+  quick:
+    - fetch
+    - preflight
+    - develop
+    - quick-recheck
+    - pre-pr
+    - approve-pre-pr
+    - create-pr
+    - reconcile
+    - metrics
+
+groups:
+  pr-comments:
+    available_after: create-pr
+    repeatable: true
+    # Documents the intended re-entry trigger; cursor_candidates offers
+    # re-entry to `analyze-comments` unconditionally once `apply-fixes` (the
+    # group's last step) is reached — the orchestrator decides whether new
+    # comments actually exist before choosing that candidate over the
+    # `returns_to: reconcile` alternative also offered from `apply-fixes`.
+    reenter_when: new_comments_present
+    steps: [analyze-comments, select-comments, apply-fixes]
+
+escalations:
+  # Quick eligibility was classified before code existed; if the real diff
+  # touches disqualifying patterns, the run escalates to full's security step.
+  - from: {mode: quick, step: quick-recheck}
+    when: {value: recheck-verdict, equals: dirty}
+    to: {mode: full, step: security}
+
+always_legal_spawns:
+  - {shape: reviewer, mode: request-triage}

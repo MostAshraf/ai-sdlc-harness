@@ -1,12 +1,12 @@
 # Story Template
 
-This is the canonical format for user stories. All commands in this skill produce output
-that follows this structure.
+The canonical format for user stories. All four commands produce output that
+follows this structure.
 
 ```markdown
 ## Context
 [Why does this story exist? What business problem or user need does it address?
-Include relevant background that helps developers understand the motivation.]
+Background that helps developers understand the motivation.]
 
 ## Description
 As a [persona], I want [capability], so that [outcome].
@@ -17,40 +17,35 @@ As a [persona], I want [capability], so that [outcome].
 - [ ] ...
 
 ## Out of Scope
-[Explicitly what this story does NOT cover. Helps prevent scope creep and
-sets clear boundaries for the implementation.]
+[Explicitly what this story does NOT cover. Prevents scope creep and sets clear
+boundaries for the implementation.]
 
 ## Open Questions
-[Anything unresolved. Gets cleared during refinement or grooming sessions.
-Remove items as they get answered — don't leave stale questions.]
+[Anything unresolved, each prefixed with who answers it. Cleared during
+refinement or grooming — remove items as they get answered.]
 
 ## Technical Notes
 [Added during or after grooming. Per-repo breakdown of affected components,
-migration concerns, testing strategy, and risk flags. See technical-notes.md
-for the detailed format.]
-
----
-🤖 Generated with [Claude Code](https://claude.ai/claude-code)
+migration concerns, testing strategy, and risk flags. See technical-notes.md.]
 ```
 
-## Section Guidelines
+## Section guidelines
 
-**Context** — Write 2-4 sentences. Focus on the "why" not the "what." If a developer reads
-only this section, they should understand the business motivation. Avoid implementation details here.
+**Context** — 2–4 sentences on the "why," not the "what." A developer reading
+only this should understand the business motivation. No implementation detail.
 
-**Description** — One sentence in user story format. If the story needs multiple "As a..."
-statements, it may be too large and should be split.
+**Description** — one sentence in user-story format. Needing multiple `As a…`
+statements usually means the story is too large and should be split.
 
-**Acceptance Criteria** — Each AC should be independently testable. Use Given/When/Then
-format. Aim for 3-7 ACs per story. Fewer than 3 usually means missing edge cases. More
-than 7 usually means the story is too large.
+**Acceptance Criteria** — each AC independently testable, in Given/When/Then.
+Aim for 3–7. Fewer than 3 usually means missing edge cases; more than 7 usually
+means the story is too large.
 
-**Out of Scope** — List 1-3 items that someone might reasonably assume are included but
-are not. This section prevents mid-sprint scope discussions. If nothing is ambiguous,
-write "No explicit exclusions identified."
+**Out of Scope** — 1–3 items someone might reasonably assume are included but
+aren't. If nothing is ambiguous, write "No explicit exclusions identified."
 
-**Open Questions** — Prefix each with who needs to answer it: `[PO]`, `[Tech]`, or `[Team]`.
-Example: `[PO] Should existing users be migrated automatically or opt-in?`
+**Open Questions** — prefix each with `[PO]`, `[Tech]`, or `[Team]`. Example:
+`[PO] Should existing users be migrated automatically or opt-in?`
 
-**Technical Notes** — Only populated during grooming. Left empty or absent before grooming.
-See `technical-notes.md` for the per-repo format.
+**Technical Notes** — only populated during grooming; left empty or absent
+before. See `technical-notes.md` for the per-repo format.

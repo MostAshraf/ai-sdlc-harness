@@ -2,17 +2,11 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Write|Edit|MultiEdit",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/tracker-transition-guard.sh",
-            "timeout": 5
-          },
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/tracker-metrics-guard.sh",
-            "timeout": 5
+            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=python3; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" bash"
           }
         ]
       },
@@ -21,140 +15,68 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/sensitive-file-guard.sh",
-            "timeout": 5
+            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=python3; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" write"
           }
         ]
       },
       {
-        "matcher": "Write|Edit|MultiEdit",
+        "matcher": "Agent|Task",
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/validate-mermaid-syntax.sh",
-            "timeout": 10
+            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=python3; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" spawn"
           }
         ]
       },
       {
-        "matcher": "Bash",
+        "matcher": "Skill",
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/bash-write-guard.sh",
-            "timeout": 10
-          },
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/validate-commit-msg.sh",
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "SubagentStop": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/agent-status-check.sh",
-            "timeout": 5
-          },
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/worktree-clean-check.sh",
-            "timeout": 15
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/squash-merge-verify.sh",
-            "timeout": 10
-          },
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/tdd-red-verify.sh",
-            "timeout": 600
+            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=python3; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" skill"
           }
         ]
       },
       {
-        "matcher": "Agent",
+        "matcher": "Read|Grep",
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/tracker-update-reminder.sh",
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "SubagentStart": [
-      {
-        "matcher": "ai-sdlc-tester",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/tester-activation-guard.sh",
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "StopFailure": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/stop-failure-marker.sh",
-            "timeout": 5
+            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=python3; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" read"
           }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
-        "matcher": "",
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/stop-failure-recovery.sh",
-            "timeout": 5
+            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=python3; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" user-prompt"
           }
         ]
       }
     ],
-    "PostCompact": [
+    "PostToolUse": [
       {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "prompt",
-            "prompt": "First, check if any per-workflow directory matching `ai/<YYYY-MM-DD>-<work-item-id>/tracker.md` exists. Use `find ai -maxdepth 2 -name tracker.md 2>/dev/null`. If none exist, there is no active workflow — skip this entirely and do nothing. (Note: if `ai/plans/` or `ai/tasks/` directories contain .md files, the workspace is on the v1.x layout and `/dev-workflow migrate` must run before any phase resumption — surface that prompt instead.) Otherwise: context was just compacted — critical workflow state may have been lost. Reconstruct it now. Find the most recently-modified `ai/<date>-<id>/tracker.md`. Read it fully. Extract: (1) Story ID from the directory name suffix, (2) every task row with ID, repo if multi-repo, description, and status, (3) current phase — if any task is In Progress or In Review: Phase 3 (TDD Development Loop); all dev tasks Done, human approval not set: Phase 4; human approval set but Test Hardening not complete: Phase 5; Test Hardening complete but security review not stamped: Phase 5.5; security review stamped but no PR: Phase 6; PR exists but not merged: Phase 7 (on-demand) or idle; PR merged but tracker not archived: Phase 8. Check .claude/context/repos-paths.md for repo paths. For each repo get the current branch and run `git -C <repo-path> worktree list`. For every listed worktree whose branch matches `worktree/<story-id>-t<n>-<uid>`, look up task T<n> in the tracker: preserve worktrees whose task is 🔧 In Progress or 🔄 In Review (the resumed session will pick them up); flag worktrees whose task is ✅ Done or has no matching tracker row as candidates for removal (do NOT remove yet — surface the list and ask the human to confirm). Repos running in worktree-failed fallback mode (no worktrees) are valid; do not flag. The plan lives alongside the tracker at `ai/<date>-<id>/plan.md`. Output a structured state block: story ID, tracker path, phase, all task statuses (one line each), worktree reconciliation table (path, branch, task ID, preserve/remove classification), branches, plan path. Then continue the workflow from where it was interrupted."
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "matcher": "",
+        "matcher": "Agent|Task",
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/metrics-token-collector.sh",
-            "timeout": 10
+            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=python3; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" post-spawn"
           }
         ]
       }
     ],
-    "SessionStart": []
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=python3; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" subagent-stop"
+          }
+        ]
+      }
+    ]
   }
 }

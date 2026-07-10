@@ -1,0 +1,19 @@
+{
+  "provider": "gitlab",
+  "op": "fetch-pr-comments",
+  "cli": "glab",
+  "argv_harness": [
+    "api",
+    "projects/:id/merge_requests/1/notes?per_page=100"
+  ],
+  "argv_captured": [
+    "api",
+    "projects/78/merge_requests/1/notes?per_page=100"
+  ],
+  "returncode": 0,
+  "stdout": "[{\"id\":354,\"type\":null,\"body\":\"assigned to @USER\",\"attachment\":null,\"author\":{\"id\":14,\"username\":\"USER\",\"name\":\"USER Example\",\"state\":\"active\",\"locked\":false,\"avatar_url\":\"https://gitlab.example.com/uploads/-/system/user/avatar/14/avatar.png\",\"web_url\":\"https://gitlab.example.com/USER\"},\"created_at\":\"2026-07-06T10:38:58.269Z\",\"updated_at\":\"2026-07-06T10:38:58.275Z\",\"system\":true,\"noteable_id\":148,\"noteable_type\":\"MergeRequest\",\"project_id\":78,\"resolvable\":false,\"confidential\":false,\"internal\":false,\"imported\":false,\"imported_from\":\"none\",\"noteable_iid\":1,\"commands_changes\":{}},{\"id\":353,\"type\":null,\"body\":\"marked this merge request as **draft**\",\"attachment\":null,\"author\":{\"id\":14,\"username\":\"USER\",\"name\":\"USER Example\",\"state\":\"active\",\"locked\":false,\"avatar_url\":\"https://gitlab.example.com/uploads/-/system/user/avatar/14/avatar.png\",\"web_url\":\"https://gitlab.example.com/USER\"},\"created_at\":\"2026-07-06T10:38:57.820Z\",\"updated_at\":\"2026-07-06T10:38:57.823Z\",\"system\":true,\"noteable_id\":148,\"noteable_type\":\"MergeRequest\",\"project_id\":78,\"resolvable\":false,\"confidential\":false,\"internal\":false,\"imported\":false,\"imported_from\":\"none\",\"noteable_iid\":1,\"commands_changes\":{}},{\"id\":352,\"type\":null,\"body\":\"changed the description\",\"attachment\":null,\"author\":{\"id\":14,\"username\":\"USER\",\"name\":\"USER Example\",\"state\":\"active\",\"locked\":false,\"avatar_url\":\"https://gitlab.example.com/uploads/-/system/user/avatar/14/avatar.png\",\"web_url\":\"https://gitlab.example.com/USER\"},\"created_at\":\"2026-07-06T10:38:57.360Z\",\"updated_at\":\"2026-07-06T10:38:57.373Z\",\"system\":true,\"noteable_id\":148,\"noteable_type\":\"MergeRequest\",\"project_id\":78,\"resolvable\":false,\"confidential\":false,\"internal\":false,\"imported\":false,\"imported_from\":\"none\",\"noteable_iid\":1,\"commands_changes\":{}},{\"id\":350,\"type\":null,\"body\":\"Human note: please split parse() and add a whitespace-only test.\",\"attachment\":null,\"author\":{\"id\":14,\"username\":\"USER\",\"name\":\"USER Example\",\"state\":\"active\",\"locked\":false,\"avatar_url\":\"https://gitlab.example.com/uploads/-/system/user/avatar/14/avatar.png\",\"web_url\":\"https://gitlab.example.com/USER\"},\"created_at\":\"2026-07-06T10:38:24.501Z\",\"updated_at\":\"2026-07-06T10:38:24.501Z\",\"system\":false,\"noteable_id\":148,\"noteable_type\":\"MergeRequest\",\"project_id\":78,\"resolvable\":false,\"confidential\":false,\"internal\":false,\"imported\":false,\"imported_from\":\"none\",\"noteable_iid\":1,\"commands_changes\":{}}]",
+  "stderr": "",
+  "captured_via": "harness's exact `:id` argv is blocked by this instance's %2F rejection; captured the byte-identical NUMERIC-id equivalent (projects/78/...) which the instance permits, so the raw note JSON shape is REAL forge output.",
+  "status": "PARTIAL",
+  "verified": "Fed this real JSON through the actual fetch_comments_gitlab logic: 3 system notes (system:true — 'assigned to', 'marked as draft', 'changed the description') correctly filtered; 1 human note kept. DIVERGENCE: the kept note got id '4' (position in the UNFILTERED raw list), not '1' — the stub only ever places the human note first so it never exercises this."
+}

@@ -1,0 +1,19 @@
+{
+  "provider": "github",
+  "op": "work_item.fetch",
+  "cli": "gh",
+  "argv": [
+    "issue",
+    "view",
+    "1",
+    "--repo",
+    "OWNER/REPO",
+    "--json",
+    "number,title,body,state,labels"
+  ],
+  "returncode": 0,
+  "stdout": "{\"body\":\"## Description\\nEmpty input makes the parser explode with a NullReferenceException instead of returning gracefully.\\n\\n## Acceptance Criteria\\n- [ ] parser returns None on empty input\\n- [ ] error is logged exactly once\\n- [x] regression test added\\n\",\"labels\":[],\"number\":1,\"state\":\"OPEN\",\"title\":\"Fix null crash in parser\"}\n",
+  "stderr": "",
+  "captured_via": "harness provider --op work_item.fetch --id 1 (real gh, live forge)",
+  "status": "PASS"
+}

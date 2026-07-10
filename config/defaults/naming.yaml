@@ -1,0 +1,26 @@
+# Shipped defaults: change-types + naming templates (design.md piece 4).
+# User overrides live in .claude/context/naming.yaml; resolution is
+# `user value ?? this file`. Applied BY `harness commit` per commit class —
+# never validated after the fact by parsing raw git (RC1).
+
+change_types: [feature, fix, chore, docs, refactor]
+
+# Provider issue-type -> change_type. Resolved once at fetch, stored in
+# state.yaml, used consistently by preflight / develop / create-pr.
+work_item_type_map:
+  Bug: fix
+  Story: feature
+  Task: chore
+
+naming:
+  branch: "{type}/{id}-{slug}"
+  pr_title: "{type}: #{id} {summary}"
+  commit:
+    # merge-task output — the one commit per task that lands on the branch
+    integration: "{type}: #{id} {summary}"
+    # harness commit default class — worktree working commits (squashed away)
+    working: "task({task}): {summary}"
+    # soft-cap checkpoint (coverage B12) — resumable PARTIAL, squashed away
+    wip: "[WIP] task({task}): {summary}"
+    # harness publish-mirror — path-exclusive ai/** snapshot commits
+    mirror: "chore(harness): publish run snapshot {run}"

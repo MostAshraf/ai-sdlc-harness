@@ -1,135 +1,60 @@
-# ai-sdlc-harness · v2.1
+# ai-sdlc-harness · v3.0
 
-**An AI-driven SDLC harness for Claude Code.** Drives a real engineering workflow — requirements → plan → tests → code → review → security → PR → reconcile — across one or many repos. Multi-agent, language-agnostic, discovery-driven. No application code lives here, only the agents, skills, hooks, and conventions that run them.
+**A governed multi-agent SDLC pipeline for Claude Code** — a ground-up rewrite of [ai-sdlc-harness](https://github.com/MostAshraf/ai-sdlc-harness). Drives a real engineering workflow — fetch → plan → proven-red TDD → review → security → PR → comment rounds → reconcile → metrics — across one or many repos. No application code lives here: only the pipeline manifest, the Python core that enforces it, and the agents, skills, and hooks that run it.
 
-| Workflow | Purpose | Entry point |
+| Command | Purpose |
+|---|---|
+| `/init-workspace` | One-time setup interview: provider, repos, discovered toolchain, verification gate |
+| `/dev-workflow <work-item-id>` | Take a work item from requirements to merged PR end-to-end |
+| `/story-workflow <command> <work-item-id>` | Shape a story's quality before it's built: `analyze` · `refine` · `improve` · `groom` |
+| `/workflow-status` | Read-only dashboard: cursor, tasks, gates, flagged events per run |
+| `/workspace-config` | Change one config section without re-running the interview |
+| `/add-repo` | Register one new repo into an already-bootstrapped workspace |
+| `/migrate-workspace` | Adopt a v2.x workspace: config carries over, run history stays archived in place |
+| `/repo-map-refresh` | Regenerate the auto-generated codebase map the planner grounds its plans in |
+
+## The rewrite, in one table
+
+The original harness works, but almost all of its accumulated complexity compensates for one root cause: *orchestration logic lived in markdown prose an LLM had to faithfully execute, with hooks bolted on to catch the cases where it didn't.* The rewrite moves every mechanical rule into code that just runs, and reserves the model for judgment.
+
+| Concern | ai-sdlc-harness (v2.x) | ai-sdlc-harness (v3.0) |
 |---|---|---|
-| **Story Workflow** | Refine and groom stories before development | `/story-workflow <command> <work-item-id>` |
-| **Dev Workflow** | Take a story from requirements to merged PR end-to-end | `/dev-workflow <work-item-id>` |
-
-> The authoritative workflow specification — phases, ownership, status transitions, non-negotiable rules — lives in [CLAUDE.md](CLAUDE.md). This README is the guided tour. New to the harness? Start with [getting-started.md](getting-started.md) for the 10-minute install-to-first-story path.
-
-## What's new in v2.1
-
-| Area | Change |
-|---|---|
-| **Quick Mode** | New `/dev-workflow quick <id>` fast-path for trivial changes (typo fixes, one-character edits, lock-file bumps). Developer + Reviewer only — Planner and Tester are skipped per CC-05.8. Eligibility is heuristic-driven via `scripts/quick-mode-classify.py`; the tracker carries an explicit `Mode: quick` header and `Quick-Mode: true` flag so P9 metrics can segment quick-vs-full runs. `QPhaseGuard` enforces the invariants (no Planner invocation, no Tester invocation, single commit). |
-| **Aggregate workflow report** | New `/dev-workflow report` utility command. Reads `ai/_metrics-log.csv` and produces a multi-story rollup with `--since`, `--format md\|json`, `--story` filters. Markdown output is a Mermaid-charted scorecard; JSON is plain rows for downstream tooling. |
-| **Manifest schema for commands** | Every dev-workflow command file now ships with a sibling `<command>.manifest.yaml` declaring its prerequisites, produced artifacts, exit criteria, and gate emissions. A new manifest-schema doc + cc-check enforces parity. Consumers (the orchestrator, `workflow-status`, future automation) read manifests instead of grepping command prose. |
-| **Markdown size budgets** | New `cc-check-md-budget` Convention-Check enforces per-file size caps from `agents/shared/markdown-budgets.md` (e.g. command files ≤ 400 lines, context files ≤ 200). Started in WARN mode, flipped to BLOCK in this release. `scripts/markdown-size-report.py` is the human-facing version (sorted budget-status table). Top-4 command files were surgically reduced to fit (`orchestrator-rules.md` 420 → 164; `plan-generator/SKILL.md` 830 → 337). |
-| **Cost + token observability** | New Stop hook `metrics-token-collector.py` aggregates per-turn token counts into the tracker so P9 metrics can report agent-token totals per phase. `_metrics-log.csv` schema bumped to v1.1.0 with a non-destructive migration. New `cost-config.md` template carries per-model rate cards; `init-workspace` Step 6d lays it down at workspace bootstrap. |
-| **Tracker + status schema v1.1** | The two cross-cutting schemas under `agents/shared/` accumulated the v2.1 amendment batch — `Mode:` header, `Workflow-Dir:` field, `Test hardening completed`/`Security review completed` stamps, ad-hoc batch counters, the `Quick-Mode:` flag. The Quick-Mode metric stamp + token-total field are reader-required (P9), writer-required (per-phase emitters). |
-| **TDD-skip planner heuristics** | The Planner's `agents/planner/index.md` carries a new section on when to recommend Quick Mode versus the full workflow at intake. Heuristics live in `scripts/quick-mode-classify.py` so they're testable and tunable in one place. |
-| **Doc surgery (CC-04.8)** | Five context/command files restructured to fit the 200/400-line caps without losing content — shared snippets moved into siblings, cross-refs replace duplication. `orchestrator-rules.md`, `plan-generator/SKILL.md`, `develop.md`, `plan.md`, `requirements.md`, `create-pr.md` all in scope. |
-| **Subagent_type mapping table** | `orchestrator-rules.md` now spells out the fully-qualified `subagent_type` for each `@ai-sdlc-X` mention (the four agent roles plus the reviewer's four modes), so the `Agent` tool can be invoked without the orchestrator pattern-matching plugin prefix + role from the mention text. CC-04. |
-
-## What's new in v2.0
-
-| Area | Change |
-|---|---|
-| **Per-workflow artifacts** | Everything for one story now lives under `ai/<YYYY-MM-DD>-<work-item-id>/` — plan, tracker, coverage, security, metrics, PR-comment-analysis, pre-PR report. Replaces the split `ai/plans/` + `ai/tasks/` layout. |
-| **Ad-hoc requests are first-class** | Mid-workflow change requests at GATE 2, GATE 3, or via `/dev-workflow request <id> "<text>"` are triaged by the Reviewer against the approved plan, classified (IN_SCOPE_BUG / IN_SCOPE_AC_MISS / OUT_OF_SCOPE / PLAN_CONFLICT / DUPLICATE / INVALID), gated by **GATE 5**, and land in a dedicated `## Ad-hoc Tasks (Batch <N>)` section. Re-enters Phase 3 with re-hardening on the affected repo's `T-TEST` lane. Out-of-scope items surface back to the human with explicit expand-scope / defer / withdraw options — never silently merged. |
-| **Pre-flight runs after GATE 1** | Feature branches are created only in the repos the plan named (via the tracker's `## Repo Status` section), eliminating the pre-v2 orphan branches in unaffected repos. The plan commit moves into pre-flight so it lands on the just-created feature branch in single-repo workspace-is-git-repo runs. |
-| **`Initial development completed` metric rename** | The Workflow Metric formerly known as `Development completed` is now `Initial development completed` — it records the **first** Phase 3 close. Phase 7 re-entries are tracked separately by `PR review response completed`; ad-hoc batches by `Ad-hoc requests completed`. `Development started` keeps its original name. |
-| **P5.5 Static Security Review** | New phase between Test Hardening and PR Creation. Runs SAST + secret-scan + CVE per repo via the `security-report` skill. Gate 2.5 fires only when findings &ge; medium, offering WAIVE / DEFER / FIX-NOW. |
-| **P8 Post-Merge Reconciliation** | New phase that auto-fires on PR merge. Transitions the work item, cleans up worktrees, stamps `Workflow completed`, archives the tracker in-place to `tracker.archived.md`. |
-| **P9 Metrics & Observability** | New auto-phase. T1 fires at PR creation, T2 each PR-response round, T3 at post-merge. Emits per-workflow `metrics-report.md` plus appends a row to workspace-level `ai/_metrics-log.csv`. |
-| **R Workflow State Recovery** | Cross-cutting recovery path is now first-class. Stop-failure marker + PostCompact rehydrate from the tracker; human picks resume vs abort. |
-| **Hotfix re-entry** | `/dev-workflow hotfix` with two modes: `un-archive` clones `tracker.archived.md` into a fresh `tracker.md` within the 30-day window; `linked-fresh` spawns a new workflow dir with bidirectional `Hotfix-Of:` / `Hotfixed-By:` headers. |
-| **TDD red-verify** | New PreToolUse hook proves test cases actually failed before the developer is allowed to write production code. Replays the test command, caches green/red attestations per task. |
-| **naming-config runtime read** | Branch, commit, and path patterns live in `.claude/context/naming-config.md` and are consumed at runtime by the commit-msg validator. Override patterns without code changes. |
-| **Convention-Check tier** | New `cc-check.py` aggregator runs 14 strict-by-default convention checks (header hygiene, shared-ref drift, artifact paths, naming, mermaid syntax, tunable thresholds, provider parity, drift-sweep residuals). Wired into `tests/run.sh`. |
-| **Per-task worktree** | Worktrees now use the `<repo>-t<n>-<uid8>` pattern with an orchestrator-side UID8 suffix, preventing the cross-task path collisions that the previous flat layout could hit. |
-| **Gate stall stamping** | Every human gate now stamps `Gate prompted <ts>` so a `workflow-status` run can surface stalled gates instead of looking idle. |
+| Pipeline definition | Prose phase files the orchestrator re-derives every run; a separate hardcoded copy in guard scripts | One declared manifest ([pipeline/manifest.yaml](pipeline/manifest.yaml)) read by **both** the orchestrator and the enforcement layer — no second copy to drift |
+| Git operations | Raw `git` calls reverse-engineered after the fact by `shlex`-parsing hooks | Owned entry points (`harness commit` / `merge-task` / `sync-branch` / `push` …); the raw verbs are blocked outright |
+| Workflow state | `tracker.md`, honor-system updates | HMAC-chain-sealed `state.yaml` + append-only ndjson evidence ledgers — tamper-evident, `exit 3` on out-of-band edits |
+| Human gates | The model reads your reply and acts on it | A hook captures your reply verbatim; deterministic code parses the decision — the model cannot approve on your behalf |
+| TDD enforcement | Separate Tester and Developer subagents per task (token/latency tax) | One developer writes test + implementation; `harness verify-red` *proves* the failure and blob-SHA-locks the test set until completion |
+| Providers | Markdown capability docs an agent must correctly read | Code modules behind one interface, each held to a shared contract test |
+| Agents | 7 role files fusing permissions with procedure | 3 fixed tool-grant *shapes* (planner / developer / reviewer); procedure lives in shared step files |
+| File-size budgets | Retrofitted after files passed 400 lines | ~100/200-line budget enforced from day one (`tools/budget_check.py`) |
 
 ## Install
 
-Requires **Claude Code** ([claude.ai/code](https://claude.ai/code)).
+Not yet published to a plugin marketplace — run it from a local clone:
+
+```sh
+git clone <this-repo> ai-sdlc-harness
+claude --plugin-dir /path/to/ai-sdlc-harness
+```
+
+Then, inside Claude Code:
 
 ```
-/plugin marketplace add MostAshraf/ai-sdlc-harness
-/plugin install ai-sdlc-harness@ai-sdlc-harness
-/reload-plugins
 /init-workspace
 ```
 
-That's it. `/dev-workflow` and `/story-workflow` are now available.
-
-> **Scope options:** Add `--scope project` to share the plugin with your team via `.claude/settings.json`, or `--scope local` to keep it personal and git-ignored. Default is `--scope user` (personal, applies everywhere).
-
-> **Runtime support:** Claude Code today. Codex CLI, Cursor, GitHub Copilot, and OpenCode are on the roadmap (separate work).
-
-## Migrating from v1.x
-
-If you've been running any v1.y.z release of the harness, your workspace has the old split layout:
-
-```
-ai/
-├── plans/<work-item-id>.md
-└── tasks/<work-item-id>.md
-```
-
-v2.0 writes every workflow artifact for one story to a single per-workflow directory keyed by date + work-item ID:
-
-```
-ai/<YYYY-MM-DD>-<work-item-id>/
-├── plan.md
-├── tracker.md
-├── coverage-report-<repo>.md
-├── static-security-report-<repo>.md
-├── pre-pr-report.md
-├── pr-comment-analysis-report-<n>.md
-└── metrics-report.md
-```
-
-The two layouts cannot coexist — v2.0's `SKILL.md` gate refuses to run any phase command against a workspace where `ai/plans/` or `ai/tasks/` still contain `.md` files. You'll see:
-
-```
-❌ v1.x layout detected — run /dev-workflow migrate before proceeding.
-```
-
-Run the migration:
-
-```
-/dev-workflow migrate
-```
-
-The migrate command handles **three classes of change** in a single pass:
-
-**Workflow artifacts** — moves your existing stories:
-
-1. **Scans** `ai/plans/` and `ai/tasks/` for every legacy `.md` story file.
-2. **Pairs** plans with their matching trackers by filename stem (the work-item ID).
-3. **Derives a date** per story from `Plan approved:` in the tracker, or falls back to the plan's mtime.
-4. **Presents a per-story table** of source files → target directory, and asks for explicit `y` confirmation. Default is NO.
-5. **Moves** each pair atomically into `ai/<YYYY-MM-DD>-<work-item-id>/` (CC-05.7.1 normalises slashes / colons / spaces in the ID).
-6. **Stamps** a migration footer in the moved tracker so the audit trail survives.
-7. **Removes** `ai/plans/` and `ai/tasks/` once they're empty (`rmdir` — defensive against accidental data loss).
-
-**Plugin shared files** — mirrors the same job as `/init-workspace --refresh-shared`:
-
-8. Runs `scripts/refresh-shared.sh` to copy the plugin's `agents/shared/*.md` files into `.claude/context/agents-shared/`. v2.0 subagents reference these via workspace-relative paths; v1.x workspaces don't have the mirror because the agent-runtime path fix landed post-1.7.2.
-
-**New + updated context files** — provisions v2.0 workspace state:
-
-9. Creates `.claude/context/naming-config.md` if absent, with defaults that **match the v1.x literal patterns** (branch `${team}/feature/${story_id}-${slug}`, commit `#${story_id} #${task_id}: ${slug}`, etc.) — your existing branches and commits stay valid.
-10. Creates `.claude/context/state.md` if absent, stamping `Bootstrap completed:` with the migration timestamp (your v1.x workspace IS bootstrapped — just without the v2.0 sentinel).
-11. Backfills `> Owner:` / `> Version:` headers (CC-04.4/.6) into the five v1.x context files (`provider-config.md`, `repos-metadata.md`, `repos-paths.md`, `language-config.md`, `conventions.md`) where missing. No other in-place mutation — your existing settings (repo paths, conventions, language toolchains, provider config) are preserved verbatim.
-
-The migration is **idempotent and non-destructive**: it never modifies branches, worktrees, or commits — only files under `ai/` and `.claude/context/`. Re-running on a v2.0 workspace short-circuits with `Workspace already on v2.0 layout — nothing to migrate.` (or proceeds to S7+S8+S9 only if the layout is already migrated but the new context files are still missing).
-
-For the full step-by-step + failure-mode table see [skills/dev-workflow/commands/migrate.md](skills/dev-workflow/commands/migrate.md).
+The interview asks only what it must (provider, repos), *discovers* your toolchain (proposing the test command it found), and offers **default** for everything else. It bootstraps a plugin-owned Python venv (PEP 668-safe — no system-python changes), ends with a verification gate — every check passes or you don't proceed — and writes per-section config under `.claude/context/`, a permission allowlist into `.claude/settings.json` (no manual `settings.json` editing needed), and the bootstrap marker.
 
 ## Prerequisites
 
 | Dependency | Why |
 |---|---|
 | **Claude Code** | The CLI that runs this harness. Install from [claude.ai/code](https://claude.ai/code). |
-| **Git** | Branch management, worktree isolation, commits. |
-| **Python 3** | **Required.** Every guard hook parses its JSON payload in Python; the commit-msg validator uses `shlex` for `git` argument parsing. If `python3` / `python` is not on `PATH`, the shared hook library exits at source time and the underlying tool call is blocked. Pre-installed on macOS and modern Linux; Windows users should install from [python.org](https://www.python.org/downloads/) before `/init-workspace`. |
-| **Provider MCP / CLI** *(optional)* | One of: ADO, Jira, GitLab, GitHub, or Zoho MCP. The `gh-cli` and `glab-cli` git providers don't need an MCP server. The `local-markdown` provider needs nothing at all. Selected during `/init-workspace`. |
+| **Git** | Branch management, per-task worktree isolation, owned commits. |
+| **Python 3.10+** | The entire core is Python. `/init-workspace` creates the plugin's own venv with PyYAML as its first step; until then the guards print a one-line notice and stand down. |
+| **Provider CLI, authed** *(optional)* | `gh auth login` / `glab auth login` / `az login`, if using that provider. MCP providers need their server connected. The `local-markdown` provider needs nothing at all. |
 
-Target repos must be **cloned locally** — this harness does not clone them. Each repo should be on its default branch and current before running `/init-workspace`. No language prerequisites — toolchains are discovered.
+Target repos must be **cloned locally**, clean, and on their default branch when registered — the harness does not clone them. No language prerequisites; toolchains are discovered.
 
 ---
 
@@ -138,494 +63,282 @@ Target repos must be **cloned locally** — this harness does not clone them. Ea
 ```mermaid
 flowchart LR
     classDef orch fill:#dde6fa,stroke:#446,stroke-width:1.5px,color:#013
-    classDef skill fill:#fff7d8,stroke:#b80,stroke-width:1px,color:#530
+    classDef agent fill:#fff7d8,stroke:#b80,stroke-width:1px,color:#530
     classDef human fill:#fff1de,stroke:#a60,stroke-width:1px,color:#420
-    classDef decision fill:#fff,stroke:#444,stroke-width:1.5px,color:#000
     classDef output fill:#eaf3ff,stroke:#36b,stroke-width:1px,color:#024
-    classDef error fill:#ffd9d9,stroke:#a00,stroke-width:2px,color:#600
 
-    P0([P0 Bootstrap]):::orch
-    P1[P1 Requirements]:::orch
-    P2[P2 Planning]:::orch
-    G1{GATE 1<br/>Plan approve}:::human
-    P25[P2.5 Preflight]:::orch
-    P3[P3 TDD Loop]:::skill
-    G2{GATE 2<br/>Impl approve}:::human
-    P5[P5 Test Hardening]:::skill
-    P55[P5.5 Security Review]:::skill
-    G25{GATE 2.5<br/>if findings<br/>&ge; medium}:::human
-    P6[P6 Pre-PR + PR]:::output
-    G3{GATE 3<br/>Pre-PR approve}:::human
-    P7[P7 PR Comment<br/>Response]:::output
-    G4{GATE 4<br/>Classify comments}:::human
-    P8[P8 Post-Merge<br/>Reconcile]:::output
-    P9[P9 Metrics<br/>auto T1/T2/T3]:::output
+    F([fetch + classify]):::orch
+    I[intake]:::agent
+    P[plan]:::agent
+    G1{approve-plan}:::human
+    PF[preflight]:::orch
+    D[develop — proven-red TDD per task]:::agent
+    G2{approve-impl}:::human
+    H[harden]:::agent
+    S[security scan]:::orch
+    G25{approve-security, when findings meet the threshold}:::human
+    QR[quick-recheck]:::orch
+    PP[pre-pr review]:::agent
+    G3{approve-pre-pr}:::human
+    FX[pre-pr-fixes]:::agent
+    CP[create-pr]:::output
+    AC[analyze-comments]:::agent
+    G4{select-comments}:::human
+    AF[apply-fixes]:::agent
+    RC[reconcile]:::output
+    M[metrics]:::output
 
-    IG[/IG Inter-Gate<br/>Ad-Hoc Request/]:::decision
-    G5{GATE 5<br/>Confirm request}:::human
-    R[/R Recovery<br/>resume / abort/]:::error
-
-    P0 --> P1 --> P2 --> G1
-    G1 -->|approved| P25 --> P3 --> G2
-    G2 -->|approved| P5 --> P55
-    P55 -->|no findings| P6
-    P55 -->|findings &ge; medium| G25
-    G25 -->|waive / defer| P6
-    G25 -->|fix-now| P3
-    P6 --> G3
-    G3 -->|approved| P7
-    G3 -->|fix required| P3
-    P7 --> G4
-    G4 -->|valid| P3
-    G4 -->|merged| P8 --> P9
-
-    G2 -.->|REQUEST| IG
-    G3 -.->|REQUEST| IG
-    IG --> G5 --> P3
-    G1 -.->|abandon| R
-    G2 -.->|abandon| R
-    G3 -.->|abandon| R
-    R -.->|resume| P3
+    F -->|full| I --> P --> G1
+    G1 -->|approved| PF
+    G1 -->|rejected| P
+    F -->|quick| PF
+    PF --> D
+    D -->|full| G2
+    G2 -->|approved| H --> S
+    G2 -->|rejected| D
+    S -->|below threshold| PP
+    S -->|findings meet the threshold| G25
+    G25 -->|waive / defer| PP
+    G25 -->|fix-now| D
+    D -->|quick| QR
+    QR -->|clean| PP
+    QR -->|dirty — escalate to full| S
+    PP --> G3
+    G3 -->|approved| CP
+    G3 -->|rejected| FX --> PP
+    CP --> RC --> M
+    CP -.->|on demand, repeatable| AC --> G4 --> AF -.-> RC
+    AF -.->|new comments| AC
 ```
 
-Five **human gates** (Plan approve, Impl approve, Pre-PR approve, PR comment classification, Ad-hoc request confirmation). One **conditional gate** (Security review — only if findings &ge; medium). Everything else runs hands-off between gates.
+**Full mode** has three unconditional human gates (plan, implementation, pre-PR), one conditional gate (security — fires only when the aggregate finding severity meets the configured threshold, default `medium`), and one multi-pick gate (comment selection, inside the on-demand PR-comments group). **Quick mode** — trivial changes classified at fetch — keeps only the pre-PR gate. Everything between gates runs hands-off.
 
-## Detailed Sequence
+At **any** cursor position, an ad-hoc human request is legal: it spawns the reviewer in `request-triage` mode (a declared always-legal spawn), which classifies the request against the approved plan. Out-of-scope requests surface back to you with explicit options — never silently merged.
+
+## The Per-Task TDD Loop
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant H as Human
     participant O as Orchestrator
-    participant P as Planner
+    participant C as harness CLI
     participant D as Developer
     participant R as Reviewer
-    participant T as Tester
-    participant K as Skill
 
-    Note over O: P0 Bootstrap runs once via /init-workspace — skipped in this view
-    Note over O: Every workflow artifact lives under ai/{date}-{work-item-id}/ per CC-05.7
-    Note over O: Single-repo view — multi-repo stories run lanes in parallel per repo
-
-    rect rgb(40, 75, 110)
-        Note over H,P: P1 — Requirements Ingestion
-        O->>P: Pull story, analyse requirements
-        P-->>O: AGENT STATUS — summary + clarifying questions
-        O->>H: Surface questions
-        H-->>O: Answers
-        O->>P: Resolve ambiguities
-        P-->>O: AGENT STATUS — requirements confirmed
+    Note over O: develop step — one task at a time, in a dedicated worktree
+    O->>C: worktree-add --task T1
+    O->>D: spawn with harness-mode develop headers
+    D->>D: write the failing tests from the plan's declared test-intents
+    Note over D: writes to non-test paths are hook-refused until the red-proof exists
+    D->>C: verify-red --task T1
+    Note over C: runs the test itself — must genuinely fail.<br/>Seals a chained red-proof + SHA-locks the test set
+    D->>D: implement until green, checkpoint via harness commit
+    D-->>O: status block SUCCESS
+    O->>C: task --id T1 --to in-review
+    Note over C: runs verify-green + red-proof check —<br/>a silently weakened test refuses the transition
+    O->>R: spawn with harness-mode review
+    R->>R: re-run build + tests independently, review the diff
+    R-->>O: verdict — hook-captured into reviews.ndjson
+    alt APPROVED
+        O->>C: task --to done, then merge-task (squash) + worktree-remove
+    else CHANGES_REQUESTED
+        O->>D: relay numbered findings — same worktree, bounded rounds
     end
-
-    rect rgb(35, 90, 75)
-        Note over H,P: P2 — Planning and Approval
-        O->>P: Decompose into plan + Test Outline + tracker
-        P-->>O: AGENT STATUS — plan + tracker written to workflow dir
-        O->>H: Present plan + Test Outline (GATE 1)
-        H-->>O: APPROVED
-        Note over O: Stamp 'Plan approved'
-    end
-
-    rect rgb(60, 60, 70)
-        Note over O: P2.5 — Preflight (orchestrator only)
-        Note over O: Create feature branch + commit the plan
-    end
-
-    rect rgb(60, 95, 50)
-        Note over H,R: P3 — TDD Development Loop (per task)
-        loop For each task T(n)
-            Note over O: Tracker T(n) → In Progress
-            alt test-required true (default)
-                O->>T: Write failing tests for T(n)
-                T-->>O: AGENT STATUS — red tests committed
-                O->>D: Make tests green
-            else test-required false
-                O->>D: Implement T(n) directly
-            end
-            D-->>O: AGENT STATUS — worktree commit + build pass
-            Note over O: Tracker T(n) → In Review
-            O->>R: Review combined diff
-            R-->>O: AGENT STATUS — verdict + [R/T/S] comments
-            alt APPROVED
-                Note over O: git merge --squash → Tracker Done
-            else CHANGES_REQUESTED
-                O->>D: Relay [R] comments, same worktree
-                Note over O: Loop back to review
-            end
-        end
-    end
-
-    rect rgb(75, 50, 100)
-        Note over H,O: P4 — Implementation Approval (GATE 2)
-        Note over O: Stamp 'Initial development completed'
-        O->>H: Present implementation summary
-        H-->>O: APPROVED
-        Note over O: Stamp 'Human approval (impl)'
-    end
-
-    rect rgb(40, 90, 85)
-        Note over H,T: P5 — Test Hardening
-        O->>T: Fill coverage gaps to 90 percent or higher
-        T-->>O: AGENT STATUS — tests committed + coverage report
-        O->>R: Review new tests (read-only)
-        R-->>O: AGENT STATUS — verdict
-        Note over O: Stamp 'Test hardening completed'
-    end
-
-    rect rgb(115, 80, 25)
-        Note over H,K: P5.5 — Static Security Review (auto)
-        O->>K: security-report skill (SAST + secrets + CVE)
-        K-->>O: static-security-report per repo
-        alt no medium-or-higher findings
-            Note over O: Auto-proceed — stamp 'Security review passed'
-        else medium-or-higher findings
-            O->>H: GATE 2.5 — WAIVE / DEFER / FIX-NOW
-            H-->>O: Decision
-            alt FIX-NOW
-                Note over O: Re-enter P3 with fix tasks
-            else WAIVE / DEFER
-                Note over O: Stamp decision, proceed to P6
-            end
-        end
-    end
-
-    rect rgb(30, 90, 120)
-        Note over H,R: P6 — Pre-PR Review + PR Creation
-        Note over O: git rebase --autosquash — squash fixups into task commits
-        O->>R: Pre-PR holistic review (full branch vs default)
-        R-->>O: pre-pr-report.md — AC coverage, conventions, security, hygiene
-        O->>H: Present report (GATE 3)
-        H-->>O: APPROVED
-        Note over O: Commit tracker, run pr-creator
-        O->>K: Create PR via provider adapter
-        K-->>O: PR URL stamped on tracker
-        Note over O: P9 trigger T1 — metrics emitted (round 0)
-    end
-
-    rect rgb(90, 55, 95)
-        Note over H,P: P7 — PR Comment Response (on-demand)
-        Note over O: Triggered by /dev-workflow review-response {id}
-        O->>R: pr-comment-analysis — challenge each comment vs plan + AC
-        R-->>O: Findings — VALID / INVALID / PARTIAL
-        O->>H: Present findings (GATE 4)
-        H-->>O: Pick which to address
-        alt at least one VALID accepted
-            O->>P: Append amendments to tracker
-            Note over O: Re-enter P3 for amendment tasks only
-            Note over O: P9 trigger T2 — metrics for this round
-        else all rejected
-            Note over O: Reply on PR with rationale
-        end
-    end
-
-    rect rgb(80, 55, 40)
-        Note over H,O: P8 — Post-Merge Reconciliation (auto on PR merge)
-        Note over O: Detect PR merged → transition work item → clean worktrees
-        Note over O: Rename tracker.md → tracker.archived.md (in place)
-        Note over O: Stamp 'PR merged' + 'Workflow completed'
-        Note over O: P9 trigger T3 — final metrics emitted
-    end
-
-    Note over O: IG — Inter-Gate Ad-Hoc Requests: reply REQUEST at GATE 2/3 or run /dev-workflow request mid-phase → Reviewer triages → GATE 5 confirms → ad-hoc batch enters P3
-    Note over O: R — Recovery — stop-failure marker plus PostCompact hook rehydrate state from tracker, human picks resume vs abort
 ```
+
+`task --to done` mechanically **refuses** without a captured `APPROVED` verdict in the ledger — the orchestrator can't paraphrase a review into an approval. Rejection rounds are bounded (`review_rounds.max`, default 5); beyond that the rework transition is refused and you are escalated, on the theory that round N+ signals plan drift, not code drift.
 
 ---
 
-## The Agents
+## The Agent Shapes
 
-| Agent | Role | Key restriction |
-|---|---|---|
-| **Planner** | Pulls the story, asks clarifying questions, proposes approaches, writes plan + Test Outline + tracker. | Writes restricted to the workflow dir (`ai/<date>-<id>/`). |
-| **Developer** | Implements production code in per-task git worktrees, runs builds. | No work-item provider access; never touches the tracker. |
-| **Reviewer** | Reviews code for spec compliance and quality; runs build/test independently. Modes: `review` / `pre-pr` / `pr-comment-analysis` / `request-triage`. | Strictly read-only — never writes any file. |
-| **Tester** | Writes failing tests in Phase 3 (`auto-tdd`); fills coverage gaps in Phase 5 (`auto-harden`). | No work-item provider access. |
+Instead of one file per role fusing "who may do what" with "what procedure to follow", there are three fixed tool-grant **shapes**; the procedure lives in per-mode step files under [skills/dev-workflow/steps/](skills/dev-workflow/steps/) that the shape reads at spawn time.
 
-The **Orchestrator** (the main Claude Code conversation) coordinates all agents, owns the task tracker, manages phase transitions, stamps metrics, and is the only writer of provider state.
+| Shape | Modes | Tool grant | Guard-enforced restriction |
+|---|---|---|---|
+| **planner** | `intake` · `plan` · `repo-map` | Read/Grep/Glob/Write/Edit/Bash | Writes only under `ai/<run>/` and `.claude/context/` — never repo source |
+| **developer** | `develop` · `harden` · `fixup` | Read/Grep/Glob/Write/Edit/Bash | Works only inside its task worktree; non-test writes refused until the task's red-proof is sealed |
+| **reviewer** | `review` · `pre-pr` · `analyze-comments` · `request-triage` | Read/Grep/Glob/Bash | Strictly read-only — no Write/Edit granted, shell writes blocked (a literal `/tmp` scratch path is the one exception); builds and test runs allowed, so it verifies independently instead of trusting another agent's claim |
 
-## Story Workflow
-
-Refines, analyzes, and grooms stories **before** development. Output is always posted as a work-item comment.
-
-| Command | When to use | What it produces |
-|---|---|---|
-| `improve` | Default — handles most stories | Complete refined story (adaptive: fast for good stories, conversational for rough ones) |
-| `analyze` | Pre-refinement assessment to share with the team | Readiness report with red/yellow/green flags |
-| `refine` | Complex stories needing section-by-section approval | Refined story (slow, interactive) |
-| `groom` | Post-refinement — technical deep-dive before sprint planning | Per-repo technical notes with affected files, risks, testing strategy |
-
-`improve` is the recommended default. It internally assesses readiness and adapts: skips questions for good stories, asks targeted questions for partial ones, runs up to two rounds for rough stories.
-
-```
-Raw story → /story-workflow improve → /story-workflow groom → /dev-workflow
-```
+The **orchestrator** (the main Claude Code conversation running `/dev-workflow`) is deliberately thin: a coordinator that walks the manifest, spawns shapes with structured `harness-mode:` headers, and calls `harness` verbs. It never writes code, never touches run-authority files directly, and never runs raw git — the guards block those paths and point it back to the owned verbs.
 
 ## Key Concepts
 
-### Per-workflow artifact paths (v2.0)
+### The run directory
 
-Every artifact for one story lives under a single directory keyed by date + work-item ID:
-
-```
-ai/2026-05-18-PROJ-123/
-├── plan.md                                    # Phase 2 output
-├── tracker.md                                 # rolling state (→ tracker.archived.md after P8)
-├── coverage-report-<repo>.md                  # Phase 5 per repo
-├── static-security-report-<repo>.md           # Phase 5.5 per repo
-├── pre-pr-report.md                           # Phase 6
-├── pr-comment-analysis-report-<n>.md          # Phase 7 per round
-└── metrics-report.md                          # Phase 9
-```
-
-The work-item ID is normalised (CC-05.7.1) — slashes, colons, spaces become `-`. Collision detection runs at P1 entry so two devs can't accidentally share the same directory. The strict CC0507 Convention-Check fails the build if any consumer regresses to the old `ai/plans/` or `ai/tasks/` paths.
-
-### Task Tracker
-
-A Markdown file (`tracker.md`) that tracks every task's status through the workflow. The tracker stays **uncommitted during development** (only the orchestrator updates it in the working tree) and is committed once in Phase 6 before PR creation. Keeps the git history clean — only code commits during development.
+Everything for one work item lives under a single directory keyed by date + work-item ID (same-day re-runs after an abort get a `-2`, `-3` suffix slot):
 
 ```
-⏳ Pending → 🔧 In Progress → 🔄 In Review → ✅ Done → 📦 Archived (after P8)
-                                     ↓
-                              🔧 In Progress (on changes requested)
+ai/2026-07-08-PROJ-123/
+├── state.yaml            # THE authority: cursor, tasks, artifacts, gate decisions — HMAC-chain-sealed
+├── work-item.json        # fetched + provider-normalized work item
+├── requirements.md       # intake output
+├── plan.md               # edge cases, risk tiers, test-intents, approach options, diagrams
+├── events.ndjson         # every deviation: test revisions, rejections, blocks, stalls, skipped gates
+├── tokens.ndjson         # real per-invocation token spend
+├── reviews.ndjson        # hook-captured reviewer verdicts (what "done" transitions check)
+├── human-input.ndjson    # your gate replies, captured verbatim — never leaves the workspace
+├── .redproof/            # sealed per-task red-proofs (read only via `harness show-redproof`)
+└── reports/              # security.md, pre-pr.md, metrics.md, coverage
 ```
 
-Dev tasks (`T1`, `T2`, ...) track Phase 3. One `T-TEST-<RepoName>` row per affected repo tracks Phase 5 hardening through the same lifecycle. Task Metrics additionally capture `Test Written` (when the tester commits failing tests) and `Green At` (when the developer commits the passing implementation).
+### Sealed state and evidence ledgers
 
-Cross-task dependencies are declared in the Notes column with a canonical `depends: T<n>[, T<n>...]` token; the orchestrator gates each lane on every listed Task ID being ✅ Done. The plan-generator also renders a Mermaid `flowchart LR` of the full task graph in a `## Dependency Graph` section of the tracker.
+`state.yaml` is HMAC-chained (key at `.claude/context/.harness-key`, pinned into git's exclude list and refused by the commit verbs if ever staged). Any out-of-band edit fails verification: every CLI verb exits `3` and refuses to proceed until you inspect and run `harness reseal`. The ndjson ledgers are append-only and chained the same way. At gate crossings, `publish-mirror` commits a **path-exclusive** snapshot of `ai/<run>/` onto your feature branch — minus `human-input.ndjson`, the red-proofs, and lockfiles — so the audit trail travels with the PR while your raw chat text stays local.
 
-A tracker can accumulate up to four additional sections — `## Pending Requests`, `## Amendments (PR Review Round <N>)`, `## Ad-hoc Tasks (Batch <N>)`, `## Deferred Requests`. The full schema lives in [skills/plan-generator/tracker-schema.md](skills/plan-generator/tracker-schema.md) (single source of truth).
+### Human gates
 
-### Worktree isolation
+Your reply at a gate is captured verbatim by a `UserPromptSubmit` hook into `human-input.ndjson`; `harness gate --decide` then derives the decision from that evidence with a deterministic parser. The grammar:
 
-The Developer works in a temporary git worktree at `<repo>-t<n>-<uid8>` — a separate checkout of the repo with an orchestrator-side UID8 suffix to prevent cross-task path collisions. This means:
+- **`APPROVED`** — exactly. A qualified approval ("approved, but also…") is *not* an approval; it routes to ad-hoc request triage.
+- **A numbered option** or the option's exact word (e.g. `2`, `waive`).
+- **Rejection-side options may lead the reply and carry notes** (`rejected — split T2 into…`); forward decisions stay bare by design.
+- The comment-selection gate additionally takes a comma-separated pick (`1,3`) or the literal `NONE`.
 
-- Development happens in isolation from the feature branch
-- On review approval, all commits are squash-merged into one clean commit
-- On changes requested, the Developer fixes in the same worktree (commits with `fixup!` markers that the Phase 6 autosquash collapses)
-- If worktree creation fails (e.g. Windows lock issue), the orchestrator falls back to working directly on the feature branch — `worktree_failed: true` is set on the task, and the `squash-merge-verify` hook still enforces commit isolation regardless of which path produced them
+Gate presentations, skips (a conditional gate whose predicate didn't fire), and rejections are all ledgered; `/workflow-status` surfaces the flagged events.
 
-### TDD red-verify
+### Proof-anchored TDD
 
-A PreToolUse hook (`tdd-red-verify`) refuses to let the developer write production code for a task until the tester has committed at least one test that the hook has independently observed failing. Replay caches live in `.claude/state/tdd-attestations/<task-id>.json`; cached green attestations are honoured for the same SHA. No tests, no implementation.
+The property that matters — *the test genuinely failed before the fix existed* — without the original's two-agent tax:
 
-### Build & test verification
+1. The developer writes the failing tests first. This ordering is **hook-enforced**, not advisory: until the red-proof exists, writes to non-test paths in the worktree are refused (test paths, fixtures, and build manifests for test dependencies stay writable — patterns configurable per language in [config/defaults/workflow.yaml](config/defaults/workflow.yaml)).
+2. `harness verify-red` runs the test itself — it must fail — then seals a chained red-proof and blob-SHA-locks the test files plus their declared closure (shared fixtures, `conftest.py`, …).
+3. The completion transition runs `verify-green` **and** re-checks the locked SHAs: a quietly weakened assertion refuses the transition.
+4. A genuinely wrong test is revised via `verify-red --revise --reason "…"` — an explicit, reviewer-visible flagged event, never a silent edit.
+5. Tasks a plan explicitly marks with no test-intents (docs, chores) are the approved opt-out: verify-red refuses, the completion guard exempts, review still applies.
 
-Quality is enforced through independent verification at each stage:
+### Owned git entry points
 
-- **API-compatibility precondition** — The Developer consults the named library's docs for the exact version stamped by the Planner (`[API: <lib> v<version>]`) before writing code. Not the latest stable, not from memory.
-- **Developer build** — The Developer runs the repo's build command (from `language-config.md`) and passes its strictness policy before committing. On failure: 2 retry attempts, then escalate.
-- **Reviewer build + test** — The Reviewer must independently run the build (and test for test reviews). Never trusts another agent's claim.
-- **Tester coverage** — The Tester runs the test command and achieves ≥ 90% line coverage on new/modified code only. Do NOT go out of scope. On failure: 2 retry attempts, then escalate.
+With the plugin enabled, raw commit-creating / history-rewriting git verbs (`commit`, `merge`, `rebase`, `cherry-pick`, `revert`, `am`, `pull`, `push`) are blocked for Claude in **any** session and repo — the guard cannot know a "harness" commit from any other, so the rule is workspace-wide by design (your own terminal outside Claude Code is unaffected). Mutations go through owned verbs that validate, execute, and ledger in one place: `commit` (declared classes `working`/`wip`, `--fixup-of`), `merge-task` (squash / `--autosquash` fold), `worktree-add`/`worktree-remove`, `sync-branch` (owned rebase), `push` (`--force-with-lease`), and `publish-mirror`. Branch and commit naming come from [config/defaults/naming.yaml](config/defaults/naming.yaml).
 
-### Structured Reviews
+### Quick mode — with a mechanical escape hatch
 
-The Reviewer performs a three-phase review:
+Trivial changes (explicit `Mode: quick` hint in the work item, no risk keywords) run the short pipeline: no plan step, no red-proof machinery, one gate. Because eligibility was classified *before code existed*, `quick-recheck` re-examines the **real diff** after develop: touching disqualifying patterns (security/auth/migration/API paths) or exceeding size caps (80 changed lines / 5 files, configurable) triggers the declared escalation edge into full mode's security step — forcibly, not at the model's discretion.
 
-0. **Ownership & convention pre-check** — Runs first. Verifies no forbidden path writes (developer/tester must not touch the workflow dir), commit-message format, no emoji shortcodes in Markdown, no sensitive files (`.env`, `.pem`, `.key`). Any failure immediately returns `🔄 Changes Requested` and skips the later phases.
-1. **Spec compliance** — Does the code match the plan? Failures produce `[S1]`, `[S2]`, ... comments. If spec fails, code quality is skipped entirely.
-2. **Code quality** — Are conventions followed? Are there bugs? Produces `[R1]`, `[R2]`, ... on production code and `[T1]`, `[T2]`, ... on test code, with severities `CRITICAL` / `WARNING` / `SUGGESTION`. The orchestrator routes `R` → Developer, `T` → Tester, `S` → by file path; when both impl and test comments exist on the same task, the Tester runs first.
+### The security step
 
-**Phase 6 pre-PR holistic review** produces a structured `pre-pr-report.md` on disk plus a console rendering for GATE 3: full change surface (every file changed with category), AC-by-AC verification with implementation and test evidence, task coverage, test quality, conventions, SOLID/DRY/YAGNI, security, git hygiene, risk & assumptions review vs plan, open items (TODO/FIXME/HACK + unanswered story questions), and a ready-to-use PR description draft. For multi-repo stories, each repo's reviewer emits a **Contract Verification table** with observed signatures; the orchestrator does a lexical cross-repo compare and surfaces any drift before PR creation.
+`security-scan` runs each repo's configured `scan_cmd`, parses severities via the configured regex, and records the aggregate maximum. The gate fires only at or above `security.gate_threshold` (default `medium`), with three dispositions: **fix-now** (routes back to develop), **waive** (recorded, pipeline continues), **defer** (pipeline continues *and* a follow-up work item is created via the provider, with paired ledger events so an in-flight, completed, or dropped deferral are distinguishable states).
 
-### Multi-repo stories
+### Multi-repo runs
 
-When a story spans multiple repos, developer lanes run **in parallel** across repos while tasks remain **sequential within each repo**. Cross-repo dependencies (API contracts, message schemas, shared DTOs) are defined by the Planner as numbered contracts (C1, C2, ...). Each repo gets its own PR/MR, all linked to the same work item.
+A work item spanning repos gets per-repo task lanes; cross-repo API contracts are declared in the plan and mechanically re-checked at reconcile time (`reconcile-contracts` greps each declared fragment across the other repos' sources, excluding test paths and the committed `ai/**` mirrors). Sync points fail closed: the cursor cannot leave `develop` while any task in any lane is non-terminal.
 
-### Naming-config
+### The repo map
 
-Branch, commit, and path patterns live in `.claude/context/naming-config.md` and are read at runtime by `_validate_commit_msg.py` (and consumed by P0 / P2.5 / P3 / P6 / P8 commands per the CC-01.8 citation). Override patterns without touching code:
-
-```yaml
-branch_format: "{team}/feature/{work_item_id}-{slug}"
-commit_format: "#${story_id} #${task_id}: ${slug}"
-```
-
-The validator falls back to the hardcoded canonical pattern when the config is absent — backward-compatible.
-
-## Branch & Commit Conventions
-
-**Branches:** `<team-name>/feature/<workitem-id>-<title>` — e.g. `backend/feature/12345-add-subscription-api`. Team name is configured at `/init-workspace` time.
-
-**Commits:** `#<STORY-ID> #<TASK-ID>: lowercase imperative description` — both IDs mandatory. TDD commits use `test:` or `impl:` suffix:
-
-```
-#PROJ-123 #T1 test: add token refresh contract test
-#PROJ-123 #T1 impl: add token refresh endpoint to auth service
-```
-
-**Phase 5 exception:** test-harden commits use Story ID only — no Task ID:
-
-```
-#PROJ-123 test-harden: add integration tests for token refresh flow
-```
-
-**Orchestrator meta commits:** the orchestrator commits plan, tracker, and (when Phase 7 runs) PR-response with designated meta Task IDs:
-
-```
-#PROJ-123 #TPLAN:    add approved implementation plan                  (Phase 2)
-#PROJ-123 #TTRACKER: add task tracker with final workflow state         (Phase 6)
-#PROJ-123 #TPR-RESP: record PR review response completion               (Phase 7)
-```
-
-Every commit body includes `Co-Authored-By: Claude Code <noreply@anthropic.com>`.
-
-Enforcement: the `validate-commit-msg` plugin-level hook (fires on every `git commit` Bash call by any agent, including the orchestrator). The hook accepts the canonical form, the TDD `test:`/`impl:` variants, the Phase 5 `test-harden` exception, the meta-Task IDs, and git's autosquash markers (`fixup!`/`squash!`/`amend!`/`reword!`). Anything else is fail-closed.
+`/init-workspace` (optionally) and `/repo-map-refresh` generate a tiered codebase map under `.claude/context/repo-map/` — directories and modules by purpose, key abstractions, notable patterns — stamped with the SHA it was generated at and flagged stale after 50 commits (configurable). The planner does targeted lookups against it per work item instead of re-deriving the codebase from scratch every run. Auto-generated only, never hand-maintained: corrections go through regeneration.
 
 ## Guardrail Hooks
 
-The plugin ships hooks that enforce harness invariants at the Claude Code level. They fire on every relevant tool call in every session — no setup beyond installing the plugin. All hooks scope themselves to initialised harness workspaces (`.claude/context/provider-config.md` must exist), so they don't interfere with unrelated Claude Code sessions.
+One Python entry point ([hooks/guards.py](hooks/guards.py)) handles every event, registered in [hooks/hooks.json](hooks/hooks.json). Guards scope themselves to workspaces with a live harness run (resolved from `CLAUDE_PROJECT_DIR` first, so a drifted shell `cwd` can't dodge them) — with one deliberate exception: the raw-git block is active whenever the plugin is enabled, everywhere.
 
-| Hook | Event · Matcher | What it enforces |
+| Guard | Event · Matcher | What it enforces |
 |---|---|---|
-| `validate-commit-msg` | PreToolUse · Bash | `git commit` subjects match the naming-config patterns or one of the documented variants. Fail-closed on unparseable forms — chained commands, `git -C`, multiple `-m`, `--message=`, `-F`, `--amend`, heredoc bodies. |
-| `bash-write-guard` | PreToolUse · Bash | Blocks shell-driven writes (redirects, `tee`, `cp`, `mv`, `install`, `dd of=…`, `ln`) into the workflow dir or sensitive files. Role-aware when subagent identity is available: reviewer = no writes; planner = writes only under `ai/`. |
-| `sensitive-file-guard` | PreToolUse · Write&#124;Edit&#124;MultiEdit&#124;NotebookEdit | Blocks direct file-tool writes to `.env*`, `*.pem`, `*.key`, `id_rsa*`, `*.tfstate`, and similar credential patterns. Shares the deny-list with `bash-write-guard`. |
-| `validate-mermaid-syntax` | PreToolUse · Write&#124;Edit&#124;MultiEdit | Structural Mermaid validation (R1 known opener, R3 quoted subgraph titles, R4 classDef closure, R7 shape delimiters, R8 no HTML comments inside fences, R9 node-count advisory, R10 optional mmdc). |
-| `tracker-transition-guard` | PreToolUse · Write&#124;Edit&#124;MultiEdit | Applies edit in-memory and validates every task-status transition against the legal state machine on a per-row basis. Whole-file `Write` covered; metadata-only edits (Notes, Commit, Verdict, timestamps) pass through. |
-| `tracker-metrics-guard` | PreToolUse · Write&#124;Edit&#124;MultiEdit | Validates that the tracker's Workflow Metrics and Task Metrics tables stay well-formed; stamps `Gate prompted <ts>` so `workflow-status` can surface stalled gates. |
-| `squash-merge-verify` | PostToolUse · Bash | Verifies `git merge --squash` only ran after Reviewer approval. `shlex`-aware — handles `cd repo && …`, subshells, env-var prefixes, `git -c key=val`. Also detects FF merges as no-ops. |
-| `tdd-red-verify` | PreToolUse · Bash&#124;Write&#124;Edit | New in v2.0. Refuses to let the Developer touch production code for a task until the Tester has committed at least one independently-replayed failing test. Cached attestations per task SHA. |
-| `tracker-update-reminder` | PostToolUse · Agent | After subagent runs, reminds the orchestrator to sync tracker status if it looks stale. |
-| `tester-activation-guard` | SubagentStart · ai-sdlc-tester | Mode-aware: `auto-tdd` allows when at least one task is 🔧 In Progress; `auto-harden` blocks unless every dev task is ✅ Done. Falls back to harden semantics if mode is undetectable (safe default). |
-| `agent-status-check` | SubagentStop | Verifies every agent response ends with a `📋 AGENT STATUS` block — tail position plus a non-empty `Outcome:` or `Verdict:` field. HTML-entity tolerant. |
-| `worktree-clean-check` | SubagentStop | New in v2.0. On developer/tester SUCCESS, dirty-worktree detection — fail-closed with recovery prompt. Out-of-scope agents fall through fail-open. |
-| `stop-failure-marker` | StopFailure | Writes a recovery marker on unexpected agent stop (API failure, timeout). Cwd-independent via shared workspace walk-up. |
-| `stop-failure-recovery` | UserPromptSubmit | Detects the recovery marker at the start of the next prompt and injects resume instructions for the orchestrator. Also scans `ai/.snapshots/` for orphan plan snapshots and presents `[1] restore / [2] keep / [3] discard` per orphan. |
-| *(inline prompt)* | PostCompact | Reconstructs workflow state from the latest tracker after context compaction. |
+| bash | PreToolUse · Bash | Blocks raw history-mutating git everywhere and points to the owned verbs. Role-aware shell-write analysis (quote-masked shape matching on redirects, `tee`, `cp`/`mv`, in-place editors): reviewer writes only to literal `/tmp` paths; developer confined to its worktree; secret/evidence files unreadable. |
+| write | PreToolUse · Write/Edit/MultiEdit/NotebookEdit | Path confinement per shape (planner → `ai/<run>/` + `.claude/context/`; developer → its worktree with the pre-red test-first lock; reviewer → nothing) plus sensitive-file patterns. |
+| spawn | PreToolUse · Agent/Task | Only the spawn-set the manifest declares for the current cursor is legal — shape *and* `harness-mode:` header both checked; out-of-run spawns (e.g. repo-map generation) must be declared in [pipeline/surfaces.yaml](pipeline/surfaces.yaml). Fail-closed. |
+| skill | PreToolUse · Skill | USER-ENTRY skills (`/dev-workflow`, `/init-workspace`, …) refuse invocation from subagents or autonomous triggering — they run only when you ran them. |
+| read | PreToolUse · Read/Grep | Red-proofs are readable by harness shapes only via `harness show-redproof` (chain-verified) — a raw `.redproof/` read skips integrity verification and is blocked. |
+| prompt capture | UserPromptSubmit | Verbatim capture of your replies into `human-input.ndjson` — the only evidence `gate --decide` accepts. |
+| verdict capture | PostToolUse · Agent/Task | The authoritative writer of `reviews.ndjson` (reviewer verdicts) and missing-status-block events — anchored here because this payload deterministically carries both the spawn prompt and the agent's final reply. |
+| stop capture | SubagentStop | Per-invocation token accounting into `tokens.ndjson`; secondary status-block capture. |
 
-**Fail-closed vs fail-open** — every hook declares its policy in [scripts/README.md](scripts/README.md). Recognised violations always block; unparseable inputs default to fail-open so legitimate-but-weird commands aren't silently swallowed. The strictest is `bash-write-guard`: every recognised shell-write pattern is fail-closed.
+Every guard's fail-open/fail-closed policy is chosen deliberately and tested: recognised violations always block; the spawn guard is fail-closed even on ambiguity.
 
-**Convention-Check tier** — `python3 scripts/cc-check.py` runs 14 strict-by-default convention checks (CC03 hook policy, CC04 shared-ref drift, CC0507 artifact paths, CC06 test naming, CC07-04 mermaid syntax, CC07-04-4-5 failure-mode parity, CC07-04 phase-heading style, CC07 canonical-spec headers, CC07 diagram palette, CC09 tunable thresholds, CC21 provider parity, CC24 drift-sweep residuals, CC0108 naming-from-context). Wired into `tests/run.sh`. Strict-mode opt-outs and opt-ins are documented in each script's header.
+## The `harness` CLI
 
-**Tests** — every hook has a pure-bash test suite under `tests/hooks/`. Skill files have doc-grep regression tests under `tests/skills/`. Provider adapter capability assertions live under `tests/adapters/`. Behavioural fixtures live under `tests/integration/`. Run everything via `tests/run.sh`.
+All ~49 owned verbs run through the wrapper `${CLAUDE_PLUGIN_ROOT}/bin/harness` (resolves the plugin venv, falls back to system `python3`). Agents call it; you rarely need to — except `abort`.
 
-## Utility commands
-
-| Command | What it does |
+| Group | Verbs |
 |---|---|
-| `/workflow-status <id>` | Dashboard showing story progress, task states, branch info. Section-aware — renders Main, Amendments, Ad-hoc Tasks, and Deferred Requests separately. Surfaces stalled gates via `Gate prompted <ts>` age. |
-| `/dev-workflow request <id> "<text>"` | Submit an ad-hoc request mid-flow — Reviewer triages against the plan, GATE 5 confirms each (repo, request) row, in-scope items become tasks. |
-| `/dev-workflow review-response <id>` | Trigger Phase 7 — re-triage open PR review comments and append amendments. |
-| `/dev-workflow reconcile <id>` | Manually trigger Phase 8 — useful when the auto-trigger missed a merge. |
-| `/dev-workflow hotfix <id>` | Re-enter a closed workflow. Auto-detects mode: un-archive if within the 30-day window, linked-fresh otherwise. |
-| `/dev-workflow resume <id>` | Manually trigger Recovery (R) — pick resume vs abort. |
-| `/validate-build` | Pre-PR sanity check — runs discovered build + test commands. |
-| `/coverage-report` | Code coverage analysis against the configured threshold. |
+| Workspace setup | `init` · `discover` · `ensure-default-branch` · `init-verify` · `init-section` · `init-finalize` · `add-repo` · `migrate-detect` · `migrate-extract` · `resolve-model` · `resolve-coverage-cmd` |
+| Pipeline steps | `fetch` · `preflight` · `plan-register` · `quick-recheck` · `security-scan` · `reconcile-contracts` · `create-pr` · `fetch-pr-comments` · `reconcile` · `write-back` · `metrics` |
+| State & evidence | `bootstrap` · `cursor` · `task` · `artifact` · `gate` · `stall` · `log-event` · `verify` · `show` · `status` · `abort` · `complete` · `reseal` |
+| TDD proof | `verify-red` (and `--revise`) · `show-redproof` |
+| Git (owned) | `worktree-add` · `worktree-remove` · `commit` · `merge-task` · `sync-branch` · `push` · `publish-mirror` |
+| Providers & misc | `provider` · `provider-normalize` · `validate-mermaid` · `repo-map-check` · `repo-map-stamp` |
+
+Exit codes: `0` ok · `1` refused (read the JSON `error`) · `2` usage error · `3` integrity violation (a sealed file changed out-of-band — recover with `harness reseal` after review).
+
+## Providers
+
+Work-item integrations are code modules behind one interface — callers name an *operation* (`work_item.fetch`, `work_item.create`, `create-pr`, …), never a provider — and every module must pass the shared contract test in [tests/test_providers.py](tests/test_providers.py). Adding a provider = implementing the interface.
+
+| Provider | Transport | Needs |
+|---|---|---|
+| `local-markdown` | files | Nothing — work items are `.md` files in a configured stories directory |
+| `github` | CLI (`gh`) | `gh auth login` |
+| `gitlab` | CLI (`glab`) | `glab auth login` |
+| `ado` | CLI (`az boards`) | `az login` + DevOps extension |
+| `ado-mcp` | MCP | Azure DevOps MCP server connected |
+| `jira` | MCP | Jira MCP server connected |
+| `zoho` | MCP | Zoho MCP server connected |
+
+CLI/file-transport providers execute inside the harness process. MCP-transport providers can't be script-called: the module declares a tool **mapping**, the model invokes the MCP tool, and pipes the raw result to `harness fetch --from-raw` for the same shared normalize + bootstrap path.
 
 ## Project Structure
 
 ```
 ai-sdlc-harness/
-├── CLAUDE.md                  # Authoritative workflow specification
-├── getting-started.md         # 10-minute onboarding
-├── .claude-plugin/
-│   ├── plugin.json            # Plugin manifest (name, version, skills root)
-│   └── marketplace.json       # Marketplace entry
-├── agents/                    # Agent definitions
-│   ├── planner/index.md
-│   ├── developer/index.md
-│   ├── reviewer/              # index.md + pre-pr.md + pr-comment-analysis.md
-│   ├── tester/index.md
-│   └── shared/                # Content shared across agents
-├── skills/
-│   ├── dev-workflow/          # Master orchestrator (phase command files)
-│   │   └── commands/          # requirements/plan/preflight/develop/approve-impl/test/
-│   │                          # security-review/create-pr/review-response/reconcile/
-│   │                          # metrics/handle-request/hotfix/resume
-│   ├── story-workflow/        # Story refinement (4 sub-commands)
-│   ├── story-intake/          # Phase 1: requirements ingestion
-│   ├── plan-generator/        # Phase 2: plan decomposition (+ tracker-schema.md SSOT)
-│   ├── pr-creator/            # Phase 6: PR/MR creation
-│   ├── security-report/       # Phase 5.5: SAST/secrets/CVE aggregator
-│   ├── metrics-collector/     # Phase 9: metrics aggregator (T1/T2/T3 triggers)
-│   ├── init-workspace/        # One-time setup + language discovery
-│   ├── validate-build/        # Build + test validation
-│   ├── validate-mermaid/      # Structural mermaid validation
-│   ├── coverage-report/       # Coverage analysis
-│   ├── workflow-status/       # Status dashboard
-│   └── providers/             # Provider adapters (ado, jira, gitlab, github, zoho, gh-cli, glab-cli, local-markdown, shared/)
+├── .claude-plugin/plugin.json   # plugin manifest
+├── pipeline/
+│   ├── manifest.yaml            # THE pipeline source of truth: steps, modes, gates, escalations
+│   ├── task-fsm.yaml            # legal task-status transitions
+│   └── surfaces.yaml            # subagent shapes, write surfaces, out-of-run spawns
+├── config/defaults/             # shipped knobs (workflow, naming, quick-mode, review-policy,
+│                                #   status-mapping, subagent-models) — overrides live in the
+│                                #   workspace's .claude/context/
+├── harness/                     # the Python core behind every owned verb
+│   ├── cli.py                   # verb surface
+│   ├── workflow.py              # step implementations
+│   ├── state.py · transitions.py · gates.py · chain.py   # sealed state + FSM + gate parser
+│   ├── gitops.py                # owned git machinery
+│   ├── migrate.py               # v2.x workspace adoption (the fork seam)
+│   └── providers/               # code-modular provider adapters
 ├── hooks/
-│   └── hooks.json             # Plugin hook registrations
-├── scripts/
-│   ├── *.sh                   # Guardrail shell entry points
-│   └── *.py                   # Guard logic + shared library + cc-check aggregator
-└── tests/
-    ├── hooks/                 # Pure-bash unit tests for every hook
-    ├── skills/                # Doc-grep regression tests for skill files
-    ├── adapters/              # Provider adapter capability assertions
-    ├── integration/           # Behavioural fixtures (workflow-fixture-self-check, p1/p5.5/p8/p9/r-resume, gate-reject-paths, hotfix-re-entry, ...)
-    └── convention-check/      # cc-check.py-driven strict convention enforcement
+│   ├── hooks.json               # hook registrations
+│   └── guards.py                # all guard + capture logic (one entry point)
+├── agents/                      # the 3 shapes: planner.md, developer.md, reviewer.md
+├── skills/
+│   ├── dev-workflow/            # thin orchestrator walker + per-step instruction files
+│   └── init-workspace/ · add-repo/ · migrate-workspace/ · workspace-config/ · workflow-status/ · repo-map-refresh/
+├── bin/harness                  # wrapper script resolving the plugin venv
+├── tools/                       # meta-tooling: line-budget checker, sandbox workspace generators
+└── tests/                       # 582 stdlib-unittest tests
 ```
 
-Target-workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside your working directory by `/init-workspace` and the workflow phases. They do **not** live inside this plugin repo.
+Workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside *your* working directory by `/init-workspace` and the pipeline. They never live inside this plugin repo.
 
-### Permissions
+## Development
 
-Claude Code plugins cannot ship pre-approved bash permissions — those must live in user or project `settings.json`. If you want the workflow to run without prompting on every `git` call, add the following to your project `.claude/settings.json` or `~/.claude/settings.json`:
+Requires Python 3.10+ and PyYAML.
 
-```json
-{
-  "permissions": {
-    "allow": [
-      "Bash(git add:*)", "Bash(git commit:*)", "Bash(git checkout:*)",
-      "Bash(git merge:*)", "Bash(git branch -D:*)", "Bash(git pull:*)",
-      "Bash(git log:*)", "Bash(git diff:*)", "Bash(git status:*)",
-      "Bash(git worktree:*)", "Bash(git rev-parse:*)",
-      "Bash(git symbolic-ref:*)", "Bash(git remote:*)", "Bash(git -C:*)"
-    ]
-  }
-}
+```sh
+python3 -m venv .venv && .venv/bin/pip install pyyaml
+.venv/bin/python -m harness.schema          # validate all declared data against the fixed vocabulary
+.venv/bin/python tools/budget_check.py      # line budget + duplication sweep
+.venv/bin/python -m unittest discover -s tests
 ```
 
-`git push` is deliberately excluded so PR creation requires an explicit confirmation.
-
-## Extending the Harness
-
-### Agent Frontmatter
-
-Agent files live at `agents/<name>/index.md` with YAML frontmatter (the `reviewer` directory also contains `pre-pr.md` and `pr-comment-analysis.md` for its Phase 6 and Phase 7 modes):
-
-| Field | Description |
-|---|---|
-| `name` | Agent identifier — for harness agents this is `ai-sdlc-<role>` (e.g. `ai-sdlc-planner`) |
-| `description` | Role description shown in the Agent tool |
-| `tools` / `disallowedTools` | Allowed and denied tool lists |
-| `model` | LLM model — `inherit` (default), `opus`, `sonnet`, or `haiku` |
-| `memory` | Memory scope — `project` for shared project memory |
-| `maxTurns` | Maximum conversation turns before auto-stop |
-| `skills` | Preloaded skill names |
-
-### Skill Frontmatter
-
-Skill files live at `skills/<name>/SKILL.md`:
-
-| Field | Description |
-|---|---|
-| `name` | Skill identifier |
-| `description` | Purpose shown when listed |
-| `allowed-tools` | Tools the skill may use |
-| `argument-hint` | Usage hint shown to the user |
-| `disable-model-invocation` | If `true`, content is injected as reference, not a model call |
-| `user-invocable` | If `true`, callable via `/<skill-name>` (default `true`) |
+The test suite (582 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of both pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 
-**Can I resume a workflow after closing the terminal?** Yes. Start a new session in the same workspace and run `/dev-workflow resume <story-id>` — or just type `/workflow-status` to see where you left off. The PostCompact hook also surfaces in-progress trackers during long sessions.
+**Can I resume after closing the terminal?** Yes — `state.yaml` *is* the resume point. Start a new session in the same workspace, run `/workflow-status` to see where you are, then `/dev-workflow <id>`: it detects the live run and offers **Resume or Abort** — never clobbers.
 
-**What if a build fails?** The Developer gets 2 retry attempts; then the issue is escalated to you. The Phase 6 pre-PR review re-runs build and test before PR creation.
+**How do I abandon a run?** `harness abort --run <run> --reason "<why>"` (via the plugin's `bin/harness`). Terminal: sweeps worktrees, keeps the full audit trail, frees the work item. A same-day re-run gets a fresh `-2` suffix slot; nothing is deleted.
 
-**What if the Reviewer rejects code?** The Orchestrator relays the comments to the Developer (R-comments) or Tester (T-comments). They fix in the same worktree. Cycle repeats until approved.
+**What does exit code 3 mean?** A sealed file (`state.yaml`, a ledger, a red-proof) changed outside the owned verbs. Every verb refuses until you inspect the diff and run `harness reseal` — deliberately loud, because silent tolerance would make the audit trail worthless.
 
-**What if I find a bug while testing before approving?** Don't reply `APPROVED` at GATE 2 / GATE 3 — instead reply `REQUEST <description>` or run `/dev-workflow request <story-id> "<text>"` mid-phase. The Reviewer triages your request against the approved plan and classifies it (in-scope bug, in-scope AC miss, out-of-scope, plan conflict, duplicate, invalid). You confirm at GATE 5 via a per-(repo, request) decision matrix — in-scope items become tasks under `## Ad-hoc Tasks (Batch <N>)` and follow the standard TDD path. The previous gate resumes once the batch is done.
+**Why can't Claude run `git commit` even in my other projects?** The guard can't distinguish a harness commit from any other, so the block is workspace-wide by design whenever the plugin is enabled. Your own terminal outside Claude Code is unaffected. Disable the plugin for sessions where you want raw git back.
 
-**What if Phase 5.5 finds a real security issue?** GATE 2.5 fires when findings ≥ medium. Pick `FIX-NOW` to re-enter Phase 3 with fix tasks, `WAIVE` to record the risk and proceed, or `DEFER` to file follow-up work and proceed. Findings below medium auto-pass — the per-repo `static-security-report-<repo>.md` is still retained in the workflow dir for audit.
+**What if the reviewer keeps rejecting?** Rounds are bounded (`review_rounds.max`, default 5). Beyond that the rework transition is refused and you're escalated — persistent rejection signals plan drift, not code drift.
 
-**How does the harness know my PR merged?** Phase 8 detects it via the git provider adapter (`work_item.transition` capability when available, otherwise polled). If your adapter doesn't support transitions, the orchestrator prompts you to mark the work item done manually, then proceeds with worktree cleanup + tracker archive. You can also trigger it manually with `/dev-workflow reconcile <id>`.
+**What if an agent stalls or returns garbage?** A missing/invalid status block is detected mechanically; the orchestrator re-invokes with a continuation prompt (bounded, default 2), then escalates to you (default 3). It never acts on the agent's behalf.
 
-**What happens after merge?** Phase 8 cleans up worktrees, archives the tracker in place (`tracker.md` → `tracker.archived.md`; the workflow dir stays intact so reports remain co-located), stamps final metrics. Phase 9's T3 trigger fires the metrics-collector for the closeout numbers.
+**What if a test is genuinely wrong after it was proven red?** `harness verify-red --revise --reason "<why>"` — the revision is sealed and flagged in the events ledger, reviewer-visible. There is no silent path.
 
-**Can I patch a closed story?** Yes — `/dev-workflow hotfix <id>` re-enters. Within 30 days the harness clones the archived tracker (`un-archive` mode); after 30 days it spawns a new linked workflow with bidirectional `Hotfix-Of:` / `Hotfixed-By:` headers. Both modes preserve the original archive.
+**What happens on a security finding?** Below the threshold: recorded, pipeline continues. At/above: the gate fires with **fix-now** (back to develop), **waive** (recorded), or **defer** — defer also creates a follow-up work item through your provider, with paired events so a dropped deferral is detectable.
 
-**How do I add my repos?** Run `/init-workspace`. It scans each codebase (read-only), discovers language and toolchain via negotiate-and-confirm, generates `.claude/context/` files. Any language — frontend or backend — is supported.
+**How do I trust what a run did?** Read the ledgers. `events.ndjson` records every deviation (test revisions, gate rejections, blocked actions, stalls, skipped gates), `tokens.ndjson` the real spend, `reviews.ndjson` the verdicts, and the chained `state.yaml` the decisions — all mirrored onto the feature branch at gate crossings (minus your raw replies). `/workflow-status` and `harness metrics` are deterministic projections of the same files.
 
-**Why isn't `git push` pre-approved?** Safety. It prompts during Phase 6 (PR creation) so you confirm before anything leaves your machine.
+**I'm coming from ai-sdlc-harness v2.x — can I migrate my workspace?** Yes — run `/migrate-workspace` in it. Config carries over as per-section proposals you confirm (provider, repos, test commands, stories directory), applied through the same verification gate as a fresh setup; the old markdown configs are archived to `.claude/context/legacy-2.1/` with a migration report. Run history is never converted — v3.0 state is sealed evidence v2.x never produced — so old `ai/` run dirs stay in place as readable archives, and in-flight v2.x stories finish on v2.x (or are abandoned) before you switch. Existing `local-markdown` stories work in place, including their `> Status:` blockquotes.

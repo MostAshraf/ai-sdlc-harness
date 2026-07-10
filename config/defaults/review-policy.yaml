@@ -1,0 +1,25 @@
+# Shipped defaults: review-policy (design.md piece 4, coverage B6/B11).
+# The slim, CONFIGURED policy file — team/repo review-enforcement and
+# architectural rules the reviewer applies. Deliberately narrow: style and
+# formatting are left to real code + linters; generic standards live in the
+# shipped engineering-principles. This file carries only policy nothing else
+# can infer. Users add team rules in .claude/context/review-policy.yaml.
+
+review_policy:
+  # Hardening tests must assert the full response/error-envelope contract,
+  # not just a status code (anti-gaming, coverage B11).
+  - id: assertion-depth
+    applies: [harden, review]
+    rule: >
+      Coverage tests assert the complete observable contract (body shape,
+      error envelope, side effects) — status-code-only assertions are
+      incomplete and must be flagged.
+
+  # Optional fields on partial-update (PATCH-style) DTOs must use
+  # nullable/wrapper types, never bare primitives — a primitive default cannot
+  # distinguish "client sent false" from "client omitted the field" (B6).
+  - id: patch-dto-wrapper
+    applies: [plan, develop, review]
+    rule: >
+      Every optional field on a PATCH/partial-update DTO uses a
+      nullable/wrapper type; bare-primitive optionals are a defect.

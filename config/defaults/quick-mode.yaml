@@ -1,0 +1,18 @@
+# Shipped defaults: quick-mode eligibility (design.md piece 1).
+# Consumed twice, from this one declaration:
+#   1. fetch's classifier (selects the mode) — ex-ante, before code exists
+#   2. quick-recheck's diff-pattern re-check (RC3 small) — post-develop, on the
+#      real diff; a hit escalates to full's security step (declared edge)
+# Thresholds follow the original's tested classifier defaults.
+
+quick_mode:
+  loc_max: 80
+  files_max: 5
+  # Path patterns: any match on the REAL DIFF dirties quick-recheck (post-develop).
+  disqualify_patterns:
+    security: ["**/auth/**", "**/security/**", "**/crypto/**", "**/*secret*", "**/*credential*"]
+    migration: ["**/migrations/**", "**/*.sql"]
+    public_api: ["**/api/**", "**/public/**", "openapi*", "**/*.proto"]
+  # Keywords: matched against the WORK ITEM TEXT by fetch's ex-ante classifier
+  # (before code exists). Conservative by design; the diff re-check is the backstop.
+  disqualify_keywords: [auth, security, crypto, secret, credential, migration, schema, public api]

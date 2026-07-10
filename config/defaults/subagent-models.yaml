@@ -1,0 +1,15 @@
+# Shipped defaults: per-shape / per-mode model override (design.md piece 3).
+# `inherit` = pass no model at spawn -> subagent runs on the session model.
+# An entry is either a scalar (all modes of that shape) or an object with
+# `default` + per-mode overrides. Resolution, most-specific wins:
+#   per-mode ?? per-shape default ?? inherit
+#
+# Example of the object form (commented out):
+#   reviewer:
+#     default: inherit
+#     pre-pr: claude-opus-4-8      # strongest model where rigor matters most
+
+subagent_models:
+  planner: inherit
+  developer: inherit
+  reviewer: inherit

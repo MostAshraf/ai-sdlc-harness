@@ -1,0 +1,35 @@
+# pipeline/surfaces.yaml — invocation-control classification (design.md piece 3).
+# Every plugin surface is user-entry or harness-internal; the boundary is
+# enforced by the invocation guard, not requested in prose.
+
+# Invoked only by a human command. Blocked from subagent context by the
+# invocation guard (hook payload agent_id/agent_type identifies context).
+# Descriptions must never auto-trigger from conversation.
+user_entry:
+  skills: [init-workspace, dev-workflow, workflow-status, repo-map-refresh, add-repo,
+          workspace-config, migrate-workspace, story-workflow]
+
+# The three shapes and their legal modes. Instruction files are NOT registered
+# as skills at all — they are content the orchestrator and shapes Read.
+# The spawn guard validates {shape, mode} pairs against this file + the
+# manifest's spawn-sets; shape comes from the payload's agent_type, mode from
+# the mandated structured spawn-prompt header.
+shapes:
+  planner:
+    tools: [Read, Grep, Glob, Write, Edit, Bash]
+    modes: [intake, plan, repo-map]
+  developer:
+    tools: [Read, Grep, Glob, Write, Edit, Bash]
+    modes: [develop, harden, fixup]
+  reviewer:
+    tools: [Read, Grep, Glob, Bash]      # no Write/Edit + bash-write-guard
+    modes: [review, pre-pr, analyze-comments, request-triage]
+
+# Standing spawn-guard exceptions: legal regardless of whether any run's
+# current step declares this pair in its own spawn-set, and regardless of
+# whether other run directories exist in the workspace (ai/*/ is never
+# cleaned up after a run reaches its terminal step, so "no runs exist" is
+# almost never true post-bootstrap — these pairs must stay legal anyway).
+# Absent any run at all, the guard is otherwise fail-closed pre-run.
+out_of_run_spawns:
+  - {shape: planner, mode: repo-map}

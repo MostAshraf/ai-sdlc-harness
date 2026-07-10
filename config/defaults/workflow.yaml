@@ -1,0 +1,53 @@
+# Shipped defaults: cross-cutting workflow knobs (design.md pieces 1/2/5 +
+# coverage decisions). Users override in .claude/context/workflow.yaml.
+
+# Reviewer-rejection circuit breaker (coverage B3): beyond max, the
+# in-review -> in-progress rework transition is refused and the human is
+# escalated — "round N+ signals plan drift, not code drift".
+review_rounds:
+  max: 5
+
+# Stalled-agent procedure (coverage B4): SubagentStop detects a missing/invalid
+# status block; never act on the agent's behalf; re-invoke with a continuation
+# prompt; bounded retries then escalate.
+stall:
+  recovery_after: 2
+  human_after: 3
+
+# Repo-map staleness (design.md piece 5B): refresh when missing or more than
+# N commits behind the SHA it was generated at.
+repo_map:
+  stale_after_commits: 50
+
+# Severity model for the security step + conditional gate predicate.
+security:
+  severity_order: [info, low, medium, high, critical]
+  gate_threshold: medium
+
+# Work-item tags written at workflow milestones (extension example from the
+# modularity section). Empty by default; e.g. `on_develop_start: in-development`.
+tags: {}
+
+# Test-set identification for the TDD proof (design.md piece 5A + RC4).
+# `test_cmd` itself is DISCOVERED per repo by init-workspace, never defaulted.
+# test_paths: which changed files count as the red test-set. Also the write
+#   surface the test-first ordering guard allows BEFORE a task's red-proof is
+#   sealed — so the defaults must cover the mainstream layouts (field report:
+#   the Python/JS-only defaults would have stranded a Maven developer at the
+#   first `src/test/**` write).
+# test_closure: existing files SHA-locked WITH the tests (fixtures/config —
+# the RC4 widening: weakening a shared fixture must not evade the lock).
+# pre_red_paths: additionally writable before the red-proof is sealed — build
+#   manifests a failing test's new dependency lands in. Deliberately NOT
+#   test_closure: closure files are SHA-locked at red, and a post-red
+#   implementation-dependency edit to pom.xml must stay legal.
+language:
+  test_paths: ["tests/**", "**/test_*.py", "**/*_test.*", "**/*.test.*",
+               "**/*.spec.*", "src/test/**", "**/*Test.java", "**/*Tests.java",
+               "**/__tests__/**"]
+  test_closure: ["**/conftest.py", "pytest.ini", "tests/**", "src/test/**"]
+  pre_red_paths: ["**/pom.xml", "**/build.gradle", "**/build.gradle.kts",
+                  "**/settings.gradle", "**/settings.gradle.kts",
+                  "**/package.json", "**/*.csproj", "pyproject.toml",
+                  "setup.py", "setup.cfg", "requirements*.txt", "go.mod",
+                  "go.sum", "Cargo.toml", "Gemfile", "composer.json"]

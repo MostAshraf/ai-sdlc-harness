@@ -1,0 +1,21 @@
+{
+  "provider": "gitlab",
+  "op": "work_item.create",
+  "cli": "glab",
+  "argv": [
+    "issue",
+    "create",
+    "--title",
+    "probe issue",
+    "--description",
+    "probe body",
+    "--repo",
+    "OWNER/REPO"
+  ],
+  "returncode": 1,
+  "stdout": "",
+  "stderr": "          \n   ERROR  \n          \n  404 Not Found.                                                                                                      \n\n",
+  "captured_via": "harness provider (real glab, live instance)",
+  "status": "BLOCKED",
+  "note": "Valid subcommand: glab parsed it and EXECUTED (rc=1, stderr '404 Not Found') — NOT the nonexistent-subcommand bug class (which prints parent help to stdout with rc=0). Blocked by this self-hosted instance rejecting %2F-encoded project-path lookups; would pass on an instance that permits them (e.g. gitlab.com)."
+}

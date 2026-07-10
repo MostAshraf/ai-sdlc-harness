@@ -1,0 +1,31 @@
+{
+  "provider": "github",
+  "op": "fetch-pr-comments",
+  "cli": "gh",
+  "captured_via": "harness git_providers.fetch_pr_comments (github) — real PR #3 with all three feedback surfaces posted by hand",
+  "status": "PASS",
+  "verified": "all THREE surfaces returned: 1 top-level conversation comment, 1 review-summary body, 1 inline diff comment. An inline comment auto-created an EMPTY-body review which the provider correctly skips.",
+  "calls": [
+    {
+      "argv": [
+        "pr",
+        "view",
+        "3",
+        "--json",
+        "comments,reviews"
+      ],
+      "returncode": 0,
+      "stdout": "{\"comments\":[{\"id\":\"IC_kwDOTPGIJM8AAAABI5KSmg\",\"author\":{\"login\":\"USER\"},\"authorAssociation\":\"OWNER\",\"body\":\"Top-level: please add a regression test for the empty-input path.\",\"createdAt\":\"2026-07-06T10:33:25Z\",\"includesCreatedEdit\":false,\"isMinimized\":false,\"minimizedReason\":\"\",\"reactionGroups\":[],\"url\":\"https://github.com/OWNER/REPO/pull/3#issuecomment-4891775642\",\"viewerDidAuthor\":true}],\"reviews\":[{\"id\":\"PRR_kwDOTPGIJM8AAAABFERLGA\",\"author\":{\"login\":\"USER\"},\"authorAssociation\":\"OWNER\",\"body\":\"Review body: overall looks good, one nit inline.\",\"submittedAt\":\"2026-07-06T10:33:26Z\",\"includesCreatedEdit\":false,\"reactionGroups\":[],\"state\":\"COMMENTED\",\"commit\":{\"oid\":\"1cdc292ff1471d202bc830ce2338155c52c4450a\"}},{\"id\":\"PRR_kwDOTPGIJM8AAAABFERLwg\",\"author\":{\"login\":\"USER\"},\"authorAssociation\":\"OWNER\",\"body\":\"\",\"submittedAt\":\"2026-07-06T10:33:27Z\",\"includesCreatedEdit\":false,\"reactionGroups\":[],\"state\":\"COMMENTED\",\"commit\":{\"oid\":\"1cdc292ff1471d202bc830ce2338155c52c4450a\"}}]}\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "api",
+        "repos/{owner}/{repo}/pulls/3/comments"
+      ],
+      "returncode": 0,
+      "stdout": "[{\"url\":\"https://api.github.com/repos/OWNER/REPO/pulls/comments/3528145831\",\"pull_request_review_id\":4634987458,\"id\":3528145831,\"node_id\":\"PRRC_kwDOTPGIJM7SSzun\",\"diff_hunk\":\"@@ -0,0 +1,4 @@\\n+def parse(s):\\n+    if not s:\",\"path\":\"parser.py\",\"commit_id\":\"1cdc292ff1471d202bc830ce2338155c52c4450a\",\"original_commit_id\":\"1cdc292ff1471d202bc830ce2338155c52c4450a\",\"user\":{\"login\":\"USER\",\"id\":1000042,\"node_id\":\"MDQ6VXNlcjM3MDM2MTQy\",\"avatar_url\":\"https://avatars.githubusercontent.com/u/1000042?v=4\",\"gravatar_id\":\"\",\"url\":\"https://api.github.com/users/USER\",\"html_url\":\"https://github.com/USER\",\"followers_url\":\"https://api.github.com/users/USER/followers\",\"following_url\":\"https://api.github.com/users/USER/following{/other_user}\",\"gists_url\":\"https://api.github.com/users/USER/gists{/gist_id}\",\"starred_url\":\"https://api.github.com/users/USER/starred{/owner}{/repo}\",\"subscriptions_url\":\"https://api.github.com/users/USER/subscriptions\",\"organizations_url\":\"https://api.github.com/users/USER/orgs\",\"repos_url\":\"https://api.github.com/users/USER/repos\",\"events_url\":\"https://api.github.com/users/USER/events{/privacy}\",\"received_events_url\":\"https://api.github.com/users/USER/received_events\",\"type\":\"User\",\"user_view_type\":\"public\",\"site_admin\":false},\"body\":\"Inline: strip() then check emptiness to handle whitespace-only input.\",\"created_at\":\"2026-07-06T10:33:27Z\",\"updated_at\":\"2026-07-06T10:33:27Z\",\"html_url\":\"https://github.com/OWNER/REPO/pull/3#discussion_r3528145831\",\"pull_request_url\":\"https://api.github.com/repos/OWNER/REPO/pulls/3\",\"_links\":{\"self\":{\"href\":\"https://api.github.com/repos/OWNER/REPO/pulls/comments/3528145831\"},\"html\":{\"href\":\"https://github.com/OWNER/REPO/pull/3#discussion_r3528145831\"},\"pull_request\":{\"href\":\"https://api.github.com/repos/OWNER/REPO/pulls/3\"}},\"reactions\":{\"url\":\"https://api.github.com/repos/OWNER/REPO/pulls/comments/3528145831/reactions\",\"total_count\":0,\"+1\":0,\"-1\":0,\"laugh\":0,\"hooray\":0,\"confused\":0,\"heart\":0,\"rocket\":0,\"eyes\":0},\"start_line\":null,\"original_start_line\":null,\"start_side\":null,\"line\":2,\"original_line\":2,\"side\":\"RIGHT\",\"author_association\":\"OWNER\",\"original_position\":2,\"position\":2,\"subject_type\":\"line\"}]",
+      "stderr": ""
+    }
+  ]
+}

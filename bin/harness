@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Resolves the plugin venv (created by /init-workspace); falls back to
+# system python3 pre-setup. Every skill/step file invokes THIS, never a
+# bare `harness` (no such binary exists) or a shell-state-dependent alias
+# (Bash tool calls don't persist shell state between invocations).
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY="$HERE/../.venv/bin/python"
+[ -x "$PY" ] || PY=python3
+# `python -m harness` only resolves the package if the repo root is on
+# sys.path; callers run this from their TARGET workspace (config is
+# written relative to cwd, and --workspace defaults to it), never from
+# this repo, so PYTHONPATH — not `cd` — is what makes it importable
+# without disturbing that cwd.
+exec env PYTHONPATH="$HERE/.." "$PY" -m harness "$@"

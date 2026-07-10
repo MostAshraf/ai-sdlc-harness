@@ -1,0 +1,19 @@
+{
+  "provider": "github",
+  "op": "work_item.add_comment",
+  "cli": "gh",
+  "argv": [
+    "issue",
+    "comment",
+    "1",
+    "--repo",
+    "OWNER/REPO",
+    "--body",
+    "round 1 done — verified via harness live-forge"
+  ],
+  "returncode": 0,
+  "stdout": "https://github.com/OWNER/REPO/issues/1#issuecomment-4891754144\n",
+  "stderr": "",
+  "captured_via": "harness provider --op work_item.add_comment (gh issue comment). Stdout is the comment URL; the provider ignores it.",
+  "status": "PASS"
+}

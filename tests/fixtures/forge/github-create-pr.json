@@ -1,0 +1,22 @@
+{
+  "provider": "github",
+  "op": "create-pr",
+  "cli": "gh",
+  "argv": [
+    "pr",
+    "create",
+    "--title",
+    "fix: #1 Fix null crash in parser",
+    "--body",
+    "Return None on empty input instead of crashing.\n\nCloses #1\n",
+    "--base",
+    "main",
+    "--head",
+    "fix/1-live-forge"
+  ],
+  "returncode": 0,
+  "stdout": "https://github.com/OWNER/REPO/pull/3\n",
+  "stderr": "",
+  "captured_via": "harness git_providers.create_pr (github) — real gh pr create, live PR #3",
+  "status": "PASS"
+}

@@ -1,0 +1,43 @@
+# pipeline/task-fsm.yaml — per-task status FSM (design.md piece 2).
+# Declared once, as data. Enforced by `harness set-state` (the single validated
+# write path); read by any agent that needs the legal moves. Never hardcoded.
+#
+# `guard` names a check implemented in harness code — data names it, code
+# provides it. Adding a transition is a data change unless it needs a novel
+# guard kind (modularity section).
+
+states: [pending, in-progress, in-review, done, archived]
+initial: pending
+
+transitions:
+  # A task may start only once every task it depends_on is done/archived
+  # (adversarial-review finding: depends_on was stored, validated nowhere,
+  # and enforced never — the declared DAG was decorative).
+  - {from: pending, to: in-progress, guard: dependencies-done}
+
+  # Task completion: verify-green runs + red-proof must exist (RC1).
+  # Activation is per-task DATA, not a mode/step check: the guard fires
+  # exactly when the task declares test_intents — the same condition the
+  # hook-side pre-red write lock uses, so the invariant's two halves can't
+  # disagree. Quick mode is exempt because its seed task declares no
+  # intents; `test_intents: []` is the plan-approved opt-out.
+  - {from: in-progress, to: in-review, guard: verify-green-with-red-proof}
+
+  # Completion out of review requires a hook-captured reviewer verdict
+  # (adversarial-review finding: this transition had NO guard, so the
+  # per-task review loop was pure orchestrator obedience — `task --to done`
+  # right after verify-green, zero reviewer ever spawned, was accepted).
+  # The verdict ledger (reviews.ndjson) is written only by the
+  # PostToolUse(Agent) capture hook, never by any CLI verb.
+  - {from: in-review, to: done, guard: reviewer-approved}
+
+  # Reviewer rejection -> rework. Bounded (coverage B3): increments
+  # `review_rounds`; beyond config review_rounds.max the transition is refused
+  # and the run escalates to the human ("round N+ signals plan drift").
+  - {from: in-review, to: in-progress, guard: review-round-bound, counter: review_rounds}
+
+  - {from: done, to: archived}
+
+  # Hotfix re-entry: legal only on a cloned tracker (the hotfix command is
+  # deferred; the edge is declared now so the FSM never needs a breaking change).
+  - {from: archived, to: in-progress, only_when: hotfix-clone}

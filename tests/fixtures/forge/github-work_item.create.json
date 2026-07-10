@@ -1,0 +1,20 @@
+{
+  "provider": "github",
+  "op": "work_item.create",
+  "cli": "gh",
+  "argv": [
+    "issue",
+    "create",
+    "--title",
+    "Follow-up: rotate leaked token",
+    "--body",
+    "## Description\nFound by security scan.\n\n## Acceptance Criteria\n- [ ] token rotated",
+    "--repo",
+    "OWNER/REPO"
+  ],
+  "returncode": 0,
+  "stdout": "https://github.com/OWNER/REPO/issues/2\n",
+  "stderr": "",
+  "captured_via": "harness provider --op work_item.create (gh issue create). Stdout is the new issue URL; provider parses the trailing path segment as id.",
+  "status": "PASS"
+}
