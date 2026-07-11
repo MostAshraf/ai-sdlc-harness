@@ -9,12 +9,18 @@ Per-guard policy (declared, a "keeping" from the original):
                   the guarantee for authority files; this guard is fast-fail.
                   Its raw-commit/merge/rebase/.../push block (GIT_VERB_RE) is
                   a STANDING, workspace-scoped invocation rule, not a
-                  run-state guard: it applies in every session and every
-                  repo the plugin is installed in, regardless of whether any
-                  `ai/<run>/` exists — unlike `spawn` below, there is no
-                  "no run yet" carve-out for it (adversarial-review finding:
-                  previously undocumented, easy to mistake for a run-scoped
-                  check like the others in this list).
+                  run-state guard: it applies for the life of a harness
+                  workspace — from the moment `/init-workspace` completes,
+                  regardless of whether any `ai/<run>/` currently exists —
+                  unlike `spawn` below, there is no "no run yet" carve-out
+                  for it (adversarial-review finding: previously
+                  undocumented, easy to mistake for a run-scoped check like
+                  the others in this list). It is NOT session- or repo-wide
+                  beyond that: `_is_harness_workspace` gates it on the
+                  `/init-workspace` bootstrap marker, so a session touching
+                  an unrelated, never-initialized repo sees raw git
+                  untouched — see `_is_harness_workspace` for the one
+                  documented residual this leaves open.
   write           fail-open on unparseable payload; fail-closed on authority
                   paths (they are never legal via tools).
   spawn           FAIL-CLOSED: no run -> no harness-shape spawns beyond the
@@ -467,13 +473,17 @@ def _scan_targets(cmd: str) -> list[str]:
 def guard_bash(p: dict) -> None:
     cmd = (p.get("tool_input") or {}).get("command") or ""
     cwd = Path(p.get("cwd") or ".")
+    is_harness_ws = None  # computed lazily — most bash calls carry no git verb
     for target in _scan_targets(cmd):
         m = GIT_VERB_RE.search(target)
         if m:
-            block(f"raw `git {m.group(1)}` is blocked (RC1): commits, history "
-                  "rewrites, and remote updates go through the owned entry points — "
-                  "`harness commit`, `harness merge-task`, `harness sync-branch`, "
-                  "`harness push`, `harness publish-mirror`.", cwd)
+            if is_harness_ws is None:
+                is_harness_ws = _is_harness_workspace(cwd)
+            if is_harness_ws:
+                block(f"raw `git {m.group(1)}` is blocked (RC1): commits, history "
+                      "rewrites, and remote updates go through the owned entry points — "
+                      "`harness commit`, `harness merge-task`, `harness sync-branch`, "
+                      "`harness push`, `harness publish-mirror`.", cwd)
         if AUTHORITY_RE.search(target) and WRITE_HINT_RE.search(target):
             block("run-authority files mutate only via the owned entry points — "
                   "`harness cursor` / `harness task` / `harness gate` / "
@@ -1045,6 +1055,89 @@ def _session_workspace(cwd: Path) -> Path:
         except OSError:
             pass
     return _nearest_workspace(cwd)
+
+
+def _has_bootstrap_marker(path: Path) -> bool:
+    """True if `path` is a workspace root that has completed
+    `/init-workspace` — `harness init-finalize` is the one call that writes
+    `bootstrap_completed` into `.claude/context/overrides.yaml`
+    (harness/initws.py `mark_bootstrapped`). A plain substring check, not a
+    YAML parse: guard_bash is a "pure regex+payload" guard that must keep
+    working — and blocking — without PyYAML (module docstring); overrides.yaml
+    is a flat top-level mapping, so a raw-text check for the key is safe and
+    avoids putting a hard dependency on this guard's git-verb path.
+
+    Presence, not truthiness (unlike `migrate.detect`/`workflow.bootstrap_gate`,
+    which parse the YAML and check `bool(...)`): the sole writer,
+    `mark_bootstrapped`, only ever writes a non-empty ISO timestamp, so the
+    two checks agree today. If a future un-bootstrap path ever sets the key
+    falsy instead of removing it, this would need to switch to a value check
+    too — flagged here so that change doesn't silently drift from the other
+    two consumers (adversarial-review finding).
+
+    `except Exception`, matching `_registered_repos`' own stance on this
+    file's un-chain-sealed, hand-editable config: a decode error (invalid
+    UTF-8) is a `ValueError`, not an `OSError` — adversarial-review finding:
+    an `OSError`-only catch let a corrupt `overrides.yaml` raise uncaught out
+    of `guard_bash`, which is a FAIL_OPEN guard — so the exception aborted
+    the ENTIRE bash guard invocation mid-loop, silently skipping every other
+    check for that same command (AUTHORITY_RE included), not just this one."""
+    f = path / ".claude" / "context" / "overrides.yaml"
+    try:
+        return "bootstrap_completed" in f.read_text(encoding="utf-8")
+    except Exception:
+        return False
+
+
+def _is_harness_workspace(cwd: Path) -> bool:
+    """Whether `cwd`'s session belongs to a workspace that has ever
+    completed `/init-workspace` — the gate for guard_bash's raw-git block,
+    RC1's one deliberately STANDING (not run-scoped) rule, narrowed here to
+    sessions that actually opted into the harness rather than every session
+    the plugin happens to be enabled for (README FAQ). Mirrors
+    `_session_workspace`'s CLAUDE_PROJECT_DIR-first, cd-drift-immune
+    resolution: the env var is the session's ACTUAL project root and wins
+    when it is itself bootstrapped, before falling back to a bounded
+    up-walk from the payload's (driftable) cwd — same 8-level bound as
+    `_nearest_workspace`, same rationale.
+
+    Two known, accepted residuals (not bugs to chase):
+
+    1. A session whose CLAUDE_PROJECT_DIR is rooted directly inside a repo
+       REGISTERED to a SIBLING workspace — rather than the workspace itself
+       — finds no marker walking its own ancestors, since nothing today
+       points from a registered repo back to the workspace that owns it
+       (`_registered_repos` only resolves workspace -> repos, never the
+       reverse). Raw git stays unprotected in that one layout, same as
+       today's pre-existing "disable the plugin for sessions where you want
+       raw git back" workaround for it — just narrower in scope than before.
+
+    2. The bootstrap marker itself (`.claude/context/overrides.yaml`) is an
+       ordinary, non-chain-sealed config file — unlike `state.yaml`/the
+       ledgers, it isn't HMAC-sealed (RC4) or `AUTHORITY_RE`-protected, and
+       is legally writable by the orchestrator and the planner shape via
+       Write/Edit. A direct edit stripping `bootstrap_completed` (not
+       reachable through any owned CLI verb, but not blocked by any guard
+       either) silently turns the raw-git block back off for the rest of
+       the session, even mid-run. Accepted deliberately, adversarial-review
+       finding: matches this module's existing two-layer stance elsewhere
+       (guard = fast-fail defense-in-depth, HMAC chain = the actual
+       integrity guarantee) rather than a gap unique to this change — but
+       it IS a new capability the unconditional pre-change block never had
+       (there was no file to edit before). Revisit if it turns out to
+       matter in practice, e.g. by chain-protecting the marker or adding it
+       to `AUTHORITY_RE`."""
+    proj = os.environ.get("CLAUDE_PROJECT_DIR")
+    if proj and _has_bootstrap_marker(Path(proj)):
+        return True
+    probe = cwd
+    for _ in range(8):
+        if _has_bootstrap_marker(probe):
+            return True
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+    return False
 
 
 def capture_user_prompt(p: dict) -> None:

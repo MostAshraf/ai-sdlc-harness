@@ -21,8 +21,9 @@ is the main tool.
      that repo — don't scan a repo you couldn't refresh.
    - `git -C "<path>" rev-list HEAD..origin/<default-branch> --count` — a read;
      how far behind the checkout is.
-   - **The harness blocks raw `git pull` / `merge` / `reset` in every session**
-     (owned-entry-point rule), so this command does **not** update the working
+   - **The harness blocks raw `git pull` / `merge` inside any workspace that has
+     completed `/init-workspace`** (owned-entry-point rule; this skill only ever
+     runs inside one), so this command does **not** update the working
      tree. If a repo is behind, say so and offer two choices: **(a)** analyze the
      current checkout as-is — and stamp the staleness into the notes so the
      reader knows the analysis reflects commit `<short-sha>`, N commits behind

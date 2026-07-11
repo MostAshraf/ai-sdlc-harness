@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from harness import chain, gates, ndjson, state as state_mod, transitions
+from harness import chain, gates, initws, ndjson, state as state_mod, transitions
 from harness.cli import load_declared
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -84,6 +84,16 @@ def bash(cmd, agent=None):
 
 
 class BashGuard(GuardHarness):
+    def setUp(self):
+        # The raw-git block (RC1) is gated on `/init-workspace` having
+        # completed (_is_harness_workspace) — bootstrap the temp workspace
+        # once here so every existing test in this class keeps exercising
+        # "inside a harness workspace" without repeating the call. The
+        # dedicated non-bootstrapped behavior gets its own class below,
+        # subclassing GuardHarness directly rather than this one.
+        super().setUp()
+        initws.mark_bootstrapped(self.workspace)
+
     def test_raw_git_verbs_blocked_with_redirect(self):
         for verb, cmd in [("commit", 'git commit -m "x"'),
                           ("commit", 'git -C repo commit -am x'),
@@ -471,6 +481,115 @@ class BashGuard(GuardHarness):
         proc = subprocess.run([sys.executable, str(GUARDS), "bash"],
                               input="not json{", capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0)
+
+
+class BashGuardOutsideHarnessWorkspace(GuardHarness):
+    """Deliberately does NOT bootstrap self.workspace (unlike BashGuard) —
+    these prove the raw-git block (RC1) stays OFF in a session that has
+    never run `/init-workspace`, closing the gap the guard's module
+    docstring used to document as a deliberate, unscoped exception (README
+    FAQ: "the block is workspace-wide by design whenever the plugin is
+    enabled"). A plain, never-initialized repo must see ordinary git."""
+
+    def test_raw_git_verbs_allowed_before_init_workspace(self):
+        for cmd in ('git commit -m "x"', "git merge --squash task/T1",
+                    "git rebase -i main", "git push", "git pull",
+                    'bash -c "git commit -m x"'):
+            self.assert_allows("bash", bash(cmd))
+
+    def test_becomes_blocked_once_bootstrapped(self):
+        # same workspace, same command — only the bootstrap marker changes,
+        # proving the gate (not some other confound) is what flips it.
+        self.assert_allows("bash", bash('git commit -m "x"'))
+        initws.mark_bootstrapped(self.workspace)
+        self.assert_blocks("bash", bash('git commit -m "x"'), "harness commit")
+
+    def test_project_dir_env_finds_bootstrap_marker_despite_drifted_cwd(self):
+        # Mirrors test_spawn_legality_survives_drifted_cwd_via_project_dir:
+        # CLAUDE_PROJECT_DIR is immune to shell `cd`, so a session whose
+        # shell drifted into an unrelated, non-harness directory is still
+        # recognized as the bootstrapped workspace via the env var.
+        initws.mark_bootstrapped(self.workspace)
+        outside = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        payload = bash('git commit -m "x"')
+        payload["cwd"] = str(outside)
+        code, err = self.run_guard(
+            "bash", payload, env={"CLAUDE_PROJECT_DIR": str(self.workspace)})
+        self.assertEqual(code, 2)
+        self.assertIn("harness commit", err)
+        # without the env var, the drifted cwd finds no marker and allows it
+        code, err = self.run_guard("bash", dict(payload))
+        self.assertEqual(code, 0, err)
+
+    def test_nested_cwd_under_bootstrapped_workspace_still_blocked(self):
+        # up-walk parity with _nearest_workspace: a session cwd'd into a
+        # subdirectory of an already-bootstrapped workspace must still
+        # resolve to it.
+        initws.mark_bootstrapped(self.workspace)
+        nested = self.workspace / "repo" / "src"
+        nested.mkdir(parents=True)
+        payload = bash('git commit -m "x"')
+        payload["cwd"] = str(nested)
+        code, err = self.run_guard("bash", payload)
+        self.assertEqual(code, 2)
+        self.assertIn("harness commit", err)
+
+    def test_sibling_registered_repo_residual_documented(self):
+        # Documented, accepted residual (_is_harness_workspace docstring):
+        # a session rooted directly in a repo REGISTERED to a SIBLING
+        # workspace finds no bootstrap marker walking its own ancestors —
+        # nothing today points from a registered repo back to its owning
+        # workspace. Adversarial-review finding: the first version of this
+        # test never actually registered the sibling in repos.yaml, so it
+        # passed for the wrong reason — identical to an arbitrary unrelated
+        # directory, not a proof of the documented "registered but
+        # unrecognized" scenario. Registering it here (mirroring
+        # init-workspace's own repos.yaml shape) makes the pinned-down
+        # residual real: if a future change closes it, this genuinely
+        # registered case is what should start failing and get updated.
+        parent = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, parent, ignore_errors=True)
+        owning_ws = parent / "workspace"
+        owning_ws.mkdir()
+        initws.mark_bootstrapped(owning_ws)
+        sibling_repo = parent / "sibling-repo"
+        sibling_repo.mkdir()
+        initws.write_section(owning_ws, "repos",
+                             {"repos": {"sibling": str(sibling_repo)}})
+        payload = bash('git commit -m "x"')
+        payload["cwd"] = str(sibling_repo)
+        code, err = self.run_guard(
+            "bash", payload, env={"CLAUDE_PROJECT_DIR": str(sibling_repo)})
+        self.assertEqual(code, 0, err)
+
+    def test_corrupt_overrides_yaml_does_not_crash_the_guard(self):
+        # Adversarial-review finding: _has_bootstrap_marker originally caught
+        # only OSError; invalid UTF-8 in overrides.yaml raises
+        # UnicodeDecodeError (a ValueError, not an OSError), which propagated
+        # out of guard_bash uncaught. Since "bash" is a FAIL_OPEN guard, an
+        # uncaught exception anywhere in it allows the WHOLE invocation, not
+        # just the one check that raised — must resolve cleanly instead.
+        ctx = self.workspace / ".claude" / "context"
+        ctx.mkdir(parents=True)
+        (ctx / "overrides.yaml").write_bytes(b"bootstrap_completed: \xff\xfe garbage\n")
+        code, err = self.run_guard("bash", bash('git commit -m "x"'))
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("Traceback", err)
+
+    def test_corrupt_overrides_yaml_does_not_bypass_the_authority_guard(self):
+        # The sharper form of the same finding: a corrupt overrides.yaml
+        # must not let an UNRELATED check (AUTHORITY_RE, evaluated later in
+        # the same guard_bash loop iteration) silently skip too. One command
+        # carries both a git verb (triggers the now-exception-prone
+        # _is_harness_workspace call) and an authority-file write — if the
+        # exception escaped guard_bash entirely, both checks would have been
+        # skipped and this would wrongly return 0.
+        ctx = self.workspace / ".claude" / "context"
+        ctx.mkdir(parents=True)
+        (ctx / "overrides.yaml").write_bytes(b"bootstrap_completed: \xff\xfe garbage\n")
+        cmd = 'git commit -m "x" && echo pwned > ai/2026-01-01-X/state.yaml'
+        self.assert_blocks("bash", bash(cmd), "owned entry points")
 
 
 class WriteGuard(GuardHarness):
@@ -1662,7 +1781,21 @@ class PreSetupDegradation(GuardHarness):
         return proc.returncode, proc.stderr
 
     def test_bash_guard_still_blocks_without_yaml(self):
+        # mark_bootstrapped runs under THIS test's own (PyYAML-equipped)
+        # interpreter — only the guard subprocess below is yaml-less; the
+        # bootstrap-marker check itself is a plain-text substring read
+        # (_has_bootstrap_marker), never a YAML parse, so the guard must
+        # still find it and block correctly.
+        initws.mark_bootstrapped(self.workspace)
         self.assert_blocks("bash", bash('git commit -m "x"'), "harness commit")
+
+    def test_bash_guard_allows_git_without_yaml_when_not_bootstrapped(self):
+        # The inverse: a genuinely fresh install (no /init-workspace yet,
+        # exactly this class's scenario) must ALSO resolve cleanly without
+        # PyYAML — no traceback, no false block.
+        code, err = self.run_guard("bash", bash('git commit -m "x"'))
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("Traceback", err)
 
     def test_write_guard_still_blocks_without_yaml(self):
         p = {"tool_name": "Write",

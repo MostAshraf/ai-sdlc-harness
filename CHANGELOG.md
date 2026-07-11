@@ -6,6 +6,8 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
+- The raw-git block (raw `commit`/`merge`/`rebase`/`cherry-pick`/`revert`/`am`/`pull`/`push` redirected to the owned `harness` verbs) used to apply in **any** session and repo the moment the plugin was enabled, even ones with nothing to do with the harness. It now only applies inside a workspace that has actually completed `/init-workspace` — a project you've never initialized sees ordinary git, no need to disable the plugin for it. Two documented residuals: a session opened directly inside a repo registered to a *sibling* workspace (rather than the workspace itself) isn't recognized yet; and the bootstrap marker used for this check isn't tamper-protected the way `state.yaml` is, so a direct edit to it can silently turn the block back off — accepted for now, revisit if it matters in practice.
+
 ## [3.0.1] — 2026-07-10
 
 > **Linux CI fix.** The v3.0 rewrite's first CI run failed on every Linux job — a real confinement gap in the guard layer, not a flaky test. This patch closes it.
