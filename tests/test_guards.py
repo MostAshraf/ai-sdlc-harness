@@ -337,6 +337,28 @@ class BashGuard(GuardHarness):
         # a genuinely unrelated /tmp scratch path is still allowed
         self.assert_allows("bash", bash("pytest > /tmp/o.txt", rev))
 
+    def test_scratch_root_ancestor_of_workspace_is_not_scratch(self):
+        # Adversarial-review finding (surfaced by the Windows port; the
+        # hole was cross-platform): `_is_scratch_write` checked only
+        # descendant-ness, so `rm -rf /tmp` ITSELF was sanctioned as
+        # scratch while the workspace — ledgers included — lived under
+        # the scratch root (the mkdtemp norm on Linux, and on Windows
+        # where %TEMP% is the root). An ancestor target must refuse.
+        # Workspace built under the scratch root explicitly so the
+        # ancestor relation holds deterministically on every host OS,
+        # macOS included.
+        ws = Path(tempfile.mkdtemp(prefix="harness-ws-",
+                                   dir=support.SCRATCH_FIXTURE_DIR))
+        self.addCleanup(support.rmtree, ws, ignore_errors=True)
+        rev = "ai-sdlc-harness:reviewer:ai-sdlc-reviewer"
+        payload = bash("rm -rf /tmp", rev)
+        payload["cwd"] = str(ws)
+        self.assert_blocks("bash", payload, "read-only")
+        # …while a sibling scratch dir under the same root stays allowed
+        ok = bash("rm -rf /tmp/some-unrelated-scratch-dir", rev)
+        ok["cwd"] = str(ws)
+        self.assert_allows("bash", ok)
+
     def test_reviewer_destructive_git_and_python_writes_blocked(self):
         # adversarial-review finding: a "read-only" reviewer could still
         # discard a developer's uncommitted worktree changes, or write a
@@ -1931,9 +1953,47 @@ class WindowsPathShapes(GuardHarness):
         # false-blocked the reviewer's one sanctioned output idiom
         rev = "ai-sdlc-harness:reviewer:ai-sdlc-reviewer"
         self.assert_allows("bash", bash("npm test > /tmp/win-out.log", rev))
+        # msys mounts are case-insensitive — /TMP is the same mount
+        # (adversarial-review finding: the prefix test was case-sensitive)
+        self.assert_allows("bash", bash("npm test > /TMP/win-out.log", rev))
         # …while a rootless NON-tmp msys mount stays blocked
         self.assert_blocks("bash", bash("npm test > /etc/profile", rev),
                            "read-only")
+
+    def test_developer_msys_drive_spelling_reaches_the_real_target(self):
+        # Git Bash's own pwd emits /c/… drive-mount spellings, so they
+        # show up naturally in developer commands — untranslated they
+        # mis-resolved against the cwd drive and false-blocked legitimate
+        # in-worktree writes (adversarial-review finding, both lenses
+        # independently, reproduced end-to-end)
+        repo = self.workspace / "Code" / "backend"
+        repo.mkdir(parents=True)
+        self._register_repo(repo)
+        wt = self.workspace / "Code" / "backend-wt-T1-ab12cd34"
+        wt.mkdir()
+        posix = wt.as_posix()                        # C:/Users/…/backend-wt-…
+        msys = "/" + posix[0].lower() + posix[2:]    # /c/Users/…/backend-wt-…
+        payload = bash(f"echo build > {msys}/build.log", "x:developer")
+        payload["cwd"] = str(self.workspace)
+        self.assert_allows("bash", payload)
+        # the same spelling of a target OUTSIDE the allowed roots still
+        # blocks — translation must not blanket-allow the mount family
+        ws_posix = self.workspace.as_posix()
+        bad = "/" + ws_posix[0].lower() + ws_posix[2:] + "/Code/other/x.py"
+        payload = bash(f"echo x > {bad}", "x:developer")
+        payload["cwd"] = str(self.workspace)
+        self.assert_blocks("bash", payload, "worktree")
+
+    def test_developer_quoted_unc_target_is_confined(self):
+        # quoted \\server\share targets swept ZERO tokens pre-fix — the
+        # destructive-verb confinement never ran (the one fail-open the
+        # adversarial review found on this change)
+        repo = self.workspace / "Code" / "backend"
+        repo.mkdir(parents=True)
+        self._register_repo(repo)
+        payload = bash(r'rm "\\nonexistent-srv-xyz\share\x"', "x:developer")
+        payload["cwd"] = str(self.workspace)
+        self.assert_blocks("bash", payload, "worktree")
 
 
 if __name__ == "__main__":

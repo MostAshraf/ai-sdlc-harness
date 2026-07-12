@@ -146,23 +146,34 @@ def _probe(cmd: list[str]) -> tuple[bool, str]:
 # cmd.exe builtins a test command could plausibly start with — they resolve
 # to nothing on PATH, so the first-token check below must not call a command
 # built from one of these "not found"
-_CMD_BUILTINS = frozenset({"cd", "call", "set", "echo", "type", "start"})
+_CMD_BUILTINS = frozenset({"cd", "pushd", "popd", "call", "set", "echo",
+                           "type", "start"})
 
 
-def _first_token_resolves(cmd: str) -> bool:
+def _first_token_resolves(cmd: str, cwd: Path | None = None) -> bool:
     """Whether a shell command's FIRST token names something invocable —
     the Windows side of verify()'s test_cmd invocability gate, where the
     exit code alone can't distinguish `missing-cmd` (cmd.exe exits 1) from
     a runnable-but-red suite (also 1). A quoted first token may contain
-    spaces (`\"C:\\Program Files\\x\\python.exe\" -m pytest`)."""
+    spaces (`\"C:\\Program Files\\x\\python.exe\" -m pytest`).
+
+    `cwd` is the directory the command actually RAN in (the repo) —
+    a relative repo-local runner (`.\\run-tests.cmd`, `.\\gradlew.bat`)
+    exists there, not wherever the harness process happens to sit
+    (adversarial-review finding: a legitimately-red repo-local runner was
+    misclassified "command not found", blocking init-finalize against
+    this check's own stated contract that a red suite passes)."""
     import re as _re
     import shutil as _shutil
     m = _re.match(r'\s*(?:"([^"]+)"|(\S+))', cmd or "")
     tok = (m.group(1) or m.group(2)) if m else ""
     if not tok:
         return False
-    return (tok.lower() in _CMD_BUILTINS or Path(tok).exists()
-            or _shutil.which(tok) is not None)
+    if tok.lower() in _CMD_BUILTINS or Path(tok).exists():
+        return True
+    if cwd is not None and (Path(cwd) / tok).exists():
+        return True
+    return _shutil.which(tok) is not None
 
 
 def repo_name(config: dict, repo_path) -> str | None:
@@ -341,7 +352,8 @@ def verify(config: dict, workspace: Path | None = None) -> list[dict]:
             # resolves to nothing — a red suite's runner resolves fine.
             not_runnable = proc.returncode in (126, 127) or (
                 os.name == "nt" and proc.returncode in (1, 9009)
-                and not _first_token_resolves(cmd))
+                and not _first_token_resolves(
+                    cmd, Path(path) if Path(path).is_dir() else None))
             if not_runnable:
                 add(f"test_cmd:{name}", "fail", f"exit {proc.returncode}",
                     f"command not found — fix language.repos.{name}.test_cmd")

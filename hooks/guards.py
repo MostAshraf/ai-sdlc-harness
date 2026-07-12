@@ -31,10 +31,16 @@ Per-guard policy (declared, a "keeping" from the original):
   user-prompt     never blocks (capture only).
   subagent-stop   never blocks (capture + stall detection feed events ledger).
 
-If PyYAML is missing, guards exit non-zero with a visible remediation error
-(they do not silently disable); init-workspace verifies the dependency up
-front, and the HMAC chain (RC4) still detects authority-file tampering even
-with guards down — defense in depth, guard = fast-fail, chain = guarantee.
+If PyYAML is missing, the yaml-needing guards DEGRADE OPEN with one visible
+remediation line on stderr (exit 0 — see main()'s YamlMissing handler; the
+yaml-free bash/write guards keep blocking); init-workspace verifies the
+dependency up front, and the HMAC chain (RC4) still detects authority-file
+tampering even with guards down — defense in depth, guard = fast-fail,
+chain = guarantee. The same posture covers a missing INTERPRETER: if the
+hook probe chain (hooks.json) finds no runnable python at all — including
+the Windows Store alias that answers to `python`/`python3` but only prints
+an install nag — the hook errors non-2 and the platform treats it as
+non-blocking. Accepted: pre-venv, nothing harness-y can execute anyway.
 """
 from __future__ import annotations
 
@@ -235,8 +241,12 @@ _DESTRUCTIVE_VERB_RE = re.compile(
 # quoted forms accept `\` only BEHIND a drive letter: a bare `"\section{x}"`
 # (TeX/grep prose) must not become a phantom write target. POSIX keeps the
 # original `/`-only pattern so its match set cannot move.
+# The quoted forms also admit `\\server\…` UNC (double backslash — still
+# structurally distinct from `"\section{x}"` prose): without it, a
+# developer's `rm "\\server\share\x"` swept ZERO tokens and the
+# confinement never ran — the one fail-open the adversarial review found.
 _ABS_TOKEN_RE = re.compile(
-    r"\"((?:[A-Za-z]:[/\\]|/)[^\"]*)\"|'((?:[A-Za-z]:[/\\]|/)[^']*)'"
+    r"\"((?:[A-Za-z]:[/\\]|\\\\|/)[^\"]*)\"|'((?:[A-Za-z]:[/\\]|\\\\|/)[^']*)'"
     r"|(?<![\w/])((?:[A-Za-z]:)?/[^\s;|&<>]+)"
 ) if os.name == "nt" else re.compile(
     r"\"(/[^\"]*)\"|'(/[^']*)'|(?<![\w/])(/[^\s;|&<>]+)")
@@ -247,18 +257,40 @@ _BASH_WRITE_SINK_OK = ("/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty")
 _QUOTED_SPAN_RE = re.compile(r"\"[^\"]*\"|'[^']*'")
 
 
+# /x or /x/… where x is one drive letter — Git Bash's drive mounts
+_MSYS_DRIVE_RE = re.compile(r"^/([A-Za-z])(/|$)")
+
+
 def _bash_path(tgt: str) -> Path:
     """A bash-command path token, as the EXECUTING shell will resolve it.
-    On Windows the Bash tool runs under Git Bash, whose `/tmp` mount IS the
-    user temp directory — so a literal `/tmp/…` target in a command lands
-    in genuine scratch there, not in `<drive>:\\tmp`. Translating here keeps
-    the guard's judgment aligned with where the write actually goes (the
-    reviewer's `tee /tmp/build.log` idiom — the field pain the scratch
-    allowance exists for — would otherwise false-block on every Windows
-    host, since `Path('/tmp/x')` is not even absolute under Windows path
-    semantics). POSIX: identity."""
-    if os.name == "nt" and (tgt == "/tmp" or tgt.startswith("/tmp/")):
-        return Path(tempfile.gettempdir(), tgt[5:].lstrip("/"))
+    On Windows the Bash tool runs under Git Bash, and two of its mount
+    spellings must map to where the write actually goes:
+
+    - `/tmp/…` IS the user temp directory — so a literal `/tmp` target
+      lands in genuine scratch there, not in `<drive>:\\tmp`. Without the
+      translation the reviewer's `tee /tmp/build.log` idiom (the field
+      pain the scratch allowance exists for) false-blocks on every
+      Windows host, since `Path('/tmp/x')` is not even absolute under
+      Windows path semantics.
+    - `/c/Users/…` IS `C:\\Users\\…` — the spelling Git Bash's own `pwd`
+      emits, so it shows up naturally in developer commands. Untranslated
+      it mis-resolves against the cwd drive (`D:\\c\\Users\\…`) and
+      false-blocks legitimate in-repo/worktree writes (adversarial-review
+      finding on this change).
+
+    Other msys mounts (`/etc`, `/usr`, …) stay untranslated: they live
+    inside the Git installation, never inside a registered repo, so the
+    rootless-target gate's fail-closed handling is the right answer for
+    them. POSIX: identity."""
+    if os.name == "nt":
+        # casefolded prefix test: msys mounts are case-insensitive —
+        # `cygpath -w /TMP/x` lands in the same temp dir (review finding)
+        low = tgt.lower()
+        if low == "/tmp" or low.startswith("/tmp/"):
+            return Path(tempfile.gettempdir(), tgt[5:].lstrip("/"))
+        m = _MSYS_DRIVE_RE.match(tgt)
+        if m:
+            return Path(m.group(1).upper() + ":/", tgt[3:])
     return Path(tgt)
 
 
@@ -652,9 +684,17 @@ def _is_scratch_write(path: Path, workspace: Path) -> bool:
     such prior check)."""
     if not any(path.is_relative_to(r) for r in _tmp_roots()):
         return False
-    if path.is_relative_to(workspace):
+    # BOTH directions, not just descendant-ness (adversarial-review finding
+    # on the Windows port, but the hole was cross-platform): the workspace
+    # commonly lives UNDER the scratch root (Linux mkdtemp, Windows %TEMP%
+    # as the norm), so an ANCESTOR target — `rm -rf /tmp` itself — passed
+    # the descendant checks and was sanctioned as scratch while the sweep
+    # would take the workspace, its ledgers, and any temp-resident repo
+    # with it.
+    if path.is_relative_to(workspace) or workspace.is_relative_to(path):
         return False
-    return not any(path.is_relative_to(r) for r in _registered_repos(workspace))
+    return not any(path.is_relative_to(r) or r.is_relative_to(path)
+                   for r in _registered_repos(workspace))
 
 
 def _registered_repos(workspace: Path) -> list[Path]:
@@ -1500,9 +1540,16 @@ def main() -> None:
     # Guard stderr is read by the platform (and by the test suite) as
     # UTF-8; the messages carry em-dashes/arrows, and Windows' default
     # cp1252 pipe encoding would mojibake them — same output contract as
-    # harness/__main__.py.
+    # harness/__main__.py. errors= must be RESTATED: reconfigure resets it
+    # to "strict", and stderr's documented default is "backslashreplace" —
+    # under strict, a block() message interpolating an un-encodable payload
+    # char (a lone surrogate in a path token) RAISES inside print, and a
+    # fail-open guard then exits 0: the write it just decided to block is
+    # allowed (adversarial-review finding on this very change, CONFIRMED
+    # with an end-to-end repro — the one edit here that had silently moved
+    # POSIX behavior).
     if hasattr(sys.stderr, "reconfigure"):
-        sys.stderr.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
     name = sys.argv[1] if len(sys.argv) > 1 else ""
     guard = GUARDS.get(name)
     if guard is None:

@@ -14,10 +14,21 @@ os.environ.pop("PYTHONPATH", None)
 # are printed with ensure_ascii=False (cli.py), and on Windows the default
 # pipe encoding is cp1252 — which mojibakes every em-dash/arrow in a detail
 # string for whoever parses the output (the orchestrator, the test suite).
-# UTF-8 on both streams, unconditionally, on every OS.
-for _stream in (sys.stdout, sys.stderr):
-    if hasattr(_stream, "reconfigure"):
-        _stream.reconfigure(encoding="utf-8")
+# UTF-8 on both streams, unconditionally, on every OS. The error handlers
+# must be RESTATED per stream — reconfigure resets errors= to "strict",
+# and stderr's documented default is "backslashreplace" on every platform
+# (adversarial-review finding: dropping it let an un-encodable char turn a
+# printed error into a raised one). stdout's default IS "strict" — kept.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="strict")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+
+if sys.version_info < (3, 10):  # a bare-`python` fallback (bin/harness,
+    # hooks.json) can land on an ancient interpreter — refuse with the
+    # actual requirement instead of a downstream SyntaxError
+    sys.exit(f"ai-sdlc-harness requires Python 3.10+ — this is "
+             f"{sys.version.split()[0]}")
 
 from .cli import main  # noqa: E402  (must follow the PYTHONPATH scrub above)
 

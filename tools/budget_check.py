@@ -72,6 +72,14 @@ def check_duplication(root: Path) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
+    # UTF-8 output contract (see harness/__main__.py): the duplication
+    # report embeds runtime-markdown content, which carries arrows and
+    # em-dashes a cp1252 pipe cannot encode — a finding must print, not
+    # crash with UnicodeEncodeError in place of the report.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="strict")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
     root = Path(argv[1]) if len(argv) > 1 else Path(__file__).resolve().parent.parent
     errors, warnings = check_budgets(root)
     errors += check_duplication(root)

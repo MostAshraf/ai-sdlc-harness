@@ -329,6 +329,15 @@ def validate_all(root: Path) -> Issues:
 
 
 def main(argv: list[str]) -> int:
+    # Same UTF-8 output contract as harness/__main__.py — this module has
+    # its own entry point (`python -m harness.schema`), and its error lines
+    # interpolate declared-data content that legally carries non-cp1252
+    # chars; stderr's documented default error handler is restated because
+    # reconfigure would otherwise reset it to strict.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="strict")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
     root = Path(argv[1]) if len(argv) > 1 else Path(__file__).resolve().parent.parent
     issues = validate_all(root)
     for w in issues.warnings:

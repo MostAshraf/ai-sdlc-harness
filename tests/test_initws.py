@@ -4,6 +4,7 @@ permissions, repo-map staleness, and the status dashboard."""
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -312,6 +313,40 @@ class VerificationGates(M7Harness):
         self.assertIn("not gated at init", check["detail"])
         self.assertEqual(check["remediation"], "")
         self.assertNotIn("command not found", check["remediation"])
+
+    @unittest.skipUnless(os.name == "nt", "cmd.exe first-token resolution")
+    def test_repo_local_red_runner_is_runnable_not_notfound(self):
+        """Adversarial-review finding on the Windows not-found gate: the
+        first-token check anchored to the harness PROCESS cwd, so a
+        repo-local runner (`./run-tests.cmd`) that runs and exits 1 — a
+        legitimately red suite, this check's own documented pass case —
+        was misclassified `command not found` and blocked init-finalize."""
+        (self.repo / "run-tests.cmd").write_text("@exit /b 1\r\n",
+                                                 encoding="ascii")
+        stories = self.workspace / "stories"
+        stories.mkdir()
+        self.cli("init", "--stories-dir", str(stories),
+                 "--repo", f"repo={self.repo}",
+                 "--test-cmd", r"repo=.\run-tests.cmd")  # cmd.exe spelling
+        out = self.cli("init-verify")
+        check = next(c for c in out["checks"] if c["check"] == "test_cmd:repo")
+        self.assertEqual(check["status"], "pass")
+        self.assertIn("exit 1", check["detail"])   # the runner genuinely ran
+        self.assertIn("not gated at init", check["detail"])
+
+    def test_first_token_resolver_units(self):
+        # direct units for the Windows invocability probe (the function is
+        # platform-neutral even though only the nt branch consults it):
+        # cmd builtins resolve; a repo-local runner resolves only via the
+        # cwd the command actually ran in; garbage doesn't resolve.
+        self.assertTrue(initws._first_token_resolves("pushd sub && npm test"))
+        self.assertFalse(
+            initws._first_token_resolves("definitely-not-a-command-xyz"))
+        local = Path(tempfile.mkdtemp())
+        self.addCleanup(support.rmtree, local, ignore_errors=True)
+        (local / "runner.cmd").write_text("@exit /b 1\r\n", encoding="ascii")
+        self.assertFalse(initws._first_token_resolves("./runner.cmd"))
+        self.assertTrue(initws._first_token_resolves("./runner.cmd", local))
 
     def test_zero_repos_fails_verify_instead_of_emitting_no_checks(self):
         """Adversarial-review finding: an empty `repos` map used to emit
