@@ -6,8 +6,22 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
-- Plans are now explicitly grounded in the repo map: the planning instruction itself points at the map and prescribes the tiered reading order (index first, then only the areas the story touches), instead of leaving it to chance whether a plan consults the map the workspace generated for exactly that purpose. The intake step's ask carries the same map location.
-- `repo-map-stamp` now refuses to stamp a repo map that has no content — previously, stamping after a failed or empty map generation certified a nonexistent map as "fresh" for the next 50 commits (or your configured staleness window) with nothing left to notice.
+## [3.0.4] — 2026-07-12
+
+> **The repo map now reaches the planner it was built for.** Generation, staleness tracking, and stamping were already solid; this release closes the gap on the consumption side, plus a false-fresh hole in the stamp itself.
+
+### Release highlights
+
+| Theme | What changed |
+|---|---|
+| **Plans are now explicitly grounded in the repo map** | The plan-mode planning instruction points directly at `.claude/context/repo-map/<repo-name>/` and prescribes the tiered reading order (index first, then only the areas the story touches) — previously whether a plan consulted the map came down to model initiative, not the instruction. The intake step's ask carries the same map location. |
+| **`repo-map-stamp` refuses to certify an empty map** | Stamping after a failed or empty map generation used to mark a nonexistent map "fresh" for the next 50 commits (or your configured staleness window), with nothing left to notice. The stamp now requires real map content first. |
+
+### Verification on tag tip
+
+- `python -m harness.schema` — declared data valid
+- `python tools/budget_check.py` — line budget green
+- `python -m unittest discover -s tests` — 606 tests green
 
 ## [3.0.3] — 2026-07-12
 
