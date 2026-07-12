@@ -17,6 +17,7 @@ from pathlib import Path
 
 from harness import gitops, ndjson
 from tests.test_gitops import FAILING_TEST, TEST_CMD, make_repo
+from tests import support
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -41,14 +42,14 @@ class VerticalSlice(unittest.TestCase):
         self.repo = make_repo(self.workspace)
 
     def tearDown(self):
-        shutil.rmtree(self.workspace)
+        support.rmtree(self.workspace)
 
     def cli(self, *args, run=None, expect=0):
         cmd = [sys.executable, "-m", "harness", "--workspace", str(self.workspace)]
         if run:
             cmd += ["--run", str(run)]
         proc = subprocess.run([*cmd, *args], cwd=ROOT, capture_output=True,
-                              text=True, timeout=120)
+                              text=True, encoding="utf-8", timeout=120)
         payload = json.loads(proc.stdout) if proc.stdout.strip() else {}
         self.assertEqual(proc.returncode, expect,
                          f"harness {' '.join(args)} -> {payload} {proc.stderr}")
@@ -148,7 +149,7 @@ class VerticalSlice(unittest.TestCase):
         run = Path(out["run"])
         self.assertEqual(out["mode"], "full")          # Bug, no quick hint
         self.assertEqual(out["change_type"], "fix")    # Bug -> fix via type map
-        item = json.loads((run / "work-item.json").read_text())
+        item = json.loads((run / "work-item.json").read_text(encoding="utf-8"))
         self.assertEqual(item["title"], "Fix null crash in parser")
 
         # second fetch for the same item: collision refusal (B5)

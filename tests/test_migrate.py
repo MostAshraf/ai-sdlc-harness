@@ -19,9 +19,10 @@ from pathlib import Path
 
 from harness import gitops, initws, migrate
 from harness.cli import load_declared
+from tests import support
 
 ROOT = Path(__file__).resolve().parent.parent
-HARNESS_BIN = ROOT / "bin" / "harness"
+HARNESS_BIN = support.HARNESS_BIN  # bin/harness, or its .cmd sibling on Windows
 
 
 def _load_generator():
@@ -41,12 +42,12 @@ class V21Fixture(unittest.TestCase):
         GEN.build(self.ws)
 
     def tearDown(self):
-        shutil.rmtree(self.ws)
+        support.rmtree(self.ws)
 
     def cli(self, *args, expect=0):
         proc = subprocess.run(
             [str(HARNESS_BIN), "--workspace", str(self.ws), *args],
-            cwd=self.ws, capture_output=True, text=True, timeout=120)
+            cwd=self.ws, capture_output=True, text=True, encoding="utf-8", timeout=120)
         payload = json.loads(proc.stdout) if proc.stdout.strip() else {}
         self.assertEqual(proc.returncode, expect,
                          f"{args} -> {proc.stdout}\n{proc.stderr}")
@@ -72,7 +73,7 @@ class Detect(V21Fixture):
             self.assertEqual(found["evidence"], [])
             self.assertFalse(found["already_bootstrapped"])
         finally:
-            shutil.rmtree(empty)
+            support.rmtree(empty)
 
     def test_reports_a_v3_bootstrap(self):
         initws.mark_bootstrapped(self.ws)
@@ -104,7 +105,7 @@ class Inventory(V21Fixture):
         self.assertIn("provider-config.md", inv["legacy_context_files"])
 
     def test_state_md_supplements_a_missing_tracker(self):
-        shutil.rmtree(self.ws / "ai" / "2026-06-01-US-002")
+        support.rmtree(self.ws / "ai" / "2026-06-01-US-002")
         inv = migrate.inventory(self.ws)
         ids = [e["id"] for e in inv["in_flight"]]
         self.assertEqual(ids, ["US-002-add-multiply"])
@@ -207,7 +208,7 @@ class SectionPayloadContract(V21Fixture):
                               type="feature", id="X-1", summary="Do thing"),
                 "[X-1] Do thing")
         finally:
-            shutil.rmtree(target)
+            support.rmtree(target)
 
 
 class ReviewHardening(V21Fixture):
@@ -352,13 +353,13 @@ class CliSeam(V21Fixture):
         try:
             proc = subprocess.run(
                 [str(HARNESS_BIN), "--workspace", str(empty), "migrate-detect"],
-                cwd=empty, capture_output=True, text=True, timeout=120)
+                cwd=empty, capture_output=True, text=True, encoding="utf-8", timeout=120)
             payload = json.loads(proc.stdout)
             self.assertEqual(proc.returncode, 0)
             self.assertIsNone(payload["legacy"])
             self.assertNotIn("inventory", payload)
         finally:
-            shutil.rmtree(empty)
+            support.rmtree(empty)
 
     def test_migrate_extract_emits_sections(self):
         payload = self.cli("migrate-extract")
@@ -372,12 +373,12 @@ class CliSeam(V21Fixture):
             proc = subprocess.run(
                 [str(HARNESS_BIN), "--workspace", str(empty),
                  "migrate-extract"],
-                cwd=empty, capture_output=True, text=True, timeout=120)
+                cwd=empty, capture_output=True, text=True, encoding="utf-8", timeout=120)
             payload = json.loads(proc.stdout)
             self.assertEqual(proc.returncode, 1)
             self.assertIn("/init-workspace", payload["error"])
         finally:
-            shutil.rmtree(empty)
+            support.rmtree(empty)
 
     def test_migrate_extract_refuses_a_bootstrapped_workspace(self):
         initws.mark_bootstrapped(self.ws)

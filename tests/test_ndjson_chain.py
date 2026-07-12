@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from harness import chain, ndjson
+from tests import support
 
 
 class NdjsonLedger(unittest.TestCase):
@@ -16,7 +17,7 @@ class NdjsonLedger(unittest.TestCase):
         self.ledger = self.root / "events.ndjson"
 
     def tearDown(self):
-        shutil.rmtree(self.root)
+        support.rmtree(self.root)
 
     def test_append_and_read(self):
         ndjson.append_record(self.ledger, {"kind": "a"})
@@ -92,7 +93,7 @@ class IntegrityChain(unittest.TestCase):
         self.target = self.workspace / "state.yaml"
 
     def tearDown(self):
-        shutil.rmtree(self.workspace)
+        support.rmtree(self.workspace)
 
     def test_seal_then_verify_round_trip(self):
         chain.seal(self.target, b"content-1", self.key)
@@ -147,7 +148,13 @@ class IntegrityChain(unittest.TestCase):
             chain.load_or_create_key(self.workspace)
 
     def test_key_file_is_owner_only_from_birth(self):
+        import os
         import stat as stat_mod
+        if os.name == "nt":
+            # POSIX mode bits don't exist on Windows (os.open's 0o600 maps
+            # to nothing; protection is NTFS ACLs, inherited) — the
+            # owner-only guarantee is a POSIX-only assertion by nature
+            self.skipTest("POSIX permission bits are not a Windows concept")
         key_file = self.workspace / ".claude" / "context" / ".harness-key"
         mode = stat_mod.S_IMODE(key_file.stat().st_mode)
         self.assertEqual(mode, 0o600)
@@ -166,11 +173,14 @@ class IntegrityChain(unittest.TestCase):
             with self.assertRaises(chain.IntegrityError):
                 chain.verify(self.target, self.key)
         finally:
-            shutil.rmtree(other_ws)
+            support.rmtree(other_ws)
 
     def test_key_created_once_with_tight_perms(self):
+        import os
         key2 = chain.load_or_create_key(self.workspace)
         self.assertEqual(self.key, key2)
+        if os.name == "nt":  # created-once still asserted above; mode bits
+            return           # are POSIX-only (see the sibling perms test)
         key_file = self.workspace / ".claude" / "context" / ".harness-key"
         self.assertEqual(key_file.stat().st_mode & 0o777, 0o600)
 
@@ -194,7 +204,7 @@ class Reseal(unittest.TestCase):
         self.target = self.workspace / "state.yaml"
 
     def tearDown(self):
-        shutil.rmtree(self.workspace)
+        support.rmtree(self.workspace)
 
     def test_reseal_recovers_from_a_missing_seal(self):
         self.target.write_bytes(b"content survived the crash")
@@ -208,7 +218,7 @@ class Reseal(unittest.TestCase):
         chain.seal(self.target, b"v1", self.key)
         chain.seal(self.target, b"v2", self.key)
         seal_file = self.target.with_name(self.target.name + ".hmac")
-        prior = json.loads(seal_file.read_text())
+        prior = json.loads(seal_file.read_text(encoding="utf-8"))
         result = chain.reseal(self.target, self.key)
         self.assertEqual(result["seq"], prior["seq"] + 1)
         self.assertEqual(result["prev"], prior["hmac"])

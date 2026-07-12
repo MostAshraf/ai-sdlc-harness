@@ -134,12 +134,35 @@ def discover(repo: Path, depth: int = 3, branch: str | None = None) -> dict:
 
 def _probe(cmd: list[str]) -> tuple[bool, str]:
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                              encoding="utf-8", errors="replace")
         return proc.returncode == 0, (proc.stdout + proc.stderr).strip()[:200]
     except FileNotFoundError:
         return False, f"{cmd[0]}: not installed"
     except subprocess.TimeoutExpired:
         return False, f"{cmd[0]}: probe timed out"
+
+
+# cmd.exe builtins a test command could plausibly start with — they resolve
+# to nothing on PATH, so the first-token check below must not call a command
+# built from one of these "not found"
+_CMD_BUILTINS = frozenset({"cd", "call", "set", "echo", "type", "start"})
+
+
+def _first_token_resolves(cmd: str) -> bool:
+    """Whether a shell command's FIRST token names something invocable —
+    the Windows side of verify()'s test_cmd invocability gate, where the
+    exit code alone can't distinguish `missing-cmd` (cmd.exe exits 1) from
+    a runnable-but-red suite (also 1). A quoted first token may contain
+    spaces (`\"C:\\Program Files\\x\\python.exe\" -m pytest`)."""
+    import re as _re
+    import shutil as _shutil
+    m = _re.match(r'\s*(?:"([^"]+)"|(\S+))', cmd or "")
+    tok = (m.group(1) or m.group(2)) if m else ""
+    if not tok:
+        return False
+    return (tok.lower() in _CMD_BUILTINS or Path(tok).exists()
+            or _shutil.which(tok) is not None)
 
 
 def repo_name(config: dict, repo_path) -> str | None:
@@ -307,12 +330,18 @@ def verify(config: dict, workspace: Path | None = None) -> list[dict]:
         try:
             proc = subprocess.run(cmd, shell=True, capture_output=True,
                                   text=True, timeout=300,
+                                  encoding="utf-8", errors="replace",
                                   cwd=path if Path(path).is_dir() else None)
-            # 126/127 are the POSIX not-executable/not-found codes; 9009 is
-            # cmd.exe's not-found (adversarial-review finding: on Windows a
-            # nonexistent test command PASSED verify).
+            # 126/127 are the POSIX not-executable/not-found codes. Windows
+            # has no reserved code: `cmd /c missing-cmd` exits **1**
+            # (measured — the 9009 this check was blind-written against
+            # only appears in batch-file contexts), and 1 is also what a
+            # legitimately-red suite exits with. So on Windows a not-found-
+            # shaped exit only counts when the command's first token ALSO
+            # resolves to nothing — a red suite's runner resolves fine.
             not_runnable = proc.returncode in (126, 127) or (
-                os.name == "nt" and proc.returncode == 9009)
+                os.name == "nt" and proc.returncode in (1, 9009)
+                and not _first_token_resolves(cmd))
             if not_runnable:
                 add(f"test_cmd:{name}", "fail", f"exit {proc.returncode}",
                     f"command not found — fix language.repos.{name}.test_cmd")
@@ -405,7 +434,7 @@ def _write_section_locked(workspace: Path, section: str, path: Path,
         # restated. A LIST-valued top-level key (review_policy) still
         # replaces wholesale even with deep_merge — only dicts recurse — so
         # that one genuinely needs the whole list resupplied.
-        existing = yaml.safe_load(path.read_text()) or {}
+        existing = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         data = deep_merge(existing, data)
     if section == "provider":
         provider = data.get("provider")
@@ -460,7 +489,7 @@ def write_permissions(workspace: Path, repos: dict[str, str],
     registered repo's own test command gets its binary allow-listed
     (per-repo language-config), not just one global command."""
     path = workspace / ".claude" / "settings.json"
-    settings = json.loads(path.read_text()) if path.exists() else {}
+    settings = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     allow = set(settings.setdefault("permissions", {}).get("allow", []))
     # Every skill/step invokes `${CLAUDE_PLUGIN_ROOT}/bin/harness`, never
     # `python3 -m harness` (adversarial-review finding: the allowlist only
@@ -502,7 +531,7 @@ def _load_mapping(path: Path, label: str) -> dict:
     calls later) on a shape merging can't safely reason about."""
     if not path.exists():
         return {}
-    loaded = yaml.safe_load(path.read_text())
+    loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
     if loaded is None:
         return {}
     if not isinstance(loaded, dict):
@@ -605,7 +634,7 @@ def repo_map_check(workspace: Path, repo_name: str, repo: Path,
     if not meta_file.exists():
         return {"status": "missing", "behind": None}
     try:
-        meta = json.loads(meta_file.read_text())
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
         stamped = meta["sha"]
     except (json.JSONDecodeError, KeyError):
         # A corrupt stamp is answerable — the map needs a refresh — so

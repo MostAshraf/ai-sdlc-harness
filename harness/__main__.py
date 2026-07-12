@@ -10,6 +10,15 @@ import sys
 # never see ai-sdlc-harness's own import path spliced into theirs).
 os.environ.pop("PYTHONPATH", None)
 
+# The CLI's output encoding is a CONTRACT, not a locale accident: payloads
+# are printed with ensure_ascii=False (cli.py), and on Windows the default
+# pipe encoding is cp1252 — which mojibakes every em-dash/arrow in a detail
+# string for whoever parses the output (the orchestrator, the test suite).
+# UTF-8 on both streams, unconditionally, on every OS.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8")
+
 from .cli import main  # noqa: E402  (must follow the PYTHONPATH scrub above)
 
 sys.exit(main())

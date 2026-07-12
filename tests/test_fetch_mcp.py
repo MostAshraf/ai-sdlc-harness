@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 
 from harness import initws
+from tests import support
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -44,13 +45,13 @@ class FetchFromRaw(unittest.TestCase):
         initws.mark_bootstrapped(self.ws)
 
     def tearDown(self):
-        shutil.rmtree(self.ws)
+        support.rmtree(self.ws)
 
     def cli(self, *args, stdin=None, expect=0):
         cmd = [sys.executable, "-m", "harness", "--workspace", str(self.ws),
                *args]
         proc = subprocess.run(cmd, cwd=ROOT, input=stdin, capture_output=True,
-                              text=True, timeout=120)
+                              text=True, encoding="utf-8", timeout=120)
         payload = json.loads(proc.stdout) if proc.stdout.strip() else {}
         self.assertEqual(proc.returncode, expect,
                          f"harness {' '.join(args)} -> {payload} {proc.stderr}")
@@ -67,7 +68,7 @@ class FetchFromRaw(unittest.TestCase):
         self.assertEqual(out["mode"], "full")            # Story, no quick hint
         self.assertEqual(out["change_type"], "feature")  # Story -> feature (map)
         # work-item.json persisted from the normalized contract (HTML stripped).
-        item = json.loads((run / "work-item.json").read_text())
+        item = json.loads((run / "work-item.json").read_text(encoding="utf-8"))
         self.assertEqual(item["id"], "4321")
         self.assertEqual(item["title"], "Add retry to uploader")
         self.assertEqual(item["provider_ref"], "ado#4321")
@@ -75,7 +76,7 @@ class FetchFromRaw(unittest.TestCase):
         # state.yaml bootstrapped, and the fetched event recorded.
         self.assertTrue((run / "state.yaml").exists())
         events = [json.loads(l) for l in
-                  (run / "events.ndjson").read_text().splitlines()]
+                  (run / "events.ndjson").read_text(encoding="utf-8").splitlines()]
         self.assertEqual(events[0]["kind"], "fetched")
 
     def test_from_raw_collision_refuses_second_time(self):

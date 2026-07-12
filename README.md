@@ -246,7 +246,7 @@ Every guard's fail-open/fail-closed policy is chosen deliberately and tested: re
 
 ## The `harness` CLI
 
-All ~49 owned verbs run through the wrapper `${CLAUDE_PLUGIN_ROOT}/bin/harness` (resolves the plugin venv, falls back to system `python3`). Agents call it; you rarely need to — except `abort`.
+All ~49 owned verbs run through the wrapper `${CLAUDE_PLUGIN_ROOT}/bin/harness` (resolves the plugin venv in either OS layout, falls back to system `python3`/`python`). It runs on macOS, Linux, and Windows — on Windows it executes under Git Bash, with `bin/harness.cmd` as the cmd.exe sibling. Agents call it; you rarely need to — except `abort`.
 
 | Group | Verbs |
 |---|---|
@@ -301,16 +301,16 @@ ai-sdlc-harness/
 ├── skills/
 │   ├── dev-workflow/            # thin orchestrator walker + per-step instruction files
 │   └── init-workspace/ · add-repo/ · migrate-workspace/ · workspace-config/ · workflow-status/ · repo-map-refresh/
-├── bin/harness                  # wrapper script resolving the plugin venv
+├── bin/harness                  # wrapper script resolving the plugin venv (+ harness.cmd for Windows)
 ├── tools/                       # meta-tooling: line-budget checker, sandbox workspace generators
-└── tests/                       # 594 stdlib-unittest tests
+└── tests/                       # 598 stdlib-unittest tests
 ```
 
 Workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside *your* working directory by `/init-workspace` and the pipeline. They never live inside this plugin repo.
 
 ## Development
 
-Requires Python 3.10+ and PyYAML.
+Requires Python 3.10+ and PyYAML. CI runs the suite on Linux, macOS, and Windows — all three lanes enforcing.
 
 ```sh
 python3 -m venv .venv && .venv/bin/pip install pyyaml
@@ -319,7 +319,14 @@ python3 -m venv .venv && .venv/bin/pip install pyyaml
 .venv/bin/python -m unittest discover -s tests
 ```
 
-The test suite (594 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of both pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+On Windows the venv lands its interpreter under `Scripts\` instead of `bin/`:
+
+```powershell
+python -m venv .venv; .venv\Scripts\pip install pyyaml
+.venv\Scripts\python -m unittest discover -s tests
+```
+
+The test suite (598 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of both pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 

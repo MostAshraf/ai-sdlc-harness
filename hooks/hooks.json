@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=python3; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" bash"
+            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe\"; [ -x \"$PY\" ] || PY=\"$(command -v python3 || command -v python || echo python3)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" bash"
           }
         ]
       },
@@ -15,7 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=python3; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" write"
+            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe\"; [ -x \"$PY\" ] || PY=\"$(command -v python3 || command -v python || echo python3)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" write"
           }
         ]
       },
@@ -24,7 +24,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=python3; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" spawn"
+            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe\"; [ -x \"$PY\" ] || PY=\"$(command -v python3 || command -v python || echo python3)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" spawn"
           }
         ]
       },
@@ -33,7 +33,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=python3; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" skill"
+            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe\"; [ -x \"$PY\" ] || PY=\"$(command -v python3 || command -v python || echo python3)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" skill"
           }
         ]
       },
@@ -42,7 +42,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=python3; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" read"
+            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe\"; [ -x \"$PY\" ] || PY=\"$(command -v python3 || command -v python || echo python3)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" read"
           }
         ]
       }
@@ -52,7 +52,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=python3; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" user-prompt"
+            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe\"; [ -x \"$PY\" ] || PY=\"$(command -v python3 || command -v python || echo python3)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" user-prompt"
           }
         ]
       }
@@ -63,7 +63,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=python3; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" post-spawn"
+            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe\"; [ -x \"$PY\" ] || PY=\"$(command -v python3 || command -v python || echo python3)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" post-spawn"
           }
         ]
       }
@@ -73,7 +73,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=python3; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" subagent-stop"
+            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe\"; [ -x \"$PY\" ] || PY=\"$(command -v python3 || command -v python || echo python3)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" subagent-stop"
           }
         ]
       }

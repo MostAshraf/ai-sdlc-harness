@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from tests import support
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import budget_check  # noqa: E402
@@ -22,7 +23,7 @@ class BudgetCaps(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp())
 
     def tearDown(self):
-        shutil.rmtree(self.root)
+        support.rmtree(self.root)
 
     def test_hard_cap_is_error(self):
         _write(self.root, "skills/big/SKILL.md", [f"line {i}" for i in range(250)])

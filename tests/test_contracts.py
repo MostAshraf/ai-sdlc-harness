@@ -13,6 +13,7 @@ from pathlib import Path
 from harness import gitops, state as state_mod, workflow
 from harness.cli import load_declared
 from tests.test_gitops import make_repo
+from tests import support
 
 
 class _ContractHarness(unittest.TestCase):
@@ -29,7 +30,7 @@ class _ContractHarness(unittest.TestCase):
             tasks=[{"id": "T1", "repo": str(self.repo_a)}], entry_step="plan")
 
     def tearDown(self):
-        shutil.rmtree(self.workspace)
+        support.rmtree(self.workspace)
 
     def _repos(self):
         return {"repo-a": str(self.repo_a), "repo-b": str(self.repo_b)}
@@ -113,7 +114,7 @@ class ContractReconciliation(_ContractHarness):
         verdict = workflow.reconcile_contracts(self.workspace, self.run, self.config,
                                                self._repos())
         self.assertEqual(verdict, "drift")
-        report = (self.run / "reports" / "contracts.md").read_text()
+        report = (self.run / "reports" / "contracts.md").read_text(encoding="utf-8")
         self.assertIn("field: item_id", report)
         self.assertIn("MISSING", report)
 
@@ -154,7 +155,7 @@ class ContractReconciliation(_ContractHarness):
         self._write(self.repo_a, "api.py", "POST /v2/items\n")
         self._write(self.repo_b, "client.py", "POST /v2/items\n")
         workflow.reconcile_contracts(self.workspace, self.run, self.config, self._repos())
-        report = (self.run / "reports" / "contracts.md").read_text()
+        report = (self.run / "reports" / "contracts.md").read_text(encoding="utf-8")
         self.assertIn("http", report)
         self.assertIn("repo-a → repo-b", report)
 
@@ -165,7 +166,7 @@ class ContractReconciliation(_ContractHarness):
         self._write(self.repo_a, "api.py", "POST /v2/items\n")
         self._write(self.repo_b, "client.py", "POST /v2/items\n")
         workflow.reconcile_contracts(self.workspace, self.run, self.config, self._repos())
-        report = (self.run / "reports" / "contracts.md").read_text()
+        report = (self.run / "reports" / "contracts.md").read_text(encoding="utf-8")
         self.assertEqual(report.count("@ repo-b"), 1)  # one line, not one per duplicate
         self.assertIn("repo-a → repo-b)", report)      # role text also deduped
 

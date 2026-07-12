@@ -38,7 +38,7 @@ class ShippedDataValidates(unittest.TestCase):
         # 12 releases — now derived FROM it, so this can't regress silently.
         import json
         import harness
-        plugin = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())
+        plugin = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
         self.assertEqual(harness.__version__, plugin["version"])
 
 

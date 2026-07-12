@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import unittest
 from pathlib import Path
+from tests import support
 
 ROOT = Path(__file__).resolve().parent.parent
 BARE_INVOCATION = re.compile(r'`harness [a-z]|^\s*harness [a-z]|[&;|]\s*harness [a-z]',
@@ -25,7 +26,7 @@ class InvocationConsistency(unittest.TestCase):
     def test_no_bare_harness_invocations(self):
         offenders = {}
         for f in self._runtime_md():
-            hits = BARE_INVOCATION.findall(f.read_text())
+            hits = BARE_INVOCATION.findall(f.read_text(encoding="utf-8"))
             if hits:
                 offenders[str(f.relative_to(ROOT))] = hits
         self.assertFalse(offenders,
@@ -34,16 +35,25 @@ class InvocationConsistency(unittest.TestCase):
 
     def test_no_shell_variable_alias(self):
         offenders = [str(f.relative_to(ROOT)) for f in self._runtime_md()
-                     if SHELL_VAR_ALIAS.search(f.read_text())]
+                     if SHELL_VAR_ALIAS.search(f.read_text(encoding="utf-8"))]
         self.assertFalse(offenders,
                          f"$HARNESS shell-variable alias found (Bash calls "
                          f"don't persist shell state — inline the wrapper "
                          f"path every time): {offenders}")
 
     def test_wrapper_script_exists_and_is_executable(self):
+        import os
         wrapper = ROOT / "bin" / "harness"
         self.assertTrue(wrapper.is_file())
-        self.assertTrue(wrapper.stat().st_mode & 0o111, "bin/harness not executable")
+        # POSIX-only: Windows has no exec bit — there the launch contract is
+        # carried by the .cmd sibling instead, asserted for every OS below
+        # (skills reference bin/harness, which Git Bash runs fine on Windows;
+        # harness.cmd is the cmd.exe-side entry the tests themselves use).
+        if os.name != "nt":
+            self.assertTrue(wrapper.stat().st_mode & 0o111,
+                            "bin/harness not executable")
+        self.assertTrue((ROOT / "bin" / "harness.cmd").is_file(),
+                        "bin/harness.cmd (Windows sibling) missing")
 
     def test_wrapper_falls_back_to_system_python_and_still_runs(self):
         import os
@@ -52,8 +62,8 @@ class InvocationConsistency(unittest.TestCase):
         # FORCE_COLOR in the calling environment (argparse's colorizer
         # honors it even off a tty, Python 3.13+) would otherwise ANSI-wrap
         # this output and break the plain-text assertion below.
-        proc = subprocess.run([str(ROOT / "bin" / "harness"), "--help"],
-                              capture_output=True, text=True, timeout=30,
+        proc = subprocess.run([str(support.HARNESS_BIN), "--help"],
+                              capture_output=True, text=True, encoding="utf-8", timeout=30,
                               env={**os.environ, "NO_COLOR": "1"})
         self.assertEqual(proc.returncode, 0)
         self.assertIn("usage: harness", proc.stdout)
@@ -67,12 +77,12 @@ class InvocationConsistency(unittest.TestCase):
         import os
         import subprocess
         import tempfile
-        wrapper = ROOT / "bin" / "harness"
+        wrapper = support.HARNESS_BIN
         with tempfile.TemporaryDirectory() as tmp:
             for args in (["--workspace", tmp, "--run", tmp, "show"],
                         ["show", "--workspace", tmp, "--run", tmp]):
                 proc = subprocess.run([str(wrapper), *args], capture_output=True,
-                                      text=True, timeout=30,
+                                      text=True, encoding="utf-8", timeout=30,
                                       env={**os.environ, "NO_COLOR": "1"})
                 self.assertNotIn("unrecognized arguments", proc.stderr,
                                  f"{args} -> {proc.stderr}")
@@ -85,7 +95,7 @@ class InvocationConsistency(unittest.TestCase):
         hooks/guards.py's PLANNER_STAMP_RE for the mechanical backstop on
         the same rule) must stay present; a future edit to this bullet
         could otherwise silently drop it with nothing else noticing."""
-        text = (ROOT / "agents" / "planner.md").read_text()
+        text = (ROOT / "agents" / "planner.md").read_text(encoding="utf-8")
         self.assertIn("never write `.meta.json` or run `repo-map-stamp`", text)
 
     def test_every_documented_verb_and_flag_exists_in_argparse(self):
@@ -104,7 +114,7 @@ class InvocationConsistency(unittest.TestCase):
             for verb, parser in subs.items()}
         span_re = re.compile(r"```(?:\w*\n)?(.*?)```|`([^`]+)`", re.DOTALL)
         for f in self._runtime_md():
-            text = f.read_text()
+            text = f.read_text(encoding="utf-8")
             for m in span_re.finditer(text):
                 span = m.group(1) or m.group(2) or ""
                 if "bin/harness" not in span:
@@ -137,7 +147,7 @@ class InvocationConsistency(unittest.TestCase):
         # manifest step without its instruction file strands the walker)
         import yaml
         manifest = yaml.safe_load(
-            (ROOT / "pipeline" / "manifest.yaml").read_text())
+            (ROOT / "pipeline" / "manifest.yaml").read_text(encoding="utf-8"))
         gate_steps = {sid for sid, s in manifest["steps"].items()
                       if s.get("gate")}  # all gates share steps/gate.md
         referenced = {s for seq in manifest["modes"].values() for s in seq}
@@ -154,9 +164,9 @@ class InvocationConsistency(unittest.TestCase):
         # — the two must agree or the human's "2" means the wrong thing
         import yaml
         manifest = yaml.safe_load(
-            (ROOT / "pipeline" / "manifest.yaml").read_text())
+            (ROOT / "pipeline" / "manifest.yaml").read_text(encoding="utf-8"))
         declared = manifest["steps"]["approve-security"]["dispositions"]
-        text = (ROOT / "skills" / "dev-workflow" / "steps" / "gate.md").read_text()
+        text = (ROOT / "skills" / "dev-workflow" / "steps" / "gate.md").read_text(encoding="utf-8")
         shown = re.findall(r"\[(\d)\]\s*([a-z-]+)", text)
         self.assertTrue(shown, "gate.md no longer shows the numbered options")
         for num, name in shown:

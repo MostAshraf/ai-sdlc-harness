@@ -34,7 +34,10 @@ def runtime_md_files(root: Path) -> list[Path]:
 def check_budgets(root: Path) -> tuple[list[str], list[str]]:
     errors, warnings = [], []
     for path in runtime_md_files(root):
-        rel = path.relative_to(root)
+        # as_posix so a report line reads `agents/a.md` on every OS —
+        # these strings are matched by tests and read by humans across
+        # platforms, so the rendering must not vary with the host separator
+        rel = path.relative_to(root).as_posix()
         count = len(path.read_text(encoding="utf-8").splitlines())
         if count > HARD_CAP:
             errors.append(f"{rel}: {count} lines exceeds hard cap {HARD_CAP}")
@@ -46,7 +49,7 @@ def check_budgets(root: Path) -> tuple[list[str], list[str]]:
 def check_duplication(root: Path) -> list[str]:
     windows: dict[tuple, dict[str, int]] = {}
     for path in runtime_md_files(root):
-        rel = str(path.relative_to(root))
+        rel = path.relative_to(root).as_posix()  # separator-stable reports
         lines = [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines()]
         lines = [ln for ln in lines if ln]  # ignore blanks: dedup is about content
         for i in range(len(lines) - DUP_WINDOW + 1):

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from harness import chain, gates, ndjson, state as state_mod, transitions, workflow
 from harness.cli import load_declared
+from tests import support
 
 T0 = "2026-01-01T00:00:00+00:00"
 
@@ -39,7 +40,7 @@ class Harness(unittest.TestCase):
         self.key = chain.load_or_create_key(self.workspace)
 
     def tearDown(self):
-        shutil.rmtree(self.workspace)
+        support.rmtree(self.workspace)
 
     # -- helpers ----------------------------------------------------------
     def advance_to(self, st, run, target_step, artifacts=None):
@@ -167,7 +168,7 @@ class CollisionRefusal(Harness):
 
         for _ in range(25):
             for d in self.workspace.glob("ai/*"):
-                shutil.rmtree(d, ignore_errors=True)
+                support.rmtree(d, ignore_errors=True)
             results.clear()
             t1 = threading.Thread(target=boot, args=("2026-03-01",))
             t2 = threading.Thread(target=boot, args=("2026-03-02",))
@@ -183,7 +184,7 @@ class CollisionRefusal(Harness):
         # run might still hold real in-progress work.
         run1, _ = self._bootstrap_dated("2026-01-01-BAD-1", "BAD-1")
         (run1 / "state.yaml").write_text(
-            (run1 / "state.yaml").read_text() + "# tampered\n")
+            (run1 / "state.yaml").read_text(encoding="utf-8") + "# tampered\n")
         with self.assertRaises(state_mod.CollisionError) as ctx:
             self._bootstrap_dated("2026-01-02-BAD-1", "BAD-1")
         self.assertIn("Resume or Abort", str(ctx.exception))

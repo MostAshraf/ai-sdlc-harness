@@ -37,8 +37,13 @@ class RedProofError(Exception):
 
 
 def run_git(repo: Path, *args: str, check: bool = True) -> str:
+    # Explicit UTF-8, never the locale codec: git emits UTF-8 (subjects,
+    # paths), and on Windows the locale default is cp1252 — which silently
+    # mojibakes every non-ASCII commit subject, breaking the byte-exact
+    # subject round-trip find_commit_by_subject depends on after a rewrite.
     proc = subprocess.run(["git", "-C", str(repo), *args],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
     if check and proc.returncode != 0:
         # stderr first, but fall back to stdout — several git failures
         # (merge --squash conflicts, notably) report on stdout only, and
@@ -106,13 +111,13 @@ _LOCAL_EXCLUDES = (".harness-key",)
 def ensure_repo_excludes(repo: Path) -> None:
     out = run_git(repo, "rev-parse", "--git-path", "info/exclude")
     exclude = Path(out) if Path(out).is_absolute() else repo / out
-    text = exclude.read_text() if exclude.exists() else ""
+    text = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
     missing = [p for p in _LOCAL_EXCLUDES if p not in text.splitlines()]
     if not missing:
         return
     exclude.parent.mkdir(parents=True, exist_ok=True)
     glue = "" if (not text or text.endswith("\n")) else "\n"
-    with exclude.open("a") as fh:
+    with exclude.open("a", encoding="utf-8") as fh:
         fh.write(glue + "\n".join(missing) + "\n")
 
 
@@ -192,13 +197,17 @@ def squash_merge(repo: Path, task_branch: str, message: str) -> str:
 def autosquash(repo: Path, base: str) -> None:
     """Fold `fixup!` commits non-interactively (coverage B10)."""
     import os
-    # POSIX `true` doesn't exist on Windows; `cmd /c exit 0` is its no-op
-    # editor equivalent there (the state-lock msvcrt fallback claims Windows
-    # support, so the git verbs must hold it too).
-    noop = "cmd /c exit 0" if os.name == "nt" else "true"
+    # `true` on EVERY platform: git launches editors through its own sh —
+    # which Git for Windows bundles, `/usr/bin/true` included — so the
+    # plain POSIX no-op works there too (probe-verified on this exact
+    # flow). The previous `cmd /c exit 0` special case, written blind for
+    # the Windows lane, was itself the breakage: git's sh-level editor
+    # invocation mangled the multi-word command against the todo path
+    # ("'epo' is not recognized…" — first Windows triage, 2026-07).
+    noop = "true"
     proc = subprocess.run(
         ["git", "-C", str(repo), "rebase", "-i", "--autosquash", base],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
         env={**os.environ, "GIT_SEQUENCE_EDITOR": noop, "GIT_EDITOR": noop})
     if proc.returncode != 0:
         run_git(repo, "rebase", "--abort", check=False)
@@ -293,7 +302,8 @@ def publish_mirror(repo: Path, run_dir: Path, config: dict, run_name: str) -> st
 def sync_branch(repo: Path, onto: str) -> None:
     """`harness sync-branch` — the owned update-from-main entry point (RC4)."""
     proc = subprocess.run(["git", "-C", str(repo), "rebase", onto],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
     if proc.returncode != 0:
         run_git(repo, "rebase", "--abort", check=False)
         raise GitError(f"sync-branch rebase onto {onto} conflicted (aborted cleanly): "
@@ -354,7 +364,8 @@ def default_branch(repo: Path) -> str:
 def _branch_exists(repo: Path, branch: str) -> bool:
     proc = subprocess.run(
         ["git", "-C", str(repo), "show-ref", "--verify", "--quiet",
-         f"refs/heads/{branch}"], capture_output=True, text=True)
+         f"refs/heads/{branch}"], capture_output=True, text=True,
+        encoding="utf-8", errors="replace")
     return proc.returncode == 0
 
 
@@ -474,8 +485,12 @@ def diff_line_count(repo: Path, base: str) -> int:
 
 def _run_tests(repo: Path, test_cmd: str) -> tuple[int, str]:
     try:
+        # utf-8 + replace, not the locale codec: test runners routinely
+        # emit UTF-8 (check marks, tree glyphs), and Windows' cp1252 has
+        # undefined bytes that make a locale decode RAISE mid-run.
         proc = subprocess.run(test_cmd, shell=True, cwd=repo,
-                              capture_output=True, text=True, timeout=600)
+                              capture_output=True, text=True, timeout=600,
+                              encoding="utf-8", errors="replace")
     except subprocess.TimeoutExpired as exc:
         # Uncaught, this raised a raw traceback instead of the CLI's JSON
         # error contract (adversarial-review finding) — verify-red/green's

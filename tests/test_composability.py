@@ -30,8 +30,8 @@ SOLO = ["fetch", "intake", "plan", "approve-plan", "preflight", "develop",
 
 
 def shipped() -> tuple[dict, dict, dict]:
-    manifest = yaml.safe_load((ROOT / "pipeline" / "manifest.yaml").read_text())
-    surfaces = yaml.safe_load((ROOT / "pipeline" / "surfaces.yaml").read_text())
+    manifest = yaml.safe_load((ROOT / "pipeline" / "manifest.yaml").read_text(encoding="utf-8"))
+    surfaces = yaml.safe_load((ROOT / "pipeline" / "surfaces.yaml").read_text(encoding="utf-8"))
     config = schema.merge_defaults(ROOT / "config" / "defaults", schema.Issues())
     return manifest, surfaces, config
 

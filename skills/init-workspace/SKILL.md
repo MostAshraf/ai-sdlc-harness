@@ -21,13 +21,22 @@ The harness needs PyYAML; system pythons are often externally managed
 automatically on every future call:
 
 ```
-"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python" -c "import yaml" 2>/dev/null || {
-  python3 -m venv "${CLAUDE_PLUGIN_ROOT}/.venv" &&
-  "${CLAUDE_PLUGIN_ROOT}/.venv/bin/pip" install --quiet pyyaml; }
+PY="${CLAUDE_PLUGIN_ROOT}/.venv/bin/python"
+[ -x "$PY" ] || PY="${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe"
+"$PY" -c "import yaml" 2>/dev/null || {
+  SYS="$(command -v python3 || command -v python)" &&
+  "$SYS" -m venv "${CLAUDE_PLUGIN_ROOT}/.venv" &&
+  PY="${CLAUDE_PLUGIN_ROOT}/.venv/bin/python" &&
+  { [ -x "$PY" ] || PY="${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe"; } &&
+  "$PY" -m pip install --quiet pyyaml; }
 ```
 
-Until this step runs, `bin/harness` itself still works (it falls back to
-system `python3`, which is what fails on a PyYAML-less system — that's why
+One snippet for every OS: the Bash tool is Git Bash on Windows, so this
+stays POSIX shell there too — the two `.venv` probes cover the `bin/` (POSIX)
+vs `Scripts/` (Windows) venv layouts, and the `python3 || python` fallback
+covers hosts where only one spelling exists. Until this step runs,
+`bin/harness` itself still works (it falls back to the same system
+interpreter probe, which is what fails on a PyYAML-less system — that's why
 this step exists), and the spawn/skill guards degrade open with a one-line
 notice rather than erroring — expected pre-setup behavior, not a bug to chase.
 

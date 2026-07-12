@@ -1,9 +1,9 @@
 # CI matrix — the suite, schema validation, and the line-budget/duplication
-# sweep on every push/PR. macOS + Linux are expected-green; the Windows lane
-# is informational (continue-on-error) until its first real triage: the
-# msvcrt lock fallback / harness.cmd / 9009 checks were written blind, and
-# the fake-CLI provider stubs rely on shebang execution Windows doesn't do.
-# Flip continue-on-error off once that lane has been made honest.
+# sweep on every push/PR. All three OS lanes are enforcing. The Windows lane
+# had its first real triage in 2026-07 (290 -> 0 failures): the blind-written
+# msvcrt/9009/harness.cmd assumptions were replaced with measured behavior,
+# fake-CLI stubs became real PE launchers (tests/support.py), and the guard
+# layer grew nt-scoped path handling — see CHANGELOG [Unreleased].
 name: ci
 
 on:
@@ -18,7 +18,6 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.10", "3.14"]
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

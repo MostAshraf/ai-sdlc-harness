@@ -6,8 +6,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
-import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +14,7 @@ from harness.providers import dispatch, normalize, ProviderError, ProviderUnsupp
 from harness.providers import git_providers
 from harness.providers.git_providers import create_pr
 from tests.test_providers import assert_work_item_contract
+from tests import support
 
 STUB = r'''#!/usr/bin/env python3
 import json, sys
@@ -24,12 +23,12 @@ base = Path(__file__).parent
 (base / "invocations.log").open("a").write(json.dumps(sys.argv[1:]) + "\n")
 (base / "cwd.log").open("a").write(str(Path.cwd()) + "\n")
 state_file = base / "state.json"
-state = json.loads(state_file.read_text()) if state_file.exists() else {
+state = json.loads(state_file.read_text(encoding="utf-8")) if state_file.exists() else {
     "state": "{initial_state}", "comments": []}
 args = sys.argv[1:]
 joined = " ".join(args)
 if "{fetch_marker}" in joined:
-    out = json.loads((base / "fetch.json").read_text())
+    out = json.loads((base / "fetch.json").read_text(encoding="utf-8"))
     {state_patch}
     print(json.dumps(out))
 elif any(a in args for a in ("close", "reopen")) or "--state" in joined:
@@ -42,7 +41,7 @@ elif "comment" in args or "note" in args or "--discussion" in joined:
     state["comments"].append(joined); state_file.write_text(json.dumps(state))
     print("{}")
 elif "pr" in args or "mr" in args:
-    print((base / "pr_output.txt").read_text())
+    print((base / "pr_output.txt").read_text(encoding="utf-8"))
 else:
     print("{}")
 state_file.write_text(json.dumps(state))
@@ -53,11 +52,14 @@ class FakeCliHarness(unittest.TestCase):
     def setUp(self):
         self.bin = Path(tempfile.mkdtemp())
         self._path = os.environ["PATH"]
-        os.environ["PATH"] = f"{self.bin}:{self._path}"
+        # os.pathsep, not ':' — a literal ':' corrupts PATH wholesale on
+        # Windows (first Windows triage: the real host `glab` leaked
+        # through and answered where the stub should have)
+        os.environ["PATH"] = f"{self.bin}{os.pathsep}{self._path}"
 
     def tearDown(self):
         os.environ["PATH"] = self._path
-        shutil.rmtree(self.bin)
+        support.rmtree(self.bin)
 
     def stub(self, name: str, fetch_json: dict, *, fetch_marker: str,
              initial_state: str, closed: str, state_patch: str = "pass",
@@ -67,13 +69,11 @@ class FakeCliHarness(unittest.TestCase):
         script = STUB.replace("{fetch_marker}", fetch_marker) \
             .replace("{initial_state}", initial_state) \
             .replace("{closed}", closed).replace("{state_patch}", state_patch)
-        path = self.bin / name
-        path.write_text(script)
-        path.chmod(path.stat().st_mode | stat.S_IEXEC)
+        support.write_cli_stub(self.bin, name, script)
 
     def invocations(self) -> list[list[str]]:
         log = self.bin / "invocations.log"
-        return [json.loads(l) for l in log.read_text().splitlines()] \
+        return [json.loads(l) for l in log.read_text(encoding="utf-8").splitlines()] \
             if log.exists() else []
 
 
@@ -197,7 +197,7 @@ class GitProviderPrCreation(FakeCliHarness):
         real_repo = self.bin / "a-real-repo-checkout"
         real_repo.mkdir()
         create_pr({"provider": {"git": "github"}}, **{**self.KW, "repo": real_repo})
-        seen_cwd = Path((self.bin / "cwd.log").read_text().strip().splitlines()[-1])
+        seen_cwd = Path((self.bin / "cwd.log").read_text(encoding="utf-8").strip().splitlines()[-1])
         self.assertEqual(seen_cwd.resolve(), real_repo.resolve())
 
     def test_unknown_git_provider(self):
@@ -231,14 +231,12 @@ class GitProviderCommentFetch(FakeCliHarness):
             "(base / 'cwd.log').open('a').write(str(Path.cwd()) + '\\n')\n"
             f"print({output!r})\n"
         )
-        path = self.bin / name
-        path.write_text(script)
-        path.chmod(path.stat().st_mode | stat.S_IEXEC)
+        support.write_cli_stub(self.bin, name, script)
 
     def _last_argv(self) -> list[str]:
         import ast
         return ast.literal_eval(
-            (self.bin / "invocations.log").read_text().strip().splitlines()[-1])
+            (self.bin / "invocations.log").read_text(encoding="utf-8").strip().splitlines()[-1])
 
     def test_local_provider_returns_no_comments(self):
         # records-only provider, no forge to fetch from — the human pastes
@@ -262,14 +260,12 @@ class GitProviderCommentFetch(FakeCliHarness):
             "(base / 'cwd.log').open('a').write(str(Path.cwd()) + '\\n')\n"
             f"print({api_output!r} if sys.argv[1] == 'api' else {view_output!r})\n"
         )
-        path = self.bin / "gh"
-        path.write_text(script)
-        path.chmod(path.stat().st_mode | stat.S_IEXEC)
+        support.write_cli_stub(self.bin, "gh", script)
 
     def _all_argv(self) -> list[list[str]]:
         import ast
         return [ast.literal_eval(line) for line in
-                (self.bin / "invocations.log").read_text().strip().splitlines()]
+                (self.bin / "invocations.log").read_text(encoding="utf-8").strip().splitlines()]
 
     def test_github_fetch_comments_covers_all_three_feedback_surfaces(self):
         view = json.dumps({
@@ -301,7 +297,7 @@ class GitProviderCommentFetch(FakeCliHarness):
         self.assertIn("comments,reviews", calls[0])
         self.assertEqual(calls[1][0], "api")
         self.assertIn("pulls/9/comments", calls[1][1])
-        for line in (self.bin / "cwd.log").read_text().strip().splitlines():
+        for line in (self.bin / "cwd.log").read_text(encoding="utf-8").strip().splitlines():
             self.assertEqual(Path(line).resolve(), repo.resolve())
 
     def test_github_fetch_comments_survives_error_shaped_api_response(self):
@@ -383,14 +379,12 @@ class WorkItemCreateFollowUp(FakeCliHarness):
             ".write(repr(sys.argv[1:]) + '\\n')\n"
             f"print({url!r})\n"
         )
-        path = self.bin / name
-        path.write_text(script)
-        path.chmod(path.stat().st_mode | stat.S_IEXEC)
+        support.write_cli_stub(self.bin, name, script)
 
     def _last_argv(self) -> list[str]:
         import ast
         return ast.literal_eval(
-            (self.bin / "invocations.log").read_text().strip().splitlines()[-1])
+            (self.bin / "invocations.log").read_text(encoding="utf-8").strip().splitlines()[-1])
 
     def test_github_create_returns_id_and_url(self):
         self._stub_url("gh", "https://github.com/o/r/issues/42")

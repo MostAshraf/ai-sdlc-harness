@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from tests import support
 
 ROOT = Path(__file__).resolve().parent.parent
 N_TASKS = 8
@@ -25,13 +26,13 @@ class ConcurrentSetState(unittest.TestCase):
         self.run = self.workspace / "ai" / "2026-01-01-RACE-1"
 
     def tearDown(self):
-        shutil.rmtree(self.workspace)
+        support.rmtree(self.workspace)
 
     def _cli(self, *args) -> subprocess.Popen:
         return subprocess.Popen(
             [sys.executable, "-m", "harness",
              "--workspace", str(self.workspace), "--run", str(self.run), *args],
-            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
 
     def test_no_lost_updates_under_parallel_writers(self):
         tasks = [f"T{i}" for i in range(1, N_TASKS + 1)]
@@ -68,7 +69,7 @@ class ConcurrentSetState(unittest.TestCase):
                          "--mode", "quick", "--change-type", "fix")
         boot.communicate(timeout=60); self.assertEqual(boot.returncode, 0)
         state_file = self.run / "state.yaml"
-        state_file.write_text(state_file.read_text() + "# tampered\n")
+        state_file.write_text(state_file.read_text(encoding="utf-8") + "# tampered\n")
         show = self._cli("show")
         out, _ = show.communicate(timeout=30)
         self.assertEqual(show.returncode, 3)  # 3 = integrity (2 is argparse usage)

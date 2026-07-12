@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 
 from harness import mermaid
+from tests import support
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -25,7 +26,7 @@ class MermaidValidator(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
 
     def tearDown(self):
-        shutil.rmtree(self.tmp)
+        support.rmtree(self.tmp)
 
     def _check(self, content: str) -> dict:
         path = self.tmp / "diagram.md"
@@ -306,12 +307,12 @@ class MermaidCliEndToEnd(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
 
     def tearDown(self):
-        shutil.rmtree(self.tmp)
+        support.rmtree(self.tmp)
 
     def _cli(self, *args) -> tuple[int, dict]:
         proc = subprocess.run(
             [sys.executable, "-m", "harness", "--workspace", str(self.tmp), *args],
-            cwd=ROOT, capture_output=True, text=True, timeout=30)
+            cwd=ROOT, capture_output=True, text=True, encoding="utf-8", timeout=30)
         return proc.returncode, json.loads(proc.stdout)
 
     def test_valid_file_exits_zero(self):

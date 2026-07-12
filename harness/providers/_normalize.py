@@ -5,6 +5,7 @@ acceptance-criteria field (GitHub/GitLab/local-markdown: look for an
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 
 
@@ -42,7 +43,17 @@ def run_cli(args: list[str], cwd=None) -> str:
     they run in, so a git-provider call MUST run inside the target repo, not
     the harness process's own cwd (work-item providers pass an explicit
     `--repo`/`--repo` flag instead, so they don't need this)."""
-    proc = subprocess.run(args, capture_output=True, text=True, timeout=120, cwd=cwd)
+    # `which()` resolution, not a bare exec: Windows' CreateProcess appends
+    # only `.exe` to a bare name, so the real Azure CLI (`az.cmd`) — and any
+    # non-.exe shim — is unfindable without the PATHEXT walk which() does.
+    # It also honors PATH order, which is what lets the test suite's
+    # fake-CLI directory shadow a real `gh`/`glab` installed on the host.
+    # UTF-8 decode, never the locale codec: forge CLIs print UTF-8 JSON,
+    # and Windows' cp1252 both mojibakes it and can raise on undefined bytes.
+    exe = shutil.which(args[0]) or args[0]
+    proc = subprocess.run([exe, *args[1:]], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace",
+                          timeout=120, cwd=cwd)
     if proc.returncode != 0:
         from . import ProviderError
         raise ProviderError(

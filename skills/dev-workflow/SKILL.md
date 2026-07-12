@@ -14,8 +14,9 @@ raw `git commit|merge|rebase` — every mutation goes through `harness`
 (guards block the raw paths and redirect you here).
 
 Every command below runs through `${CLAUDE_PLUGIN_ROOT}/bin/harness` — a
-wrapper script that resolves the plugin venv (created by /init-workspace)
-and falls back to system `python3` pre-setup. `--workspace <ws>` and
+wrapper script that resolves the plugin venv (created by /init-workspace,
+either OS layout) and falls back to system `python3`/`python` pre-setup;
+it runs under Git Bash on Windows too. `--workspace <ws>` and
 `--run <run>` may go before or after the verb, in any mix — e.g. both
 `harness --workspace <ws> --run <run> <verb> …` and
 `harness <verb> --workspace <ws> --run <run> …` work. Always use the full

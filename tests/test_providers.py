@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from harness.providers import ProviderUnsupported, dispatch, get_module
+from tests import support
 
 STORY = """# WORK-7: Fix null crash in parser
 Type: Bug
@@ -59,7 +60,7 @@ class LocalMarkdownContract(unittest.TestCase):
                                     "stories_dir": str(self.stories)}}
 
     def tearDown(self):
-        shutil.rmtree(self.stories)
+        support.rmtree(self.stories)
 
     def test_passes_the_shared_contract(self):
         assert_work_item_contract(self, self.config, "WORK-7")
@@ -75,7 +76,7 @@ class LocalMarkdownContract(unittest.TestCase):
 
     def test_comment_lands_in_file(self):
         dispatch(self.config, "work_item.add_comment", id="WORK-7", text="hello")
-        body = (self.stories / "WORK-7.md").read_text()
+        body = (self.stories / "WORK-7.md").read_text(encoding="utf-8")
         self.assertIn("## Comments", body)
         self.assertIn("- hello", body)
 
@@ -114,7 +115,7 @@ class LocalMarkdownContract(unittest.TestCase):
             with self.assertRaises(ProviderError) as ctx:
                 dispatch(self.config, op, id=rel, **kwargs)
             self.assertIn("escapes stories_dir", str(ctx.exception))
-        self.assertNotIn("Done", outside.read_text())   # never touched
+        self.assertNotIn("Done", outside.read_text(encoding="utf-8"))   # never touched
 
     def test_unset_stories_dir_is_a_refusal_not_cwd_hunting(self):
         from harness.providers import ProviderError
@@ -153,7 +154,7 @@ class LocalMarkdownV21Adoption(unittest.TestCase):
                                     "stories_dir": str(self.stories)}}
 
     def tearDown(self):
-        shutil.rmtree(self.stories)
+        support.rmtree(self.stories)
 
     def test_blockquote_status_is_read_not_defaulted(self):
         item = dispatch(self.config, "work_item.fetch",
@@ -168,7 +169,7 @@ class LocalMarkdownV21Adoption(unittest.TestCase):
     def test_transition_upgrades_to_strict_v3_form(self):
         dispatch(self.config, "work_item.transition",
                  id="US-042-add-multiply", to="In Review")
-        body = (self.stories / "US-042-add-multiply.md").read_text()
+        body = (self.stories / "US-042-add-multiply.md").read_text(encoding="utf-8")
         self.assertIn("Status: In Review", body)
         self.assertNotIn("> Status", body)   # blockquote form is gone
         self.assertEqual(dispatch(self.config, "work_item.fetch",
@@ -204,7 +205,7 @@ class LocalMarkdownV21Adoption(unittest.TestCase):
         self.assertEqual(item["state"], "Open")     # absent -> defaulted
         dispatch(self.config, "work_item.transition", id="US-044",
                  to="In Progress")
-        body = (self.stories / "US-044.md").read_text()
+        body = (self.stories / "US-044.md").read_text(encoding="utf-8")
         self.assertIn("> Status: everything was on fire", body)  # untouched
         # the new Status landed in the HEADER, where the read can see it
         self.assertEqual(dispatch(self.config, "work_item.fetch",

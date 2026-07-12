@@ -13,6 +13,7 @@ from pathlib import Path
 
 from harness import chain, gates, initws, ndjson, state as state_mod, transitions
 from harness.cli import load_declared
+from tests import support
 
 ROOT = Path(__file__).resolve().parent.parent
 GUARDS = ROOT / "hooks" / "guards.py"
@@ -23,7 +24,7 @@ class GuardHarness(unittest.TestCase):
         self.workspace = Path(tempfile.mkdtemp())
 
     def tearDown(self):
-        shutil.rmtree(self.workspace)
+        support.rmtree(self.workspace)
 
     def run_guard(self, name: str, payload: dict,
                   env: dict | None = None) -> tuple[int, str]:
@@ -35,7 +36,7 @@ class GuardHarness(unittest.TestCase):
                 if k != "CLAUDE_PROJECT_DIR"}
         proc = subprocess.run([sys.executable, str(GUARDS), name],
                               input=json.dumps(payload), capture_output=True,
-                              text=True, timeout=60,
+                              text=True, encoding="utf-8", timeout=60,
                               env={**base, **(env or {})})
         return proc.returncode, proc.stderr
 
@@ -247,7 +248,12 @@ class BashGuard(GuardHarness):
         (ws / ".claude" / "context").mkdir(parents=True)
         (ws / ".claude" / "context" / "repos.yaml").write_text(
             f"repos:\n  backend: {repo}\n")
-        wt = f"{ws}/Code/backend-wt-T1-abc/x.java"
+        # commands spell paths the way the executing shell sees them —
+        # forward slashes on every OS (the Bash tool is Git Bash on
+        # Windows), so the target-detection regex is exercised for real
+        # there instead of trivially missing a backslash spelling
+        ws_sh, repo_sh = ws.as_posix(), repo.as_posix()
+        wt = f"{ws_sh}/Code/backend-wt-T1-abc/x.java"
         dev = "ai-sdlc-harness:developer:ai-sdlc-developer"
 
         def bash_dev(cmd):
@@ -257,12 +263,12 @@ class BashGuard(GuardHarness):
         # read-from-abs-write-to-relative
         for ok in ("mvn -q test", "npm test > /dev/null 2>&1",
                    "pytest > /tmp/o.txt", f"sed -i 's/a/b/' {wt}",
-                   f"rm {repo}/scratch.txt", "cat /etc/os-release > ./v.txt"):
+                   f"rm {repo_sh}/scratch.txt", "cat /etc/os-release > ./v.txt"):
             code, err = self.run_guard("bash", bash_dev(ok))
             self.assertEqual(code, 0, f"should allow: {ok} -> {err}")
         # blocked: writes targeting absolute paths outside the allowed roots
         for bad in ("echo x > /etc/hosts", f"cp {wt} /etc/evil",
-                    f"rm -rf {ws}/Code/other",
+                    f"rm -rf {ws_sh}/Code/other",
                     "python3 -c 'open(\"/etc/x\",\"w\").write(\"y\")'",
                     "echo x | tee /usr/local/x"):
             code, err = self.run_guard("bash", bash_dev(bad))
@@ -313,17 +319,21 @@ class BashGuard(GuardHarness):
         # finds repos VIA repos.yaml, never assumes they live under the
         # workspace) was still waved through as scratch, letting a
         # nominally read-only reviewer mutate real repo content. The repo
-        # is built directly under /tmp (dir="/tmp", not the platform tmp
-        # default) so this reproduces deterministically on every host OS,
-        # not just the Linux CI runners where the *workspace* happens to
-        # collide with /tmp.
-        repo = Path(tempfile.mkdtemp(prefix="harness-repo-", dir="/tmp"))
-        self.addCleanup(shutil.rmtree, repo, ignore_errors=True)
+        # is built directly under the guard's scratch root (dir="/tmp" on
+        # POSIX; on Windows the default temp dir IS that root) so this
+        # reproduces deterministically on every host OS, not just the Linux
+        # CI runners where the *workspace* happens to collide with /tmp.
+        repo = Path(tempfile.mkdtemp(prefix="harness-repo-",
+                                     dir=support.SCRATCH_FIXTURE_DIR))
+        self.addCleanup(support.rmtree, repo, ignore_errors=True)
         ctx = self.workspace / ".claude" / "context"
         ctx.mkdir(parents=True, exist_ok=True)
         (ctx / "repos.yaml").write_text(f"repos:\n  r: {repo}\n")
         rev = "ai-sdlc-harness:reviewer:ai-sdlc-reviewer"
-        self.assert_blocks("bash", bash(f"rm -rf {repo}/src", rev), "read-only")
+        # forward-slash spelling: what Git Bash commands actually carry
+        self.assert_blocks("bash",
+                           bash(f"rm -rf {repo.as_posix()}/src", rev),
+                           "read-only")
         # a genuinely unrelated /tmp scratch path is still allowed
         self.assert_allows("bash", bash("pytest > /tmp/o.txt", rev))
 
@@ -479,7 +489,7 @@ class BashGuard(GuardHarness):
 
     def test_unparseable_payload_fails_open(self):
         proc = subprocess.run([sys.executable, str(GUARDS), "bash"],
-                              input="not json{", capture_output=True, text=True)
+                              input="not json{", capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(proc.returncode, 0)
 
 
@@ -511,7 +521,7 @@ class BashGuardOutsideHarnessWorkspace(GuardHarness):
         # recognized as the bootstrapped workspace via the env var.
         initws.mark_bootstrapped(self.workspace)
         outside = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        self.addCleanup(support.rmtree, outside, ignore_errors=True)
         payload = bash('git commit -m "x"')
         payload["cwd"] = str(outside)
         code, err = self.run_guard(
@@ -549,7 +559,7 @@ class BashGuardOutsideHarnessWorkspace(GuardHarness):
         # residual real: if a future change closes it, this genuinely
         # registered case is what should start failing and get updated.
         parent = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, parent, ignore_errors=True)
+        self.addCleanup(support.rmtree, parent, ignore_errors=True)
         owning_ws = parent / "workspace"
         owning_ws.mkdir()
         initws.mark_bootstrapped(owning_ws)
@@ -707,10 +717,12 @@ class WriteGuard(GuardHarness):
         # original bug (a workspace living under /tmp colliding with the
         # blanket /tmp scratch allowance) only ever reproduced on Linux CI
         # runners — 9 confinement tests passed locally on macOS while
-        # genuinely broken. Built directly under /tmp (dir="/tmp") so this
-        # reproduces on any host OS running this suite, not just Linux.
-        ws = Path(tempfile.mkdtemp(prefix="harness-ws-", dir="/tmp"))
-        self.addCleanup(shutil.rmtree, ws, ignore_errors=True)
+        # genuinely broken. Built directly under the guard's scratch root
+        # (dir="/tmp" on POSIX; on Windows the default temp dir IS that
+        # root) so this reproduces on any host OS running this suite.
+        ws = Path(tempfile.mkdtemp(prefix="harness-ws-",
+                                   dir=support.SCRATCH_FIXTURE_DIR))
+        self.addCleanup(support.rmtree, ws, ignore_errors=True)
         repo = ws / "Code" / "backend"
         repo.mkdir(parents=True)
         ctx = ws / ".claude" / "context"
@@ -726,8 +738,9 @@ class WriteGuard(GuardHarness):
         self.assert_blocks("write", planner_write, "repo source")
 
         # genuine scratch, a sibling of ws (not nested in it), still allowed
-        scratch_write = self._w("/tmp/genuinely-unrelated-scratch.md",
-                                "x:developer")
+        scratch_write = self._w(
+            support.scratch_path("genuinely-unrelated-scratch.md"),
+            "x:developer")
         scratch_write["cwd"] = str(ws)
         self.assert_allows("write", scratch_write)
 
@@ -763,16 +776,19 @@ class WriteGuard(GuardHarness):
     def test_planner_scratch_excludes_a_registered_repo_checkout_under_tmp(self):
         # Same class as the reviewer-side finding above: the planner's
         # scratch check must not wave through a registered repo's checkout
-        # just because it independently sits under /tmp. Built directly
-        # under /tmp (dir="/tmp") so this is deterministic on every host OS.
-        repo = Path(tempfile.mkdtemp(prefix="harness-repo-", dir="/tmp"))
-        self.addCleanup(shutil.rmtree, repo, ignore_errors=True)
+        # just because it independently sits under the scratch root. Built
+        # directly under that root (dir="/tmp" on POSIX; the default temp
+        # dir on Windows) so this is deterministic on every host OS.
+        repo = Path(tempfile.mkdtemp(prefix="harness-repo-",
+                                     dir=support.SCRATCH_FIXTURE_DIR))
+        self.addCleanup(support.rmtree, repo, ignore_errors=True)
         self._register_repo(repo)
         pl = "x:planner"
         self.assert_blocks("write", self._w(str(repo / "src" / "x.py"), pl),
                            "repo source")
-        # a genuinely unrelated /tmp scratch path is still allowed
-        self.assert_allows("write", self._w("/tmp/plan-scratch.md", pl))
+        # a genuinely unrelated scratch path is still allowed
+        self.assert_allows("write",
+                           self._w(support.scratch_path("plan-scratch.md"), pl))
 
     def test_planner_cannot_write_meta_json_directly(self):
         """The path-confinement check above allows anything under
@@ -882,19 +898,23 @@ class TddOrderingGuard(GuardHarness):
     def test_bash_write_surface_has_parity(self):
         run, wt = self._tdd_run()
         dev = "x:developer"
+        # forward-slash spellings, as Git Bash commands carry on every OS —
+        # a native backslash spelling would trivially evade target
+        # detection on Windows instead of exercising the parity
+        wt_sh = wt.as_posix()
         self.assert_blocks(
-            "bash", bash(f"sed -i 's/a/b/' {wt}/src/main/App.java", dev),
+            "bash", bash(f"sed -i 's/a/b/' {wt_sh}/src/main/App.java", dev),
             "red-proof")
         self.assert_allows(
-            "bash", bash(f"echo 'x' > {wt}/tests/test_new.py", dev))
+            "bash", bash(f"echo 'x' > {wt_sh}/tests/test_new.py", dev))
         # reads of production files are not writes — must not block
-        self.assert_allows("bash", bash(f"cat {wt}/src/main/App.java", dev))
+        self.assert_allows("bash", bash(f"cat {wt_sh}/src/main/App.java", dev))
         # a destructive verb makes the target sweep grab EVERY absolute
         # token — including the `cd` argument, which resolves to the
         # worktree ROOT ('.') and would block a legitimate clean-and-build.
         # The root itself is never a real file write.
         self.assert_allows(
-            "bash", bash(f'cd "{wt}" && rm -rf target && mvn -q test', dev))
+            "bash", bash(f'cd "{wt_sh}" && rm -rf target && mvn -q test', dev))
 
     def test_unlocks_once_red_proof_sealed(self):
         run, wt = self._tdd_run()
@@ -974,7 +994,7 @@ class SpawnGuard(GuardHarness):
         env-first."""
         run = self.make_run(to_step="intake")   # planner:intake is legal
         outside = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        self.addCleanup(support.rmtree, outside, ignore_errors=True)
         payload = spawn("planner",
                         f"harness-mode: intake\nharness-run: {run}\ngo")
         payload["cwd"] = str(outside)
@@ -1065,7 +1085,7 @@ class SpawnGuard(GuardHarness):
     def test_tampered_state_fails_closed(self):
         run = self.make_run(to_step="develop")
         sf = run / "state.yaml"
-        sf.write_text(sf.read_text() + "# tampered\n")
+        sf.write_text(sf.read_text(encoding="utf-8") + "# tampered\n")
         # A tampered run contributes no legal spawn-set of its own — still
         # blocked, just no longer via an uncaught exception (see the next
         # test: it must not veto a HEALTHY sibling run's legal spawn either).
@@ -1081,7 +1101,7 @@ class SpawnGuard(GuardHarness):
         tampered = self.make_run(to_step="harden", run_name="2026-01-01-BAD-1",
                                  item_id="BAD-1")
         sf = tampered / "state.yaml"
-        sf.write_text(sf.read_text() + "# tampered\n")
+        sf.write_text(sf.read_text(encoding="utf-8") + "# tampered\n")
         good = self.make_run(to_step="develop", run_name="2026-01-02-GOOD-1",
                              item_id="GOOD-1")
         self.assert_allows("spawn", spawn(
@@ -1246,7 +1266,7 @@ class CaptureHooks(GuardHarness):
         run = self.make_run()
         self.present_gate(run)
         outside = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        self.addCleanup(support.rmtree, outside, ignore_errors=True)
         code, err = self.run_guard(
             "user-prompt", {"prompt": "waive", "cwd": str(outside)},
             env={"CLAUDE_PROJECT_DIR": str(self.workspace)})
@@ -1262,7 +1282,7 @@ class CaptureHooks(GuardHarness):
         child = self.workspace / "svc"
         child.mkdir()
         bogus = Path(tempfile.mkdtemp())     # a project dir holding no runs
-        self.addCleanup(shutil.rmtree, bogus, ignore_errors=True)
+        self.addCleanup(support.rmtree, bogus, ignore_errors=True)
         code, err = self.run_guard(
             "user-prompt", {"prompt": "APPROVED", "cwd": str(child)},
             env={"CLAUDE_PROJECT_DIR": str(bogus)})
@@ -1757,10 +1777,17 @@ class CaptureHooks(GuardHarness):
 
 def _yamlless_python() -> str | None:
     """An interpreter WITHOUT PyYAML (e.g. macOS system python3) — the exact
-    pre-setup environment a fresh install runs hooks under."""
-    for candidate in ("/usr/bin/python3", "python3"):
-        probe = subprocess.run([candidate, "-c", "import yaml"],
-                               capture_output=True)
+    pre-setup environment a fresh install runs hooks under. A missing
+    candidate must be SKIPPED, not raised: this runs at import time, and an
+    unhandled FileNotFoundError (e.g. no `/usr/bin/python3` on Windows)
+    used to kill the entire module's collection — every guard test silently
+    uncollected (first Windows triage)."""
+    for candidate in ("/usr/bin/python3", "python3", "python"):
+        try:
+            probe = subprocess.run([candidate, "-c", "import yaml"],
+                                   capture_output=True)
+        except OSError:
+            continue
         if probe.returncode != 0:
             return candidate
     return None
@@ -1777,7 +1804,7 @@ class PreSetupDegradation(GuardHarness):
         payload.setdefault("cwd", str(self.workspace))
         proc = subprocess.run([_yamlless_python(), str(GUARDS), name],
                               input=json.dumps(payload), capture_output=True,
-                              text=True, timeout=60)
+                              text=True, encoding="utf-8", timeout=60)
         return proc.returncode, proc.stderr
 
     def test_bash_guard_still_blocks_without_yaml(self):
@@ -1847,6 +1874,66 @@ class ShapeOfConvention(unittest.TestCase):
         self.assertEqual(s("reviewer"), "reviewer")
         self.assertEqual(s("ai-sdlc-harness:reviewer"), "reviewer")
         self.assertEqual(s(None), "")
+
+
+@unittest.skipUnless(os.name == "nt", "Windows-only path shapes")
+class WindowsPathShapes(GuardHarness):
+    """Path spellings only a Windows host produces (first Windows triage).
+    Every case here failed on the pre-triage, POSIX-only guard regexes —
+    this class is the Windows CI lane's mutation coverage for the
+    nt-conditional forms in hooks/guards.py (which deliberately leave the
+    POSIX patterns byte-identical, so these shapes CANNOT be exercised on
+    the other lanes)."""
+
+    def _register_repo(self, repo: Path):
+        ctx = self.workspace / ".claude" / "context"
+        ctx.mkdir(parents=True, exist_ok=True)
+        (ctx / "repos.yaml").write_text(f"repos:\n  r: {repo}\n",
+                                        encoding="utf-8")
+
+    def test_authority_write_blocked_in_backslash_spelling(self):
+        # Git Bash's msys runtime maps a QUOTED backslash path onto the
+        # same file the forward-slash spelling reaches — pre-triage,
+        # AUTHORITY_RE's `/`-only separators waved this straight through
+        self.assert_blocks(
+            "bash",
+            bash('echo pwned > "ai\\2026-01-01-X\\state.yaml"'),
+            "owned entry points")
+
+    def test_developer_drive_letter_escape_blocked(self):
+        # a drive-letter absolute target outside every allowed root was
+        # invisible to the POSIX-only _ABS_TOKEN_RE (confinement fail-open)
+        repo = self.workspace / "Code" / "backend"
+        repo.mkdir(parents=True)
+        self._register_repo(repo)
+        outside = (self.workspace / "notes.txt").as_posix()  # ws is not a repo
+        payload = bash(f"sed -i s/a/b/ {outside}", "x:developer")
+        payload["cwd"] = str(self.workspace)
+        self.assert_blocks("bash", payload, "worktree")
+
+    def test_reviewer_drive_letter_scratch_swept_correctly(self):
+        # cleanup of a %TEMP% file spelled with a drive letter is scratch
+        # (pre-triage: zero absolute tokens found -> blanket fail-closed
+        # block); the same verb on a workspace file still blocks
+        scratch = Path(tempfile.mkdtemp())
+        self.addCleanup(support.rmtree, scratch, ignore_errors=True)
+        rev = "ai-sdlc-harness:reviewer:ai-sdlc-reviewer"
+        self.assert_allows(
+            "bash", bash(f"rm {scratch.as_posix()}/out.log", rev))
+        self.assert_blocks(
+            "bash",
+            bash(f"rm {(self.workspace / 'x.log').as_posix()}", rev),
+            "read-only")
+
+    def test_reviewer_tmp_literal_is_git_bash_scratch(self):
+        # a literal `/tmp/…` redirect is Git Bash's temp mount on Windows —
+        # pre-triage it resolved as a relative path under the workspace and
+        # false-blocked the reviewer's one sanctioned output idiom
+        rev = "ai-sdlc-harness:reviewer:ai-sdlc-reviewer"
+        self.assert_allows("bash", bash("npm test > /tmp/win-out.log", rev))
+        # …while a rootless NON-tmp msys mount stays blocked
+        self.assert_blocks("bash", bash("npm test > /etc/profile", rev),
+                           "read-only")
 
 
 if __name__ == "__main__":

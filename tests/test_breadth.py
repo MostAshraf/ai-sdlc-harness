@@ -13,6 +13,7 @@ from pathlib import Path
 
 from harness import gitops, ndjson, state as state_mod
 from tests.test_gitops import FAILING_TEST, TEST_CMD, make_repo
+from tests import support
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -25,7 +26,7 @@ class BreadthHarness(unittest.TestCase):
         self.repo = make_repo(self.workspace)
 
     def tearDown(self):
-        shutil.rmtree(self.workspace)
+        support.rmtree(self.workspace)
 
     def story(self, sid, title, body="", type_="Bug"):
         (self.stories / f"{sid}.md").write_text(
@@ -37,7 +38,7 @@ class BreadthHarness(unittest.TestCase):
         if run:
             cmd += ["--run", str(run)]
         proc = subprocess.run([*cmd, *args], cwd=ROOT, capture_output=True,
-                              text=True, timeout=120)
+                              text=True, encoding="utf-8", timeout=120)
         payload = json.loads(proc.stdout) if proc.stdout.strip() else {}
         self.assertEqual(proc.returncode, expect,
                          f"harness {' '.join(map(str, args))} -> {payload} {proc.stderr}")
@@ -153,7 +154,7 @@ class FullWalk(BreadthHarness):
         self.cli("cursor", "--to", "reconcile", run=run)
         self.cli("reconcile", run=run)
         # provider write-back (conservative default: on_done)
-        self.assertIn("Status: Done", (self.stories / "W-10.md").read_text())
+        self.assertIn("Status: Done", (self.stories / "W-10.md").read_text(encoding="utf-8"))
         state = self.cli("show", run=run)["state"]
         self.assertEqual(state["tasks"][0]["status"], "archived")
 
@@ -166,7 +167,7 @@ class FullWalk(BreadthHarness):
                 "model": "m1", "input": 10, "output": out,
                 "cache_read": 0, "cache_write": 0})
         report = Path(self.cli("metrics", run=run)["report"])
-        text = report.read_text()
+        text = report.read_text(encoding="utf-8")
         self.assertIn("## Step timings", text)
         # human-view tables (regenerable projection of the ledgers): the
         # task row, the review verdict rows, aggregated tokens + totals
@@ -183,7 +184,7 @@ class FullWalk(BreadthHarness):
         # status + metrics count flagged events off ONE shared list (they
         # used to drift: 18 vs 23 on the same run)
         events = [json.loads(line) for line in
-                  (run / "events.ndjson").read_text().splitlines()]
+                  (run / "events.ndjson").read_text(encoding="utf-8").splitlines()]
         skips = [e for e in events if e["kind"] == "gate-skipped"]
         self.assertEqual([e["step"] for e in skips], ["approve-security"])
         self.assertIn("gate-skipped", text)
@@ -223,7 +224,7 @@ class WriteBackMilestones(BreadthHarness):
         out = self.cli("write-back", "--milestone", "develop_start", run=run)
         self.assertEqual(out["written"], True)
         self.assertEqual(out["to"], "In Progress")
-        self.assertIn("Status: In Progress", (self.stories / "W-51.md").read_text())
+        self.assertIn("Status: In Progress", (self.stories / "W-51.md").read_text(encoding="utf-8"))
 
     def test_in_review_is_a_noop_by_shipped_default(self):
         self.story("W-52", "thing", type_="Bug")
@@ -231,7 +232,7 @@ class WriteBackMilestones(BreadthHarness):
         run = Path(self.cli("fetch", "--id", "W-52", "--date", "2026-02-13")["run"])
         out = self.cli("write-back", "--milestone", "in_review", run=run)
         self.assertEqual(out["written"], False)
-        self.assertNotIn("Status: In Review", (self.stories / "W-52.md").read_text())
+        self.assertNotIn("Status: In Review", (self.stories / "W-52.md").read_text(encoding="utf-8"))
 
 
 class FetchCollisionPreservesWorkItemJson(BreadthHarness):
@@ -247,14 +248,14 @@ class FetchCollisionPreservesWorkItemJson(BreadthHarness):
         self.story("W-70", "Original title")
         self.init()
         run = Path(self.cli("fetch", "--id", "W-70", "--date", "2026-02-17")["run"])
-        original = json.loads((run / "work-item.json").read_text())
+        original = json.loads((run / "work-item.json").read_text(encoding="utf-8"))
         self.assertEqual(original["title"], "Original title")
 
         self.story("W-70", "Changed title")   # source ticket edited
         out = self.cli("fetch", "--id", "W-70", "--date", "2026-02-17", expect=1)
         self.assertIn("Resume or Abort", out["error"])
 
-        after = json.loads((run / "work-item.json").read_text())
+        after = json.loads((run / "work-item.json").read_text(encoding="utf-8"))
         self.assertEqual(after["title"], "Original title")   # untouched
 
 
@@ -316,7 +317,7 @@ class WorktreeDeadPathResume(BreadthHarness):
 
         wt = self.cli("worktree-add", "--repo", str(self.repo),
                       "--task-id", "T1", "--base", branch, run=run)
-        shutil.rmtree(wt["path"])   # simulate manual cleanup / crash
+        support.rmtree(wt["path"])   # simulate manual cleanup / crash
 
         resumed = self.cli("worktree-add", "--repo", str(self.repo),
                            "--task-id", "T1", "--base", branch, run=run)
@@ -512,7 +513,7 @@ class TwoRepoContracts(BreadthHarness):
 
         v = self.cli("reconcile-contracts", run=run)
         self.assertEqual(v["verdict"], "drift")        # surfaced, not auto-fixed
-        report = (run / "reports" / "contracts.md").read_text()
+        report = (run / "reports" / "contracts.md").read_text(encoding="utf-8")
         self.assertIn("C1 @ repo-b: **MISSING**", report)
         self.assertIn("C1 @ repo: present", report)
 
@@ -824,7 +825,7 @@ class SecurityScanParsing(BreadthHarness):
             self.cli("cursor", "--to", step, run=run)
         sev = self.cli("security-scan", run=run)
         self.assertEqual(sev["max_severity"], "critical")
-        report = (run / "reports" / "security.md").read_text()
+        report = (run / "reports" / "security.md").read_text(encoding="utf-8")
         self.assertIn("## repo", report)
         self.assertIn("## repo-b", report)
         # gate REQUIRED (critical >= medium): the critical finding survived
@@ -924,7 +925,7 @@ class CliBoundary(BreadthHarness):
         good = Path(self.cli("fetch", "--id", "W-91", "--date", "2026-02-01")["run"])
         bad = Path(self.cli("fetch", "--id", "W-92", "--date", "2026-02-01")["run"])
         sf = bad / "state.yaml"
-        sf.write_text(sf.read_text() + "# tampered\n")
+        sf.write_text(sf.read_text(encoding="utf-8") + "# tampered\n")
         out = self.cli("status")
         by_name = {r["run"]: r for r in out["runs"]}
         self.assertEqual(by_name[good.name]["work_item"], "W-91")   # survives
@@ -1175,10 +1176,10 @@ class DeferFollowThrough(BreadthHarness):
         self.assertEqual(out["decision"], "defer")
         self.assertIn("work_item.create", out["follow_up"])
         kinds = [json.loads(line)["kind"] for line in
-                 (run / "events.ndjson").read_text().splitlines()]
+                 (run / "events.ndjson").read_text(encoding="utf-8").splitlines()]
         self.assertIn("deferral-pending", kinds)
         report = Path(self.cli("metrics", run=run)["report"])
-        self.assertIn("deferral-pending", report.read_text())
+        self.assertIn("deferral-pending", report.read_text(encoding="utf-8"))
         # non-defer decisions carry no follow_up and flag nothing
         self.cli("gate", "--id", "approve-security", "--present", run=run)
         ndjson.append_record(run / "human-input.ndjson", {"text": "waive"})
@@ -1206,7 +1207,7 @@ class DeferFollowThrough(BreadthHarness):
                         if r["run"] == run.name)["flagged_events"]
 
         def _metrics_flagged():
-            text = Path(self.cli("metrics", run=run)["report"]).read_text()
+            text = Path(self.cli("metrics", run=run)["report"]).read_text(encoding="utf-8")
             return int(text.split("## Flagged events (")[1].split(")")[0])
 
         before = _status_flagged()
@@ -1287,7 +1288,7 @@ class SecretSweepBreadth(BreadthHarness):
         self.cli("cursor", "--to", "preflight", run=run)
         self.cli("preflight", "--repo", str(self.repo), run=run)
         exclude = self.repo / ".git" / "info" / "exclude"
-        self.assertIn(".harness-key", exclude.read_text())
+        self.assertIn(".harness-key", exclude.read_text(encoding="utf-8"))
 
         exclude.write_text("")            # simulate a pre-0.16.12 preflight
         key = self.repo / ".claude" / "context" / ".harness-key"
@@ -1298,17 +1299,17 @@ class SecretSweepBreadth(BreadthHarness):
                        "--summary", "sweep attempt", run=run, expect=1)
         self.assertIn("integrity key", out["error"])
         kinds = [json.loads(line)["kind"] for line in
-                 (run / "events.ndjson").read_text().splitlines()]
+                 (run / "events.ndjson").read_text(encoding="utf-8").splitlines()]
         self.assertIn("secret-sweep-blocked", kinds)
         report = Path(self.cli("metrics", run=run)["report"])
-        self.assertIn("secret-sweep-blocked", report.read_text())
+        self.assertIn("secret-sweep-blocked", report.read_text(encoding="utf-8"))
 
 
 class WorkspaceResolution(BreadthHarness):
     def _raw(self, *args, cwd, expect=0):
         proc = subprocess.run(
             [sys.executable, "-m", "harness", *args], cwd=cwd,
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, encoding="utf-8", timeout=120,
             env={**__import__("os").environ, "PYTHONPATH": str(ROOT)})
         payload = json.loads(proc.stdout) if proc.stdout.strip() else {}
         self.assertEqual(proc.returncode, expect,

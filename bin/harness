@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # Resolves the plugin venv (created by /init-workspace); falls back to
-# system python3 pre-setup. Every skill/step file invokes THIS, never a
-# bare `harness` (no such binary exists) or a shell-state-dependent alias
-# (Bash tool calls don't persist shell state between invocations).
+# system python3/python pre-setup. Every skill/step file invokes THIS,
+# never a bare `harness` (no such binary exists) or a shell-state-dependent
+# alias (Bash tool calls don't persist shell state between invocations).
+# On Windows the Bash tool is Git Bash, so this same script runs there too:
+# the venv layout is Scripts/python.exe, and `python3` frequently doesn't
+# exist (python.org installs ship only `python`) — probe both. bin/
+# harness.cmd is the cmd.exe sibling for non-bash callers.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="$HERE/../.venv/bin/python"
-[ -x "$PY" ] || PY=python3
+[ -x "$PY" ] || PY="$HERE/../.venv/Scripts/python.exe"
+[ -x "$PY" ] || PY="$(command -v python3 || command -v python || echo python3)"
 # `python -m harness` only resolves the package if the repo root is on
 # sys.path; callers run this from their TARGET workspace (config is
 # written relative to cwd, and --workspace defaults to it), never from

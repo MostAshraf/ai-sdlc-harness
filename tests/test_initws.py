@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,9 +15,10 @@ import yaml
 
 from harness import gitops, initws
 from tests.test_gitops import TEST_CMD, make_repo
+from tests import support
 
 ROOT = Path(__file__).resolve().parent.parent
-HARNESS_BIN = ROOT / "bin" / "harness"
+HARNESS_BIN = support.HARNESS_BIN  # bin/harness, or its .cmd sibling on Windows
 
 
 class M7Harness(unittest.TestCase):
@@ -25,7 +27,7 @@ class M7Harness(unittest.TestCase):
         self.repo = make_repo(self.workspace)
 
     def tearDown(self):
-        shutil.rmtree(self.workspace)
+        support.rmtree(self.workspace)
 
     def cli(self, *args, expect=0):
         """Invokes the real bin/harness launcher, from the workspace's own
@@ -35,7 +37,7 @@ class M7Harness(unittest.TestCase):
         instead of shipping unnoticed."""
         proc = subprocess.run(
             [str(HARNESS_BIN), "--workspace", str(self.workspace), *args],
-            cwd=self.workspace, capture_output=True, text=True, timeout=300)
+            cwd=self.workspace, capture_output=True, text=True, encoding="utf-8", timeout=300)
         payload = json.loads(proc.stdout) if proc.stdout.strip() else {}
         self.assertEqual(proc.returncode, expect,
                          f"{args} -> {payload} {proc.stderr}")
@@ -239,7 +241,7 @@ class VerificationGates(M7Harness):
         self.assertEqual(statuses["test_cmd:repo"], "pass")
         # permissions written, mergeable, non-destructive
         settings = json.loads((self.workspace / ".claude" / "settings.json")
-                              .read_text())
+                              .read_text(encoding="utf-8"))
         self.assertIn("Bash(python3 -m harness:*)",
                       settings["permissions"]["allow"])
         # and the pipeline starts with zero hand edits:
@@ -255,13 +257,18 @@ class VerificationGates(M7Harness):
         a Python target repo's own pytest run via namespace-package
         collisions)."""
         marker = self.workspace / "pythonpath-marker.txt"
-        probe_cmd = f"printenv PYTHONPATH > {marker} 2>/dev/null; true"
+        # python probe, not `printenv … ; true` — runnable on every OS, and
+        # it writes the marker itself instead of relying on POSIX redirects
+        probe_cmd = (
+            f'"{sys.executable}" -c '
+            f'"import os, pathlib; pathlib.Path(r\'{marker}\')'
+            f".write_text(os.environ.get('PYTHONPATH', ''))\"")
         stories = self.workspace / "stories"
         stories.mkdir()
         self.cli("init", "--stories-dir", str(stories),
                  "--repo", f"repo={self.repo}", "--test-cmd", f"repo={probe_cmd}")
         self.cli("init-verify")
-        self.assertEqual(marker.read_text(), "")
+        self.assertEqual(marker.read_text(encoding="utf-8"), "")
 
     def test_verify_fails_closed_on_bad_config(self):
         self.cli("init", "--stories-dir", str(self.workspace / "nope"),
@@ -287,10 +294,17 @@ class VerificationGates(M7Harness):
         `exit N`."""
         stories = self.workspace / "stories"
         stories.mkdir()
-        # `sh -c 'exit 2'` is runnable (sh resolves) but exits 2 — not 126/127.
+        # A runnable-everywhere command that exits 2 — not a not-found shape
+        # on either the POSIX (126/127) or Windows (exit 1 + unresolvable
+        # first token) branch. The interpreter running this suite is the one
+        # binary guaranteed present; double quotes parse in cmd.exe AND sh
+        # (the old `sh -c 'exit 2'` fixture relied on single-quote handling
+        # cmd.exe doesn't have, so on Windows sh got mangled args and the
+        # asserted exit code was wrong).
+        exit2 = f'"{sys.executable}" -c "raise SystemExit(2)"'
         self.cli("init", "--stories-dir", str(stories),
                  "--repo", f"repo={self.repo}",
-                 "--test-cmd", "repo=sh -c 'exit 2'")
+                 "--test-cmd", f"repo={exit2}")
         out = self.cli("init-verify")
         check = next(c for c in out["checks"] if c["check"] == "test_cmd:repo")
         self.assertEqual(check["status"], "pass")
@@ -354,13 +368,13 @@ class VerificationGates(M7Harness):
         stories.mkdir()
         self.cli("init", "--stories-dir", str(stories),
                  "--repo", f"repo={self.repo}", "--test-cmd", f"repo={TEST_CMD}")
-        lang_before = (self.workspace / ".claude/context/language.yaml").read_text()
+        lang_before = (self.workspace / ".claude/context/language.yaml").read_text(encoding="utf-8")
         self.cli("init-section", "--section", "provider", "--json",
                  '{"provider": {"work_item": "github", "git": "github"}}')
         self.assertEqual((self.workspace / ".claude/context/language.yaml")
-                         .read_text(), lang_before)      # untouched
+                         .read_text(encoding="utf-8"), lang_before)      # untouched
         self.assertIn("github",
-                      (self.workspace / ".claude/context/provider.yaml").read_text())
+                      (self.workspace / ".claude/context/provider.yaml").read_text(encoding="utf-8"))
 
     def test_init_finalize_writes_permissions_and_marker(self):
         """The interview flow (init-section per piece) does not get
@@ -385,7 +399,7 @@ class VerificationGates(M7Harness):
 
         self.cli("init-finalize")
 
-        settings = json.loads(settings_path.read_text())
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
         allow = settings["permissions"]["allow"]
         self.assertIn("Bash(python3 -m harness:*)", allow)
         self.assertIn(f"Bash({TEST_CMD.split()[0]}:*)", allow)
@@ -401,7 +415,7 @@ class VerificationGates(M7Harness):
                             for p in literal_prefixes),
                         "no allow rule prefix-matches the literal command "
                         "shape skill files instruct the model to run")
-        overrides = yaml.safe_load(overrides_path.read_text())
+        overrides = yaml.safe_load(overrides_path.read_text(encoding="utf-8"))
         self.assertIn("bootstrap_completed", overrides)
 
     def test_init_finalize_preserves_prior_overrides(self):
@@ -416,7 +430,7 @@ class VerificationGates(M7Harness):
         self.cli("init-finalize")
         overrides = yaml.safe_load(
             (self.workspace / ".claude" / "context" / "overrides.yaml")
-            .read_text())
+            .read_text(encoding="utf-8"))
         self.assertEqual(overrides["quick_mode"], {"loc_threshold": 50})
         self.assertIn("bootstrap_completed", overrides)
 
@@ -431,7 +445,7 @@ class VerificationGates(M7Harness):
                  json.dumps({"quick_mode": {"loc_threshold": 50}}))
         overrides = yaml.safe_load(
             (self.workspace / ".claude" / "context" / "overrides.yaml")
-            .read_text())
+            .read_text(encoding="utf-8"))
         self.assertEqual(overrides["status_mapping"],
                          {"default": {"Open": "todo"}})
         self.assertEqual(overrides["quick_mode"], {"loc_threshold": 50})
@@ -450,7 +464,7 @@ class VerificationGates(M7Harness):
                  json.dumps({"security": {"scan_cmd": {"frontend": "eslint ."}}}))
         overrides = yaml.safe_load(
             (self.workspace / ".claude" / "context" / "overrides.yaml")
-            .read_text())
+            .read_text(encoding="utf-8"))
         self.assertEqual(overrides["security"]["scan_cmd"],
                          {"backend": "bandit .", "frontend": "eslint ."})
 
@@ -575,23 +589,25 @@ class MultiRepoLanguageConfig(M7Harness):
         stories.mkdir()
         self.cli("init", "--stories-dir", str(stories),
                  "--repo", f"repo={self.repo}", "--repo", f"repo-b={repo_b}",
-                 "--test-cmd", f"repo={TEST_CMD}", "--test-cmd", "repo-b=true")
+                 "--test-cmd", f"repo={TEST_CMD}",
+                 "--test-cmd", f"repo-b={support.NOP_CMD}")
         out = self.cli("init-verify")
         statuses = {c["check"]: c["status"] for c in out["checks"]}
         self.assertEqual(statuses["test_cmd:repo"], "pass")
         self.assertEqual(statuses["test_cmd:repo-b"], "pass")
 
         lang = yaml.safe_load(
-            (self.workspace / ".claude/context/language.yaml").read_text())
+            (self.workspace / ".claude/context/language.yaml").read_text(encoding="utf-8"))
         self.assertEqual(lang["language"]["repos"]["repo"]["test_cmd"], TEST_CMD)
-        self.assertEqual(lang["language"]["repos"]["repo-b"]["test_cmd"], "true")
+        self.assertEqual(lang["language"]["repos"]["repo-b"]["test_cmd"],
+                         support.NOP_CMD)
 
         # both repos' command heads allow-listed, not just one
         settings = json.loads((self.workspace / ".claude" / "settings.json")
-                              .read_text())
+                              .read_text(encoding="utf-8"))
         allow = settings["permissions"]["allow"]
         self.assertIn(f"Bash({TEST_CMD.split()[0]}:*)", allow)
-        self.assertIn("Bash(true:*)", allow)
+        self.assertIn(f"Bash({support.NOP_CMD.split()[0]}:*)", allow)
 
     def test_missing_repo_language_entry_fails_closed(self):
         """Mutation: a registered repo with no language entry must fail
@@ -645,7 +661,7 @@ class AddRepo(M7Harness):
         self.assertEqual(out["added"], {"name": "repo-b", "path": str(repo_b),
                                         "test_cmd": "true"})
         repos = yaml.safe_load(
-            (self.workspace / ".claude/context/repos.yaml").read_text())["repos"]
+            (self.workspace / ".claude/context/repos.yaml").read_text(encoding="utf-8"))["repos"]
         self.assertEqual(repos, {"repo": str(self.repo), "repo-b": str(repo_b)})
 
     def test_add_repo_merges_language_entry_without_disturbing_others(self):
@@ -654,17 +670,17 @@ class AddRepo(M7Harness):
         self.cli("add-repo", "--name", "repo-b", "--path", str(repo_b),
                  "--test-cmd", "true")
         lang = yaml.safe_load(
-            (self.workspace / ".claude/context/language.yaml").read_text())
+            (self.workspace / ".claude/context/language.yaml").read_text(encoding="utf-8"))
         self.assertEqual(lang["language"]["repos"]["repo"]["test_cmd"], TEST_CMD)
         self.assertEqual(lang["language"]["repos"]["repo-b"]["test_cmd"], "true")
 
     def test_add_repo_without_test_cmd_leaves_language_untouched(self):
         self._init_one_repo()
-        lang_before = (self.workspace / ".claude/context/language.yaml").read_text()
+        lang_before = (self.workspace / ".claude/context/language.yaml").read_text(encoding="utf-8")
         repo_b = make_repo(self.workspace, "repo-b")
         self.cli("add-repo", "--name", "repo-b", "--path", str(repo_b))
         self.assertEqual(
-            (self.workspace / ".claude/context/language.yaml").read_text(),
+            (self.workspace / ".claude/context/language.yaml").read_text(encoding="utf-8"),
             lang_before)
 
     def test_add_repo_refuses_duplicate_name(self):
@@ -677,7 +693,7 @@ class AddRepo(M7Harness):
         self.assertIn("init-section --section repos", out["error"])
         self.assertNotIn("edit repos.yaml directly", out["error"])
         repos = yaml.safe_load(
-            (self.workspace / ".claude/context/repos.yaml").read_text())["repos"]
+            (self.workspace / ".claude/context/repos.yaml").read_text(encoding="utf-8"))["repos"]
         self.assertEqual(repos, {"repo": str(self.repo)})   # untouched
 
     def test_repo_name_matches_equivalent_path_spellings(self):
@@ -719,7 +735,7 @@ class AddRepo(M7Harness):
         self.assertFalse(out["ok"])
         self.assertIn("already registered as 'repo'", out["error"])
         repos = yaml.safe_load(
-            (self.workspace / ".claude/context/repos.yaml").read_text())["repos"]
+            (self.workspace / ".claude/context/repos.yaml").read_text(encoding="utf-8"))["repos"]
         self.assertEqual(repos, {"repo": str(self.repo)})   # untouched
 
     def test_init_verify_catches_a_hand_edited_workspace_root_repo(self):
@@ -747,7 +763,7 @@ class AddRepo(M7Harness):
         self.assertFalse(out["ok"])
         self.assertIn("workspace root", out["error"])
         repos = yaml.safe_load(
-            (self.workspace / ".claude/context/repos.yaml").read_text())["repos"]
+            (self.workspace / ".claude/context/repos.yaml").read_text(encoding="utf-8"))["repos"]
         self.assertNotIn("self", repos)
 
     def test_init_section_repos_refuses_workspace_root_as_a_repo(self):
@@ -791,17 +807,17 @@ class AddRepo(M7Harness):
         self.cli("init-finalize")
         repo_b = make_repo(self.workspace, "repo-b")
         self.cli("add-repo", "--name", "repo-b", "--path", str(repo_b),
-                 "--test-cmd", "true")
+                 "--test-cmd", support.NOP_CMD)
         out = self.cli("init-verify")
         statuses = {c["check"]: c["status"] for c in out["checks"]}
         self.assertEqual(statuses["repo:repo-b"], "pass")
         self.assertEqual(statuses["test_cmd:repo-b"], "pass")
         self.cli("init-finalize")
         settings = json.loads((self.workspace / ".claude" / "settings.json")
-                              .read_text())
+                              .read_text(encoding="utf-8"))
         allow = settings["permissions"]["allow"]
         self.assertIn(f"Read({repo_b}/**)", allow)
-        self.assertIn("Bash(true:*)", allow)
+        self.assertIn(f"Bash({support.NOP_CMD.split()[0]}:*)", allow)
 
 
 class ResolveRepoCommand(unittest.TestCase):
@@ -900,7 +916,7 @@ class RepoMapAndStatus(M7Harness):
         self.cli("repo-map-stamp", "--repo-name", "repo", "--repo", str(self.repo))
         meta = (self.workspace / ".claude" / "context" / "repo-map" / "repo"
                 / ".meta.json")
-        stamped = json.loads(meta.read_text())
+        stamped = json.loads(meta.read_text(encoding="utf-8"))
         stamped["sha"] = "deadbeef" * 5   # a SHA this history never had
         meta.write_text(json.dumps(stamped))
         out = self.cli("repo-map-check", "--repo-name", "repo",

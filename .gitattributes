@@ -1,0 +1,8 @@
+# Executable-script line endings are load-bearing, not cosmetic:
+# bin/harness is a bash script — Git Bash on Windows tolerates CRLF
+# (igncr), but a stock Linux bash does not, so a working tree that ever
+# crosses from a Windows checkout to a Linux host (zip, docker volume,
+# network share) must carry LF. bin/harness.cmd is the inverse: cmd.exe
+# parsing has known CRLF-only edge cases (multi-line blocks, goto).
+bin/harness text eol=lf
+bin/harness.cmd text eol=crlf

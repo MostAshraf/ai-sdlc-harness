@@ -392,7 +392,8 @@ def security_scan(workspace: Path, run: Path, config: dict, manifest: dict) -> s
                     f"(`security.scan_cmd.{name}`) — informational.\n")
         try:
             proc = subprocess.run(cmd, shell=True, cwd=path, capture_output=True,
-                                  text=True, timeout=900)
+                                  text=True, timeout=900,
+                                  encoding="utf-8", errors="replace")
         except subprocess.TimeoutExpired:
             # Uncaught, this raised a raw traceback for the WHOLE step
             # instead of the CLI's JSON error contract (adversarial-review

@@ -26,6 +26,8 @@ except ImportError:  # pragma: no cover
         '  python3 -m venv "$CLAUDE_PLUGIN_ROOT/.venv" && '
         '"$CLAUDE_PLUGIN_ROOT/.venv/bin/pip" install pyyaml\n'
         "then invoke as: .venv/bin/python -m harness …\n"
+        "(Windows: `python -m venv`, and the venv lands its interpreter at "
+        ".venv\\Scripts\\python.exe — bin/harness probes both layouts)\n"
     )
     raise
 

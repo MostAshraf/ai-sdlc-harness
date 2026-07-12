@@ -6,6 +6,23 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
+### Added / Changed
+
+- **Native Windows support — the CI lane is now enforcing.** The harness was built and tested on macOS/Linux; the Windows CI lane was informational (`continue-on-error`) and admitted to being written blind. Its first real triage took the suite from **290 failures to 0** on Windows, and the lane now gates PRs like the other two. What that took, roughly in order of user impact:
+  - **Hooks and launcher resolve the Windows venv layout.** `hooks/hooks.json` and `bin/harness` probed only `.venv/bin/python` (POSIX layout) and fell back to `python3`, which most Windows hosts don't have. Both now probe `.venv/Scripts/python.exe` too and fall back `python3` → `python`. (Hook commands stay POSIX shell — Claude Code runs them under Git Bash on Windows.) `/init-workspace`'s bootstrap snippet, `harness.schema`'s remediation text, and the README instructions cover both layouts.
+  - **Guard layer understands Windows paths** — all changes gated on `os.name == "nt"` so POSIX behavior is byte-identical: the scratch root is `%TEMP%` (there is no `/tmp` on Windows; the workspace/registered-repo exclusions carry the confinement exactly as on Linux); a literal `/tmp/…` in a Bash command is recognized as Git Bash's temp mount instead of false-blocking the reviewer's sanctioned scratch idiom; drive-letter absolute targets (`C:/x`, quoted `C:\x`) are now visible to the developer write-confinement and the reviewer's destructive-verb sweep; rootless msys targets (`/etc/x`) no longer slip past confinement as "relative"; and a backslash-spelled authority path (`ai\<run>\state.yaml`) blocks the same as the forward-slash spelling.
+  - **`merge-task --autosquash` works on Windows.** The blind-written `cmd /c exit 0` no-op editor was itself the breakage (git mangles multi-word editors through its sh layer); plain `GIT_SEQUENCE_EDITOR=true` works on every OS because Git for Windows bundles its own sh — probe-verified, then covered by the suite.
+  - **Provider CLIs resolve through `shutil.which`.** Bare `CreateProcess` only appends `.exe`, so the real Azure CLI — which ships as `az.cmd` — was unfindable on Windows. Resolution now walks PATHEXT and honors PATH order.
+  - **Output encoding is a contract, not a locale accident.** The harness CLI and the guard hooks emit UTF-8 on every OS (`cp1252` pipes mojibaked every em-dash in a detail string); every subprocess the harness runs (`git`, test suites, forge CLIs, scanners) is decoded as UTF-8 with replacement, and all production file IO carries an explicit `encoding="utf-8"`.
+  - **`init-verify`'s not-found detection measured, not assumed.** `cmd /c missing-cmd` exits **1** (not the assumed 9009) — indistinguishable from a red-but-runnable suite by code alone, so on Windows a not-found-shaped exit also requires the command's first token to resolve to nothing.
+  - **Test suite is OS-portable.** Fake forge CLIs (`gh`/`glab`/`az`) are real PE launchers on Windows (pip's vendored distlib launcher + zipapp — a `.cmd` shim truncates argv at embedded newlines, and PR bodies are multi-line); `tests/support.py` centralizes the platform seams (read-only-safe `rmtree` for git fixtures, wrapper resolution, scratch-root constants); a hardcoded `:` PATH separator that let the real host `glab` answer for a stub is fixed; and a new Windows-only guard-shape test class covers the nt-conditional forms the other lanes can't reach.
+- Known residual (documented, not fixed): passing multi-line arguments to a `.cmd`-implemented CLI (real-world: some `az` operations with multi-line descriptions) is lossy at the `cmd.exe` parser layer on Windows; `gh`/`glab` ship as `.exe` and are unaffected.
+
+### Verification (unreleased tip)
+
+- `python -m unittest discover -s tests` — **598 tests, OK** on Windows 11 (skipped=2: two POSIX-only permission/symlink assertions) and on Linux (containerized run of the same tree)
+- `python -m harness.schema` — declared data valid; `python tools/budget_check.py` — 0 errors (3 pre-existing soft-cap warnings)
+
 ## [3.0.2] — 2026-07-11
 
 > **Guard scope, not guard bypass.** The one guard rule that ignored workspace boundaries now respects them — raw git stays blocked exactly where you've actually turned the harness on, nowhere else.

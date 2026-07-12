@@ -17,6 +17,7 @@ from unittest import mock
 from harness import chain, gitops, ndjson, state as state_mod, transitions, workflow
 from harness.cli import load_declared
 from harness.providers import ProviderError
+from tests import support
 
 TEST_CMD = f'"{sys.executable}" -m unittest discover -s tests -t .'
 
@@ -64,7 +65,7 @@ class GitopsHarness(unittest.TestCase):
         self._set_declared_test_intents(["test_val"])
 
     def tearDown(self):
-        shutil.rmtree(self.workspace)
+        support.rmtree(self.workspace)
 
     def _write_test(self):
         (self.repo / "tests" / "test_x.py").write_text(FAILING_TEST)
@@ -299,7 +300,7 @@ class CommitAndSquash(GitopsHarness):
         self.assertEqual(subjects, ["fix: #GIT-1 task one"])   # fixup folded
         new_sha = gitops.find_commit_by_subject(self.repo, base, "fix: #GIT-1 task one")
         self.assertNotEqual(new_sha, task_sha)                  # SHA re-derived
-        self.assertEqual((self.repo / "a.txt").read_text(), "v2 fixed\n")
+        self.assertEqual((self.repo / "a.txt").read_text(encoding="utf-8"), "v2 fixed\n")
 
 
 class SecretSweepGuard(GitopsHarness):
@@ -345,7 +346,7 @@ class SecretSweepGuard(GitopsHarness):
         gitops.ensure_repo_excludes(self.repo)   # idempotent — no duplicates
         exclude = self.repo / ".git" / "info" / "exclude"
         self.assertEqual(
-            exclude.read_text().splitlines().count(".harness-key"), 1)
+            exclude.read_text(encoding="utf-8").splitlines().count(".harness-key"), 1)
         self._plant_key(self.repo)
         (self.repo / "w.txt").write_text("work\n")
         # no refusal needed: add -A never sees the excluded key
@@ -390,7 +391,7 @@ class SquashConflictCleanup(GitopsHarness):
             gitops.squash_merge(self.repo, "task/T1", "fix: #X collide")
         self.assertIn("conflicted", str(ctx.exception))
         # tree restored: no markers, no unmerged index, nothing staged
-        self.assertEqual((self.repo / "c.txt").read_text(), "main version\n")
+        self.assertEqual((self.repo / "c.txt").read_text(encoding="utf-8"), "main version\n")
         self.assertFalse(gitops.run_git(self.repo, "ls-files", "-u"))
         with self.assertRaises(gitops.GitError):   # nothing to commit
             gitops.commit_class(self.repo, self.config, "working",
@@ -712,7 +713,7 @@ class SecurityScanTimeout(GitopsHarness):
                         side_effect=subprocess.TimeoutExpired("some-slow-scanner", 900)):
             sev = workflow.security_scan(self.workspace, self.run, config, self.manifest)
         self.assertEqual(sev, "critical")   # order[-1] — worst, forces review
-        report = (self.run / "reports" / "security.md").read_text()
+        report = (self.run / "reports" / "security.md").read_text(encoding="utf-8")
         self.assertIn("timed out", report)
 
 
@@ -881,7 +882,7 @@ class CliEndToEnd(GitopsHarness):
         proc = subprocess.run(
             [sys.executable, "-m", "harness", "--workspace", str(self.workspace),
              "--run", str(self.run), *args],
-            cwd=self.ROOT, capture_output=True, text=True, timeout=120)
+            cwd=self.ROOT, capture_output=True, text=True, encoding="utf-8", timeout=120)
         payload = json.loads(proc.stdout) if proc.stdout.strip() else {}
         return proc.returncode, payload
 
