@@ -1,6 +1,6 @@
 {
   "name": "ai-sdlc-harness",
-  "version": "3.0.2",
+  "version": "3.0.3",
   "description": "Governed multi-agent SDLC pipeline for Claude Code — v3.0, a ground-up rewrite of the v2.x line. Declared-data pipeline, owned entry points, proof-anchored TDD, code-modular providers.",
   "author": {
     "name": "Mostafa Ashraf"

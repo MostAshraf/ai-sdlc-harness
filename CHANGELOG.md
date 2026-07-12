@@ -6,30 +6,35 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
-### Added / Changed
+## [3.0.3] — 2026-07-12
 
-- **Native Windows support — the CI lane is now enforcing.** The harness was built and tested on macOS/Linux; the Windows CI lane was informational (`continue-on-error`) and admitted to being written blind. Its first real triage took the suite from **290 failures to 0** on Windows, and the lane now gates PRs like the other two. What that took, roughly in order of user impact:
-  - **Hooks and launcher resolve the Windows venv layout.** `hooks/hooks.json` and `bin/harness` probed only `.venv/bin/python` (POSIX layout) and fell back to `python3`, which most Windows hosts don't have. Both now probe `.venv/Scripts/python.exe` too and fall back `python3` → `python`. (Hook commands stay POSIX shell — Claude Code runs them under Git Bash on Windows.) `/init-workspace`'s bootstrap snippet, `harness.schema`'s remediation text, and the README instructions cover both layouts.
-  - **Guard layer understands Windows paths** — all changes gated on `os.name == "nt"` so POSIX behavior is byte-identical: the scratch root is `%TEMP%` (there is no `/tmp` on Windows; the workspace/registered-repo exclusions carry the confinement exactly as on Linux); a literal `/tmp/…` in a Bash command is recognized as Git Bash's temp mount instead of false-blocking the reviewer's sanctioned scratch idiom; drive-letter absolute targets (`C:/x`, quoted `C:\x`) are now visible to the developer write-confinement and the reviewer's destructive-verb sweep; rootless msys targets (`/etc/x`) no longer slip past confinement as "relative"; and a backslash-spelled authority path (`ai\<run>\state.yaml`) blocks the same as the forward-slash spelling.
-  - **`merge-task --autosquash` works on Windows.** The blind-written `cmd /c exit 0` no-op editor was itself the breakage (git mangles multi-word editors through its sh layer); plain `GIT_SEQUENCE_EDITOR=true` works on every OS because Git for Windows bundles its own sh — probe-verified, then covered by the suite.
-  - **Provider CLIs resolve through `shutil.which`.** Bare `CreateProcess` only appends `.exe`, so the real Azure CLI — which ships as `az.cmd` — was unfindable on Windows. Resolution now walks PATHEXT and honors PATH order.
-  - **Output encoding is a contract, not a locale accident.** The harness CLI and the guard hooks emit UTF-8 on every OS (`cp1252` pipes mojibaked every em-dash in a detail string); every subprocess the harness runs (`git`, test suites, forge CLIs, scanners) is decoded as UTF-8 with replacement, and all production file IO carries an explicit `encoding="utf-8"`.
-  - **`init-verify`'s not-found detection measured, not assumed.** `cmd /c missing-cmd` exits **1** (not the assumed 9009) — indistinguishable from a red-but-runnable suite by code alone, so on Windows a not-found-shaped exit also requires the command's first token to resolve to nothing.
-  - **Test suite is OS-portable.** Fake forge CLIs (`gh`/`glab`/`az`) are real PE launchers on Windows (pip's vendored distlib launcher + zipapp — a `.cmd` shim truncates argv at embedded newlines, and PR bodies are multi-line); `tests/support.py` centralizes the platform seams (read-only-safe `rmtree` for git fixtures, wrapper resolution, scratch-root constants); a hardcoded `:` PATH separator that let the real host `glab` answer for a stub is fixed; and a new Windows-only guard-shape test class covers the nt-conditional forms the other lanes can't reach.
-- **Adversarial-review pass on the port itself** (two independent lenses, findings fixed before shipping):
-  - The UTF-8 stream reconfigure had silently reset stderr's error handler to `strict` — on *every* OS, a lone-surrogate character in a payload path could then crash a fail-open confinement guard's block message and turn its BLOCK into an ALLOW. The documented `backslashreplace` handler is now restated explicitly (guards, CLI, and the two standalone entry points `harness.schema` / `budget_check`, whose reports interpolate repo content).
-  - The scratch allowance checked only descendant-ness, so `rm -rf /tmp` *itself* was sanctioned as scratch while the workspace lived under the scratch root — the mkdtemp norm on Linux and the rule on Windows. Ancestor targets now refuse. (Cross-platform tightening: this closes a pre-existing Linux hole the Windows port made mainstream.)
-  - Git Bash's `/c/…` drive-mount spellings — what its own `pwd` emits — and case-variant `/TMP/…` now translate like `/tmp`, instead of false-blocking legitimate in-worktree writes; quoted `\\server\share` UNC targets are now visible to the developer's destructive-verb sweep (previously swept zero tokens — fail-open).
-  - The Windows not-found gate resolved the command's first token against the harness process cwd instead of the repo the command ran in, misclassifying a legitimately-red repo-local runner (`.\run-tests.cmd`) as "command not found"; `pushd` joined the cmd-builtin carve-outs. The CLI also now refuses interpreters below Python 3.10 with a clear message (the new bare-`python` fallback could otherwise land on an ancient interpreter and die with a SyntaxError).
-- Known residuals (documented, not fixed):
-  - Multi-line arguments to a `.cmd`-implemented CLI (real-world: some `az` operations with multi-line descriptions) are lossy at the `cmd.exe` parser layer on Windows; `gh`/`glab` ship as `.exe` and are unaffected.
-  - Pre-venv on a Windows host whose only `python`/`python3` is the Microsoft Store install alias, hooks error non-blocking (degrade-open) until `/init-workspace` creates the venv — consistent with the existing pre-setup posture (without a working Python, nothing harness-y can execute anyway).
-  - msys mounts other than `/tmp` and `/<drive>` (e.g. `/etc`, `/usr`) stay untranslated in the guards: they live inside the Git installation, so the fail-closed handling they get is the intended answer.
+> **Native Windows support — the CI lane is now enforcing.** The harness was built and tested on macOS/Linux; the Windows CI lane was informational (`continue-on-error`) and admitted to being written blind. First real triage took the suite from **290 failures to 0**, and the lane now gates PRs like the other two — followed by an adversarial-review pass that closed four more gaps before shipping.
 
-### Verification (unreleased tip)
+### Release highlights
 
-- `python -m unittest discover -s tests` — **603 tests, OK** on Windows 11 (skipped=2: two POSIX-only permission/symlink assertions) and on Linux (containerized clone of the same tree)
-- `python -m harness.schema` — declared data valid; `python tools/budget_check.py` — 0 errors (3 pre-existing soft-cap warnings)
+| Theme | What changed |
+|---|---|
+| **Windows CI lane now gates PRs** | Was `continue-on-error` (informational only, written blind); first real triage took the suite from **290 failures to 0** on Windows, and the lane now blocks merges like the Linux and macOS lanes. |
+| **Hooks, launcher, and provider CLIs resolve the Windows layout** | `hooks/hooks.json` / `bin/harness` probe `.venv/Scripts/python.exe` alongside the POSIX layout and fall back `python3` → `python`; provider CLI resolution goes through `shutil.which` (walks PATHEXT) instead of bare `CreateProcess`, so `az.cmd` and similar shims are found; `/init-workspace`, `harness.schema`'s remediation text, and the README instructions cover both venv layouts. |
+| **Guard layer is Windows-path aware** | All new behavior gated on `os.name == "nt"`, POSIX behavior untouched: scratch root is `%TEMP%`; a literal `/tmp/…` in a Bash command is recognized as Git Bash's temp mount; drive-letter absolute targets (`C:/x`, `C:\x`) are visible to write-confinement and the destructive-verb sweep; rootless msys targets (`/etc/x`) no longer slip past confinement as "relative"; backslash-spelled authority paths block like forward-slash ones. |
+| **`merge-task --autosquash` works on Windows** | The blind-written `cmd /c exit 0` no-op editor was itself the breakage — git mangles multi-word editors through its sh layer. Plain `GIT_SEQUENCE_EDITOR=true` works everywhere because Git for Windows bundles its own sh. |
+| **UTF-8 output is a contract, not a locale accident** | The CLI and guard hooks emit UTF-8 on every OS (`cp1252` mojibaked every em-dash in a detail string); every subprocess the harness runs (`git`, test suites, forge CLIs, scanners) is decoded as UTF-8 with replacement, and all production file IO carries an explicit `encoding="utf-8"`. |
+| **`init-verify` measures not-found instead of assuming it** | `cmd /c missing-cmd` exits **1** on Windows, not the assumed 9009 — indistinguishable from a red-but-runnable suite by code alone, so a not-found-shaped exit now also requires the command's first token to resolve to nothing. |
+| **Test suite made OS-portable** | Fake forge CLIs (`gh`/`glab`/`az`) are real PE launchers on Windows; `tests/support.py` centralizes the platform seams (read-only-safe `rmtree` for git fixtures, wrapper resolution, scratch-root constants); a hardcoded `:` PATH separator that let the real host `glab` answer for a stub is fixed; a new Windows-only guard-shape test class covers the `nt`-conditional forms. |
+| **Adversarial-review pass closed 4 gaps before shipping** | A lone-surrogate character in a payload path could crash a fail-open guard's block message and flip BLOCK to ALLOW (`backslashreplace` now explicit everywhere); the scratch allowance sanctioned `rm -rf /tmp` itself when the workspace lived under the scratch root (ancestor targets now refuse); Git Bash's `/c/…` and case-variant `/TMP/…` spellings now translate like `/tmp`, and quoted `\\server\share` UNC targets are now swept; the not-found gate resolved the command's first token against the harness process cwd instead of the repo the command ran in (misclassifying legitimately-red repo-local runners), and the CLI now refuses interpreters below Python 3.10. |
+
+### Known residuals (documented, not fixed)
+
+- Multi-line arguments to a `.cmd`-implemented CLI (e.g. some `az` operations) are lossy at the `cmd.exe` parser layer; `gh`/`glab` ship as `.exe` and are unaffected.
+- Pre-venv on a Windows host whose only `python`/`python3` is the Microsoft Store alias, hooks degrade open until `/init-workspace` creates the venv — consistent with the existing pre-setup posture.
+- msys mounts other than `/tmp` and `/<drive>` (e.g. `/etc`, `/usr`) stay untranslated in the guards — they live inside the Git installation, so fail-closed is the intended answer.
+
+### Verification on tag tip
+
+- `python -m harness.schema` — declared data valid
+- `python tools/budget_check.py` — 0 errors (3 pre-existing soft-cap warnings)
+- `python -m unittest discover -s tests` — 603 tests, OK on Windows 11 (skipped=2: two POSIX-only permission/symlink assertions) and on Linux (containerized clone of the same tree)
+- `/verify`: 5/5 PASS, fresh stamp written
 
 ## [3.0.2] — 2026-07-11
 
