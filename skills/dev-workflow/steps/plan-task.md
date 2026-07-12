@@ -4,6 +4,20 @@ Produce `<run>/plan.md`: the human-facing design for this story. Both
 altitudes of approach decision below are approved at the single
 `approve-plan` gate (design.md:495 — one gate, two altitudes).
 
+## 0. Ground in the repo map
+
+Before decomposing, read the auto-generated map at
+`.claude/context/repo-map/<repo-name>/` for each repo the story touches —
+the index first, then only the area detail files this story is likely to
+touch (each is loadable standalone; never load the whole map). This is
+where "the team uses <pattern>" comes from — cite it instead of
+re-deriving the codebase. Two boundaries: the map speeds targeting, it
+never replaces reading the real code for areas you plan to change; and its
+freshness was already settled by the orchestrator before your spawn — READ
+what's there, never run `repo-map-check`/`repo-map-stamp` or write
+`.meta.json`. A missing map is not a blocker: proceed on code reading
+alone and note the absence in your self-adversarial pass.
+
 ## 1. Decomposition
 
 Tasks keyed by id (`T1`, `T2`…), each with: description, repo, edge-case

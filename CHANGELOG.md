@@ -6,6 +6,9 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
+- Plans are now explicitly grounded in the repo map: the planning instruction itself points at the map and prescribes the tiered reading order (index first, then only the areas the story touches), instead of leaving it to chance whether a plan consults the map the workspace generated for exactly that purpose. The intake step's ask carries the same map location.
+- `repo-map-stamp` now refuses to stamp a repo map that has no content — previously, stamping after a failed or empty map generation certified a nonexistent map as "fresh" for the next 50 commits (or your configured staleness window) with nothing left to notice.
+
 ## [3.0.3] — 2026-07-12
 
 > **Native Windows support — the CI lane is now enforcing.** The harness was built and tested on macOS/Linux; the Windows CI lane was informational (`continue-on-error`) and admitted to being written blind. First real triage took the suite from **290 failures to 0**, and the lane now gates PRs like the other two — followed by an adversarial-review pass that closed four more gaps before shipping.

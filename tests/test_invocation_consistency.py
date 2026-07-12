@@ -98,6 +98,24 @@ class InvocationConsistency(unittest.TestCase):
         text = (ROOT / "agents" / "planner.md").read_text(encoding="utf-8")
         self.assertIn("never write `.meta.json` or run `repo-map-stamp`", text)
 
+    def test_plan_contract_points_the_planner_at_the_repo_map(self):
+        """Usage-review finding: steps/plan.md owns the map's freshness and
+        the README sells the map as what the planner grounds its plans in,
+        yet plan-task.md — the plan-mode content contract — never mentioned
+        the map at all, so consumption happened only by model initiative
+        (some e2e plans cited it, some didn't). The grounding step must
+        stay present, must carry the map's path, and must keep freshness/
+        stamping on the orchestrator's side of the line. Intake's ask
+        carries the same path so the intake planner isn't left guessing
+        where "the repo-map" lives."""
+        steps = ROOT / "skills" / "dev-workflow" / "steps"
+        plan_task = (steps / "plan-task.md").read_text(encoding="utf-8")
+        self.assertIn(".claude/context/repo-map/", plan_task)
+        self.assertIn("never run `repo-map-check`/`repo-map-stamp`",
+                      plan_task)
+        intake = (steps / "intake.md").read_text(encoding="utf-8")
+        self.assertIn(".claude/context/repo-map/", intake)
+
     def test_every_documented_verb_and_flag_exists_in_argparse(self):
         """Adversarial-review finding: the wrapper-only checks above can't
         see a nonexistent verb or flag AFTER the wrapper path — e.g. a

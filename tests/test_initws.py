@@ -923,10 +923,18 @@ class ResolveRepoCommand(unittest.TestCase):
 
 
 class RepoMapAndStatus(M7Harness):
+    def seed_map(self, name="repo", rel="index.md"):
+        """Write map content the way the planner does — stamping is only
+        legal after content exists (repo_map_stamp refuses otherwise)."""
+        f = self.workspace / ".claude" / "context" / "repo-map" / name / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("# repo map\n", encoding="utf-8")
+
     def test_repo_map_staleness_lifecycle(self):
         out = self.cli("repo-map-check", "--repo-name", "repo",
                        "--repo", str(self.repo))
         self.assertEqual(out["status"], "missing")
+        self.seed_map()
         self.cli("repo-map-stamp", "--repo-name", "repo", "--repo", str(self.repo))
         out = self.cli("repo-map-check", "--repo-name", "repo",
                        "--repo", str(self.repo))
@@ -948,6 +956,7 @@ class RepoMapAndStatus(M7Harness):
         history (force-pushed default branch, re-clone, gc) raised a raw
         `unknown revision` GitError — recovery required knowing to
         hand-delete .meta.json. That IS staleness; answer it as such."""
+        self.seed_map()
         self.cli("repo-map-stamp", "--repo-name", "repo", "--repo", str(self.repo))
         meta = (self.workspace / ".claude" / "context" / "repo-map" / "repo"
                 / ".meta.json")
@@ -960,6 +969,7 @@ class RepoMapAndStatus(M7Harness):
         self.assertIn("not in this history", out["note"])
 
     def test_repo_map_check_survives_a_corrupt_stamp(self):
+        self.seed_map()
         self.cli("repo-map-stamp", "--repo-name", "repo", "--repo", str(self.repo))
         meta = (self.workspace / ".claude" / "context" / "repo-map" / "repo"
                 / ".meta.json")
@@ -968,6 +978,40 @@ class RepoMapAndStatus(M7Harness):
                        "--repo", str(self.repo))
         self.assertEqual(out["status"], "missing")
         self.assertIn("corrupt", out["note"])
+
+    def test_repo_map_stamp_refuses_an_empty_map(self):
+        """Mutation case for the false-fresh gap: the orchestrator stamps
+        unconditionally after the planner spawn returns, so a failed/empty
+        spawn used to mint a stamp that repo-map-check would report 'fresh'
+        for the next stale_after_commits commits — on a map that doesn't
+        exist. Stamping before content is now a refusal, both when the map
+        directory is absent and when it exists but holds only the stamp
+        path itself."""
+        out = self.cli("repo-map-stamp", "--repo-name", "repo",
+                       "--repo", str(self.repo), expect=1)
+        self.assertIn("no map content", out["error"])
+        # an empty-but-existing directory is the same refusal
+        d = self.workspace / ".claude" / "context" / "repo-map" / "repo"
+        d.mkdir(parents=True)
+        out = self.cli("repo-map-stamp", "--repo-name", "repo",
+                       "--repo", str(self.repo), expect=1)
+        self.assertIn("no map content", out["error"])
+        self.assertFalse((d / ".meta.json").exists())
+        out = self.cli("repo-map-check", "--repo-name", "repo",
+                       "--repo", str(self.repo))
+        self.assertEqual(out["status"], "missing")
+
+    def test_repo_map_stamp_accepts_nested_only_content(self):
+        """Real maps tier detail files under subdirectories (e.g.
+        areas/src.md) — the content check must count recursively, or a
+        legitimately generated map with no top-level file would be refused."""
+        self.seed_map(rel="areas/src.md")
+        out = self.cli("repo-map-stamp", "--repo-name", "repo",
+                       "--repo", str(self.repo))
+        self.assertTrue(out["ok"])
+        out = self.cli("repo-map-check", "--repo-name", "repo",
+                       "--repo", str(self.repo))
+        self.assertEqual((out["status"], out["behind"]), ("fresh", 0))
 
     def test_status_dashboard_across_runs(self):
         stories = self.workspace / "stories"

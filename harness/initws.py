@@ -633,9 +633,23 @@ def repo_map_dir(workspace: Path, repo_name: str) -> Path:
 
 
 def repo_map_stamp(workspace: Path, repo_name: str, repo: Path) -> dict:
-    meta = {"sha": gitops.head_sha(repo), "at": ndjson.now_iso()}
     d = repo_map_dir(workspace, repo_name)
-    d.mkdir(parents=True, exist_ok=True)
+    # The stamp is the only thing repo-map-check trusts, so stamping an
+    # empty directory certifies a map that doesn't exist — "fresh" for the
+    # next stale_after_commits commits, with nothing left to notice (usage-
+    # review finding: the orchestrator stamps unconditionally after the
+    # planner spawn returns, so a failed/empty spawn became a persistent
+    # false-fresh). Content is anything but the stamp itself, counted
+    # recursively — tiered maps nest detail files under areas/.
+    has_content = d.is_dir() and any(
+        p.is_file() and p.name != ".meta.json" for p in d.rglob("*"))
+    if not has_content:
+        raise ValueError(
+            f"repo-map-stamp: no map content under {d} — generate the map "
+            "first (planner spawn, `harness-mode: repo-map`), then stamp; "
+            "stamping an empty map would false-report 'fresh' to "
+            "repo-map-check")
+    meta = {"sha": gitops.head_sha(repo), "at": ndjson.now_iso()}
     (d / ".meta.json").write_text(json.dumps(meta), encoding="utf-8")
     return meta
 

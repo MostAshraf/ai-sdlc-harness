@@ -11,7 +11,9 @@ harness-run: <run>
 harness-repo: <primary-repo-path>
 ```
 
-…plus the ask: read `work-item.json` (+ repo-map if present), produce
+…plus the ask: read `work-item.json` (+ the repo-map at
+`.claude/context/repo-map/<repo-name>/` if present — index first, then
+only the area files the work item touches), produce
 `<run>/requirements.md` — restated requirements, acceptance criteria,
 ambiguities/clarifying questions for the human.
 
