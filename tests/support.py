@@ -67,7 +67,15 @@ def rmtree(path, ignore_errors: bool = False) -> None:
     Windows honors on unlink where POSIX does not)."""
     def _clear_readonly(func, p, _exc):
         os.chmod(p, stat.S_IWRITE)
-        func(p)
+        # Don't trust func's arity — POSIX's fd-based rmtree walker can hand
+        # us os.open (which needs a `flags` arg, not just a path) when a
+        # permission-locked entry blocks the directory scan itself, not just
+        # unlink/rmdir. Decide unlink vs. rmdir from the path's own type
+        # instead; that's a strict superset of what func(p) covered.
+        if os.path.isdir(p) and not os.path.islink(p):
+            os.rmdir(p)
+        else:
+            os.unlink(p)
     kwargs = ({"onexc": _clear_readonly} if sys.version_info >= (3, 12)
               else {"onerror": _clear_readonly})  # onexc is 3.12+
     try:

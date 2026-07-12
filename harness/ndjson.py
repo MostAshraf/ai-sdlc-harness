@@ -8,15 +8,30 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+_now_lock = threading.Lock()
+_last_now: datetime | None = None
 
 
 def now_iso() -> str:
     # Microsecond precision: gate presentation and the human's reply may land
     # within the same second, and the RC4 record-selection rule is STRICTLY
-    #-after (fail closed) — found by the M4 slice, fixed by resolution.
-    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    #-after (fail closed) — found by the M4 slice, fixed by resolution. That
+    # rule further assumes two calls close together never read the SAME OS
+    # clock value; a courser clock grain than the microsecond precision we
+    # format (observed on a Windows Python 3.10 CI image) can violate that,
+    # silently failing the ">" comparison. Clamp to strictly-increasing
+    # ourselves rather than trust the OS clock's actual resolution.
+    global _last_now
+    with _now_lock:
+        now = datetime.now(timezone.utc)
+        if _last_now is not None and now <= _last_now:
+            now = _last_now + timedelta(microseconds=1)
+        _last_now = now
+        return now.isoformat(timespec="microseconds")
 
 
 def append_record(path: Path, record: dict) -> dict:
