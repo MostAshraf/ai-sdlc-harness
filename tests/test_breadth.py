@@ -96,6 +96,29 @@ class BreadthHarness(unittest.TestCase):
                              {"task": task_id, "mode": "review",
                               "verdict": verdict})
 
+    def scope(self, run, *repos):
+        """Record the user-confirmed target-repo scope (intake's job in
+        production) — plan-register refuses tasks without/outside it."""
+        self.cli("scope-register", "--repos-json",
+                 json.dumps([str(r) for r in (repos or (self.repo,))]),
+                 run=run)
+
+    def pass_plan_review(self, run, verdict="APPROVED"):
+        """Cross plan-review: enter it, then seed the task-less hook-captured
+        verdict its verdict_bound exits derive from."""
+        self.cli("cursor", "--to", "plan-review", run=run)
+        support.seed_review_verdict(run, verdict=verdict)
+
+    def _force_cursor(self, run, step):
+        """Test-only shortcut for tests exercising something OTHER than
+        cursor legality itself (gate option machinery, deferral plumbing)
+        that still need the cursor AT a given step — `gate --decide` is
+        cursor-anchored, and walking the whole pipeline would drown those
+        tests in unrelated setup."""
+        st = state_mod.load(run, self.workspace)
+        st["cursor"]["current_step"] = step
+        state_mod.save(run, self.workspace, st)
+
 
 class FullWalk(BreadthHarness):
     def test_full_manifest_end_to_end(self):
@@ -104,13 +127,15 @@ class FullWalk(BreadthHarness):
         run = Path(self.cli("fetch", "--id", "W-10", "--date", "2026-02-01")["run"])
 
         self.cli("cursor", "--to", "intake", run=run)
+        self.scope(run)
         self.cli("cursor", "--to", "plan", run=run)
         (run / "plan.md").write_text("# Plan\n## T1\n")
         self.cli("plan-register",
                  "--tasks-json", json.dumps([{"id": "T1", "repo": str(self.repo)}]),
                  run=run)
-        self.gate(run, "approve-plan")
+        self.pass_plan_review(run)
         self.cli("cursor", "--to", "approve-plan", run=run)
+        self.gate(run, "approve-plan")   # decided AT the gate (cursor-anchored)
         self.cli("cursor", "--to", "preflight", run=run)
         branch = self.cli("preflight", "--repo", str(self.repo), run=run)["branch"]
         self.cli("cursor", "--to", "develop", run=run)
@@ -306,11 +331,13 @@ class WorktreeDeadPathResume(BreadthHarness):
         run = Path(self.cli("fetch", "--id", "W-60", "--date", "2026-02-16")["run"])
         self.cli("cursor", "--to", "intake", run=run)
         self.cli("cursor", "--to", "plan", run=run)
+        self.scope(run)
         self.cli("plan-register",
                  "--tasks-json", json.dumps([{"id": "T1", "repo": str(self.repo)}]),
                  run=run)
-        self.gate(run, "approve-plan")
+        self.pass_plan_review(run)
         self.cli("cursor", "--to", "approve-plan", run=run)
+        self.gate(run, "approve-plan")   # decided AT the gate (cursor-anchored)
         self.cli("cursor", "--to", "preflight", run=run)
         branch = self.cli("preflight", "--repo", str(self.repo), run=run)["branch"]
         self.cli("cursor", "--to", "develop", run=run)
@@ -338,12 +365,14 @@ class PreflightDefaultBranch(BreadthHarness):
         run = Path(self.cli("fetch", "--id", sid, "--date", "2026-02-10")["run"])
         self.cli("cursor", "--to", "intake", run=run)
         self.cli("cursor", "--to", "plan", run=run)
+        self.scope(run)
         (run / "plan.md").write_text("# Plan\n## T1\n")
         self.cli("plan-register",
                  "--tasks-json", json.dumps([{"id": "T1", "repo": str(self.repo)}]),
                  run=run)
-        self.gate(run, "approve-plan")
+        self.pass_plan_review(run)
         self.cli("cursor", "--to", "approve-plan", run=run)
+        self.gate(run, "approve-plan")   # decided AT the gate (cursor-anchored)
         self.cli("cursor", "--to", "preflight", run=run)
         return run
 
@@ -498,6 +527,7 @@ class TwoRepoContracts(BreadthHarness):
         run = Path(self.cli("fetch", "--id", "W-20", "--date", "2026-02-03")["run"])
         self.cli("cursor", "--to", "intake", run=run)
         self.cli("cursor", "--to", "plan", run=run)
+        self.scope(run, self.repo, repo_b)
         self.cli("plan-register",
                  "--tasks-json", json.dumps([
                      {"id": "T1", "repo": str(self.repo)},
@@ -537,6 +567,7 @@ class TwoRepoContracts(BreadthHarness):
                             "--date", "2026-02-22")["run"])
         self.cli("cursor", "--to", "intake", run=run)
         self.cli("cursor", "--to", "plan", run=run)
+        self.scope(run)
         self.cli("plan-register",
                  "--tasks-json",
                  json.dumps([{"id": "T1", "repo": str(self.repo)}]),
@@ -581,8 +612,10 @@ class TwoRepoContracts(BreadthHarness):
         run = Path(self.cli("fetch", "--id", "W-22", "--date", "2026-02-05")["run"])
         self.cli("cursor", "--to", "intake", run=run)
         self.cli("cursor", "--to", "plan", run=run)
+        self.scope(run)
         self.cli("plan-register", "--tasks-json",
-                 json.dumps([{"id": "T1", "test_intents": ["test_a", "test_b"]}]),
+                 json.dumps([{"id": "T1", "repo": str(self.repo),
+                              "test_intents": ["test_a", "test_b"]}]),
                  run=run)
         state = self.cli("show", run=run)["state"]
         self.assertEqual(state["tasks"][0]["test_intents"], ["test_a", "test_b"])
@@ -595,6 +628,7 @@ class TwoRepoContracts(BreadthHarness):
         run = Path(self.cli("fetch", "--id", "W-23", "--date", "2026-02-06")["run"])
         self.cli("cursor", "--to", "intake", run=run)
         self.cli("cursor", "--to", "plan", run=run)
+        self.scope(run)
         tasks_file = self.workspace / "tasks.json"
         tasks_file.write_text(json.dumps([
             {"id": "T1", "repo": str(self.repo)},
@@ -654,13 +688,15 @@ class TwoRepoContracts(BreadthHarness):
         run = Path(self.cli("fetch", "--id", "W-27", "--date", "2026-02-10")["run"])
         self.cli("cursor", "--to", "intake", run=run)
         self.cli("cursor", "--to", "plan", run=run)
+        self.scope(run, self.repo, repo_b)
         self.cli("plan-register",
                  "--tasks-json", json.dumps([
                      {"id": "T1", "repo": str(self.repo)},
                      {"id": "T2", "repo": str(repo_b)}]),
                  run=run)
-        self.gate(run, "approve-plan")
+        self.pass_plan_review(run)
         self.cli("cursor", "--to", "approve-plan", run=run)
+        self.gate(run, "approve-plan")   # decided AT the gate (cursor-anchored)
         self.cli("cursor", "--to", "preflight", run=run)
 
         branch_a = self.cli("preflight", "--repo", str(self.repo), run=run)["branch"]
@@ -743,6 +779,7 @@ class TwoRepoContracts(BreadthHarness):
         # plan-register replaces the seed wholesale — no residual flag.
         self.cli("cursor", "--to", "intake", run=run)
         self.cli("cursor", "--to", "plan", run=run)
+        self.scope(run)
         self.cli("plan-register", "--tasks-json",
                  json.dumps([{"id": "T1", "repo": str(self.repo)}]), run=run)
         state = self.cli("show", run=run)["state"]
@@ -765,20 +802,29 @@ class SecurityScanParsing(BreadthHarness):
             f'    repo: "echo FINDING high: hardcoded token; exit 1"\n')
         run = Path(self.cli("fetch", "--id", "W-30", "--date", "2026-02-05")["run"])
         st = self.cli("show", run=run)["state"]
-        for step in ("intake", "plan", "approve-plan", "preflight", "develop",
+        for step in ("intake", "plan", "plan-review", "approve-plan",
+                     "preflight", "develop",
                      "approve-impl", "harden", "security"):
             if st["cursor"]["current_step"] == "security":
                 break
-            if step == "approve-plan":
-                # leaving `plan` requires the registered (non-provisional)
-                # task list — the requires_tasks_registered mechanization
+            if step == "plan-review":
+                # leaving `plan` requires the confirmed scope + registered
+                # (non-provisional) task list — the requires_tasks_registered
+                # mechanization
+                self.scope(run)
                 self.cli("plan-register", "--tasks-json",
                          json.dumps([{"id": "T1", "repo": str(self.repo)}]),
                          run=run)
-            if step in ("approve-plan", "approve-impl"):
-                self.gate(run, step)
+            if step == "approve-plan":
+                # seeded while the cursor is still at plan-review — the
+                # verdict is what legalizes the move into the gate
+                support.seed_review_verdict(run)
+            if step == "preflight":
+                self.gate(run, "approve-plan")   # decided AT the gate
             if step == "approve-impl":
                 self._force_tasks_done(run)
+            if step == "harden":
+                self.gate(run, "approve-impl")   # decided AT the gate
             self.cli("cursor", "--to", step, run=run)
         sev = self.cli("security-scan", run=run)
         self.assertEqual(sev["max_severity"], "high")
@@ -808,20 +854,29 @@ class SecurityScanParsing(BreadthHarness):
             '    repo-b: "echo clean"\n')
         run = Path(self.cli("fetch", "--id", "W-31", "--date", "2026-02-06")["run"])
         st = self.cli("show", run=run)["state"]
-        for step in ("intake", "plan", "approve-plan", "preflight", "develop",
+        for step in ("intake", "plan", "plan-review", "approve-plan",
+                     "preflight", "develop",
                      "approve-impl", "harden", "security"):
             if st["cursor"]["current_step"] == "security":
                 break
-            if step == "approve-plan":
-                # leaving `plan` requires the registered (non-provisional)
-                # task list — the requires_tasks_registered mechanization
+            if step == "plan-review":
+                # leaving `plan` requires the confirmed scope + registered
+                # (non-provisional) task list — the requires_tasks_registered
+                # mechanization
+                self.scope(run)
                 self.cli("plan-register", "--tasks-json",
                          json.dumps([{"id": "T1", "repo": str(self.repo)}]),
                          run=run)
-            if step in ("approve-plan", "approve-impl"):
-                self.gate(run, step)
+            if step == "approve-plan":
+                # seeded while the cursor is still at plan-review — the
+                # verdict is what legalizes the move into the gate
+                support.seed_review_verdict(run)
+            if step == "preflight":
+                self.gate(run, "approve-plan")   # decided AT the gate
             if step == "approve-impl":
                 self._force_tasks_done(run)
+            if step == "harden":
+                self.gate(run, "approve-impl")   # decided AT the gate
             self.cli("cursor", "--to", step, run=run)
         sev = self.cli("security-scan", run=run)
         self.assertEqual(sev["max_severity"], "critical")
@@ -951,6 +1006,7 @@ class PlanRegisterValidation(BreadthHarness):
             self.cli("fetch", "--id", "W-95", "--date", "2026-02-01")["run"])
         self.cli("cursor", "--to", "intake", run=self.run_dir)
         self.cli("cursor", "--to", "plan", run=self.run_dir)
+        self.scope(self.run_dir)
 
     def _register(self, tasks, expect=0):
         return self.cli("plan-register", "--tasks-json", json.dumps(tasks),
@@ -970,7 +1026,123 @@ class PlanRegisterValidation(BreadthHarness):
         self.assertIn("not usable", out["error"])
 
     def test_valid_dag_registers(self):
-        self._register([{"id": "T1"}, {"id": "T2", "depends_on": ["T1"]}])
+        self._register([{"id": "T1", "repo": str(self.repo)},
+                        {"id": "T2", "repo": str(self.repo),
+                         "depends_on": ["T1"]}])
+
+    def test_task_repo_outside_confirmed_scope_refused(self):
+        out = self._register([{"id": "T1", "repo": str(self.repo)},
+                              {"id": "T2", "repo": "/somewhere/else"}],
+                             expect=1)
+        self.assertIn("outside the confirmed scope", out["error"])
+
+    def test_repo_less_task_refused_as_off_scope(self):
+        # the legacy "." default is never in a confirmed scope — a task
+        # must carry its registered repo path explicitly
+        out = self._register([{"id": "T1"}], expect=1)
+        self.assertIn("outside the confirmed scope", out["error"])
+
+
+class ScopeRegisterValidation(BreadthHarness):
+    """The human-confirmed target-repo set is an owned entry point with
+    fail-closed validation — never a prose convention the planner could
+    drift past (plan-register's scope containment reads what this records)."""
+
+    def _fetch(self, sid="W-98", **init_kw):
+        self.story(sid, "scope thing")
+        self.init(**init_kw)
+        return Path(self.cli("fetch", "--id", sid,
+                             "--date", "2026-02-01")["run"])
+
+    def test_refused_outside_intake_or_plan(self):
+        run = self._fetch()
+        out = self.cli("scope-register", "--repos-json",
+                       json.dumps([str(self.repo)]), run=run, expect=1)
+        # legality is DERIVED from the manifest's `produces: scope` steps,
+        # never a hardcoded step list
+        self.assertIn("a step the manifest declares producing 'scope' "
+                      "(intake, plan)", out["error"])
+
+    def test_unregistered_path_refused(self):
+        run = self._fetch()
+        self.cli("cursor", "--to", "intake", run=run)
+        out = self.cli("scope-register", "--repos-json",
+                       json.dumps(["/not/registered"]), run=run, expect=1)
+        self.assertIn("not registered", out["error"])
+
+    def test_empty_or_malformed_payload_refused(self):
+        run = self._fetch()
+        self.cli("cursor", "--to", "intake", run=run)
+        out = self.cli("scope-register", "--repos-json", "[]",
+                       run=run, expect=1)
+        self.assertIn("non-empty", out["error"])
+        out = self.cli("scope-register", "--repos-json", '"just-a-string"',
+                       run=run, expect=1)
+        self.assertIn("non-empty", out["error"])
+        out = self.cli("scope-register", "--repos-json", "not json",
+                       run=run, expect=1)
+        self.assertIn("not valid JSON", out["error"])
+
+    def test_records_scope_artifact_state_and_event(self):
+        run = self._fetch()
+        self.cli("cursor", "--to", "intake", run=run)
+        out = self.cli("scope-register", "--repos-json",
+                       json.dumps([str(self.repo)]), run=run)
+        self.assertEqual(out["scope"], [str(self.repo)])
+        state = self.cli("show", run=run)["state"]
+        self.assertEqual(state["scope"]["repos"], [str(self.repo)])
+        self.assertEqual(state["artifacts"]["scope"], [str(self.repo)])
+        kinds = [r["kind"] for r in
+                 ndjson.read_records(run / "events.ndjson")]
+        self.assertIn("scope-registered", kinds)
+
+    def test_generic_artifact_verb_cannot_write_scope(self):
+        run = self._fetch()
+        self.cli("cursor", "--to", "intake", run=run)
+        out = self.cli("artifact", "--name", "scope", "--value",
+                       json.dumps([str(self.repo)]), run=run, expect=1)
+        self.assertIn("scope-register", out["error"])
+
+    def test_narrowing_below_registered_tasks_refused(self):
+        # containment is an invariant, not a point-in-time check: a
+        # re-registration must not strand already-registered tasks
+        repo_b = make_repo(self.workspace, "repo-scope-b")
+        run = self._fetch(extra_repos=f"repo-scope-b={repo_b}",
+                          extra_test_cmd=f"repo-scope-b={TEST_CMD}")
+        self.cli("cursor", "--to", "intake", run=run)
+        self.cli("scope-register", "--repos-json",
+                 json.dumps([str(self.repo), str(repo_b)]), run=run)
+        self.cli("cursor", "--to", "plan", run=run)
+        self.cli("plan-register", "--tasks-json", json.dumps([
+            {"id": "T1", "repo": str(self.repo)},
+            {"id": "T2", "repo": str(repo_b)}]), run=run)
+        out = self.cli("scope-register", "--repos-json",
+                       json.dumps([str(self.repo)]), run=run, expect=1)
+        self.assertIn("would fall outside the new scope", out["error"])
+
+    def test_task_less_stall_counts_per_step(self):
+        run = self._fetch()
+        self.assertEqual(self.cli("stall", run=run)["action"], "reinvoke")
+        self.assertEqual(self.cli("stall", run=run)["action"], "recovery")
+        self.assertEqual(self.cli("stall", run=run)["action"], "human")
+        state = self.cli("show", run=run)["state"]
+        self.assertEqual(state["step_stalls"], {"step:fetch": 3})
+
+    def test_reregistration_at_plan_replaces_the_set(self):
+        # The plan step's 0c escape valve: widening is legal (full-set
+        # replace), silent widening is not — plan-register reads the result.
+        repo_b = make_repo(self.workspace, "repo-b")
+        run = self._fetch(extra_repos=f"repo-b={repo_b}",
+                          extra_test_cmd=f"repo-b={TEST_CMD}")
+        self.cli("cursor", "--to", "intake", run=run)
+        self.cli("scope-register", "--repos-json",
+                 json.dumps([str(self.repo)]), run=run)
+        self.cli("cursor", "--to", "plan", run=run)
+        self.cli("scope-register", "--repos-json",
+                 json.dumps([str(self.repo), str(repo_b)]), run=run)
+        state = self.cli("show", run=run)["state"]
+        self.assertEqual(state["scope"]["repos"],
+                         sorted([str(self.repo), str(repo_b)]))
 
 
 class GateOptionsAreDeclaredData(BreadthHarness):
@@ -1000,6 +1172,7 @@ class GateOptionsAreDeclaredData(BreadthHarness):
         self.assertIn("only for select gates", out["error"])
         self.cli("gate", "--id", "approve-security", "--present", run=self.run_dir)
         ndjson.append_record(self.run_dir / "human-input.ndjson", {"text": "2"})
+        self._force_cursor(self.run_dir, "approve-security")  # decide is cursor-anchored
         self.cli("gate", "--id", "approve-security", "--decide", run=self.run_dir)
         st = state_mod.load(self.run_dir, self.workspace)
         # manifest dispositions: [fix-now, waive, defer] -> "2" is waive
@@ -1014,6 +1187,7 @@ class GateOptionsAreDeclaredData(BreadthHarness):
         self.cli("gate", "--id", "select-comments", "--present",
                  "--options", "c1,c2,c3", run=self.run_dir)
         ndjson.append_record(self.run_dir / "human-input.ndjson", {"text": "2,3"})
+        self._force_cursor(self.run_dir, "select-comments")  # decide is cursor-anchored
         self.cli("gate", "--id", "select-comments", "--decide", run=self.run_dir)
         st = state_mod.load(self.run_dir, self.workspace)
         self.assertEqual(st["gates"]["select-comments"]["decision"], ["c2", "c3"])
@@ -1022,6 +1196,17 @@ class GateOptionsAreDeclaredData(BreadthHarness):
         out = self.cli("gate", "--id", "fetch", "--present", run=self.run_dir,
                        expect=1)
         self.assertIn("not a declared gate step", out["error"])
+
+    def test_decide_away_from_the_gate_refused(self):
+        # adversarial-review (plan-accuracy round): an any-cursor decide
+        # could bank an approval before the gate's artifacts exist, or move
+        # the verdict window mid-plan-cycle and reset the review budget.
+        self.cli("gate", "--id", "approve-plan", "--present", run=self.run_dir)
+        ndjson.append_record(self.run_dir / "human-input.ndjson",
+                             {"text": "APPROVED"})
+        out = self.cli("gate", "--id", "approve-plan", "--decide",
+                       run=self.run_dir, expect=1)   # cursor is at fetch
+        self.assertIn("not the current step", out["error"])
 
 
 class AutosquashMultiRepo(BreadthHarness):
@@ -1136,8 +1321,11 @@ class RejectionWithNotes(BreadthHarness):
                             "--date", "2026-03-02")["run"])
         self.cli("cursor", "--to", "intake", run=run)
         self.cli("cursor", "--to", "plan", run=run)
+        self.scope(run)
         self.cli("plan-register", "--tasks-json",
                  json.dumps([{"id": "T1", "repo": str(self.repo)}]), run=run)
+        self.pass_plan_review(run)
+        self.cli("cursor", "--to", "approve-plan", run=run)
         self.cli("gate", "--id", "approve-plan", "--present", run=run)
         ndjson.append_record(run / "human-input.ndjson",
                              {"text": "APPROVED but rename T1 first"})
@@ -1151,8 +1339,15 @@ class RejectionWithNotes(BreadthHarness):
         state = self.cli("show", run=run)["state"]
         self.assertEqual(state["gates"]["approve-plan"]["decision"],
                          "rejected")
-        self.cli("cursor", "--to", "approve-plan", run=run)
         self.cli("cursor", "--to", "plan", run=run)   # on_reject edge opens
+        # the rejection was CONSUMED by that edge (single-use): it stays on
+        # the dashboard as history, and the re-armed registration plus a
+        # fresh verdict window govern the new cycle
+        state = self.cli("show", run=run)["state"]
+        self.assertNotIn("decision", state["gates"]["approve-plan"])
+        self.assertEqual(
+            state["gates"]["approve-plan"]["consumed_decision"], "rejected")
+        self.assertTrue(all(t["provisional"] for t in state["tasks"]))
 
 
 class DeferFollowThrough(BreadthHarness):
@@ -1169,6 +1364,7 @@ class DeferFollowThrough(BreadthHarness):
         self.init()
         run = Path(self.cli("fetch", "--id", "W-97",
                             "--date", "2026-03-03")["run"])
+        self._force_cursor(run, "approve-security")  # decide is cursor-anchored
         self.cli("gate", "--id", "approve-security", "--present", run=run)
         ndjson.append_record(run / "human-input.ndjson", {"text": "defer"})
         out = self.cli("gate", "--id", "approve-security", "--decide",
@@ -1198,6 +1394,7 @@ class DeferFollowThrough(BreadthHarness):
         self.init()
         run = Path(self.cli("fetch", "--id", "W-96",
                             "--date", "2026-03-05")["run"])
+        self._force_cursor(run, "approve-security")  # decide is cursor-anchored
         self.cli("gate", "--id", "approve-security", "--present", run=run)
         ndjson.append_record(run / "human-input.ndjson", {"text": "defer"})
         self.cli("gate", "--id", "approve-security", "--decide", run=run)
@@ -1235,6 +1432,7 @@ class DeferFollowThrough(BreadthHarness):
         self.cli("log-event", "--json",
                  json.dumps({"kind": "deferral-recorded", "item": "STRAY"}),
                  run=run)
+        self._force_cursor(run, "approve-security")  # decide is cursor-anchored
         self.cli("gate", "--id", "approve-security", "--present", run=run)
         ndjson.append_record(run / "human-input.ndjson", {"text": "defer"})
         self.cli("gate", "--id", "approve-security", "--decide", run=run)
@@ -1281,10 +1479,12 @@ class SecretSweepBreadth(BreadthHarness):
         run = Path(self.cli("fetch", "--id", "W-91", "--date", "2026-02-21")["run"])
         self.cli("cursor", "--to", "intake", run=run)
         self.cli("cursor", "--to", "plan", run=run)
+        self.scope(run)
         self.cli("plan-register", "--tasks-json",
                  json.dumps([{"id": "T1", "repo": str(self.repo)}]), run=run)
-        self.gate(run, "approve-plan")
+        self.pass_plan_review(run)
         self.cli("cursor", "--to", "approve-plan", run=run)
+        self.gate(run, "approve-plan")   # decided AT the gate (cursor-anchored)
         self.cli("cursor", "--to", "preflight", run=run)
         self.cli("preflight", "--repo", str(self.repo), run=run)
         exclude = self.repo / ".git" / "info" / "exclude"

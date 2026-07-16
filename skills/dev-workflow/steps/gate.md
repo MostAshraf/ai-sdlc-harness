@@ -8,6 +8,10 @@ request; deterministic code decides (design.md RC3).
    `presents:` names it — plan.md, task summary, security report…), plus the
    options: plain gates → `APPROVED` / `rejected`; security gate →
    `[1] fix-now [2] waive [3] defer`.
+   ⟨approve-plan⟩ only: ALSO show `<run>/reports/plan-review.md` verbatim —
+   the independent review travels with the plan (and if it reached this
+   gate with the review bound exhausted, say so explicitly; the human is
+   deciding on a plan the reviewer still rejects).
 3. Wait for the user's reply — it must arrive as a PLAIN TYPED CHAT
    MESSAGE. The capture hook anchors decisions to UserPromptSubmit events
    only; an AskUserQuestion answer arrives as a structured tool result,

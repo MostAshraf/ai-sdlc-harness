@@ -20,6 +20,13 @@
 #                             {value: <produced artifact>, at_least: {config: key}}
 #   steps.<id>.on_reject      declared re-entry target on gate rejection (B10)
 #   steps.<id>.returns_to     declared return edge for an off-sequence side-step
+#   steps.<id>.verdict_bound  {mode, bound: {config: key}} — the step's exits
+#                             are derived from the hook-captured reviewer-
+#                             verdict ledger (reviews.ndjson) for that mode:
+#                             no in-window verdict -> no exits; latest
+#                             CHANGES_REQUESTED under the bound -> only the
+#                             step's returns_to edge; APPROVED or bound
+#                             exhausted -> only forward. Requires returns_to.
 #   steps.<id>.selects_mode   the single declared classify branch (fetch only),
 #                             schema-validated AND runtime-interpreted:
 #                             workflow.classify() returns the quick_eligible
@@ -49,9 +56,15 @@ steps:
       "false": full
 
   intake:
+    # Besides the requirements summary (with NUMBERED acceptance criteria —
+    # AC1, AC2, … — the ids plan's traceability table and plan-review's
+    # coverage check key on), intake ends by proposing the story's Target
+    # Repos from the repo-map indexes; the human confirms and the
+    # orchestrator records the set via `harness scope-register` (the `scope`
+    # artifact + state.scope). plan-register refuses tasks outside it.
     spawns: [{shape: planner, mode: intake}]
     preconditions: [work-item]
-    produces: [requirements-summary]
+    produces: [requirements-summary, scope]
 
   plan:
     # Plan content contract (coverage decisions): edge-case enumeration, risk
@@ -63,14 +76,54 @@ steps:
     # skills/dev-workflow/steps/plan-task.md. Replaces the fetch seed task
     # list.
     spawns: [{shape: planner, mode: plan}]
-    preconditions: [requirements-summary]
-    produces: [plan, test-intents, tasks]
+    # `scope` is both consumed (the planner decomposes ONLY within the
+    # human-confirmed target repos) and re-producible here: a revision
+    # round that legitimately needs a repo outside the confirmed set goes
+    # back through the user and re-registers at this cursor — widening is
+    # legal but never silent.
+    preconditions: [requirements-summary, scope]
+    produces: [plan, test-intents, tasks, scope]
     # The cursor cannot leave `plan` while the task list is still the
     # fetch-seeded provisional placeholder (adversarial-review finding:
     # nothing forced `plan-register` to run, so a forgotten registration
     # let the gate approve a plan the run would then ignore — develop ran
     # on the placeholder task with empty test_intents).
     requires_tasks_registered: true
+
+  plan-review:
+    # Independent pre-gate plan review: AC coverage (every numbered
+    # criterion in requirements.md maps to a task + test-intent),
+    # conventions consistency (repo-map conventions.md + spot-reads of the
+    # code the plan cites), dependency-edge and contract-signature audit.
+    # The reviewer is read-only; the orchestrator persists the report
+    # (pre-pr pattern) and the hook-captured verdict in reviews.ndjson —
+    # not any orchestrator claim — is what gates this step's exits.
+    spawns: [{shape: reviewer, mode: plan-review}]
+    # `scope` is a real runtime read (the reviewer's scope-containment
+    # check reads state.scope) — declared so the validator's reordering
+    # proof covers it, same rule as create-pr's `branches`.
+    preconditions: [plan, requirements-summary, scope]
+    produces: [plan-review-report]
+    # verdict_bound: this step's exits are DERIVED from the verdict ledger
+    # (interpreted by cursor_candidates, validated by the schema):
+    #   no in-window verdict          -> no exits (fail-closed, like an
+    #                                    undecided gate)
+    #   CHANGES_REQUESTED under bound -> only `returns_to` is legal (the
+    #                                    revision loop is forced, not
+    #                                    advisory)
+    #   APPROVED, or bound exhausted  -> only forward is legal (bound
+    #                                    exhaustion reaches the human WITH
+    #                                    the failing report attached —
+    #                                    round N+ signals plan drift and the
+    #                                    human decides; never a deadlock)
+    # Window: verdicts strictly after the latest human gate decision — a
+    # rejection at ⟨approve-plan⟩ starts a fresh round budget for the new
+    # plan cycle instead of inheriting the old one. Rounds count captured
+    # CHANGES_REQUESTED RECORDS, not revision cycles: a duplicate capture
+    # (double spawn, stall re-invoke) burns budget toward the human —
+    # deliberately the safe direction, not a bug to compensate for.
+    returns_to: plan
+    verdict_bound: {mode: plan-review, bound: {config: review_rounds.max}}
 
   approve-plan:
     gate: true
@@ -205,6 +258,7 @@ modes:
     - fetch
     - intake
     - plan
+    - plan-review
     - approve-plan
     - preflight
     - develop

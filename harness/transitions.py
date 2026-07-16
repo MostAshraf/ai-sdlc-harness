@@ -72,7 +72,62 @@ def _gate_forward(step_def: dict, decision: str | None) -> bool | None:
     return decision in step_def.get("forward_on", FORWARD_DEFAULT)
 
 
-def cursor_candidates(state: dict, manifest: dict, config: dict) -> dict[str, str]:
+def _verdict_bound_filter(cur_def: dict, state: dict, config: dict,
+                          run: Path | None,
+                          candidates: dict[str, str]) -> dict[str, str]:
+    """A `verdict_bound` step's exits are DERIVED from the hook-captured
+    reviewer-verdict ledger (reviews.ndjson) — the same trust anchor the
+    task FSM's `reviewer-approved` guard uses; an orchestrator claim never
+    substitutes. Window: records strictly after the latest human gate
+    decision (`decided_at`), so a gate rejection starts a fresh round
+    budget for the new cycle instead of inheriting the old one.
+
+      no in-window verdict           -> {}   (fail-closed, like an
+                                              undecided gate)
+      CHANGES_REQUESTED under bound  -> only the returns_to edge (the
+                                              revision loop is forced)
+      APPROVED, or bound exhausted   -> only forward (bound exhaustion
+                                              reaches the human WITH the
+                                              failing report — plan drift
+                                              is the human's call, never a
+                                              deadlock)
+    """
+    vb = cur_def["verdict_bound"]
+    if run is None:
+        return {}  # no ledger access -> fail closed (CLI always passes run)
+    anchor = max((g.get("decided_at", "") or ""
+                  for g in (state.get("gates") or {}).values()), default="")
+    try:
+        records = ndjson.read_records(run / "reviews.ndjson", strict=True)
+    except ndjson.LedgerCorruption as exc:
+        raise TransitionError(
+            "verdict_bound: reviewer-verdict ledger has a corrupt record — "
+            f"refusing to derive exits (fail closed): {exc}") from exc
+    qualifying = [r for r in records
+                  if r.get("mode") == vb["mode"] and r.get("at", "") > anchor]
+    if not qualifying:
+        return {}
+    # Timestamp ties fail closed: two hook processes can stamp identical
+    # `at` (per-process monotonic clamp, coarse OS clocks), and a plain
+    # max() is first-wins — which would let an APPROVED beat a same-instant
+    # CHANGES_REQUESTED. Any CR at the latest instant wins the tie.
+    latest_at = max(r.get("at", "") for r in qualifying)
+    at_tie = [r for r in qualifying if r.get("at", "") == latest_at]
+    if any(r.get("verdict") == "CHANGES_REQUESTED" for r in at_tie):
+        latest_verdict = "CHANGES_REQUESTED"
+    else:
+        latest_verdict = at_tie[-1].get("verdict")
+    rounds = sum(1 for r in qualifying
+                 if r.get("verdict") == "CHANGES_REQUESTED")
+    bound = _config_get(config, vb["bound"]["config"])
+    ret = cur_def.get("returns_to")
+    if latest_verdict == "APPROVED" or rounds >= bound:
+        return {k: v for k, v in candidates.items() if k != ret}
+    return {ret: "returns_to"} if ret in candidates else {}
+
+
+def cursor_candidates(state: dict, manifest: dict, config: dict,
+                      run: Path | None = None) -> dict[str, str]:
     """Legal next steps from the current cursor: {step_id: reason}."""
     steps, mode = manifest["steps"], state["mode"]
     seq = manifest["modes"][mode]
@@ -163,11 +218,17 @@ def cursor_candidates(state: dict, manifest: dict, config: dict) -> dict[str, st
             if triggered is not False and seq_key:
                 candidates.pop(seq_key, None)
 
+    # verdict_bound owns ALL exits of its step — applied last so it filters
+    # the full computed set (sequence + returns_to), never a partial one.
+    if cur_def.get("verdict_bound"):
+        candidates = _verdict_bound_filter(cur_def, state, config, run,
+                                           candidates)
+
     return candidates
 
 
 def advance_cursor(state: dict, manifest: dict, config: dict, target: str,
-                   now: str) -> list[dict]:
+                   now: str, run: Path | None = None) -> list[dict]:
     """Returns the conditional steps SKIPPED by this move (empty for most
     moves) so the caller can ledger them. Field (e2e E2E-1): approve-
     security self-skipped on a below-threshold severity exactly as
@@ -175,7 +236,7 @@ def advance_cursor(state: dict, manifest: dict, config: dict, target: str,
     ledger couldn't distinguish 'gate skipped by predicate' from 'gate
     never considered', and the run report simply didn't know."""
     ensure_live(state, f"cursor --to {target}")
-    candidates = cursor_candidates(state, manifest, config)
+    candidates = cursor_candidates(state, manifest, config, run=run)
     if target not in candidates:
         current = state["cursor"]["current_step"]
         cur_def = manifest["steps"].get(current, {})
@@ -186,12 +247,49 @@ def advance_cursor(state: dict, manifest: dict, config: dict, target: str,
                 "list is still the fetch-seeded provisional placeholder — "
                 "run `harness plan-register` with the approved plan's tasks "
                 "first")
+        if cur_def.get("verdict_bound") and not candidates:
+            raise TransitionError(
+                f"cursor move '{current}' -> '{target}' is blocked by "
+                "verdict_bound: no in-window reviewer verdict — spawn the "
+                f"reviewer (mode: {cur_def['verdict_bound']['mode']}); its "
+                "hook-captured verdict derives this step's exits (no "
+                "verdict, no exit)")
         raise TransitionError(
             f"cursor move '{current}' -> '{target}' is not declared legal; "
             f"legal: {sorted(candidates) or 'none (gate undecided?)'}"
         )
     reason = candidates[target]
     current = state["cursor"]["current_step"]
+    cur_def = manifest["steps"].get(current, {})
+    if cur_def.get("gate"):
+        entry = state["gates"].get(current)
+        if entry and "decision" in entry:
+            # Single-use: a decision is consumed by the edge it legalizes
+            # (adversarial-review, plan-accuracy round: a stale rejection
+            # left in state re-opened its on_reject edge on every later
+            # arrival — after ONE human rejection, a humanless
+            # plan↔plan-review↔approve-plan cycle was engine-legal and the
+            # verdict window's round budget never reset). `decided_at` and
+            # `evidence` stay — the window anchor and the audit trail
+            # outlive consumption; re-arrival fail-closes until a fresh
+            # present + decide. `presented_at` is consumed WITH the
+            # decision (re-verification finding: left in place, the
+            # capture hook's presented-and-undecided window test stayed
+            # open forever — every later prompt captured — and a decide
+            # at a re-arrived gate could qualify stray mid-cycle replies
+            # against the stale round-1 presentation).
+            entry["consumed_decision"] = entry.pop("decision")
+            entry.pop("presented_at", None)
+    if (reason in ("returns_to", "on_reject")
+            and manifest["steps"].get(target, {}).get("requires_tasks_registered")):
+        # Re-entering a registration-owning step re-arms its exit condition:
+        # the revised plan must plan-register again (idempotent when the
+        # decomposition is unchanged). Otherwise a revision round could sail
+        # to the gate and into develop on the previous round's task list —
+        # the exact class requires_tasks_registered exists to close,
+        # reopened by any loop edge for every round after the first.
+        for t in state.get("tasks", []):
+            t["provisional"] = True
     skipped: list[dict] = []
     if reason == "sequence":
         # a farther-than-adjacent sequence target is only ever legal when
@@ -331,7 +429,13 @@ def _guard_reviewer_approved(state: dict, task: dict, run: Path) -> None:
             "entered in-review — spawn the reviewer (mode: review); its "
             "hook-captured verdict is the completion evidence (no review, "
             "no done)")
-    latest = max(qualifying, key=lambda r: r.get("at", ""))
+    # Same tie rule as _verdict_bound_filter: identical `at` stamps from
+    # two hook processes must not let a first-read APPROVED shadow a
+    # same-instant rejection — any non-APPROVED at the latest instant wins.
+    latest_at = max(r.get("at", "") for r in qualifying)
+    at_tie = [r for r in qualifying if r.get("at", "") == latest_at]
+    latest = next((r for r in at_tie if r.get("verdict") != "APPROVED"),
+                  at_tie[-1])
     if latest.get("verdict") != "APPROVED":
         raise TransitionError(
             f"task {task['id']}: latest reviewer verdict is "
@@ -403,8 +507,9 @@ def transition_task(state: dict, fsm: dict, config: dict, run: Path, key: bytes,
         # rework whose re-review never happened).
         task["in_review_at"] = ndjson.now_iso()
     if to == "in-progress":
-        # Full mode already clears this at plan-register (tasks are rebuilt
-        # wholesale there, well before any task reaches in-progress) — a
+        # Full mode clears this at plan-register (tasks are rebuilt
+        # wholesale there — including after a plan re-entry re-arms the
+        # flag — well before any task reaches in-progress), so this is a
         # no-op there. Quick mode has no plan-register at all (adversarial-
         # review finding), so the fetch-seeded task's `provisional: true`
         # would otherwise never clear: the first in-progress transition is
@@ -415,14 +520,26 @@ def transition_task(state: dict, fsm: dict, config: dict, run: Path, key: bytes,
 
 def record_stall(state: dict, config: dict, task_id: str) -> str:
     """Bounded stalled-agent procedure (coverage B4). Returns the declared
-    next action: reinvoke -> recovery -> human."""
-    task = next((t for t in state["tasks"] if t["id"] == task_id), None)
-    if task is None:
-        raise TransitionError(f"unknown task '{task_id}'")
-    task["stalls"] = task.get("stalls", 0) + 1
+    next action: reinvoke -> recovery -> human.
+
+    A `step:<id>` key counts stalls for a TASK-LESS spawn (plan-review,
+    pre-pr, …) at run level — the same declared bounds apply
+    (adversarial-review, plan-accuracy round: the task-keyed-only verb left
+    the plan-review reviewer, whose verdict is exit-blocking, with an
+    UNBOUNDED re-spawn loop and no human escalation trigger)."""
+    if task_id.startswith("step:"):
+        counters = state.setdefault("step_stalls", {})
+        counters[task_id] = counters.get(task_id, 0) + 1
+        count = counters[task_id]
+    else:
+        task = next((t for t in state["tasks"] if t["id"] == task_id), None)
+        if task is None:
+            raise TransitionError(f"unknown task '{task_id}'")
+        task["stalls"] = task.get("stalls", 0) + 1
+        count = task["stalls"]
     stall_cfg = config["stall"]
-    if task["stalls"] < stall_cfg["recovery_after"]:
+    if count < stall_cfg["recovery_after"]:
         return "reinvoke"
-    if task["stalls"] < stall_cfg["human_after"]:
+    if count < stall_cfg["human_after"]:
         return "recovery"
     return "human"

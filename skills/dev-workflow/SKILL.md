@@ -84,7 +84,9 @@ successful sibling of abort — the final step's file says exactly when).
   means no qualifying reply: re-present or route to ad-hoc.
 - **Stalls:** a subagent that stops without a status block → `${CLAUDE_PLUGIN_ROOT}/bin/harness stall
   --task <T>` and follow the returned action (`reinvoke` → `recovery` →
-  `human`). NEVER commit or write on a stalled agent's behalf.
+  `human`). For a TASK-LESS spawn (plan-review, pre-pr, analyze-comments)
+  omit `--task` — the stall counts per step, same bounds. NEVER commit or
+  write on a stalled agent's behalf.
 - **Ad-hoc human requests mid-run:** spawn `reviewer` with
   `harness-mode: request-triage` (always legal), surface the triage verdict
   to the user; out-of-scope items are never silently merged.
@@ -93,8 +95,9 @@ successful sibling of abort — the final step's file says exactly when).
   the code in the PR) — never into the workspace, which isn't a git repo and
   isn't a mirror target. So it only makes sense once a repo has a feature
   branch, i.e. **after `preflight`**. Rules:
-  - **Before preflight** (`fetch`/`intake`/`plan`/⟨approve-plan⟩): there is
-    no branch yet — **skip the mirror entirely**, don't guess a `--repo`.
+  - **Before preflight** (`fetch`/`intake`/`plan`/`plan-review`/
+    ⟨approve-plan⟩): there is no branch yet — **skip the mirror entirely**,
+    don't guess a `--repo`.
   - **After preflight** (task completion, and each later gate crossing):
     mirror into **every preflighted repo** (the `branches` artifact in
     `show` lists them) — one call per repo:

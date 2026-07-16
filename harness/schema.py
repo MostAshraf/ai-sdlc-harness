@@ -143,6 +143,43 @@ def validate_manifest(manifest: dict, surfaces: dict, config: dict, issues: Issu
         if step.get("requires_tasks_registered") and step.get("gate"):
             issues.err(f"{where}: `requires_tasks_registered` is not meaningful "
                        "on a gate step (registration happens before the gate)")
+        vb = step.get("verdict_bound")
+        if vb is not None:
+            # Half-enforced vocabulary is the failure mode here: a shape the
+            # engine can't interpret must be refused at validation, never
+            # discovered as a runtime surprise mid-run.
+            if step.get("gate"):
+                issues.err(f"{where}: `verdict_bound` is not meaningful on a "
+                           "gate step (gates derive from human input, not "
+                           "reviewer verdicts)")
+            if not isinstance(vb, dict) or set(vb) != {"mode", "bound"}:
+                issues.err(f"{where}: `verdict_bound` must be exactly "
+                           "{mode, bound: {config: key}}")
+            else:
+                spawn_modes = {s.get("mode")
+                               for s in step.get("spawns", []) or []}
+                if vb.get("mode") not in spawn_modes:
+                    issues.err(f"{where}: verdict_bound.mode "
+                               f"'{vb.get('mode')}' is not a mode this step "
+                               "spawns — the step could never produce the "
+                               "verdict its exits depend on")
+                ref = (vb.get("bound") or {}).get("config")
+                if not ref or not _config_path_ok(ref, config):
+                    issues.err(f"{where}: verdict_bound.bound.config "
+                               f"'{ref}' not found in config defaults")
+                if not step.get("returns_to"):
+                    issues.err(f"{where}: `verdict_bound` requires a "
+                               "`returns_to` edge (the CHANGES_REQUESTED-"
+                               "under-bound loop target)")
+                # Two data features each claiming exclusive exit ownership
+                # would silently resolve by interpreter ordering — refuse
+                # the combination instead (half-enforced-vocabulary bar).
+                for esc in manifest.get("escalations", []) or []:
+                    if (esc.get("from") or {}).get("step") == sid:
+                        issues.err(
+                            f"{where}: `verdict_bound` cannot share a step "
+                            "with an escalation source — both claim exclusive "
+                            "ownership of the step's exits")
         for spawn in step.get("spawns", []) or []:
             _spawn_ok(spawn, surfaces, where, issues)
         for edge_key in ("on_reject", "returns_to"):

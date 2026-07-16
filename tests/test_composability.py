@@ -118,6 +118,47 @@ class ModeComposition(unittest.TestCase):
                                        "pre-pr", "2026-07-08T00:00:00Z")
         self.assertIn("docs-sync", str(ctx.exception))
 
+    def test_verdict_bound_step_composes_and_the_engine_derives_its_exits(self):
+        """plan-review (a `verdict_bound` step) is declared data like any
+        other: a new mode reusing it validates, and the engine derives its
+        exits from the verdict ledger with no step-name hardcode — while
+        the SOLO probe above proves a mode may equally OMIT it."""
+        import tempfile
+        from tests import support as tsupport
+        seq = list(SOLO)
+        seq.insert(seq.index("approve-plan"), "plan-review")
+        self.manifest["modes"]["solo"] = seq
+        issues = validate(self.manifest, self.surfaces, self.config)
+        self.assertTrue(issues.ok, issues.errors)
+
+        run = Path(tempfile.mkdtemp())
+        try:
+            state = {
+                "mode": "solo",
+                "cursor": {"current_step": "plan-review",
+                           "completed_steps": ["fetch", "intake", "plan"]},
+                "artifacts": {"work-item": "<w>", "requirements-summary": "<r>",
+                              "scope": ["<s>"], "plan": "<p>",
+                              "test-intents": "<i>", "tasks": "<t>"},
+                "gates": {}, "tasks": [{"id": "T1", "status": "pending"}],
+                "metrics": {"plan-review": {"started_at": "t0", "ended_at": None}},
+            }
+            # no verdict -> fail-closed, run handle or not
+            self.assertEqual(transitions.cursor_candidates(
+                state, self.manifest, self.config), {})
+            self.assertEqual(transitions.cursor_candidates(
+                state, self.manifest, self.config, run=run), {})
+            tsupport.seed_review_verdict(run, verdict="CHANGES_REQUESTED")
+            self.assertEqual(transitions.cursor_candidates(
+                state, self.manifest, self.config, run=run),
+                {"plan": "returns_to"})
+            tsupport.seed_review_verdict(run, verdict="APPROVED")
+            self.assertEqual(transitions.cursor_candidates(
+                state, self.manifest, self.config, run=run),
+                {"approve-plan": "sequence"})
+        finally:
+            tsupport.rmtree(run)
+
 
 class ModeEntry(unittest.TestCase):
     """A run's entry mode is minted from declared data end to end: argparse

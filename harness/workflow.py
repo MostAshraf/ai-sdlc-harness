@@ -277,6 +277,67 @@ def _validate_contract(c: dict) -> None:
             f"contract type must be one of {sorted(CONTRACT_TYPES)}")
 
 
+def scope_register(workspace: Path, run: Path, manifest: dict, config: dict,
+                   repos: list) -> dict:
+    """Record the human-confirmed target-repo set for this run — the scope
+    the planner decomposes within (`plan_register` refuses tasks outside
+    it). Legal at `intake` (first registration, right after the user
+    confirms intake's Target Repos proposal) and at `plan` (re-registration
+    when a revision round legitimately widens/narrows the set — still
+    user-confirmed, never silent). Entries are the exact registered repo
+    PATHS (config repos VALUES), matching what plan-register's tasks carry."""
+    from .transitions import ensure_live
+    if not isinstance(repos, list) or not repos or not all(
+            isinstance(r, str) and r for r in repos):
+        raise state_mod.StateError(
+            "scope-register: --repos-json must be a non-empty JSON array of "
+            "registered repo path strings")
+    registered = set((config.get("repos") or {}).values())
+    unknown = sorted(set(repos) - registered)
+    if unknown:
+        raise state_mod.StateError(
+            "scope-register: not registered in this workspace's repos: "
+            f"{', '.join(unknown)} — entries must be the exact registered "
+            "repo PATH strings (config repos VALUES, e.g. /abs/path/to/"
+            "backend), never the short NAMES")
+    scoped = sorted(set(repos))
+    with state_mod.locked(run):
+        st = state_mod.load(run, workspace)
+        ensure_live(st, "scope-register")
+        cursor = st["cursor"]["current_step"]
+        # Legality is derived from the manifest, not a hardcoded step list
+        # (adversarial-review: a second copy of a fact `produces: scope`
+        # already declares would silently refuse a future mode's scope-
+        # producing step that validates clean).
+        producers = sorted(sid for sid, s in (manifest.get("steps") or {}).items()
+                           if "scope" in (s.get("produces") or []))
+        if cursor not in producers:
+            raise state_mod.StateError(
+                "scope-register is legal only at a step the manifest "
+                f"declares producing 'scope' ({', '.join(producers)}) — "
+                f"cursor: {cursor}")
+        # Containment is an invariant, not a point-in-time check: a
+        # re-registration must not strand already-registered tasks outside
+        # the new set (adversarial-review: narrowing after plan-register
+        # silently broke tasks ⊆ scope with nothing left to notice it).
+        stranded = sorted({t.get("repo", ".") for t in st.get("tasks", [])
+                           if not t.get("provisional")
+                           and t.get("repo", ".") not in scoped})
+        if stranded:
+            raise state_mod.StateError(
+                "scope-register: registered task repo(s) would fall outside "
+                f"the new scope: {', '.join(stranded)} — re-run plan-register "
+                "with a task list inside the new set first, or include those "
+                "repos")
+        set_artifact(st, manifest, "scope", scoped)
+        st["scope"] = {"repos": scoped, "at": ndjson.now_iso()}
+        state_mod.save(run, workspace, st)
+    ndjson.append_record(run / "events.ndjson",
+                         {"kind": "scope-registered", "repos": scoped,
+                          "actor": "scope-register"})
+    return {"scope": scoped}
+
+
 def plan_register(workspace: Path, run: Path, manifest: dict,
                   tasks: list[dict], contracts: list[dict] | None = None) -> dict:
     """Replace the fetch-seeded task list with the approved plan's tasks
@@ -319,6 +380,24 @@ def plan_register(workspace: Path, run: Path, manifest: dict,
                 remaining.pop(tid)
             for dl in remaining.values():
                 dl.difference_update(free)
+        # Scope containment (after the payload-shape checks — a malformed
+        # list gets its shape error, not a scope one): the task list must
+        # stay inside the human-confirmed target-repo set (scope-register).
+        # Fail-closed on a missing scope — an unconfirmed decomposition is
+        # exactly what the confirmation step exists to prevent.
+        scope = (st.get("scope") or {}).get("repos") or []
+        if not scope:
+            raise state_mod.StateError(
+                "plan-register: no confirmed target-repo scope — record the "
+                "user-confirmed set first (`harness scope-register`, from "
+                "intake's Target Repos proposal), then register tasks")
+        off_scope = sorted({t.get("repo", ".") for t in tasks} - set(scope))
+        if off_scope:
+            raise state_mod.StateError(
+                "plan-register: task repo(s) outside the confirmed scope: "
+                f"{', '.join(off_scope)} — widen the scope first (user-"
+                "confirmed `harness scope-register` at the plan step); an "
+                "unconfirmed repo never enters the task list silently")
         st["tasks"] = [
             {"id": t["id"], "repo": t.get("repo", "."), "status": "pending",
              "depends_on": t.get("depends_on", []), "risk": t.get("risk", "low"),

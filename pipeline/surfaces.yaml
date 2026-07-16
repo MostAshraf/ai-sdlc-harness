@@ -23,7 +23,7 @@ shapes:
     modes: [develop, harden, fixup]
   reviewer:
     tools: [Read, Grep, Glob, Bash]      # no Write/Edit + bash-write-guard
-    modes: [review, pre-pr, analyze-comments, request-triage]
+    modes: [review, plan-review, pre-pr, analyze-comments, request-triage]
 
 # Standing spawn-guard exceptions: legal regardless of whether any run's
 # current step declares this pair in its own spawn-set, and regardless of

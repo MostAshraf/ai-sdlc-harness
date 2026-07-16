@@ -6,6 +6,22 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
+### Added — plan-generation accuracy: confirmed scope, independent plan review, richer plan contract
+
+- **Human-confirmed target-repo scope, mechanically enforced.** Intake now produces NUMBERED acceptance criteria (`AC1`, `AC2`, …) and a `## Target Repos` proposal grounded in the repo-map indexes; after you confirm the set, the orchestrator records it with the new `harness scope-register` verb (registered repo paths only, legal exactly at the manifest's `scope`-producing steps, event-ledgered). `plan-register` refuses a task list with no confirmed scope or any task repo outside it; re-registering a scope that would strand already-registered tasks is refused; the registration verbs are guard-blocked from subagent shapes (orchestrator-only); the generic `artifact` verb refuses to write `scope` past the owning verb. Widening mid-plan is legal but goes back through you (plan step 0c) — never silent.
+- **New `plan-review` pipeline step** (full mode, between `plan` and `approve-plan`): an independent reviewer-shape pass checking AC coverage (every criterion → task + test-intent), conventions consistency against the repo-map's `conventions.md` plus spot-reads of the code the plan cites, dependency-edge and contract-signature audit, file-touch sanity, and scope containment. Its exits are derived from the hook-captured verdict ledger via the new manifest vocabulary **`verdict_bound`**: no in-window verdict → no exits (fail-closed); `CHANGES_REQUESTED` under the bound → only the `returns_to: plan` revision loop is legal (forced, not advisory); `APPROVED` or bound exhaustion (`review_rounds.max`) → forward, with exhaustion reaching the ⟨approve-plan⟩ gate *with the failing report attached* — never a deadlock, never an auto-approval. Schema-validated end to end (shape, mode-must-be-spawnable, config path, `returns_to` required, refused on gates and on escalation-source steps).
+- **Repo-map content contract** (`steps/repo-map-task.md`): per repo, `index.md` (purpose/stack/module inventory/cross-repo edges — intake's targeting tier), `areas/*` (plan's detail tier), and `conventions.md` (observed patterns with cited examples — plan-review's checking tier). Existing maps stay valid; plan-review degrades to code reading when `conventions.md` is absent and says so.
+- **Plan content contract additions** (`plan-task.md`): per-task file-touch manifest (create/modify + why), exact verify command, size budget with split rule; story-level AC-traceability table and an explicit "Out of scope / do not touch" section.
+
+### Changed / hardened (from this change's adversarial review)
+
+- **Gate decisions are single-use**: consumed (with their presentation stamp) by the edge they legalize — a stale rejection can no longer re-open its `on_reject` edge on a later arrival, the capture window can't stay open past a crossing, and `gate --decide` is now cursor-anchored (refused unless the cursor is at that gate), so decisions can't be banked early or stamped mid-cycle to corrupt the plan-review round budget. Consumed decisions stay on the `status` dashboard as history.
+- **Revision-loop honesty**: re-entering `plan` via `returns_to`/`on_reject` re-arms `requires_tasks_registered` (tasks flip back to provisional), so a revised plan must re-register before advancing — closing the "gate approves a plan the run then ignores" class for every round after the first.
+- **Verdict-ledger tie semantics**: identical-timestamp records (two hook processes, coarse OS clocks) now fail closed — a same-instant `CHANGES_REQUESTED` beats an `APPROVED` in both `verdict_bound` and the per-task `reviewer-approved` guard.
+- **Task-less spawns get the bounded stall procedure**: `harness stall` without `--task` counts per step (`step_stalls` in state), same declared bounds — plan-review's exit-blocking reviewer can no longer be re-spawned unboundedly.
+
+Migration note for in-flight full-mode runs bootstrapped before this version: the next `plan-register` will refuse until the scope is recorded — run `harness scope-register` at the `plan` cursor with the user-confirmed repo set, then re-register.
+
 ## [3.0.4] — 2026-07-12
 
 > **The repo map now reaches the planner it was built for.** Generation, staleness tracking, and stamping were already solid; this release closes the gap on the consumption side, plus a false-fresh hole in the stamp itself.

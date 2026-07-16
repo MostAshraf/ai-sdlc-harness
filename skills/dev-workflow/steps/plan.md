@@ -5,8 +5,9 @@
    touches it (intake only reads it), so this is the one place in the
    pipeline that confirms it's current. Its status is filesystem-only
    (`.claude/context/repo-map/<name>/.meta.json`) — not in `state.yaml`, so
-   the `show` verb won't surface it; check it explicitly, per registered
-   repo:
+   the `show` verb won't surface it; check it explicitly — for the
+   CONFIRMED SCOPE repos only (`show` → `scope.repos`, registered at
+   intake; a repo the story can't touch doesn't need a fresh map):
    `${CLAUDE_PLUGIN_ROOT}/bin/harness repo-map-check --repo-name <name>
    --repo <path>`.
    - `fresh` → nothing to do (init already generated + stamped it; do NOT
@@ -16,18 +17,40 @@
      via `${CLAUDE_PLUGIN_ROOT}/bin/harness repo-map-stamp` after it
      returns — a plan grounded in a stale map cites patterns that no longer
      exist.
-0b. **Re-entering plan** (gate rejection / approved mid-run amendment)?
-   Snapshot the current plan first — copy `<run>/plan.md` to
-   `<run>/plan-r<n>.md` — so the previously-approved text stays
-   recoverable. Never rewrite it silently.
+0b. **Re-entering plan** (plan-review's revision loop / gate rejection /
+   approved mid-run amendment)? Snapshot the current plan first — copy
+   `<run>/plan.md` to `<run>/plan-r<n>.md` — so the previous text stays
+   recoverable. Never rewrite it silently. A plan-review re-entry carries
+   the reviewer's numbered findings: pass them to the planner verbatim as
+   the revision input. Re-entry also RE-ARMS registration mechanically
+   (tasks flip back to provisional): plan-register must run again before
+   the cursor can leave — re-issuing an unchanged task list is a cheap
+   idempotent call, and it's what keeps the registered state honest against
+   the revised plan text.
+0c. **Scope escape valve.** If planning reveals the story genuinely needs a
+   repo OUTSIDE the confirmed scope, don't plan around it and don't
+   register it — surface it to the user with the evidence, and on their
+   confirmation widen the scope right here:
+   `${CLAUDE_PLUGIN_ROOT}/bin/harness scope-register --run <run>
+   --repos-json '[<the full confirmed set>]'` (legal at this cursor;
+   full-set replace, not a delta). Widening is legal, silent widening is
+   not — plan-register refuses out-of-scope tasks either way.
 
 Spawn `planner` with headers (`harness-mode: plan`, `harness-run`,
-`harness-repo`) to produce `<run>/plan.md`. It follows `steps/plan-task.md`
+`harness-repo`) to produce `<run>/plan.md` — and name the CONFIRMED SCOPE
+repos (paths from `show` → `scope.repos`) in the ask: the planner has no
+provider or state access and decomposes only within what the prompt gives
+it (plan-task.md §0 relies on this). It follows `steps/plan-task.md`
 (the content contract). The plan's REQUIRED content (coverage decisions
 B1/B2/B7/B8 — the gate presents all of it):
 
-- Tasks keyed by id (`T1`, `T2`…), each with: description, repo, edge-case
-  enumeration, risk tier, dependencies.
+- Tasks keyed by id (`T1`, `T2`…), each with: description, repo (from the
+  confirmed scope ONLY), edge-case enumeration, risk tier, dependencies,
+  file-touch manifest (create/modify + one-line why), verify command, and
+  a size budget (est. LOC + the split rule).
+- An **AC traceability table** (AC id × tasks × test-intents — every
+  numbered criterion from requirements.md covered) and an
+  **Out of scope / do not touch** section.
 - **Per-task test-intents** (named tests + one-line intent each) — approved
   at the plan gate; carry the NAMES (not the intent prose) into
   `plan-register`'s `test_intents` field per task — `verify-red` mechanically
@@ -54,6 +77,10 @@ When the planner's status block reports the plan ready:
    a name instead of a path resolves to no registered repo and fails
    silently until a later step (`verify-red`/task completion) reports a
    confusing "no test command" error instead of a clear one here.
+   Every task's `repo` must also be inside the confirmed scope —
+   plan-register refuses an out-of-scope task (and refuses outright when no
+   scope was ever registered); the fix is the step-0c escape valve, never
+   an unconfirmed registration.
    `risk` is free-form (defaults to `low` if omitted) — no enum is
    enforced, but use `low`/`medium`/`high` for consistency with what the
    plan itself declares. (`test_intents` is the plan's declared test
@@ -77,4 +104,6 @@ When the planner's status block reports the plan ready:
 3. Record the declared artifact: `${CLAUDE_PLUGIN_ROOT}/bin/harness
    artifact --name plan --value plan.md --run <run>` (the gate presents it
    by this name).
-4. Advance to the gate: `${CLAUDE_PLUGIN_ROOT}/bin/harness cursor --to approve-plan --run <run>`.
+4. Advance to independent review (NOT straight to the gate — plan-review
+   sits between): `${CLAUDE_PLUGIN_ROOT}/bin/harness cursor --to
+   plan-review --run <run>`.

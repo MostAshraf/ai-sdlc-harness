@@ -61,10 +61,17 @@ class Harness(unittest.TestCase):
             if step_def.get("requires_tasks_terminal"):
                 for t in st.get("tasks", []):
                     t["status"] = "done"  # unit shortcut for the real TDD completion path
-            cands = transitions.cursor_candidates(st, self.manifest, self.config)
+            if step_def.get("verdict_bound"):
+                # unit shortcut for the hook-captured reviewer verdict a
+                # verdict_bound step's exits derive from
+                support.seed_review_verdict(
+                    run, mode=step_def["verdict_bound"]["mode"])
+            cands = transitions.cursor_candidates(st, self.manifest,
+                                                  self.config, run=run)
             self.assertTrue(cands, f"stuck at {current}")
             nxt = next(iter(cands))
-            transitions.advance_cursor(st, self.manifest, self.config, nxt, T0)
+            transitions.advance_cursor(st, self.manifest, self.config, nxt, T0,
+                                       run=run)
         self.fail(f"never reached {target_step}")
 
 
@@ -272,6 +279,7 @@ class CursorLegality(Harness):
         self.assertIn("pre-pr", cands)          # gate skipped
         self.assertNotIn("approve-security", cands)
 
+
     def test_conditional_gate_required_when_predicate_true(self):
         run, st = _bootstrap(self.workspace, "full")
         self.advance_to(st, run, "security")
@@ -365,6 +373,131 @@ class CursorLegality(Harness):
         run, st = _bootstrap(self.workspace, "full")
         with self.assertRaises(transitions.TransitionError):
             transitions.set_artifact(st, self.manifest, "security.max_severity", "low")
+
+
+class VerdictBoundExits(Harness):
+    """plan-review's exits are DERIVED from the hook-captured verdict
+    ledger (`verdict_bound`): fail-closed with no in-window verdict,
+    loop-forcing on CHANGES_REQUESTED under the bound, forward-only on
+    APPROVED or bound exhaustion (the human sees the failing report —
+    never a deadlock, never an auto-approval)."""
+
+    def setUp(self):
+        super().setUp()
+        self.run, self.st = _bootstrap(self.workspace, "full")
+        # advance_to stops the moment current == target, so no verdict has
+        # been seeded for plan-review itself: the ledger window is clean.
+        self.advance_to(self.st, self.run, "plan-review")
+
+    def _cands(self):
+        return transitions.cursor_candidates(self.st, self.manifest,
+                                             self.config, run=self.run)
+
+    def test_no_verdict_means_no_exits(self):
+        self.assertEqual(self._cands(), {})
+        with self.assertRaises(transitions.TransitionError) as ctx:
+            transitions.advance_cursor(self.st, self.manifest, self.config,
+                                       "approve-plan", T0, run=self.run)
+        self.assertIn("no in-window reviewer verdict", str(ctx.exception))
+
+    def test_no_run_handle_fails_closed(self):
+        # A caller that can't provide the ledger gets NO exits, not a guess.
+        support.seed_review_verdict(self.run)
+        self.assertEqual(transitions.cursor_candidates(
+            self.st, self.manifest, self.config), {})
+
+    def test_changes_requested_under_bound_forces_the_loop(self):
+        support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        self.assertEqual(self._cands(), {"plan": "returns_to"})
+        # and the loop edge actually walks: back to plan (which re-arms
+        # registration), re-register, forward again
+        transitions.advance_cursor(self.st, self.manifest, self.config,
+                                   "plan", T0, run=self.run)
+        for t in self.st["tasks"]:   # unit shortcut for plan-register
+            t.pop("provisional", None)
+        self.assertIn("plan-review", transitions.cursor_candidates(
+            self.st, self.manifest, self.config, run=self.run))
+
+    def test_approved_opens_forward_only(self):
+        support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        support.seed_review_verdict(self.run, verdict="APPROVED")  # latest wins
+        self.assertEqual(self._cands(), {"approve-plan": "sequence"})
+
+    def test_bound_exhaustion_opens_forward_with_the_failing_verdict(self):
+        for _ in range(self.config["review_rounds"]["max"]):
+            support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        self.assertEqual(self._cands(), {"approve-plan": "sequence"})
+
+    def test_gate_decision_resets_the_round_window(self):
+        # A human rejection at approve-plan starts a fresh cycle: verdicts
+        # from before the decision must not satisfy (or exhaust) the new one.
+        support.seed_review_verdict(self.run, verdict="APPROVED")
+        self.st["gates"]["approve-plan"] = {
+            "decision": "rejected", "decided_at": "2999-01-01T00:00:00+00:00"}
+        self.assertEqual(self._cands(), {})
+
+    def test_corrupt_ledger_fails_closed(self):
+        support.seed_review_verdict(self.run)
+        with open(self.run / "reviews.ndjson", "a", encoding="utf-8") as fh:
+            fh.write("{torn record\n")
+        with self.assertRaises(transitions.TransitionError) as ctx:
+            self._cands()
+        self.assertIn("corrupt", str(ctx.exception))
+
+    def test_timestamp_tie_prefers_changes_requested(self):
+        # Two hook processes can stamp identical `at` (coarse OS clock);
+        # a first-wins max() would let APPROVED shadow the rejection.
+        tie = "2026-01-01T00:00:01+00:00"
+        for verdict in ("APPROVED", "CHANGES_REQUESTED"):
+            ndjson.append_record(self.run / "reviews.ndjson",
+                                 {"task": None, "mode": "plan-review",
+                                  "verdict": verdict, "at": tie})
+        self.assertEqual(self._cands(), {"plan": "returns_to"})
+
+    def test_returns_to_reentry_rearms_registration(self):
+        # The loop edge re-arms requires_tasks_registered: a revised plan
+        # must re-register (else round 1's task list sails to the gate).
+        support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        transitions.advance_cursor(self.st, self.manifest, self.config,
+                                   "plan", T0, run=self.run)
+        self.assertTrue(all(t.get("provisional")
+                            for t in self.st["tasks"]))
+        self.assertEqual(transitions.cursor_candidates(
+            self.st, self.manifest, self.config, run=self.run), {})
+        for t in self.st["tasks"]:   # unit shortcut for plan-register
+            t.pop("provisional", None)
+        self.assertIn("plan-review", transitions.cursor_candidates(
+            self.st, self.manifest, self.config, run=self.run))
+
+    def test_gate_decision_is_consumed_by_the_edge_it_legalizes(self):
+        # A stale rejection must not re-open its on_reject edge on a later
+        # arrival — after one human rejection, a humanless
+        # plan↔plan-review↔approve-plan cycle was engine-legal without this.
+        support.seed_review_verdict(self.run)
+        transitions.advance_cursor(self.st, self.manifest, self.config,
+                                   "approve-plan", T0, run=self.run)
+        gates.present(self.st, "approve-plan", T0)
+        self.st["gates"]["approve-plan"]["decision"] = "rejected"
+        transitions.advance_cursor(self.st, self.manifest, self.config,
+                                   "plan", T0, run=self.run)
+        entry = self.st["gates"]["approve-plan"]
+        self.assertNotIn("decision", entry)
+        self.assertEqual(entry["consumed_decision"], "rejected")
+        # presented_at is consumed WITH the decision (re-verification
+        # finding: left behind, the capture hook's presented-and-undecided
+        # window stayed open forever, and a decide at a re-arrived gate
+        # could qualify stray prompts against the stale presentation)
+        self.assertNotIn("presented_at", entry)
+        # re-arrival at the gate fail-closes until a fresh present+decide
+        for t in self.st["tasks"]:
+            t.pop("provisional", None)   # unit shortcut for re-register
+        support.seed_review_verdict(self.run)
+        transitions.advance_cursor(self.st, self.manifest, self.config,
+                                   "plan-review", T0, run=self.run)
+        transitions.advance_cursor(self.st, self.manifest, self.config,
+                                   "approve-plan", T0, run=self.run)
+        self.assertEqual(transitions.cursor_candidates(
+            self.st, self.manifest, self.config, run=self.run), {})
 
 
 class RunCompletion(Harness):
@@ -639,6 +772,27 @@ class TaskFsm(Harness):
                               "verdict": "APPROVED"})
         transitions.transition_task(st, self.fsm, self.config, run, self.key,
                                     "T1", "done")   # now legal
+
+    def test_reviewer_verdict_timestamp_tie_fails_closed(self):
+        """Same tie rule as verdict_bound: two hook processes can stamp
+        identical `at`, and a first-read APPROVED must not shadow a
+        same-instant rejection."""
+        from harness import ndjson
+        run, st = _bootstrap(self.workspace, "quick", intents=())
+        self.advance_to(st, run, "develop")
+        transitions.transition_task(st, self.fsm, self.config, run, self.key,
+                                    "T1", "in-progress")
+        transitions.transition_task(st, self.fsm, self.config, run, self.key,
+                                    "T1", "in-review")
+        tie = "2999-01-01T00:00:00+00:00"   # both after in_review_at
+        for verdict in ("APPROVED", "CHANGES_REQUESTED"):
+            ndjson.append_record(run / "reviews.ndjson",
+                                 {"task": "T1", "mode": "review",
+                                  "verdict": verdict, "at": tie})
+        with self.assertRaises(transitions.TransitionError) as ctx:
+            transitions.transition_task(st, self.fsm, self.config, run,
+                                        self.key, "T1", "done")
+        self.assertIn("not APPROVED", str(ctx.exception))
 
     def test_missing_in_review_stamp_fails_closed(self):
         """Adversarial-review finding: `entered = task.get('in_review_at')

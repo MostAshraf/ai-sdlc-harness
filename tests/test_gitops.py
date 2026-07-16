@@ -897,10 +897,14 @@ class CliEndToEnd(GitopsHarness):
             if step_def.get("gate"):
                 gates_mod.present(st, current, "2026-01-01T00:00:00+00:00")
                 st["gates"][current]["decision"] = "approved"
+            if step_def.get("verdict_bound"):
+                support.seed_review_verdict(
+                    self.run, mode=step_def["verdict_bound"]["mode"])
             nxt = next(iter(transitions.cursor_candidates(
-                st, self.manifest, self.config)))
+                st, self.manifest, self.config, run=self.run)))
             transitions.advance_cursor(st, self.manifest, self.config, nxt,
-                                       "2026-01-01T00:00:00+00:00")
+                                       "2026-01-01T00:00:00+00:00",
+                                       run=self.run)
         state_mod.save(self.run, self.workspace, st)
 
     def test_full_mode_tdd_flow_through_the_cli(self):

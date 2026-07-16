@@ -69,9 +69,13 @@ class GuardHarness(unittest.TestCase):
                 if manifest["steps"][cur].get("requires_tasks_terminal"):
                     for t in st.get("tasks", []):
                         t["status"] = "done"  # unit shortcut
-                nxt = next(iter(transitions.cursor_candidates(st, manifest, config)))
+                if manifest["steps"][cur].get("verdict_bound"):
+                    support.seed_review_verdict(
+                        run, mode=manifest["steps"][cur]["verdict_bound"]["mode"])
+                nxt = next(iter(transitions.cursor_candidates(
+                    st, manifest, config, run=run)))
                 transitions.advance_cursor(st, manifest, config, nxt,
-                                           "2026-01-01T00:00:00+00:00")
+                                           "2026-01-01T00:00:00+00:00", run=run)
             state_mod.save(run, self.workspace, st)
         return run
 
@@ -508,6 +512,29 @@ class BashGuard(GuardHarness):
         self.assert_allows("bash", bash("ls .claude/context/repo-map/", plan))
         self.assert_allows("bash", bash("harness repo-map-check --repo-name x "
                                         "--repo /p", plan))
+
+    def test_subagents_cannot_register_scope_or_tasks(self):
+        """scope-register records the HUMAN's confirmation and plan-register
+        the gate-ratified task list — a subagent shape minting either from
+        inside its own spawn anchors 'user-confirmed' to nothing
+        (adversarial-review, plan-accuracy round: the intake planner has
+        Bash and is live at exactly the cursors where the verbs are legal)."""
+        for shape in ("ai-sdlc-harness:planner:ai-sdlc-planner",
+                      "ai-sdlc-reviewer", "ai-sdlc-developer"):
+            self.assert_blocks(
+                "bash",
+                bash("${CLAUDE_PLUGIN_ROOT}/bin/harness scope-register "
+                     "--repos-json '[\"/p\"]' --run ai/r", shape),
+                "orchestrator-only")
+            self.assert_blocks(
+                "bash",
+                bash("harness plan-register --tasks-json '[]' --run ai/r",
+                     shape),
+                "orchestrator-only")
+        # the orchestrator (no agent context) stays allowed
+        self.assert_allows(
+            "bash", bash("${CLAUDE_PLUGIN_ROOT}/bin/harness scope-register "
+                         "--repos-json '[\"/p\"]' --run ai/r"))
 
     def test_unparseable_payload_fails_open(self):
         proc = subprocess.run([sys.executable, str(GUARDS), "bash"],

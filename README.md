@@ -1,6 +1,6 @@
 # ai-sdlc-harness · v3.0
 
-**A governed multi-agent SDLC pipeline for Claude Code** — a ground-up rewrite of [ai-sdlc-harness](https://github.com/MostAshraf/ai-sdlc-harness). Drives a real engineering workflow — fetch → plan → proven-red TDD → review → security → PR → comment rounds → reconcile → metrics — across one or many repos. No application code lives here: only the pipeline manifest, the Python core that enforces it, and the agents, skills, and hooks that run it.
+**A governed multi-agent SDLC pipeline for Claude Code** — a ground-up rewrite of [ai-sdlc-harness](https://github.com/MostAshraf/ai-sdlc-harness). Drives a real engineering workflow — fetch → scope-confirmed plan → independent plan review → proven-red TDD → review → security → PR → comment rounds → reconcile → metrics — across one or many repos. No application code lives here: only the pipeline manifest, the Python core that enforces it, and the agents, skills, and hooks that run it.
 
 | Command | Purpose |
 |---|---|
@@ -68,8 +68,9 @@ flowchart LR
     classDef output fill:#eaf3ff,stroke:#36b,stroke-width:1px,color:#024
 
     F([fetch + classify]):::orch
-    I[intake]:::agent
+    I[intake + confirm target repos]:::agent
     P[plan]:::agent
+    PR[plan-review]:::agent
     G1{approve-plan}:::human
     PF[preflight]:::orch
     D[develop — proven-red TDD per task]:::agent
@@ -88,7 +89,9 @@ flowchart LR
     RC[reconcile]:::output
     M[metrics]:::output
 
-    F -->|full| I --> P --> G1
+    F -->|full| I --> P --> PR
+    PR -->|reviewer APPROVED, or round budget exhausted| G1
+    PR -->|CHANGES_REQUESTED — forced revision loop| P
     G1 -->|approved| PF
     G1 -->|rejected| P
     F -->|quick| PF
@@ -111,7 +114,7 @@ flowchart LR
     AF -.->|new comments| AC
 ```
 
-**Full mode** has three unconditional human gates (plan, implementation, pre-PR), one conditional gate (security — fires only when the aggregate finding severity meets the configured threshold, default `medium`), and one multi-pick gate (comment selection, inside the on-demand PR-comments group). **Quick mode** — trivial changes classified at fetch — keeps only the pre-PR gate. Everything between gates runs hands-off.
+**Full mode** has three unconditional human gates (plan, implementation, pre-PR), one conditional gate (security — fires only when the aggregate finding severity meets the configured threshold, default `medium`), and one multi-pick gate (comment selection, inside the on-demand PR-comments group). Before the plan ever reaches you, an independent **plan-review** (reviewer shape) checks it against the numbered acceptance criteria, the codebase's observed conventions, and the confirmed repo scope — a `CHANGES_REQUESTED` verdict mechanically forces a revision loop (bounded by `review_rounds.max`; exhaustion escalates to you *with* the failing report attached), and its hook-captured verdict is what legalizes the step's exits, never the orchestrator's claim. **Quick mode** — trivial changes classified at fetch — keeps only the pre-PR gate. Everything between gates runs hands-off.
 
 At **any** cursor position, an ad-hoc human request is legal: it spawns the reviewer in `request-triage` mode (a declared always-legal spawn), which classifies the request against the approved plan. Out-of-scope requests surface back to you with explicit options — never silently merged.
 
@@ -158,7 +161,7 @@ Instead of one file per role fusing "who may do what" with "what procedure to fo
 |---|---|---|---|
 | **planner** | `intake` · `plan` · `repo-map` | Read/Grep/Glob/Write/Edit/Bash | Writes only under `ai/<run>/` and `.claude/context/` — never repo source |
 | **developer** | `develop` · `harden` · `fixup` | Read/Grep/Glob/Write/Edit/Bash | Works only inside its task worktree; non-test writes refused until the task's red-proof is sealed |
-| **reviewer** | `review` · `pre-pr` · `analyze-comments` · `request-triage` | Read/Grep/Glob/Bash | Strictly read-only — no Write/Edit granted, shell writes blocked (a literal `/tmp` scratch path is the one exception); builds and test runs allowed, so it verifies independently instead of trusting another agent's claim |
+| **reviewer** | `review` · `plan-review` · `pre-pr` · `analyze-comments` · `request-triage` | Read/Grep/Glob/Bash | Strictly read-only — no Write/Edit granted, shell writes blocked (a literal `/tmp` scratch path is the one exception); builds and test runs allowed, so it verifies independently instead of trusting another agent's claim |
 
 The **orchestrator** (the main Claude Code conversation running `/dev-workflow`) is deliberately thin: a coordinator that walks the manifest, spawns shapes with structured `harness-mode:` headers, and calls `harness` verbs. It never writes code, never touches run-authority files directly, and never runs raw git — the guards block those paths and point it back to the owned verbs.
 
@@ -173,7 +176,7 @@ ai/2026-07-08-PROJ-123/
 ├── state.yaml            # THE authority: cursor, tasks, artifacts, gate decisions — HMAC-chain-sealed
 ├── work-item.json        # fetched + provider-normalized work item
 ├── requirements.md       # intake output
-├── plan.md               # edge cases, risk tiers, test-intents, approach options, diagrams
+├── plan.md               # edge cases, risk tiers, test-intents, file-touch manifests, AC traceability, diagrams
 ├── events.ndjson         # every deviation: test revisions, rejections, blocks, stalls, skipped gates
 ├── tokens.ndjson         # real per-invocation token spend
 ├── reviews.ndjson        # hook-captured reviewer verdicts (what "done" transitions check)
@@ -225,7 +228,11 @@ A work item spanning repos gets per-repo task lanes; cross-repo API contracts ar
 
 ### The repo map
 
-`/init-workspace` (optionally) and `/repo-map-refresh` generate a tiered codebase map under `.claude/context/repo-map/` — directories and modules by purpose, key abstractions, notable patterns — stamped with the SHA it was generated at and flagged stale after 50 commits (configurable). A map with no content cannot be stamped, so an empty generation can never be certified fresh. The planner's intake and plan instructions point it at the map directly (index first, then only the areas the story touches) instead of re-deriving the codebase from scratch every run. Auto-generated only, never hand-maintained: corrections go through regeneration.
+`/init-workspace` (optionally) and `/repo-map-refresh` generate a tiered codebase map under `.claude/context/repo-map/` following a declared content contract: per repo, an `index.md` (purpose, stack, module inventory, cross-repo edges — the tier intake proposes target repos from), `areas/*` detail files (each loadable alone), and a `conventions.md` (observed naming/layering/error-handling/test patterns, each with a cited example — the tier plan-review checks plans against). Stamped with the SHA it was generated at and flagged stale after 50 commits (configurable); a map with no content cannot be stamped, so an empty generation can never be certified fresh. The planner's intake and plan instructions point it at the map directly (index first, then only the areas the story touches) instead of re-deriving the codebase from scratch every run. Auto-generated only, never hand-maintained: corrections go through regeneration.
+
+### Scoped planning
+
+Intake ends by proposing the story's **target repos** with evidence from the map indexes; you confirm the set, and the orchestrator records it via `harness scope-register` — mechanical scope, not a convention: `plan-register` refuses any task outside it (and refuses outright when no scope was ever confirmed), re-registering a scope that would strand already-registered tasks is refused, the registration verbs are guard-blocked from subagent shapes, and widening mid-plan goes back through you. The plan itself must carry per-task file-touch manifests, verify commands, size budgets, an AC-traceability table over intake's numbered acceptance criteria, and an explicit out-of-scope section — the material both the independent plan-review and the developer run on.
 
 ## Guardrail Hooks
 
@@ -246,12 +253,12 @@ Every guard's fail-open/fail-closed policy is chosen deliberately and tested: re
 
 ## The `harness` CLI
 
-All ~49 owned verbs run through the wrapper `${CLAUDE_PLUGIN_ROOT}/bin/harness` (resolves the plugin venv in either OS layout, falls back to system `python3`/`python`). It runs on macOS, Linux, and Windows — on Windows it executes under Git Bash, with `bin/harness.cmd` as the cmd.exe sibling. Agents call it; you rarely need to — except `abort`.
+All ~50 owned verbs run through the wrapper `${CLAUDE_PLUGIN_ROOT}/bin/harness` (resolves the plugin venv in either OS layout, falls back to system `python3`/`python`). It runs on macOS, Linux, and Windows — on Windows it executes under Git Bash, with `bin/harness.cmd` as the cmd.exe sibling. Agents call it; you rarely need to — except `abort`.
 
 | Group | Verbs |
 |---|---|
 | Workspace setup | `init` · `discover` · `ensure-default-branch` · `init-verify` · `init-section` · `init-finalize` · `add-repo` · `migrate-detect` · `migrate-extract` · `resolve-model` · `resolve-coverage-cmd` |
-| Pipeline steps | `fetch` · `preflight` · `plan-register` · `quick-recheck` · `security-scan` · `reconcile-contracts` · `create-pr` · `fetch-pr-comments` · `reconcile` · `write-back` · `metrics` |
+| Pipeline steps | `fetch` · `scope-register` · `preflight` · `plan-register` · `quick-recheck` · `security-scan` · `reconcile-contracts` · `create-pr` · `fetch-pr-comments` · `reconcile` · `write-back` · `metrics` |
 | State & evidence | `bootstrap` · `cursor` · `task` · `artifact` · `gate` · `stall` · `log-event` · `verify` · `show` · `status` · `abort` · `complete` · `reseal` |
 | TDD proof | `verify-red` (and `--revise`) · `show-redproof` |
 | Git (owned) | `worktree-add` · `worktree-remove` · `commit` · `merge-task` · `sync-branch` · `push` · `publish-mirror` |
@@ -303,7 +310,7 @@ ai-sdlc-harness/
 │   └── init-workspace/ · add-repo/ · migrate-workspace/ · workspace-config/ · workflow-status/ · repo-map-refresh/
 ├── bin/harness                  # wrapper script resolving the plugin venv (+ harness.cmd for Windows)
 ├── tools/                       # meta-tooling: line-budget checker, sandbox workspace generators
-└── tests/                       # 606 stdlib-unittest tests
+└── tests/                       # 636 stdlib-unittest tests
 ```
 
 Workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside *your* working directory by `/init-workspace` and the pipeline. They never live inside this plugin repo.
@@ -326,7 +333,7 @@ python -m venv .venv; .venv\Scripts\pip install pyyaml
 .venv\Scripts\python -m unittest discover -s tests
 ```
 
-The test suite (606 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of both pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (636 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of both pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 

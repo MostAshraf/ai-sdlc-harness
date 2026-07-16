@@ -75,6 +75,49 @@ class ValidatorCatchesBrokenManifest(unittest.TestCase):
         broken["steps"]["develop"]["spawns"][0]["mode"] = "juggling"
         self.assertTrue(any("no mode 'juggling'" in e for e in self._errors(broken)))
 
+    def test_verdict_bound_on_gate_step_refused(self):
+        broken = copy.deepcopy(self.manifest)
+        broken["steps"]["approve-plan"]["verdict_bound"] = {
+            "mode": "plan-review", "bound": {"config": "review_rounds.max"}}
+        self.assertTrue(any("not meaningful on a gate step" in e
+                            for e in self._errors(broken)))
+
+    def test_verdict_bound_wrong_shape_refused(self):
+        broken = copy.deepcopy(self.manifest)
+        broken["steps"]["plan-review"]["verdict_bound"] = {"mode": "plan-review"}
+        self.assertTrue(any("must be exactly" in e for e in self._errors(broken)))
+
+    def test_verdict_bound_mode_must_be_spawned_by_the_step(self):
+        # A step gated on a verdict it can never produce would deadlock at
+        # runtime — the validator must refuse it at declaration.
+        broken = copy.deepcopy(self.manifest)
+        broken["steps"]["plan-review"]["verdict_bound"]["mode"] = "pre-pr"
+        self.assertTrue(any("not a mode this step spawns" in e
+                            for e in self._errors(broken)))
+
+    def test_verdict_bound_config_path_must_exist(self):
+        broken = copy.deepcopy(self.manifest)
+        broken["steps"]["plan-review"]["verdict_bound"]["bound"] = {
+            "config": "no.such.knob"}
+        self.assertTrue(any("'no.such.knob' not found" in e
+                            for e in self._errors(broken)))
+
+    def test_verdict_bound_requires_returns_to(self):
+        broken = copy.deepcopy(self.manifest)
+        del broken["steps"]["plan-review"]["returns_to"]
+        self.assertTrue(any("requires a `returns_to` edge" in e
+                            for e in self._errors(broken)))
+
+    def test_verdict_bound_cannot_share_a_step_with_an_escalation_source(self):
+        # Two data features each claiming exclusive exit ownership would
+        # resolve by interpreter ordering — refused at validation instead.
+        broken = copy.deepcopy(self.manifest)
+        broken["steps"]["quick-recheck"]["verdict_bound"] = {
+            "mode": "plan-review", "bound": {"config": "review_rounds.max"}}
+        broken["steps"]["quick-recheck"]["returns_to"] = "develop"
+        self.assertTrue(any("cannot share a step with an escalation source"
+                            in e for e in self._errors(broken)))
+
     def test_bad_on_reject_target(self):
         broken = copy.deepcopy(self.manifest)
         broken["steps"]["approve-plan"]["on_reject"] = "no-such-step"
