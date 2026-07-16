@@ -33,9 +33,11 @@ The original harness works, but almost all of its accumulated complexity compens
 Not yet published to a plugin marketplace — run it from a local clone:
 
 ```sh
-git clone <this-repo> ai-sdlc-harness
-claude --plugin-dir /path/to/ai-sdlc-harness
+git clone https://github.com/MostAshraf/ai-sdlc-harness.git
+claude --plugin-dir ./ai-sdlc-harness
 ```
+
+(SSH works too: `git clone git@github.com:MostAshraf/ai-sdlc-harness.git`. `--plugin-dir` takes the clone's path — absolute or relative — so run `claude` from wherever suits you.)
 
 Then, inside Claude Code:
 
