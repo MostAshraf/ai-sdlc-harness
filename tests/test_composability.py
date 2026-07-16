@@ -118,6 +118,47 @@ class ModeComposition(unittest.TestCase):
                                        "pre-pr", "2026-07-08T00:00:00Z")
         self.assertIn("docs-sync", str(ctx.exception))
 
+    def test_verdict_bound_step_composes_and_the_engine_derives_its_exits(self):
+        """plan-review (a `verdict_bound` step) is declared data like any
+        other: a new mode reusing it validates, and the engine derives its
+        exits from the verdict ledger with no step-name hardcode — while
+        the SOLO probe above proves a mode may equally OMIT it."""
+        import tempfile
+        from tests import support as tsupport
+        seq = list(SOLO)
+        seq.insert(seq.index("approve-plan"), "plan-review")
+        self.manifest["modes"]["solo"] = seq
+        issues = validate(self.manifest, self.surfaces, self.config)
+        self.assertTrue(issues.ok, issues.errors)
+
+        run = Path(tempfile.mkdtemp())
+        try:
+            state = {
+                "mode": "solo",
+                "cursor": {"current_step": "plan-review",
+                           "completed_steps": ["fetch", "intake", "plan"]},
+                "artifacts": {"work-item": "<w>", "requirements-summary": "<r>",
+                              "scope": ["<s>"], "plan": "<p>",
+                              "test-intents": "<i>", "tasks": "<t>"},
+                "gates": {}, "tasks": [{"id": "T1", "status": "pending"}],
+                "metrics": {"plan-review": {"started_at": "t0", "ended_at": None}},
+            }
+            # no verdict -> fail-closed, run handle or not
+            self.assertEqual(transitions.cursor_candidates(
+                state, self.manifest, self.config), {})
+            self.assertEqual(transitions.cursor_candidates(
+                state, self.manifest, self.config, run=run), {})
+            tsupport.seed_review_verdict(run, verdict="CHANGES_REQUESTED")
+            self.assertEqual(transitions.cursor_candidates(
+                state, self.manifest, self.config, run=run),
+                {"plan": "returns_to"})
+            tsupport.seed_review_verdict(run, verdict="APPROVED")
+            self.assertEqual(transitions.cursor_candidates(
+                state, self.manifest, self.config, run=run),
+                {"approve-plan": "sequence"})
+        finally:
+            tsupport.rmtree(run)
+
 
 class ModeEntry(unittest.TestCase):
     """A run's entry mode is minted from declared data end to end: argparse
@@ -141,25 +182,77 @@ class ModeEntry(unittest.TestCase):
 
     def test_classify_returns_a_verdict_not_a_mode_name(self):
         config = {"quick_mode": {"disqualify_keywords": ["migration"]}}
-        eligible, reason = workflow.classify(
+        verdict, reason = workflow.classify(
             {"title": "t", "description": "Mode: quick\nfix a typo"}, config)
-        self.assertIs(eligible, True)
+        self.assertEqual(verdict, "quick-eligible")
         self.assertEqual(reason, "explicitly hinted")
-        eligible, reason = workflow.classify(
+        # a disqualified quick hint falls to the default tier — the
+        # keywords guard skipping the plan machinery, nothing else
+        verdict, reason = workflow.classify(
             {"title": "t", "description": "Mode: quick\nadd a migration"}, config)
-        self.assertIs(eligible, False)
+        self.assertEqual(verdict, "default")
         self.assertIn("migration", reason)
 
+    def test_classify_lean_tiers(self):
+        config = {"quick_mode": {"disqualify_keywords": ["migration"]}}
+        # explicit per-item hint
+        verdict, reason = workflow.classify(
+            {"title": "t", "description": "Mode: lean\nroutine change"}, config)
+        self.assertEqual((verdict, reason), ("lean-requested", "explicitly hinted"))
+        # quick hint outranks lean hint when both present and quick is clean
+        verdict, _ = workflow.classify(
+            {"title": "t", "description": "Mode: quick\nMode: lean\ntypo"},
+            config)
+        self.assertEqual(verdict, "quick-eligible")
+        # workspace default
+        verdict, reason = workflow.classify(
+            {"title": "t", "description": "no hints"},
+            {**config, "default_mode": "lean"})
+        self.assertEqual((verdict, reason),
+                         ("lean-requested", "workspace default_mode"))
+        # keywords never disqualify lean — it keeps the plan machinery
+        verdict, _ = workflow.classify(
+            {"title": "t", "description": "Mode: lean\nadd a migration"},
+            config)
+        self.assertEqual(verdict, "lean-requested")
+
+    def test_classify_full_hint_escapes_everything(self):
+        # the per-item escape from a lean workspace default: an item asking
+        # for MORE gating always gets it — full outranks every other tier
+        config = {"quick_mode": {"disqualify_keywords": []},
+                  "default_mode": "lean"}
+        verdict, reason = workflow.classify(
+            {"title": "t", "description": "Mode: full\npayments migration"},
+            config)
+        self.assertEqual((verdict, reason), ("full-requested", "explicitly hinted"))
+        verdict, _ = workflow.classify(
+            {"title": "t", "description": "Mode: quick\nMode: full\ntypo"},
+            config)
+        self.assertEqual(verdict, "full-requested")
+
+    def test_classify_refuses_an_invalid_default_mode(self):
+        # fail loud at fetch, never silently-full for the workspace's life
+        from harness import state as state_mod
+        with self.assertRaises(state_mod.StateError) as ctx:
+            workflow.classify({"title": "t", "description": "x"},
+                              {"default_mode": "laen"})
+        self.assertIn("default_mode", str(ctx.exception))
+
     def test_select_mode_reads_the_declared_mapping(self):
-        self.assertEqual(workflow.select_mode(self.manifest, True), "quick")
-        self.assertEqual(workflow.select_mode(self.manifest, False), "full")
+        self.assertEqual(
+            workflow.select_mode(self.manifest, "quick-eligible"), "quick")
+        self.assertEqual(
+            workflow.select_mode(self.manifest, "lean-requested"), "lean")
+        self.assertEqual(
+            workflow.select_mode(self.manifest, "full-requested"), "full")
+        self.assertEqual(workflow.select_mode(self.manifest, "default"), "full")
 
     def test_select_mode_refuses_a_mapping_to_an_undeclared_mode(self):
         broken = copy.deepcopy(self.manifest)
-        broken["steps"]["fetch"]["selects_mode"]["true"] = "ghost"
+        broken["steps"]["fetch"]["selects_mode"]["quick-eligible"] = "ghost"
         from harness import state as state_mod
         with self.assertRaises(state_mod.StateError) as ctx:
-            workflow.select_mode(broken, True)
+            workflow.select_mode(broken, "quick-eligible")
         self.assertIn("ghost", str(ctx.exception))
 
 

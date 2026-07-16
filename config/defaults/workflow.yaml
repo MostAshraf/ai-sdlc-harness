@@ -19,6 +19,28 @@ stall:
 repo_map:
   stale_after_commits: 50
 
+# The mode a work item lands on when it carries no `Mode:` hint of its own:
+# `full` (three unconditional human gates) or `lean` (exception-based
+# gating — the plan gate fires only when the plan-review panel exhausted
+# its round budget; approve-impl absent; one guaranteed human stop at
+# pre-PR). Quick is deliberately NOT defaultable: it needs per-item
+# eligibility (explicit hint + no disqualifying keyword), never a standing
+# workspace choice. A single item can still override in ANY direction with
+# `Mode: full` / `Mode: lean` / `Mode: quick` in its description — an
+# explicit full hint outranks everything (more gating is always grantable).
+default_mode: full
+
+# Adversarial plan review: the lens panel the plan-review step runs BEFORE
+# its synthesizer. Each entry spawns one reviewer in `plan-attack` mode with
+# that lens's hunt (steps/plan-attack-task.md defines the lens vocabulary);
+# the synthesizer (mode plan-review) reads the lens reports and issues THE
+# verdict — lens verdicts are advisory evidence, never read by the engine
+# (verdict_bound filters on mode plan-review), so panel size can't burn the
+# round budget. An EMPTY list is the declared single-reviewer fallback: no
+# lenses, the synthesizer reviews the plan directly.
+plan_review:
+  lenses: [contradictions, gaps]
+
 # Severity model for the security step + conditional gate predicate.
 security:
   severity_order: [info, low, medium, high, critical]

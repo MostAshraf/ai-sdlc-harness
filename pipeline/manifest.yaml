@@ -20,12 +20,30 @@
 #                             {value: <produced artifact>, at_least: {config: key}}
 #   steps.<id>.on_reject      declared re-entry target on gate rejection (B10)
 #   steps.<id>.returns_to     declared return edge for an off-sequence side-step
+#   steps.<id>.verdict_bound  {mode, bound: {config: key}, outcome_artifact?}
+#                             — the step's exits are derived from the hook-
+#                             captured reviewer-verdict ledger
+#                             (reviews.ndjson) for that mode: no in-window
+#                             verdict -> no exits; latest CHANGES_REQUESTED
+#                             under the bound -> only the step's returns_to
+#                             edge; APPROVED or bound exhausted -> only
+#                             forward. Requires returns_to. If
+#                             outcome_artifact names one of the step's
+#                             produces, the ENGINE records it: `pending` on
+#                             entry (so a follower's `when` predicate can
+#                             always evaluate), then refreshed from the
+#                             ledger at every exit evaluation —
+#                             approved | exhausted | pending — ledger-
+#                             derived, never orchestrator-claimed (a
+#                             downstream `when` gate can trust it).
 #   steps.<id>.selects_mode   the single declared classify branch (fetch only),
 #                             schema-validated AND runtime-interpreted:
-#                             workflow.classify() returns the quick_eligible
-#                             VERDICT; workflow.select_mode() resolves it to a
-#                             mode name through this mapping — retargeting the
-#                             branch (e.g. at a new mode) is a data change
+#                             workflow.classify() returns a named mode_verdict
+#                             (full-requested | quick-eligible |
+#                             lean-requested | default); workflow.
+#                             select_mode() resolves it to a mode name
+#                             through this mapping — retargeting the branch
+#                             (e.g. at a new mode) is a data change
 #   groups.<id>               on-demand repeatable step-group with re-entry
 #   escalations               declared cross-mode edges (RC4)
 #   always_legal_spawns       cross-cutting spawns legal at any cursor
@@ -43,15 +61,29 @@ steps:
     # eligibility classifier; seed state.yaml (from-nothing transition) with a
     # single task. In quick mode that seed IS the task list.
     produces: [work-item, change-type, tasks]
+    # Named verdicts, not booleans: classify() mints a VERDICT (its
+    # vocabulary), this mapping alone turns it into a mode — an explicit
+    # `Mode: full` hint outranks everything (more gating is always
+    # grantable), quick needs explicit eligibility (hint + no disqualifying
+    # keyword), lean is requested (work-item `Mode: lean` hint, or the
+    # workspace's `default_mode: lean`), everything else lands on full.
     selects_mode:
-      from: classify.quick_eligible
-      "true": quick
-      "false": full
+      from: classify.mode_verdict
+      full-requested: full
+      quick-eligible: quick
+      lean-requested: lean
+      default: full
 
   intake:
+    # Besides the requirements summary (with NUMBERED acceptance criteria —
+    # AC1, AC2, … — the ids plan's traceability table and plan-review's
+    # coverage check key on), intake ends by proposing the story's Target
+    # Repos from the repo-map indexes; the human confirms and the
+    # orchestrator records the set via `harness scope-register` (the `scope`
+    # artifact + state.scope). plan-register refuses tasks outside it.
     spawns: [{shape: planner, mode: intake}]
     preconditions: [work-item]
-    produces: [requirements-summary]
+    produces: [requirements-summary, scope]
 
   plan:
     # Plan content contract (coverage decisions): edge-case enumeration, risk
@@ -63,8 +95,13 @@ steps:
     # skills/dev-workflow/steps/plan-task.md. Replaces the fetch seed task
     # list.
     spawns: [{shape: planner, mode: plan}]
-    preconditions: [requirements-summary]
-    produces: [plan, test-intents, tasks]
+    # `scope` is both consumed (the planner decomposes ONLY within the
+    # human-confirmed target repos) and re-producible here: a revision
+    # round that legitimately needs a repo outside the confirmed set goes
+    # back through the user and re-registers at this cursor — widening is
+    # legal but never silent.
+    preconditions: [requirements-summary, scope]
+    produces: [plan, test-intents, tasks, scope]
     # The cursor cannot leave `plan` while the task list is still the
     # fetch-seeded provisional placeholder (adversarial-review finding:
     # nothing forced `plan-register` to run, so a forgotten registration
@@ -72,9 +109,75 @@ steps:
     # on the placeholder task with empty test_intents).
     requires_tasks_registered: true
 
+  plan-review:
+    # Independent pre-gate plan review, run as an ADVERSARIAL PANEL: one
+    # `plan-attack` reviewer per configured lens (config plan_review.lenses
+    # — contradictions & collisions, gaps & completeness by default; empty
+    # list = single-reviewer fallback), batched in one message, then a
+    # `plan-review` synthesizer that reads the lens reports, spot-verifies
+    # against real code, groups findings by root cause, and issues THE
+    # verdict. Checks span AC coverage (every numbered criterion in
+    # requirements.md maps to a task + test-intent), conventions
+    # consistency (repo-map conventions.md + spot-reads of the code the
+    # plan cites), dependency-edge and contract-signature audit, scope
+    # containment. Reviewers are read-only; the orchestrator persists the
+    # reports (pre-pr pattern). Only the SYNTHESIZER's hook-captured
+    # verdict gates this step's exits — verdict_bound filters on mode
+    # plan-review, so lens verdicts are advisory evidence that can neither
+    # move the window nor burn the round budget.
+    spawns:
+      - {shape: reviewer, mode: plan-attack}
+      - {shape: reviewer, mode: plan-review}
+    # `scope` is a real runtime read (the reviewer's scope-containment
+    # check reads state.scope) — declared so the validator's reordering
+    # proof covers it, same rule as create-pr's `branches`.
+    preconditions: [plan, requirements-summary, scope]
+    # plan-review.outcome is ENGINE-recorded (verdict_bound.outcome_artifact
+    # below): `pending` on entry, refreshed from the verdict ledger at
+    # every exit evaluation to `approved` / `exhausted` / `pending` — the
+    # same computation that derives the exits. The orchestrator never
+    # writes it, so lean's exception gate cannot be skipped past a
+    # rejecting panel by a drifting claim.
+    produces: [plan-review-report, plan-review.outcome]
+    # verdict_bound: this step's exits are DERIVED from the verdict ledger
+    # (interpreted by cursor_candidates, validated by the schema):
+    #   no in-window verdict          -> no exits (fail-closed, like an
+    #                                    undecided gate)
+    #   CHANGES_REQUESTED under bound -> only `returns_to` is legal (the
+    #                                    revision loop is forced, not
+    #                                    advisory)
+    #   APPROVED, or bound exhausted  -> only forward is legal (bound
+    #                                    exhaustion reaches the human WITH
+    #                                    the failing report attached —
+    #                                    round N+ signals plan drift and the
+    #                                    human decides; never a deadlock)
+    # Window: verdicts strictly after the latest human gate decision — a
+    # rejection at ⟨approve-plan⟩ starts a fresh round budget for the new
+    # plan cycle instead of inheriting the old one. Rounds count captured
+    # CHANGES_REQUESTED RECORDS, not revision cycles: a duplicate capture
+    # (double spawn, stall re-invoke) burns budget toward the human —
+    # deliberately the safe direction, not a bug to compensate for.
+    returns_to: plan
+    verdict_bound: {mode: plan-review, bound: {config: review_rounds.max},
+                    outcome_artifact: plan-review.outcome}
+
   approve-plan:
     gate: true
     presents: plan
+    on_reject: plan
+
+  approve-plan-lean:
+    # Lean mode's EXCEPTION gate — management by exception: it fires only
+    # when the plan-review panel could not approve within the round budget
+    # (`plan-review.outcome = exhausted`); a panel-approved plan self-skips
+    # it via the same `when` machinery approve-security uses (the skip is
+    # ledgered as a gate-skipped event, so "skipped by predicate" is never
+    # confused with "never evaluated"). Full mode keeps its own
+    # unconditional approve-plan above — two declared gates, not one gate
+    # with mode-dependent behavior.
+    gate: true
+    presents: plan
+    when: {value: plan-review.outcome, equals: exhausted}
     on_reject: plan
 
   preflight:
@@ -205,10 +308,37 @@ modes:
     - fetch
     - intake
     - plan
+    - plan-review
     - approve-plan
     - preflight
     - develop
     - approve-impl
+    - harden
+    - security
+    - approve-security
+    - pre-pr
+    - approve-pre-pr
+    - create-pr
+    - reconcile
+    - metrics
+  # Lean: full's rigor (scoped plan, adversarial panel, proven-red TDD,
+  # security) with exception-based human gating — the panel-approved happy
+  # path reaches exactly ONE guaranteed human stop (approve-pre-pr).
+  # approve-plan-lean fires only on panel bound exhaustion; approve-impl is
+  # deliberately absent (its guarantees are already mechanical: per-task
+  # hook-captured reviewer APPROVED, red-proof, requires_tasks_terminal —
+  # the holistic pre-pr review + gate covers the aggregate). Chosen by the
+  # work item (`Mode: lean`) or the workspace's `default_mode: lean`. Note
+  # write_back.on_in_review rides approve-impl and therefore never fires in
+  # lean; status sync happens at PR time instead.
+  lean:
+    - fetch
+    - intake
+    - plan
+    - plan-review
+    - approve-plan-lean
+    - preflight
+    - develop
     - harden
     - security
     - approve-security

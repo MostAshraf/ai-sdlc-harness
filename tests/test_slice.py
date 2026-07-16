@@ -76,12 +76,18 @@ class VerticalSlice(unittest.TestCase):
                             "--date", "2026-01-01")["run"])
         self.cli("cursor", "--to", "intake", run=run)
         self.cli("cursor", "--to", "plan", run=run)
+        self.cli("scope-register", "--repos-json",
+                 json.dumps([str(self.repo)]), run=run)
         (run / "plan.md").write_text(
             "# Plan\n## T1: return 1 from x.val()\nTest-intents: test_val\n")
-        self.gate(run, "approve-plan")
         self.cli("plan-register", "--tasks-json",
                  json.dumps([{"id": "T1", "repo": str(self.repo)}]), run=run)
+        # cross plan-review on the hook-captured verdict, then decide the
+        # gate AT the gate (decide is cursor-anchored)
+        self.cli("cursor", "--to", "plan-review", run=run)
+        support.seed_review_verdict(run)
         self.cli("cursor", "--to", "approve-plan", run=run)
+        self.gate(run, "approve-plan")
         self.cli("cursor", "--to", "preflight", run=run)
         return run
 
@@ -158,15 +164,28 @@ class VerticalSlice(unittest.TestCase):
         # ---- walk to develop through real gates ------------------------------
         self.cli("cursor", "--to", "intake", run=run)
         self.cli("cursor", "--to", "plan", run=run)
+        # plan-register refuses without the user-confirmed target-repo scope
+        out = self.cli("plan-register", "--tasks-json",
+                       json.dumps([{"id": "T1", "repo": str(self.repo)}]),
+                       run=run, expect=1)
+        self.assertIn("no confirmed target-repo scope", out["error"])
+        self.cli("scope-register", "--repos-json",
+                 json.dumps([str(self.repo)]), run=run)
         (run / "plan.md").write_text(
             "# Plan\n## T1: return 1 from x.val()\nTest-intents: test_val\n")
-        self.gate(run, "approve-plan")
         # leaving `plan` with the fetch-seeded provisional task is refused
         # (requires_tasks_registered) — register the approved plan's tasks
-        self.cli("cursor", "--to", "approve-plan", run=run, expect=1)
+        self.cli("cursor", "--to", "plan-review", run=run, expect=1)
         self.cli("plan-register", "--tasks-json",
                  json.dumps([{"id": "T1", "repo": str(self.repo)}]), run=run)
+        # leaving plan-review requires the hook-captured reviewer verdict
+        # (verdict_bound): without one, no exit is legal
+        self.cli("cursor", "--to", "plan-review", run=run)
+        self.cli("cursor", "--to", "approve-plan", run=run, expect=1)
+        support.seed_review_verdict(run)
         self.cli("cursor", "--to", "approve-plan", run=run)
+        # the decision is derived AT the gate (decide is cursor-anchored)
+        self.gate(run, "approve-plan")
         self.cli("cursor", "--to", "preflight", run=run)
 
         branch = self.cli("preflight", "--repo", str(self.repo), run=run)["branch"]

@@ -12,10 +12,19 @@ harness-repo: <primary-repo-path>
 ```
 
 …plus the ask: read `work-item.json` (+ the repo-map at
-`.claude/context/repo-map/<repo-name>/` if present — index first, then
-only the area files the work item touches), produce
-`<run>/requirements.md` — restated requirements, acceptance criteria,
-ambiguities/clarifying questions for the human.
+`.claude/context/repo-map/<repo-name>/` if present — EVERY registered
+repo's `index.md` first, then only the area files the work item touches),
+produce `<run>/requirements.md` — restated requirements, acceptance
+criteria, ambiguities/clarifying questions for the human, and a Target
+Repos proposal. Two shape requirements downstream steps key on:
+
+- **Acceptance criteria are NUMBERED** (`AC1`, `AC2`, …) — the plan's
+  traceability table and plan-review's coverage check reference these ids;
+  an unnumbered criterion is invisible to both.
+- **`## Target Repos`**: which registered repos this story touches, each
+  with a one-line evidence-based reason grounded in the repo-map indexes
+  (or code reading if no map) — and name any registered repo it
+  deliberately does NOT touch when a human might expect it to.
 
 The repo-map is generated at `/init-workspace` and its freshness is
 (re)checked and stamped at **plan step 0** (the single owner). Here, just
@@ -48,5 +57,22 @@ task list is set at plan-register and replaces it wholesale.
 Record the declared artifact once requirements.md is final:
 `${CLAUDE_PLUGIN_ROOT}/bin/harness artifact --name requirements-summary
 --value requirements.md --run <run>`.
+
+**Confirm the target repos, then register the scope.** Present the Target
+Repos proposal to the user with its per-repo evidence — this is a
+confirm-a-default when the proposal is well-grounded (state the set you'll
+take), a real fork if the map gave genuinely ambiguous signals. Once
+confirmed, record it:
+
+```
+${CLAUDE_PLUGIN_ROOT}/bin/harness scope-register --run <run> \
+  --repos-json '["/abs/path/to/backend", "/abs/path/to/frontend"]'
+```
+
+Entries are the exact registered repo PATH strings (`repos.yaml` VALUES,
+same rule as plan-register's `repo` field), never the short names. This is
+mechanical scope: `plan-register` refuses any task whose repo is outside
+it, and the plan step freshness-checks only these repos. Skipping it
+doesn't defer the question — plan-register fails closed without a scope.
 
 Then advance: `${CLAUDE_PLUGIN_ROOT}/bin/harness cursor --to plan --run <run>`.

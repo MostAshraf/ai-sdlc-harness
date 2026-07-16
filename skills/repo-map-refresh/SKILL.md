@@ -31,9 +31,13 @@ fork a second copy of it elsewhere.
    spawn gating, planner's write-confinement to `ai/`/`.claude/context/`),
    which is worse than the guess looking right. The planner can only write
    under `ai/<run>/` and `.claude/context/` (guard-enforced — never repo
-   source), so point it at `.claude/context/repo-map/<name>/`. It writes
-   the tiered map there: a short top-level index (directories/modules by
-   purpose) plus per-area detail files, each loadable alone.
+   source), so point it at `.claude/context/repo-map/<name>/`. It follows
+   the map content contract
+   (`${CLAUDE_PLUGIN_ROOT}/skills/dev-workflow/steps/repo-map-task.md`):
+   `index.md` (purpose/stack/modules/cross-repo edges — intake's targeting
+   tier), `areas/*` detail files (each loadable alone), and
+   `conventions.md` (observed patterns with cited examples — what
+   plan-review checks plans against).
 3. Stamp it yourself, not the planner:
    `${CLAUDE_PLUGIN_ROOT}/bin/harness repo-map-stamp --repo-name <n> --repo <path>`
    — stamping is the orchestrator's job, never the planner's own.

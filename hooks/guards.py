@@ -409,6 +409,14 @@ HOOK_FORGE_RE = re.compile(
     r"\bguards\.py\b" + _CMD_GAP + r"\b(?:user-prompt|post-spawn|subagent-stop)\b")
 PLANNER_STAMP_RE = re.compile(
     r"\bharness\b" + _CMD_GAP + r"\brepo-map-stamp\b")
+# Registration verbs are orchestrator-only: the scope is the HUMAN's
+# confirmation recorded by the orchestrator, and the task list is what the
+# plan gate ratifies — a subagent shape minting either from inside its own
+# spawn would anchor "user-confirmed" to nothing (adversarial-review,
+# plan-accuracy round: the intake planner has Bash and is live at exactly
+# the cursors where these verbs are legal).
+SUBAGENT_REGISTER_RE = re.compile(
+    r"\bharness\b" + _CMD_GAP + r"\b(?:scope-register|plan-register)\b")
 # `(?!<)` after the colon: spawn prompts routinely quote
 # shared/status-block.md's reply template verbatim as instructions to the
 # subagent — including its literal `harness-task: <task-id or ->` example —
@@ -628,6 +636,12 @@ def guard_bash(p: dict) -> None:
             block("the planner never stamps its own repo-map output — "
                   "`repo-map-stamp` is the orchestrator's job, run once after "
                   "the planner's spawn returns (agents/planner.md).", cwd)
+        if shape_of(p.get("agent_type")) and SUBAGENT_REGISTER_RE.search(target):
+            block("scope-register and plan-register are orchestrator-only: "
+                  "the scope records the HUMAN's confirmation and the task "
+                  "list is what the plan gate ratifies — report your "
+                  "proposal in your status block; the orchestrator confirms "
+                  "with the user and registers it.", cwd)
 
 
 # ------------------------------------------------- Write/Edit path guards

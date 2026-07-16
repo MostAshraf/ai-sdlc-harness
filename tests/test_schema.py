@@ -75,6 +75,98 @@ class ValidatorCatchesBrokenManifest(unittest.TestCase):
         broken["steps"]["develop"]["spawns"][0]["mode"] = "juggling"
         self.assertTrue(any("no mode 'juggling'" in e for e in self._errors(broken)))
 
+    def test_verdict_bound_on_gate_step_refused(self):
+        broken = copy.deepcopy(self.manifest)
+        broken["steps"]["approve-plan"]["verdict_bound"] = {
+            "mode": "plan-review", "bound": {"config": "review_rounds.max"}}
+        self.assertTrue(any("not meaningful on a gate step" in e
+                            for e in self._errors(broken)))
+
+    def test_verdict_bound_wrong_shape_refused(self):
+        broken = copy.deepcopy(self.manifest)
+        broken["steps"]["plan-review"]["verdict_bound"] = {"mode": "plan-review"}
+        self.assertTrue(any("`verdict_bound` must be" in e
+                            for e in self._errors(broken)))
+        broken["steps"]["plan-review"]["verdict_bound"] = {
+            "mode": "plan-review", "bound": {"config": "review_rounds.max"},
+            "surprise": True}   # unknown keys refused too
+        self.assertTrue(any("`verdict_bound` must be" in e
+                            for e in self._errors(broken)))
+
+    def test_verdict_bound_outcome_artifact_must_be_produced(self):
+        # the engine records it via set_artifact, which refuses names
+        # outside the step's produces — a mismatch must die at validation
+        broken = copy.deepcopy(self.manifest)
+        broken["steps"]["plan-review"]["verdict_bound"]["outcome_artifact"] = \
+            "not-a-produced-name"
+        self.assertTrue(any("must be one of the step's produces" in e
+                            for e in self._errors(broken)))
+
+    def test_default_mode_validated(self):
+        issues = schema.Issues()
+        broken = copy.deepcopy(self.config)
+        broken["default_mode"] = "laen"   # typo must refuse, never silently
+        schema.validate_configs(broken, issues)
+        self.assertTrue(any("default_mode" in e for e in issues.errors))
+        issues = schema.Issues()
+        broken["default_mode"] = "lean"
+        schema.validate_configs(broken, issues)
+        self.assertFalse(any("default_mode" in e for e in issues.errors))
+
+    def test_verdict_bound_mode_must_be_spawned_by_the_step(self):
+        # A step gated on a verdict it can never produce would deadlock at
+        # runtime — the validator must refuse it at declaration.
+        broken = copy.deepcopy(self.manifest)
+        broken["steps"]["plan-review"]["verdict_bound"]["mode"] = "pre-pr"
+        self.assertTrue(any("not a mode this step spawns" in e
+                            for e in self._errors(broken)))
+
+    def test_verdict_bound_config_path_must_exist(self):
+        broken = copy.deepcopy(self.manifest)
+        broken["steps"]["plan-review"]["verdict_bound"]["bound"] = {
+            "config": "no.such.knob"}
+        self.assertTrue(any("'no.such.knob' not found" in e
+                            for e in self._errors(broken)))
+
+    def test_verdict_bound_requires_returns_to(self):
+        broken = copy.deepcopy(self.manifest)
+        del broken["steps"]["plan-review"]["returns_to"]
+        self.assertTrue(any("requires a `returns_to` edge" in e
+                            for e in self._errors(broken)))
+
+    def test_plan_review_lenses_shape_validated(self):
+        # the lens panel is declared data the orchestrator reads — a shape
+        # error must be a validation refusal, not a runtime surprise
+        broken = copy.deepcopy(self.config)
+        for bad in ("contradictions",        # not a list
+                    [1, 2],                  # non-string entries
+                    ["gaps/../../plan"],     # not a slug — becomes a PATH
+                    ["Gaps"], [""]):         # case / empty
+            issues = schema.Issues()
+            broken["plan_review"] = {"lenses": bad}
+            schema.validate_configs(broken, issues)
+            self.assertTrue(any("plan_review.lenses" in e
+                                for e in issues.errors), bad)
+        issues = schema.Issues()
+        broken["plan_review"] = {"lenses": []}   # empty IS legal (fallback)
+        schema.validate_configs(broken, issues)
+        self.assertFalse(any("plan_review" in e for e in issues.errors))
+        issues = schema.Issues()
+        del broken["plan_review"]                # missing knob is not
+        schema.validate_configs(broken, issues)
+        self.assertTrue(any("missing 'plan_review'" in e
+                            for e in issues.errors))
+
+    def test_verdict_bound_cannot_share_a_step_with_an_escalation_source(self):
+        # Two data features each claiming exclusive exit ownership would
+        # resolve by interpreter ordering — refused at validation instead.
+        broken = copy.deepcopy(self.manifest)
+        broken["steps"]["quick-recheck"]["verdict_bound"] = {
+            "mode": "plan-review", "bound": {"config": "review_rounds.max"}}
+        broken["steps"]["quick-recheck"]["returns_to"] = "develop"
+        self.assertTrue(any("cannot share a step with an escalation source"
+                            in e for e in self._errors(broken)))
+
     def test_bad_on_reject_target(self):
         broken = copy.deepcopy(self.manifest)
         broken["steps"]["approve-plan"]["on_reject"] = "no-such-step"

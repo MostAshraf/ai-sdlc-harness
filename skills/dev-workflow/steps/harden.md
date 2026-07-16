@@ -1,7 +1,9 @@
 # Step: harden (developer shape, mode `harden`)
 
-Coverage top-up after ⟨approve-impl⟩ — tests here are green-from-birth
-(they cover code that already exists), so NO red-proof machinery applies.
+Coverage top-up after develop's all-tasks-terminal sync point (crossed
+via ⟨approve-impl⟩ in full mode; directly in lean, whose impl gate is
+deliberately absent) — tests here are green-from-birth (they cover code
+that already exists), so NO red-proof machinery applies.
 
 1. Resolve the coverage command: `${CLAUDE_PLUGIN_ROOT}/bin/harness
    resolve-coverage-cmd --repo <repo>` (per repo, `language.repos.<repo-

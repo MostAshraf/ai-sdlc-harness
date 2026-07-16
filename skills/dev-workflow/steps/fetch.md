@@ -2,8 +2,9 @@
 
 Already executed by `${CLAUDE_PLUGIN_ROOT}/bin/harness fetch` at startup — it fetched the work item via
 the configured provider, normalized it to `<run>/work-item.json`, resolved
-`change_type`, ran the ex-ante quick classifier, and bootstrapped `state.yaml`
-with a seeded task.
+`change_type`, ran the ex-ante mode classifier (full/lean/quick — `Mode:`
+hints, quick-disqualify keywords, the workspace `default_mode`), and
+bootstrapped `state.yaml` with a seeded task.
 
 ## MCP-transport providers (ado-mcp / jira / zoho)
 
@@ -31,4 +32,4 @@ Nothing further to do here. Advance:
 ${CLAUDE_PLUGIN_ROOT}/bin/harness cursor --to <next-per-manifest> --run <run>
 ```
 
-(`intake` in full mode, `preflight` in quick.)
+(`intake` in full and lean modes, `preflight` in quick.)

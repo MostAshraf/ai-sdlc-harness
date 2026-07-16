@@ -1,6 +1,6 @@
 # ai-sdlc-harness · v3.0
 
-**A governed multi-agent SDLC pipeline for Claude Code** — a ground-up rewrite of [ai-sdlc-harness](https://github.com/MostAshraf/ai-sdlc-harness). Drives a real engineering workflow — fetch → plan → proven-red TDD → review → security → PR → comment rounds → reconcile → metrics — across one or many repos. No application code lives here: only the pipeline manifest, the Python core that enforces it, and the agents, skills, and hooks that run it.
+**A governed multi-agent SDLC pipeline for Claude Code** — a ground-up rewrite of [ai-sdlc-harness](https://github.com/MostAshraf/ai-sdlc-harness). Drives a real engineering workflow — fetch → scope-confirmed plan → independent plan review → proven-red TDD → review → security → PR → comment rounds → reconcile → metrics — across one or many repos. No application code lives here: only the pipeline manifest, the Python core that enforces it, and the agents, skills, and hooks that run it.
 
 | Command | Purpose |
 |---|---|
@@ -30,11 +30,18 @@ The original harness works, but almost all of its accumulated complexity compens
 
 ## Install
 
-Not yet published to a plugin marketplace — run it from a local clone:
+This repo *is* a Claude Code plugin marketplace. Inside Claude Code:
+
+```
+/plugin marketplace add MostAshraf/ai-sdlc-harness
+/plugin install ai-sdlc-harness@ai-sdlc-harness
+```
+
+The repeated name isn't a typo — it's `plugin-name@marketplace-name`, and here they match. Restart Claude Code (or `/reload-plugins`) so the skills and hooks load. There's a non-interactive equivalent too, if you'd rather script it:
 
 ```sh
-git clone <this-repo> ai-sdlc-harness
-claude --plugin-dir /path/to/ai-sdlc-harness
+claude plugin marketplace add MostAshraf/ai-sdlc-harness
+claude plugin install ai-sdlc-harness@ai-sdlc-harness   # --scope user|project|local
 ```
 
 Then, inside Claude Code:
@@ -68,9 +75,11 @@ flowchart LR
     classDef output fill:#eaf3ff,stroke:#36b,stroke-width:1px,color:#024
 
     F([fetch + classify]):::orch
-    I[intake]:::agent
+    I[intake + confirm target repos]:::agent
     P[plan]:::agent
+    PR[plan-review — adversarial panel]:::agent
     G1{approve-plan}:::human
+    G1L{approve-plan-lean, only when the panel exhausted its rounds}:::human
     PF[preflight]:::orch
     D[develop — proven-red TDD per task]:::agent
     G2{approve-impl}:::human
@@ -88,12 +97,19 @@ flowchart LR
     RC[reconcile]:::output
     M[metrics]:::output
 
-    F -->|full| I --> P --> G1
+    F -->|full / lean| I --> P --> PR
+    PR -->|full: panel APPROVED, or round budget exhausted| G1
+    PR -->|CHANGES_REQUESTED — forced revision loop| P
+    PR -.->|lean: panel APPROVED — gate self-skips| PF
+    PR -->|lean: rounds exhausted| G1L
     G1 -->|approved| PF
     G1 -->|rejected| P
+    G1L -->|approved| PF
+    G1L -->|rejected| P
     F -->|quick| PF
     PF --> D
     D -->|full| G2
+    D -.->|lean — no impl gate| H
     G2 -->|approved| H --> S
     G2 -->|rejected| D
     S -->|below threshold| PP
@@ -111,7 +127,9 @@ flowchart LR
     AF -.->|new comments| AC
 ```
 
-**Full mode** has three unconditional human gates (plan, implementation, pre-PR), one conditional gate (security — fires only when the aggregate finding severity meets the configured threshold, default `medium`), and one multi-pick gate (comment selection, inside the on-demand PR-comments group). **Quick mode** — trivial changes classified at fetch — keeps only the pre-PR gate. Everything between gates runs hands-off.
+**Full mode** has three unconditional human gates (plan, implementation, pre-PR), one conditional gate (security — fires only when the aggregate finding severity meets the configured threshold, default `medium`), and one multi-pick gate (comment selection, inside the on-demand PR-comments group). Before the plan ever reaches you, an **adversarial plan-review panel** runs: one lens reviewer per configured lens (`plan_review.lenses`, default *contradictions & collisions* + *gaps & completeness*; empty list = single reviewer) attacks the plan in parallel, and a synthesizer verifies their findings against the real code — never relaying them raw — groups them by root cause, checks the numbered acceptance criteria, the codebase's observed conventions, and the confirmed repo scope, and issues the one verdict the engine reads. A `CHANGES_REQUESTED` verdict mechanically forces a revision loop (bounded by `review_rounds.max`; exhaustion escalates to you *with* the failing report attached; every revision round re-runs the full panel), and that hook-captured verdict is what legalizes the step's exits, never the orchestrator's claim. **Quick mode** — trivial changes classified at fetch — keeps only the pre-PR gate. Everything between gates runs hands-off.
+
+**Lean mode** keeps full's entire rigor but gates by exception — the plan gate fires only if the panel exhausts its rounds, there's no implementation gate, and the pre-PR gate stays: one human stop on the happy path. Add `Mode: lean` to a work item, or set `default_mode: lean` for the workspace — see [Choosing a mode](#choosing-a-mode) and [Lean mode](#lean-mode--gating-by-exception).
 
 At **any** cursor position, an ad-hoc human request is legal: it spawns the reviewer in `request-triage` mode (a declared always-legal spawn), which classifies the request against the approved plan. Out-of-scope requests surface back to you with explicit options — never silently merged.
 
@@ -158,7 +176,7 @@ Instead of one file per role fusing "who may do what" with "what procedure to fo
 |---|---|---|---|
 | **planner** | `intake` · `plan` · `repo-map` | Read/Grep/Glob/Write/Edit/Bash | Writes only under `ai/<run>/` and `.claude/context/` — never repo source |
 | **developer** | `develop` · `harden` · `fixup` | Read/Grep/Glob/Write/Edit/Bash | Works only inside its task worktree; non-test writes refused until the task's red-proof is sealed |
-| **reviewer** | `review` · `pre-pr` · `analyze-comments` · `request-triage` | Read/Grep/Glob/Bash | Strictly read-only — no Write/Edit granted, shell writes blocked (a literal `/tmp` scratch path is the one exception); builds and test runs allowed, so it verifies independently instead of trusting another agent's claim |
+| **reviewer** | `review` · `plan-review` · `plan-attack` · `pre-pr` · `analyze-comments` · `request-triage` | Read/Grep/Glob/Bash | Strictly read-only — no Write/Edit granted, shell writes blocked (a literal `/tmp` scratch path is the one exception); builds and test runs allowed, so it verifies independently instead of trusting another agent's claim |
 
 The **orchestrator** (the main Claude Code conversation running `/dev-workflow`) is deliberately thin: a coordinator that walks the manifest, spawns shapes with structured `harness-mode:` headers, and calls `harness` verbs. It never writes code, never touches run-authority files directly, and never runs raw git — the guards block those paths and point it back to the owned verbs.
 
@@ -173,7 +191,7 @@ ai/2026-07-08-PROJ-123/
 ├── state.yaml            # THE authority: cursor, tasks, artifacts, gate decisions — HMAC-chain-sealed
 ├── work-item.json        # fetched + provider-normalized work item
 ├── requirements.md       # intake output
-├── plan.md               # edge cases, risk tiers, test-intents, approach options, diagrams
+├── plan.md               # edge cases, risk tiers, test-intents, file-touch manifests, AC traceability, diagrams
 ├── events.ndjson         # every deviation: test revisions, rejections, blocks, stalls, skipped gates
 ├── tokens.ndjson         # real per-invocation token spend
 ├── reviews.ndjson        # hook-captured reviewer verdicts (what "done" transitions check)
@@ -211,6 +229,50 @@ The property that matters — *the test genuinely failed before the fix existed*
 
 Once a workspace has completed `/init-workspace`, raw commit-creating / history-rewriting git verbs (`commit`, `merge`, `rebase`, `cherry-pick`, `revert`, `am`, `pull`, `push`) are blocked for Claude for the life of that workspace — the guard cannot know a "harness" commit from any other, so it blocks the whole verb rather than trying to tell one commit's intent from another's (your own terminal outside Claude Code is unaffected, and a session that has never run `/init-workspace` sees ordinary git — see [Guardrail Hooks](#guardrail-hooks)). Mutations go through owned verbs that validate, execute, and ledger in one place: `commit` (declared classes `working`/`wip`, `--fixup-of`), `merge-task` (squash / `--autosquash` fold), `worktree-add`/`worktree-remove`, `sync-branch` (owned rebase), `push` (`--force-with-lease`), and `publish-mirror`. Branch and commit naming come from [config/defaults/naming.yaml](config/defaults/naming.yaml).
 
+### Choosing a mode
+
+Three modes, selected at fetch from declared data — never at the model's discretion:
+
+| Mode | Pipeline | Human gates |
+|---|---|---|
+| **full** | Everything: scoped plan, adversarial panel, proven-red TDD, harden, security | Plan, implementation, pre-PR (+ security when findings meet the threshold) |
+| **lean** | Identical rigor to full | **Pre-PR only** on the happy path — the plan gate fires only if the panel exhausts its rounds; no implementation gate |
+| **quick** | Short path: no plan step, no red-proof machinery | Pre-PR only |
+
+Pick one per work item with a **`Mode:` hint on its own line in the work item's description** (the story file for `local-markdown`, the issue body for github/gitlab/…):
+
+```
+## Description
+Mode: lean
+Refactor the notification service onto the new queue client.
+```
+
+The hint is matched case-insensitively (`Mode: lean`, `mode: lean`). Or set the workspace-wide fallback for items with no hint — in [config/defaults/workflow.yaml](config/defaults/workflow.yaml), overridable via `/workspace-config`:
+
+```yaml
+default_mode: lean    # shipped default: full
+```
+
+Precedence is **full > quick > lean > default**, resolved by the classifier and mapped to a mode by the manifest alone:
+
+- **`Mode: full`** always wins — the per-item escape *upward* out of a `default_mode: lean` workspace. An item asking for more gating always gets it.
+- **`Mode: quick`** needs eligibility: the hint *and* no risk keyword. A keyword-disqualified quick hint falls to lean/default — never past lean, because the keywords guard *skipping the plan machinery*, which lean keeps.
+- **`default_mode: quick` is not a thing** — quick requires per-item eligibility, never a standing workspace choice.
+
+`harness fetch` reports the resolved `mode`, and the `fetched` event records the `mode_verdict` plus why (`explicitly hinted` vs `workspace default_mode`), so mode selection is auditable rather than inferred.
+
+### Lean mode — gating by exception
+
+Lean keeps **all** of full's rigor — confirmed repo scope, the adversarial plan panel, proven-red TDD, harden, the security scan — and loosens only *when a human is interrupted*. On the happy path you are asked exactly once, right before the PR is opened:
+
+- **The plan gate self-skips** when the plan-review panel approved the plan within its round budget, and **fires only on bound exhaustion** — the case where the machines couldn't converge and the decision is genuinely yours. The skip is ledgered as a `gate-skipped` event, so "skipped by predicate" is never confused with "never evaluated".
+- **The implementation gate is absent** — deliberately: task completion already refuses without a hook-captured reviewer `APPROVED` per task, and the holistic pre-PR review plus its gate cover the aggregate.
+- **`approve-pre-pr` remains unconditional** — the one guaranteed stop.
+
+The skip predicate reads an outcome the **engine** records from the same verdict ledger that legalizes the step's exits — the orchestrator never writes it (the `artifact` verb refuses the name), so a drifting agent cannot skip you past a plan the panel rejected. Exhaustion also *latches*: once the panel burns its budget, a later approval can't retroactively re-open the skip.
+
+The trade to accept knowingly: on a lean happy path, the panel's approval is the plan's effective ratification — your scope confirmation and the plan's test-intents are never gate-ratified. That's the point of choosing it per item (or per workspace), and `Mode: full` buys the gates back on anything risky.
+
 ### Quick mode — with a mechanical escape hatch
 
 Trivial changes (explicit `Mode: quick` hint in the work item, no risk keywords) run the short pipeline: no plan step, no red-proof machinery, one gate. Because eligibility was classified *before code existed*, `quick-recheck` re-examines the **real diff** after develop: touching disqualifying patterns (security/auth/migration/API paths) or exceeding size caps (80 changed lines / 5 files, configurable) triggers the declared escalation edge into full mode's security step — forcibly, not at the model's discretion.
@@ -225,7 +287,11 @@ A work item spanning repos gets per-repo task lanes; cross-repo API contracts ar
 
 ### The repo map
 
-`/init-workspace` (optionally) and `/repo-map-refresh` generate a tiered codebase map under `.claude/context/repo-map/` — directories and modules by purpose, key abstractions, notable patterns — stamped with the SHA it was generated at and flagged stale after 50 commits (configurable). A map with no content cannot be stamped, so an empty generation can never be certified fresh. The planner's intake and plan instructions point it at the map directly (index first, then only the areas the story touches) instead of re-deriving the codebase from scratch every run. Auto-generated only, never hand-maintained: corrections go through regeneration.
+`/init-workspace` (optionally) and `/repo-map-refresh` generate a tiered codebase map under `.claude/context/repo-map/` following a declared content contract: per repo, an `index.md` (purpose, stack, module inventory, cross-repo edges — the tier intake proposes target repos from), `areas/*` detail files (each loadable alone), and a `conventions.md` (observed naming/layering/error-handling/test patterns, each with a cited example — the tier plan-review checks plans against). Stamped with the SHA it was generated at and flagged stale after 50 commits (configurable); a map with no content cannot be stamped, so an empty generation can never be certified fresh. The planner's intake and plan instructions point it at the map directly (index first, then only the areas the story touches) instead of re-deriving the codebase from scratch every run. Auto-generated only, never hand-maintained: corrections go through regeneration.
+
+### Scoped planning
+
+Intake ends by proposing the story's **target repos** with evidence from the map indexes; you confirm the set, and the orchestrator records it via `harness scope-register` — mechanical scope, not a convention: `plan-register` refuses any task outside it (and refuses outright when no scope was ever confirmed), re-registering a scope that would strand already-registered tasks is refused, the registration verbs are guard-blocked from subagent shapes, and widening mid-plan goes back through you. The plan itself must carry per-task file-touch manifests, verify commands, size budgets, an AC-traceability table over intake's numbered acceptance criteria, and an explicit out-of-scope section — the material both the independent plan-review and the developer run on.
 
 ## Guardrail Hooks
 
@@ -246,12 +312,12 @@ Every guard's fail-open/fail-closed policy is chosen deliberately and tested: re
 
 ## The `harness` CLI
 
-All ~49 owned verbs run through the wrapper `${CLAUDE_PLUGIN_ROOT}/bin/harness` (resolves the plugin venv in either OS layout, falls back to system `python3`/`python`). It runs on macOS, Linux, and Windows — on Windows it executes under Git Bash, with `bin/harness.cmd` as the cmd.exe sibling. Agents call it; you rarely need to — except `abort`.
+All ~50 owned verbs run through the wrapper `${CLAUDE_PLUGIN_ROOT}/bin/harness` (resolves the plugin venv in either OS layout, falls back to system `python3`/`python`). It runs on macOS, Linux, and Windows — on Windows it executes under Git Bash, with `bin/harness.cmd` as the cmd.exe sibling. Agents call it; you rarely need to — except `abort`.
 
 | Group | Verbs |
 |---|---|
 | Workspace setup | `init` · `discover` · `ensure-default-branch` · `init-verify` · `init-section` · `init-finalize` · `add-repo` · `migrate-detect` · `migrate-extract` · `resolve-model` · `resolve-coverage-cmd` |
-| Pipeline steps | `fetch` · `preflight` · `plan-register` · `quick-recheck` · `security-scan` · `reconcile-contracts` · `create-pr` · `fetch-pr-comments` · `reconcile` · `write-back` · `metrics` |
+| Pipeline steps | `fetch` · `scope-register` · `preflight` · `plan-register` · `quick-recheck` · `security-scan` · `reconcile-contracts` · `create-pr` · `fetch-pr-comments` · `reconcile` · `write-back` · `metrics` |
 | State & evidence | `bootstrap` · `cursor` · `task` · `artifact` · `gate` · `stall` · `log-event` · `verify` · `show` · `status` · `abort` · `complete` · `reseal` |
 | TDD proof | `verify-red` (and `--revise`) · `show-redproof` |
 | Git (owned) | `worktree-add` · `worktree-remove` · `commit` · `merge-task` · `sync-branch` · `push` · `publish-mirror` |
@@ -303,12 +369,19 @@ ai-sdlc-harness/
 │   └── init-workspace/ · add-repo/ · migrate-workspace/ · workspace-config/ · workflow-status/ · repo-map-refresh/
 ├── bin/harness                  # wrapper script resolving the plugin venv (+ harness.cmd for Windows)
 ├── tools/                       # meta-tooling: line-budget checker, sandbox workspace generators
-└── tests/                       # 606 stdlib-unittest tests
+└── tests/                       # 657 stdlib-unittest tests
 ```
 
 Workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside *your* working directory by `/init-workspace` and the pipeline. They never live inside this plugin repo.
 
 ## Development
+
+Working on the harness itself? Run it from a clone instead of the installed copy — `--plugin-dir` is per-session, so it never disturbs an installed version:
+
+```sh
+git clone https://github.com/MostAshraf/ai-sdlc-harness.git   # or git@github.com:MostAshraf/ai-sdlc-harness.git
+claude --plugin-dir ./ai-sdlc-harness
+```
 
 Requires Python 3.10+ and PyYAML. CI runs the suite on Linux, macOS, and Windows — all three lanes enforcing.
 
@@ -326,7 +399,7 @@ python -m venv .venv; .venv\Scripts\pip install pyyaml
 .venv\Scripts\python -m unittest discover -s tests
 ```
 
-The test suite (606 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of both pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (657 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 
@@ -338,7 +411,13 @@ The test suite (606 tests) covers the state engine, gate grammar, guard behavior
 
 **Why can't Claude run `git commit` in my harness workspace?** The guard can't distinguish a harness commit from any other, so it blocks the whole verb for the life of any workspace that has completed `/init-workspace` — regardless of whether a run is currently active. Your own terminal outside Claude Code is unaffected, and a project that has never run `/init-workspace` is unaffected too. If you need raw git inside a bootstrapped workspace, disable the plugin for that session.
 
+**How do I stop it interrupting me at every gate?** Run the item in **lean mode**: put `Mode: lean` on its own line in the work item's description, or set `default_mode: lean` in your workspace config to make it the standing choice for unhinted items. Lean keeps every guarantee full has (scoped plan, adversarial panel, proven-red TDD, security) and gates by exception instead — the plan gate fires only if the plan-review panel exhausts its round budget, there's no implementation gate, and the pre-PR gate stays. Happy path: one stop, right before the PR. `Mode: full` on a single item buys the full gates back — see [Choosing a mode](#choosing-a-mode).
+
+**Which mode will my work item run in?** Precedence is **full > quick > lean > default**: an explicit `Mode: full` hint always wins, `Mode: quick` needs the hint *and* no risk keyword, `Mode: lean` (or `default_mode: lean`) is next, and anything else lands on full. `harness fetch` reports the resolved `mode`, and the `fetched` event in `events.ndjson` records the `mode_verdict` and the reason it was chosen — so it's auditable, never a guess.
+
 **What if the reviewer keeps rejecting?** Rounds are bounded (`review_rounds.max`, default 5). Beyond that the rework transition is refused and you're escalated — persistent rejection signals plan drift, not code drift.
+
+**What if the plan-review panel keeps rejecting?** Same bound (`review_rounds.max`), applied per plan cycle: each `CHANGES_REQUESTED` verdict forces a revision loop back to the planner. Once the budget is exhausted, the plan reaches you at the plan gate **with the failing review attached** — in lean mode, that's exactly when its otherwise-skipped gate fires. Never an auto-approval, never a deadlock.
 
 **What if an agent stalls or returns garbage?** A missing/invalid status block is detected mechanically; the orchestrator re-invokes with a continuation prompt (bounded, default 2), then escalates to you (default 3). It never acts on the agent's behalf.
 

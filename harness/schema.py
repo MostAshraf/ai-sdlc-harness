@@ -14,6 +14,7 @@ CLI:  python3 -m harness.schema [repo-root]     exit 0 valid / 1 invalid
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -143,6 +144,53 @@ def validate_manifest(manifest: dict, surfaces: dict, config: dict, issues: Issu
         if step.get("requires_tasks_registered") and step.get("gate"):
             issues.err(f"{where}: `requires_tasks_registered` is not meaningful "
                        "on a gate step (registration happens before the gate)")
+        vb = step.get("verdict_bound")
+        if vb is not None:
+            # Half-enforced vocabulary is the failure mode here: a shape the
+            # engine can't interpret must be refused at validation, never
+            # discovered as a runtime surprise mid-run.
+            if step.get("gate"):
+                issues.err(f"{where}: `verdict_bound` is not meaningful on a "
+                           "gate step (gates derive from human input, not "
+                           "reviewer verdicts)")
+            if (not isinstance(vb, dict)
+                    or not {"mode", "bound"} <= set(vb)
+                    or set(vb) - {"mode", "bound", "outcome_artifact"}):
+                issues.err(f"{where}: `verdict_bound` must be "
+                           "{mode, bound: {config: key}} plus optional "
+                           "outcome_artifact")
+            else:
+                spawn_modes = {s.get("mode")
+                               for s in step.get("spawns", []) or []}
+                if vb.get("mode") not in spawn_modes:
+                    issues.err(f"{where}: verdict_bound.mode "
+                               f"'{vb.get('mode')}' is not a mode this step "
+                               "spawns — the step could never produce the "
+                               "verdict its exits depend on")
+                ref = (vb.get("bound") or {}).get("config")
+                if not ref or not _config_path_ok(ref, config):
+                    issues.err(f"{where}: verdict_bound.bound.config "
+                               f"'{ref}' not found in config defaults")
+                if not step.get("returns_to"):
+                    issues.err(f"{where}: `verdict_bound` requires a "
+                               "`returns_to` edge (the CHANGES_REQUESTED-"
+                               "under-bound loop target)")
+                oa = vb.get("outcome_artifact")
+                if oa is not None and oa not in (step.get("produces") or []):
+                    # the engine records it via set_artifact, which refuses
+                    # names outside the step's produces — catch the
+                    # mismatch at validation, not on the first forward edge
+                    issues.err(f"{where}: verdict_bound.outcome_artifact "
+                               f"'{oa}' must be one of the step's produces")
+                # Two data features each claiming exclusive exit ownership
+                # would silently resolve by interpreter ordering — refuse
+                # the combination instead (half-enforced-vocabulary bar).
+                for esc in manifest.get("escalations", []) or []:
+                    if (esc.get("from") or {}).get("step") == sid:
+                        issues.err(
+                            f"{where}: `verdict_bound` cannot share a step "
+                            "with an escalation source — both claim exclusive "
+                            "ownership of the step's exits")
         for spawn in step.get("spawns", []) or []:
             _spawn_ok(spawn, surfaces, where, issues)
         for edge_key in ("on_reject", "returns_to"):
@@ -283,9 +331,30 @@ def validate_configs(config: dict, issues: Issues) -> None:
         if not all(rule.get(k) for k in ("id", "applies", "rule")):
             issues.err(f"config: review_policy entry {rule.get('id') or rule} needs id/applies/rule")
 
-    for knob in ("review_rounds", "stall", "repo_map"):
+    for knob in ("review_rounds", "stall", "repo_map", "plan_review"):
         if knob not in config:
             issues.err(f"config: workflow defaults missing '{knob}'")
+
+    default_mode = config.get("default_mode", "full")
+    if default_mode not in ("full", "lean"):
+        # quick is deliberately not defaultable: it needs per-item
+        # eligibility (hint + no disqualifying keyword), never a standing
+        # workspace choice
+        issues.err("config: default_mode must be 'full' or 'lean' "
+                   f"(got {default_mode!r})")
+
+    lenses = (config.get("plan_review") or {}).get("lenses")
+    if not isinstance(lenses, list) or not all(
+            isinstance(x, str) and re.fullmatch(r"[a-z][a-z0-9-]{0,30}", x)
+            for x in lenses):
+        # empty list is legal (the declared single-reviewer fallback);
+        # a non-list, non-string, or non-slug entry is a shape error, not a
+        # choice — lens names become file paths (reports/plan-attack-<lens>)
+        # and spawn-ask text, so they must be plain slugs, never path or
+        # prompt material (adversarial-review finding)
+        issues.err("config: plan_review.lenses must be a list of lens-name "
+                   "slugs (lowercase [a-z0-9-], ≤31 chars; empty list = "
+                   "single-reviewer plan review)")
 
 
 def deep_merge(base: dict, override: dict) -> dict:

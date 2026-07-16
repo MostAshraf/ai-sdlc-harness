@@ -57,4 +57,6 @@ All tasks done → record the declared artifact the ⟨approve-impl⟩ gate
 presents: `${CLAUDE_PLUGIN_ROOT}/bin/harness artifact --name task-commits
 --value "<T1>: <sha1>; <T2>: <sha2>; …" --run <run>` (the SHAs are in
 `show`'s tasks) → `${CLAUDE_PLUGIN_ROOT}/bin/harness cursor --to <next> --run <run>`
-(⟨approve-impl⟩ in full; quick-recheck in quick).
+(⟨approve-impl⟩ in full; harden in lean — its impl gate is deliberately
+absent, the per-task hook-captured verdicts + pre-PR gate carry the
+guarantees; quick-recheck in quick).

@@ -53,6 +53,17 @@ NOP_CMD = "cmd /c exit 0" if os.name == "nt" else "true"
 SCRATCH_FIXTURE_DIR = None if os.name == "nt" else "/tmp"
 
 
+def seed_review_verdict(run: Path, mode: str = "plan-review",
+                        verdict: str = "APPROVED") -> None:
+    """Test-only simulation of the PostToolUse hook's reviewer-verdict
+    capture (task-less form) — what a `verdict_bound` step's exits are
+    derived from. In production ONLY the hook writes reviews.ndjson
+    (AUTHORITY_RE blocks direct writes from agent tool calls)."""
+    from harness import ndjson
+    ndjson.append_record(run / "reviews.ndjson",
+                         {"task": None, "mode": mode, "verdict": verdict})
+
+
 def scratch_path(*parts: str) -> str:
     """A scratch-root path for guard payloads: `/tmp/...` on POSIX, the
     platform temp dir on Windows — the two spellings guards' _tmp_roots()

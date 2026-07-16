@@ -62,35 +62,65 @@ def slug(title: str, limit: int = 30) -> str:
     return s[:limit].rstrip("-") or "change"
 
 
-def classify(item: dict, config: dict) -> tuple[bool, str]:
-    """Ex-ante quick eligibility (design.md piece 1). Conservative: eligible
-    only when explicitly hinted AND no disqualifying keyword appears; the
-    post-develop diff re-check (quick-recheck) is the real-diff backstop.
-    Returns (quick_eligible, reason) — a verdict, never a mode NAME: the
-    verdict-to-mode mapping is the entry step's declared `selects_mode`,
-    resolved by select_mode() below (composability round, 2026-07-08: this
-    function used to mint the literals "full"/"quick" itself, leaving the
-    manifest's selects_mode declaration decorative)."""
+def classify(item: dict, config: dict) -> tuple[str, str]:
+    """Ex-ante mode classification (design.md piece 1). Returns
+    (mode_verdict, reason) — a VERDICT from this function's vocabulary
+    (`quick-eligible` | `lean-requested` | `default`), never a mode NAME:
+    the verdict-to-mode mapping is the entry step's declared
+    `selects_mode`, resolved by select_mode() below (composability round,
+    2026-07-08: this function used to mint the literals "full"/"quick"
+    itself, leaving the manifest's selects_mode declaration decorative).
+    Precedence: an explicit `Mode: full` hint outranks everything (an item
+    asking for MORE gating always gets it — the per-item escape from a
+    `default_mode: lean` workspace); then quick (explicitly hinted AND no
+    disqualifying keyword — quick-recheck is the real-diff backstop); then
+    lean (work-item `Mode: lean` hint, or the workspace's
+    `default_mode: lean`). A keyword-disqualified quick hint falls through
+    to the lean/default tiers, never straight to full — the keywords guard
+    SKIPPING the plan machinery, which lean keeps."""
     qm = config.get("quick_mode", {})
+    default_mode = config.get("default_mode", "full")
+    if default_mode not in ("full", "lean"):
+        # fail loud at fetch, not silently-full for the life of the
+        # workspace (a typo'd override would otherwise never be noticed)
+        raise state_mod.StateError(
+            f"config: default_mode must be 'full' or 'lean' (got "
+            f"{default_mode!r}) — fix the workspace override")
     text = f"{item.get('title', '')} {item.get('description', '')}".lower()
-    hinted = bool(re.search(r"^mode:\s*quick", item.get("description", ""),
-                            re.MULTILINE | re.IGNORECASE))
-    for keyword in qm.get("disqualify_keywords", []):
-        if keyword.lower() in text:
-            return False, f"disqualified by keyword '{keyword}'"
-    return (True, "explicitly hinted") if hinted else (False, "default")
+    desc = item.get("description", "")
+
+    def hinted(mode: str) -> bool:
+        return bool(re.search(rf"^mode:\s*{mode}", desc,
+                              re.MULTILINE | re.IGNORECASE))
+
+    quick_hint = hinted("quick")
+    disqualified = next((k for k in qm.get("disqualify_keywords", [])
+                         if k.lower() in text), None)
+    note = (f" (quick disqualified by keyword '{disqualified}')"
+            if quick_hint and disqualified else "")
+    if hinted("full"):
+        return "full-requested", "explicitly hinted" + note
+    if quick_hint and not disqualified:
+        return "quick-eligible", "explicitly hinted"
+    if hinted("lean"):
+        return "lean-requested", "explicitly hinted" + note
+    if default_mode == "lean":
+        return "lean-requested", "workspace default_mode" + note
+    if quick_hint:
+        return "default", f"quick disqualified by keyword '{disqualified}'"
+    return "default", "default"
 
 
-def select_mode(manifest: dict, quick_eligible: bool) -> str:
+def select_mode(manifest: dict, verdict: str) -> str:
     """Resolve classify()'s verdict to a mode name via the entry step's
     declared `selects_mode` mapping — the single place a run's entry mode
     is minted, reading the manifest rather than repeating it."""
     sel = (manifest["steps"][manifest["entry"]] or {}).get("selects_mode") or {}
-    mode = sel.get("true" if quick_eligible else "false")
+    mode = sel.get(verdict)
     if mode not in (manifest.get("modes") or {}):
         raise state_mod.StateError(
             f"entry step '{manifest['entry']}' selects_mode maps "
-            f"quick_eligible={quick_eligible} to {mode!r}, which is not a "
+            f"verdict {verdict!r} to {mode!r}, which is not a "
             "declared mode — fix pipeline/manifest.yaml")
     return mode
 
@@ -147,8 +177,8 @@ def _bootstrap_from_item(workspace: Path, config: dict, manifest: dict,
     refusing) -> seed a single task -> persist work-item.json. Both transports
     converge here — the CLI path after `dispatch`, the MCP path after
     `normalize` — so a run is bootstrapped identically whichever was used."""
-    quick_eligible, reason = classify(item, config)
-    mode = select_mode(manifest, quick_eligible)
+    mode_verdict, reason = classify(item, config)
+    mode = select_mode(manifest, mode_verdict)
     change_type = resolve_change_type(item, config)
     date = date or _dt.date.today().isoformat()
     # same-day re-runs (abort → re-fetch) land in a `-<n>` slot instead of
@@ -196,7 +226,7 @@ def _bootstrap_from_item(workspace: Path, config: dict, manifest: dict,
         entry_step=manifest["entry"], manifest=manifest)
     ndjson.append_record(run / "events.ndjson",
                          {"kind": "fetched", "item": item["id"], "mode": mode,
-                          "quick_eligible": quick_eligible,
+                          "mode_verdict": mode_verdict,
                           "classify_reason": reason,
                           "change_type": change_type,
                           "seed_task": {
@@ -277,6 +307,67 @@ def _validate_contract(c: dict) -> None:
             f"contract type must be one of {sorted(CONTRACT_TYPES)}")
 
 
+def scope_register(workspace: Path, run: Path, manifest: dict, config: dict,
+                   repos: list) -> dict:
+    """Record the human-confirmed target-repo set for this run — the scope
+    the planner decomposes within (`plan_register` refuses tasks outside
+    it). Legal at `intake` (first registration, right after the user
+    confirms intake's Target Repos proposal) and at `plan` (re-registration
+    when a revision round legitimately widens/narrows the set — still
+    user-confirmed, never silent). Entries are the exact registered repo
+    PATHS (config repos VALUES), matching what plan-register's tasks carry."""
+    from .transitions import ensure_live
+    if not isinstance(repos, list) or not repos or not all(
+            isinstance(r, str) and r for r in repos):
+        raise state_mod.StateError(
+            "scope-register: --repos-json must be a non-empty JSON array of "
+            "registered repo path strings")
+    registered = set((config.get("repos") or {}).values())
+    unknown = sorted(set(repos) - registered)
+    if unknown:
+        raise state_mod.StateError(
+            "scope-register: not registered in this workspace's repos: "
+            f"{', '.join(unknown)} — entries must be the exact registered "
+            "repo PATH strings (config repos VALUES, e.g. /abs/path/to/"
+            "backend), never the short NAMES")
+    scoped = sorted(set(repos))
+    with state_mod.locked(run):
+        st = state_mod.load(run, workspace)
+        ensure_live(st, "scope-register")
+        cursor = st["cursor"]["current_step"]
+        # Legality is derived from the manifest, not a hardcoded step list
+        # (adversarial-review: a second copy of a fact `produces: scope`
+        # already declares would silently refuse a future mode's scope-
+        # producing step that validates clean).
+        producers = sorted(sid for sid, s in (manifest.get("steps") or {}).items()
+                           if "scope" in (s.get("produces") or []))
+        if cursor not in producers:
+            raise state_mod.StateError(
+                "scope-register is legal only at a step the manifest "
+                f"declares producing 'scope' ({', '.join(producers)}) — "
+                f"cursor: {cursor}")
+        # Containment is an invariant, not a point-in-time check: a
+        # re-registration must not strand already-registered tasks outside
+        # the new set (adversarial-review: narrowing after plan-register
+        # silently broke tasks ⊆ scope with nothing left to notice it).
+        stranded = sorted({t.get("repo", ".") for t in st.get("tasks", [])
+                           if not t.get("provisional")
+                           and t.get("repo", ".") not in scoped})
+        if stranded:
+            raise state_mod.StateError(
+                "scope-register: registered task repo(s) would fall outside "
+                f"the new scope: {', '.join(stranded)} — re-run plan-register "
+                "with a task list inside the new set first, or include those "
+                "repos")
+        set_artifact(st, manifest, "scope", scoped)
+        st["scope"] = {"repos": scoped, "at": ndjson.now_iso()}
+        state_mod.save(run, workspace, st)
+    ndjson.append_record(run / "events.ndjson",
+                         {"kind": "scope-registered", "repos": scoped,
+                          "actor": "scope-register"})
+    return {"scope": scoped}
+
+
 def plan_register(workspace: Path, run: Path, manifest: dict,
                   tasks: list[dict], contracts: list[dict] | None = None) -> dict:
     """Replace the fetch-seeded task list with the approved plan's tasks
@@ -319,6 +410,24 @@ def plan_register(workspace: Path, run: Path, manifest: dict,
                 remaining.pop(tid)
             for dl in remaining.values():
                 dl.difference_update(free)
+        # Scope containment (after the payload-shape checks — a malformed
+        # list gets its shape error, not a scope one): the task list must
+        # stay inside the human-confirmed target-repo set (scope-register).
+        # Fail-closed on a missing scope — an unconfirmed decomposition is
+        # exactly what the confirmation step exists to prevent.
+        scope = (st.get("scope") or {}).get("repos") or []
+        if not scope:
+            raise state_mod.StateError(
+                "plan-register: no confirmed target-repo scope — record the "
+                "user-confirmed set first (`harness scope-register`, from "
+                "intake's Target Repos proposal), then register tasks")
+        off_scope = sorted({t.get("repo", ".") for t in tasks} - set(scope))
+        if off_scope:
+            raise state_mod.StateError(
+                "plan-register: task repo(s) outside the confirmed scope: "
+                f"{', '.join(off_scope)} — widen the scope first (user-"
+                "confirmed `harness scope-register` at the plan step); an "
+                "unconfirmed repo never enters the task list silently")
         st["tasks"] = [
             {"id": t["id"], "repo": t.get("repo", "."), "status": "pending",
              "depends_on": t.get("depends_on", []), "risk": t.get("risk", "low"),

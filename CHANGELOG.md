@@ -6,6 +6,36 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
+## [3.1.0] — 2026-07-17
+
+> **The plan is now the most-checked artifact in the pipeline — and the human is interrupted least where it's checked most.** v3.0 could plan against a stale guess at the target repos, and the planner's self-adversarial pass was the planner grading its own homework: the human at ⟨approve-plan⟩ was a plan's *first* reviewer. This release confirms the repo scope with you and enforces it mechanically, attacks every plan with an adversarial lens panel before you see it, gives the developer a plan they can act on without re-discovery — and then, with those machines carrying the load, adds a mode that only interrupts you when they couldn't agree.
+
+### Release highlights
+
+| Theme | What changed |
+|---|---|
+| **Plans are scoped to repos you confirmed** | Intake proposes the story's **Target Repos** with per-repo evidence from the repo-map indexes and numbers the acceptance criteria (`AC1`, `AC2`, …). Your confirmation is recorded by the new `harness scope-register` verb and enforced, not trusted: `plan-register` refuses a task list with no confirmed scope or any repo outside it, re-registering a scope that would strand registered tasks is refused, both registration verbs are guard-blocked from subagent shapes, and the generic `artifact` verb can't write `scope` past its owning verb. Widening mid-plan is legal — but always back through you. |
+| **Every plan is adversarially reviewed before you see it** | New **`plan-review`** step (full and lean modes) runs an adversarial panel: one `plan-attack` reviewer per configured lens (`plan_review.lenses`, default *contradictions & collisions* + *gaps & completeness*) attacks the plan in parallel, then a synthesizer verifies their findings against real code — never relaying them raw — groups by root cause, and issues the one verdict the engine reads. Checks span AC coverage, conventions consistency (against the repo map's new `conventions.md` plus spot-reads), dependency-edge and contract-signature audits, and scope containment. |
+| **A rejected plan loops back mechanically, and never deadlocks** | New **`verdict_bound`** manifest vocabulary derives a step's exits from the hook-captured verdict ledger: no in-window verdict → no exits (fail-closed); `CHANGES_REQUESTED` under the bound → *only* the revision loop back to the planner (forced, not advisory — and re-entry re-arms task registration, so a revised plan can't sail forward on the old task list); `APPROVED` or bound exhaustion (`review_rounds.max`) → forward, with exhaustion reaching the gate **carrying the failing report**. Never an auto-approval, never a stuck run. |
+| **Plans now carry what a developer actually needs** | Per task: a **file-touch manifest** (create/modify + why, spot-checked by the reviewer), the exact **verify command**, and a size budget with a split rule. Per story: an **AC-traceability table** (criterion × task × test-intent) and an explicit **"Out of scope / do not touch"** section. The repo map gains a declared content contract — `index.md` (targeting), `areas/*` (detail), `conventions.md` (cited patterns the review checks against). |
+| **Lean mode — gating by exception** | New **`lean`** mode keeps full's entire rigor and loosens only *when you're interrupted*: the plan gate self-skips on a panel-approved plan and fires only on bound exhaustion; the impl gate is absent (per-task completion already requires a hook-captured reviewer `APPROVED`); `approve-pre-pr` stays. Happy path: **one human stop**, right before the PR. Selected per work item (`Mode: lean`) or workspace-wide (`default_mode`), with `Mode: full` as the per-item escape upward. |
+| **Mode selection became declared data** | `classify` mints named verdicts (`full-requested` / `quick-eligible` / `lean-requested` / `default`; precedence full > quick > lean > default) that only the manifest's `selects_mode` mapping turns into a mode. The `fetched` event records the verdict *and why*, so mode choice is auditable rather than inferred. |
+| **Gate machinery hardened** *(from this cycle's adversarial reviews)* | **Gate decisions are single-use** — consumed with their presentation stamp by the edge they legalize, closing a humanless `plan ↔ plan-review ↔ approve-plan` cycle that a stale rejection made engine-legal. **`gate --decide` is cursor-anchored** (no banking an approval before the artifacts exist). **Verdict ties fail closed** (a same-instant `CHANGES_REQUESTED` beats an `APPROVED`). **Task-less spawns get bounded stalls** (`stall` without `--task`, counted per step). **Panel exhaustion latches** — a late approval can't retroactively re-open lean's skip. |
+
+### Upgrade notes
+
+- **In-flight full-mode runs bootstrapped before this version**: the next `plan-register` refuses until the scope is recorded. Run `harness scope-register --run <run> --repos-json '[…]'` at the `plan` cursor with your confirmed repo set, then re-register. No other migration is needed — the version is safe to adopt mid-run.
+- **Full mode gained a step.** `plan` no longer advances straight to ⟨approve-plan⟩; it advances to `plan-review`, whose panel must return a verdict before the gate. Existing runs pick this up automatically (sequences are read live from the manifest) — the orchestrator follows it from the step files, but a run parked at `plan` will see the new step on its next move.
+- **Existing repo maps stay valid.** Maps generated before the content contract have no `conventions.md`; plan-review degrades to code reading and says so in its report. Regenerate with `/repo-map-refresh` to get the full three-tier map.
+- **`write_back.on_in_review` never fires in lean mode** — it rides the ⟨approve-impl⟩ gate, which lean deliberately omits. Status sync happens at PR creation instead. Stay on `full` if a mid-run in-review write-back matters to your tracker.
+- **New config knobs, both optional**: `default_mode` (`full` | `lean`, default `full`) and `plan_review.lenses` (default `[contradictions, gaps]`; an empty list is the declared single-reviewer fallback). Shipped defaults preserve v3.0 behavior except for the added plan-review step.
+
+### Verification on tag tip
+
+- `python -m harness.schema` — declared data valid
+- `python tools/budget_check.py` — line budget green
+- `python -m unittest discover -s tests` — 657 tests green
+
 ## [3.0.4] — 2026-07-12
 
 > **The repo map now reaches the planner it was built for.** Generation, staleness tracking, and stamping were already solid; this release closes the gap on the consumption side, plus a false-fresh hole in the stamp itself.

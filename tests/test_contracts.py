@@ -28,6 +28,13 @@ class _ContractHarness(unittest.TestCase):
             work_item={"id": "C-1", "title": "t", "provider_ref": ""},
             mode="full", change_type="feature",
             tasks=[{"id": "T1", "repo": str(self.repo_a)}], entry_step="plan")
+        # plan_register requires the human-confirmed scope; this unit
+        # harness has no init'd workspace config, so seed state directly
+        # (what `harness scope-register` records in production)
+        st = state_mod.load(self.run, self.workspace)
+        st["scope"] = {"repos": [str(self.repo_a)],
+                       "at": "2026-01-01T00:00:00+00:00"}
+        state_mod.save(self.run, self.workspace, st)
 
     def tearDown(self):
         support.rmtree(self.workspace)

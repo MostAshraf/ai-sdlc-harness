@@ -193,6 +193,12 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
     rms.add_argument("--repo-name", required=True)
     rms.add_argument("--repo", type=Path, required=True)
 
+    sr = sub.add_parser("scope-register", parents=[common],
+                        help="record the user-confirmed target-repo scope")
+    sr.add_argument("--repos-json", required=True,
+                    help="JSON array of registered repo PATHS (config repos "
+                         "values) the human confirmed for this run")
+
     pr_ = sub.add_parser("plan-register", parents=[common], help="replace seeded tasks with the plan's")
     pr_.add_argument("--tasks-json", default=None,
                      help="inline JSON array of tasks (or use --tasks-json-file)")
@@ -332,7 +338,10 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
     a.add_argument("--value", required=True)
 
     s = sub.add_parser("stall", parents=[common], help="record an agent stall; returns next action")
-    s.add_argument("--task", required=True)
+    s.add_argument("--task", default=None,
+                   help="task id for a per-task spawn; omit for a task-less "
+                        "spawn (plan-review, pre-pr, …) — the stall is then "
+                        "counted per current step, same declared bounds")
 
     e = sub.add_parser("log-event", parents=[common], help="append to the audit ledger")
     e.add_argument("--json", required=True)
@@ -575,8 +584,11 @@ def main(argv: list[str] | None = None) -> int:
                     "tasks": {t["id"]: t["status"] for t in st["tasks"]},
                     "provisional_tasks": [t["id"] for t in st["tasks"]
                                           if t.get("provisional")],
-                    "gates": {g: v.get("decision") for g, v in st["gates"].items()
-                              if v.get("decision")},
+                    # a consumed decision (single-use, cleared when its edge
+                    # fires) still belongs on the dashboard as history
+                    "gates": {g: v.get("decision") or v.get("consumed_decision")
+                              for g, v in st["gates"].items()
+                              if v.get("decision") or v.get("consumed_decision")},
                     "flagged_events": len(flagged)})
             _emit({"ok": True, "runs": runs})
             return 0
@@ -602,6 +614,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "preflight":
             result = workflow.preflight(args.workspace, args.run, config,
                                         manifest, args.repo, args.branch)
+            _emit({"ok": True, **result})
+            return 0
+
+        if args.cmd == "scope-register":
+            try:
+                repos = json.loads(args.repos_json)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"--repos-json is not valid JSON: {exc}") from exc
+            result = workflow.scope_register(args.workspace, args.run,
+                                             manifest, config, repos)
             _emit({"ok": True, **result})
             return 0
 
@@ -975,7 +998,8 @@ def main(argv: list[str] | None = None) -> int:
 
             if args.cmd == "cursor":
                 skipped = transitions.advance_cursor(st, manifest, config,
-                                                     args.to, now)
+                                                     args.to, now,
+                                                     run=args.run)
                 for s in skipped:
                     # a conditional gate skipped by its declared predicate is
                     # an evaluation, not an omission — the ledger must be able
@@ -1026,6 +1050,21 @@ def main(argv: list[str] | None = None) -> int:
                             "--decide — the decision replays the option list "
                             "sealed at --present (RC3: the caller must not "
                             "define what a numbered reply means)")
+                    # A decision is derivable only AT the gate (adversarial-
+                    # review, plan-accuracy round: `verdict_bound` made
+                    # `decided_at` load-bearing state — an any-cursor decide
+                    # could bank an approval before the gate's artifacts even
+                    # exist, or move the verdict window mid-plan-cycle and
+                    # silently reset the review round budget). --present
+                    # stays cursor-free: re-presenting only re-stamps the
+                    # window and pops any unconsumed decision, both
+                    # fail-closed directions.
+                    if st["cursor"]["current_step"] != args.id:
+                        raise gates.GateRefusal(
+                            f"gate '{args.id}' is not the current step "
+                            f"(cursor: {st['cursor']['current_step']}) — a "
+                            "decision is derived only at the gate itself; "
+                            "advance the cursor there first")
                     entry_now = st["gates"].get(args.id) or {}
                     options = entry_now.get("options") or list(
                         gate_def.get("dispositions") or ["approved", "rejected"])
@@ -1078,11 +1117,35 @@ def main(argv: list[str] | None = None) -> int:
                              "reason": "defer decided — follow-up work item "
                                        "not yet recorded"})
             elif args.cmd == "artifact":
+                if args.name == "scope":
+                    # scope has an owning verb with real validation
+                    # (registered paths, task containment, the event
+                    # record) — the generic write would bypass all of it
+                    # and split the artifact copy from state.scope.
+                    raise state_mod.StateError(
+                        "the 'scope' artifact is written only by `harness "
+                        "scope-register` — the generic artifact verb would "
+                        "bypass its validation")
+                engine_owned = {vb["outcome_artifact"]
+                                for s in manifest["steps"].values()
+                                for vb in [s.get("verdict_bound") or {}]
+                                if vb.get("outcome_artifact")}
+                if args.name in engine_owned:
+                    # verdict_bound outcomes are ENGINE-derived from the
+                    # verdict ledger (the exception gate's predicate trusts
+                    # them); an orchestrator-written value would lie on
+                    # every audit surface until the next cursor move
+                    # re-derives it.
+                    raise state_mod.StateError(
+                        f"'{args.name}' is engine-recorded from the "
+                        "reviewer-verdict ledger (verdict_bound."
+                        "outcome_artifact) — never written by hand")
                 transitions.set_artifact(st, manifest, args.name, args.value)
             elif args.cmd == "stall":
-                action = transitions.record_stall(st, config, args.task)
+                stall_key = args.task or f"step:{st['cursor']['current_step']}"
+                action = transitions.record_stall(st, config, stall_key)
                 ndjson.append_record(args.run / "events.ndjson",
-                                     {"kind": "stall", "task": args.task,
+                                     {"kind": "stall", "task": stall_key,
                                       "action": action})
                 state_mod.save(args.run, args.workspace, st)
                 _emit({"ok": True, "action": action})

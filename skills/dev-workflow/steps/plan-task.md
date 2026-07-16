@@ -4,14 +4,22 @@ Produce `<run>/plan.md`: the human-facing design for this story. Both
 altitudes of approach decision below are approved at the single
 `approve-plan` gate (design.md:495 — one gate, two altitudes).
 
-## 0. Ground in the repo map
+## 0. Ground in the repo map — within the confirmed scope
+
+The run's target repos were confirmed by the human at intake
+(`state.scope` — the orchestrator's spawn prompt names them): decompose
+WITHIN that set only. If the story genuinely needs a repo outside it,
+don't plan around the gap and don't add tasks for it — flag it in your
+status block with the evidence; widening the scope is the orchestrator's
+and human's move (plan step 0c), never yours.
 
 Before decomposing, read the auto-generated map at
-`.claude/context/repo-map/<repo-name>/` for each repo the story touches —
-the index first, then only the area detail files this story is likely to
-touch (each is loadable standalone; never load the whole map). This is
-where "the team uses <pattern>" comes from — cite it instead of
-re-deriving the codebase. Two boundaries: the map speeds targeting, it
+`.claude/context/repo-map/<repo-name>/` for each scoped repo — the index
+first, then only the area detail files this story is likely to touch, plus
+`conventions.md` (each is loadable standalone; never load the whole map).
+This is where "the team uses <pattern>" comes from — cite it instead of
+re-deriving the codebase, and expect plan-review to check your approach
+against `conventions.md`. Two boundaries: the map speeds targeting, it
 never replaces reading the real code for areas you plan to change; and its
 freshness was already settled by the orchestrator before your spawn — READ
 what's there, never run `repo-map-check`/`repo-map-stamp` or write
@@ -79,6 +87,44 @@ fork identified: <why>` under the task table, visible either way.
   consumer repo(s), and signature fragment(s) for anything one repo's task
   emits and another's depends on — the enriched shape in `steps/plan.md`'s
   registration example.
+- **File-touch manifest**: the files this task creates or modifies, each
+  with a one-line why — from actually reading the code, not guessing
+  (plan-review spot-checks that *modify* entries exist and *create*
+  entries don't). This is the single biggest developer accelerant in the
+  plan: the developer starts editing instead of re-discovering.
+  ```
+  Files:
+  - modify src/auth/service.py — add the token-refresh branch
+  - create tests/test_refresh.py — the task's declared test-intents
+  ```
+- **Verify command**: the exact invocation that proves THIS task green —
+  the repo's discovered `test_cmd` scoped down to the task's tests where
+  the framework allows (`sh mvnw -q test -Dtest=RefreshTest`,
+  `npm test -- --testPathPattern refresh`); the bare repo `test_cmd` when
+  it doesn't. Never invent a runner the repo doesn't use.
+- **Size budget**: estimated changed-LOC and the split rule — if the real
+  diff runs past ~2× the estimate, the developer stops and flags rather
+  than pushing through ("one task = one reviewable unit" is only honest
+  if oversized tasks get split, not absorbed). Advisory, reviewer-flagged;
+  not mechanically enforced.
+
+## 3b. Story-level required sections
+
+- **AC traceability table** — one row per numbered acceptance criterion
+  from `requirements.md`:
+  ```
+  | AC  | Tasks | Test-intents |
+  |-----|-------|--------------|
+  | AC1 | T1    | test_refresh_rotates_token |
+  ```
+  Every AC gets ≥1 task and ≥1 test-intent; an AC you believe needs
+  neither (pure docs, already-met) keeps its row with an explicit
+  rationale instead — plan-review checks this table first, and an AC
+  missing from it is a blocking finding.
+- **Out of scope / do not touch** — what this story deliberately does NOT
+  change (adjacent features, tempting refactors, repos confirmed out of
+  scope), so the task reviewer and `request-triage` have a tripwire for
+  scope creep instead of inferring intent.
 
 ## 4. Diagrams
 
