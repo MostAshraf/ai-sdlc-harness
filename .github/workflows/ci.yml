@@ -1,13 +1,22 @@
 # CI matrix — the suite, schema validation, and the line-budget/duplication
-# sweep on every push/PR. All three OS lanes are enforcing. The Windows lane
+# sweep on every PR. All three OS lanes are enforcing. The Windows lane
 # had its first real triage in 2026-07 (290 -> 0 failures): the blind-written
 # msvcrt/9009/harness.cmd assumptions were replaced with measured behavior,
 # fake-CLI stubs became real PE launchers (tests/support.py), and the guard
-# layer grew nt-scoped path handling — see CHANGELOG [Unreleased].
+# layer grew nt-scoped path handling — see CHANGELOG [3.0.3].
 name: ci
 
+# PR-only, deliberately. A bare `push:` (every push, every branch) ran the
+# whole matrix a SECOND time for any push to a branch with an open PR —
+# 6 jobs billed as 12, both reporting the same tree.
+#
+# No `types:` filter: the default (opened + synchronize + reopened) is
+# load-bearing, not incidental. `synchronize` is what re-tests commits
+# pushed to an already-open PR — without it, a green check could describe
+# the tree at PR-open time while a later commit rode into the merge
+# untested (this repo's releases push doc/fix commits after opening the
+# PR; that is exactly the case).
 on:
-  push:
   pull_request:
 
 jobs:
