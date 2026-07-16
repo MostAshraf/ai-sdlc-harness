@@ -444,6 +444,23 @@ class VerdictBoundExits(Harness):
             self._cands()
         self.assertIn("corrupt", str(ctx.exception))
 
+    def test_lens_verdicts_are_advisory_and_invisible_to_the_engine(self):
+        # The adversarial panel's advisory/binding line, engine-pinned:
+        # plan-attack records (task-less, a different reviewer mode) must
+        # never open this step's exits, close them, or burn the round
+        # budget — only the synthesizer's mode counts. A future edit
+        # normalizing capture modes would fail here, not in production.
+        support.seed_review_verdict(self.run, mode="plan-attack",
+                                    verdict="APPROVED")
+        self.assertEqual(self._cands(), {})   # no synthesizer verdict yet
+        for _ in range(self.config["review_rounds"]["max"]):
+            support.seed_review_verdict(self.run, mode="plan-attack",
+                                        verdict="CHANGES_REQUESTED")
+        support.seed_review_verdict(self.run, verdict="APPROVED")
+        # the lens CRs burned nothing: the synthesizer's APPROVED opens
+        # forward instead of the bound reading as exhausted
+        self.assertEqual(self._cands(), {"approve-plan": "sequence"})
+
     def test_timestamp_tie_prefers_changes_requested(self):
         # Two hook processes can stamp identical `at` (coarse OS clock);
         # a first-wins max() would let APPROVED shadow the rejection.

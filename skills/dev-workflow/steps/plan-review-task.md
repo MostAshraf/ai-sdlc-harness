@@ -1,4 +1,4 @@
-# Instruction: review the plan (reviewer shape, mode `plan-review`)
+# Instruction: synthesize the plan review (reviewer shape, mode `plan-review`)
 
 You are reviewing `<run>/plan.md` against `<run>/requirements.md` and the
 real codebase — BEFORE any human sees it. You are the independent check the
@@ -6,6 +6,26 @@ planner's self-adversarial pass cannot be. Read-only: report findings in
 your status block; the orchestrator persists them. Your `verdict:` line is
 hook-captured and mechanically derives the pipeline's next move — never
 soften a real blocker into prose.
+
+**Synthesize the lens panel first.** The orchestrator's ask names THIS
+round's lens report paths — read exactly those, never glob the reports
+directory (prior rounds' snapshots live there too; a stale attack report
+adjudicated against a revised plan is noise dressed as evidence). You are
+the SYNTHESIZER: read them all, then **verify, never relay** — spot-check
+each `CONFIRMED` finding against the plan/code it cites and adjudicate
+every `PLAUSIBLE` one yourself; a lens finding you could not verify is
+reported as rejected-with-why, not silently dropped. Group the surviving
+findings by ROOT CAUSE across lenses — independent convergence of two
+lenses on the same root cause is a strong confidence signal; say so
+explicitly. Lens verdicts are advisory: the verdict at the end of YOUR
+block is the only one the pipeline reads, and it must follow from the
+surviving findings, not from a lens's vote. The ask names no lens reports
+(empty configured panel, or a pre-panel run) → review directly; note the
+panel was absent. **Token hygiene:** when citing lens output, NEVER
+reproduce a line-anchored `verdict:` token — write `advisory: CR` — the
+capture hook scans your whole final block and a quoted verdict line reads
+as yours, conflict-fail-closed (a quoted CHANGES_REQUESTED would force a
+revision round the pipeline then cannot distinguish from a real one).
 
 Verdict discipline: `CHANGES_REQUESTED` for anything that would mislead the
 developer or the human gate (a missed AC, a fabricated pattern citation, an

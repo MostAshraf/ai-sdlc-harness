@@ -91,14 +91,24 @@ steps:
     requires_tasks_registered: true
 
   plan-review:
-    # Independent pre-gate plan review: AC coverage (every numbered
-    # criterion in requirements.md maps to a task + test-intent),
-    # conventions consistency (repo-map conventions.md + spot-reads of the
-    # code the plan cites), dependency-edge and contract-signature audit.
-    # The reviewer is read-only; the orchestrator persists the report
-    # (pre-pr pattern) and the hook-captured verdict in reviews.ndjson —
-    # not any orchestrator claim — is what gates this step's exits.
-    spawns: [{shape: reviewer, mode: plan-review}]
+    # Independent pre-gate plan review, run as an ADVERSARIAL PANEL: one
+    # `plan-attack` reviewer per configured lens (config plan_review.lenses
+    # — contradictions & collisions, gaps & completeness by default; empty
+    # list = single-reviewer fallback), batched in one message, then a
+    # `plan-review` synthesizer that reads the lens reports, spot-verifies
+    # against real code, groups findings by root cause, and issues THE
+    # verdict. Checks span AC coverage (every numbered criterion in
+    # requirements.md maps to a task + test-intent), conventions
+    # consistency (repo-map conventions.md + spot-reads of the code the
+    # plan cites), dependency-edge and contract-signature audit, scope
+    # containment. Reviewers are read-only; the orchestrator persists the
+    # reports (pre-pr pattern). Only the SYNTHESIZER's hook-captured
+    # verdict gates this step's exits — verdict_bound filters on mode
+    # plan-review, so lens verdicts are advisory evidence that can neither
+    # move the window nor burn the round budget.
+    spawns:
+      - {shape: reviewer, mode: plan-attack}
+      - {shape: reviewer, mode: plan-review}
     # `scope` is a real runtime read (the reviewer's scope-containment
     # check reads state.scope) — declared so the validator's reordering
     # proof covers it, same rule as create-pr's `branches`.

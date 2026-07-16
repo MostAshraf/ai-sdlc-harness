@@ -14,6 +14,7 @@ CLI:  python3 -m harness.schema [repo-root]     exit 0 valid / 1 invalid
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -320,9 +321,22 @@ def validate_configs(config: dict, issues: Issues) -> None:
         if not all(rule.get(k) for k in ("id", "applies", "rule")):
             issues.err(f"config: review_policy entry {rule.get('id') or rule} needs id/applies/rule")
 
-    for knob in ("review_rounds", "stall", "repo_map"):
+    for knob in ("review_rounds", "stall", "repo_map", "plan_review"):
         if knob not in config:
             issues.err(f"config: workflow defaults missing '{knob}'")
+
+    lenses = (config.get("plan_review") or {}).get("lenses")
+    if not isinstance(lenses, list) or not all(
+            isinstance(x, str) and re.fullmatch(r"[a-z][a-z0-9-]{0,30}", x)
+            for x in lenses):
+        # empty list is legal (the declared single-reviewer fallback);
+        # a non-list, non-string, or non-slug entry is a shape error, not a
+        # choice — lens names become file paths (reports/plan-attack-<lens>)
+        # and spawn-ask text, so they must be plain slugs, never path or
+        # prompt material (adversarial-review finding)
+        issues.err("config: plan_review.lenses must be a list of lens-name "
+                   "slugs (lowercase [a-z0-9-], ≤31 chars; empty list = "
+                   "single-reviewer plan review)")
 
 
 def deep_merge(base: dict, override: dict) -> dict:

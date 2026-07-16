@@ -85,8 +85,10 @@ successful sibling of abort — the final step's file says exactly when).
 - **Stalls:** a subagent that stops without a status block → `${CLAUDE_PLUGIN_ROOT}/bin/harness stall
   --task <T>` and follow the returned action (`reinvoke` → `recovery` →
   `human`). For a TASK-LESS spawn (plan-review, pre-pr, analyze-comments)
-  omit `--task` — the stall counts per step, same bounds. NEVER commit or
-  write on a stalled agent's behalf.
+  omit `--task` — the stall counts per step, same bounds — except when the
+  step file declares finer keys (plan-review counts each panel lens as
+  `--task step:plan-review:<lens>`; the step file is the authority). NEVER
+  commit or write on a stalled agent's behalf.
 - **Ad-hoc human requests mid-run:** spawn `reviewer` with
   `harness-mode: request-triage` (always legal), surface the triage verdict
   to the user; out-of-scope items are never silently merged.

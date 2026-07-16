@@ -1100,6 +1100,29 @@ class SpawnGuard(GuardHarness):
             f"harness-mode: develop\nharness-run: {run}-nonexistent\ngo"),
             "does not match")
 
+    def test_plan_review_panel_spawn_set(self):
+        # the adversarial panel: both the lens mode and the synthesizer are
+        # legal exactly at the plan-review cursor — and nowhere earlier
+        run = self.make_run(to_step="plan-review", run_name="2026-01-01-G-2",
+                            item_id="G-2")
+        self.assert_allows("spawn", spawn(
+            "reviewer", f"harness-mode: plan-attack\nharness-run: {run}\n"
+                        "lens: contradictions\ngo"))
+        self.assert_allows("spawn", spawn(
+            "reviewer", f"harness-mode: plan-review\nharness-run: {run}\ngo"))
+        run2 = self.make_run(to_step="plan", run_name="2026-01-02-G-3",
+                             item_id="G-3")
+        self.assert_blocks("spawn", spawn(
+            "reviewer", f"harness-mode: plan-attack\nharness-run: {run2}\ngo"),
+            "spawn-set")
+        # and not at OTHER reviewer-spawning cursors either — the guard
+        # checks the {shape, mode} pair, never "some reviewer is legal here"
+        run3 = self.make_run(to_step="develop", run_name="2026-01-03-G-4",
+                             item_id="G-4")
+        self.assert_blocks("spawn", spawn(
+            "reviewer", f"harness-mode: plan-attack\nharness-run: {run3}\ngo"),
+            "spawn-set")
+
     def test_always_legal_request_triage(self):
         self.make_run(to_step="develop")
         self.assert_allows("spawn",

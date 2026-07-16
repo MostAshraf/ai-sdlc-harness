@@ -108,6 +108,29 @@ class ValidatorCatchesBrokenManifest(unittest.TestCase):
         self.assertTrue(any("requires a `returns_to` edge" in e
                             for e in self._errors(broken)))
 
+    def test_plan_review_lenses_shape_validated(self):
+        # the lens panel is declared data the orchestrator reads — a shape
+        # error must be a validation refusal, not a runtime surprise
+        broken = copy.deepcopy(self.config)
+        for bad in ("contradictions",        # not a list
+                    [1, 2],                  # non-string entries
+                    ["gaps/../../plan"],     # not a slug — becomes a PATH
+                    ["Gaps"], [""]):         # case / empty
+            issues = schema.Issues()
+            broken["plan_review"] = {"lenses": bad}
+            schema.validate_configs(broken, issues)
+            self.assertTrue(any("plan_review.lenses" in e
+                                for e in issues.errors), bad)
+        issues = schema.Issues()
+        broken["plan_review"] = {"lenses": []}   # empty IS legal (fallback)
+        schema.validate_configs(broken, issues)
+        self.assertFalse(any("plan_review" in e for e in issues.errors))
+        issues = schema.Issues()
+        del broken["plan_review"]                # missing knob is not
+        schema.validate_configs(broken, issues)
+        self.assertTrue(any("missing 'plan_review'" in e
+                            for e in issues.errors))
+
     def test_verdict_bound_cannot_share_a_step_with_an_escalation_source(self):
         # Two data features each claiming exclusive exit ownership would
         # resolve by interpreter ordering — refused at validation instead.

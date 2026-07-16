@@ -70,7 +70,7 @@ flowchart LR
     F([fetch + classify]):::orch
     I[intake + confirm target repos]:::agent
     P[plan]:::agent
-    PR[plan-review]:::agent
+    PR[plan-review — adversarial panel]:::agent
     G1{approve-plan}:::human
     PF[preflight]:::orch
     D[develop — proven-red TDD per task]:::agent
@@ -114,7 +114,7 @@ flowchart LR
     AF -.->|new comments| AC
 ```
 
-**Full mode** has three unconditional human gates (plan, implementation, pre-PR), one conditional gate (security — fires only when the aggregate finding severity meets the configured threshold, default `medium`), and one multi-pick gate (comment selection, inside the on-demand PR-comments group). Before the plan ever reaches you, an independent **plan-review** (reviewer shape) checks it against the numbered acceptance criteria, the codebase's observed conventions, and the confirmed repo scope — a `CHANGES_REQUESTED` verdict mechanically forces a revision loop (bounded by `review_rounds.max`; exhaustion escalates to you *with* the failing report attached), and its hook-captured verdict is what legalizes the step's exits, never the orchestrator's claim. **Quick mode** — trivial changes classified at fetch — keeps only the pre-PR gate. Everything between gates runs hands-off.
+**Full mode** has three unconditional human gates (plan, implementation, pre-PR), one conditional gate (security — fires only when the aggregate finding severity meets the configured threshold, default `medium`), and one multi-pick gate (comment selection, inside the on-demand PR-comments group). Before the plan ever reaches you, an **adversarial plan-review panel** runs: one lens reviewer per configured lens (`plan_review.lenses`, default *contradictions & collisions* + *gaps & completeness*; empty list = single reviewer) attacks the plan in parallel, and a synthesizer verifies their findings against the real code — never relaying them raw — groups them by root cause, checks the numbered acceptance criteria, the codebase's observed conventions, and the confirmed repo scope, and issues the one verdict the engine reads. A `CHANGES_REQUESTED` verdict mechanically forces a revision loop (bounded by `review_rounds.max`; exhaustion escalates to you *with* the failing report attached; every revision round re-runs the full panel), and that hook-captured verdict is what legalizes the step's exits, never the orchestrator's claim. **Quick mode** — trivial changes classified at fetch — keeps only the pre-PR gate. Everything between gates runs hands-off.
 
 At **any** cursor position, an ad-hoc human request is legal: it spawns the reviewer in `request-triage` mode (a declared always-legal spawn), which classifies the request against the approved plan. Out-of-scope requests surface back to you with explicit options — never silently merged.
 
@@ -161,7 +161,7 @@ Instead of one file per role fusing "who may do what" with "what procedure to fo
 |---|---|---|---|
 | **planner** | `intake` · `plan` · `repo-map` | Read/Grep/Glob/Write/Edit/Bash | Writes only under `ai/<run>/` and `.claude/context/` — never repo source |
 | **developer** | `develop` · `harden` · `fixup` | Read/Grep/Glob/Write/Edit/Bash | Works only inside its task worktree; non-test writes refused until the task's red-proof is sealed |
-| **reviewer** | `review` · `plan-review` · `pre-pr` · `analyze-comments` · `request-triage` | Read/Grep/Glob/Bash | Strictly read-only — no Write/Edit granted, shell writes blocked (a literal `/tmp` scratch path is the one exception); builds and test runs allowed, so it verifies independently instead of trusting another agent's claim |
+| **reviewer** | `review` · `plan-review` · `plan-attack` · `pre-pr` · `analyze-comments` · `request-triage` | Read/Grep/Glob/Bash | Strictly read-only — no Write/Edit granted, shell writes blocked (a literal `/tmp` scratch path is the one exception); builds and test runs allowed, so it verifies independently instead of trusting another agent's claim |
 
 The **orchestrator** (the main Claude Code conversation running `/dev-workflow`) is deliberately thin: a coordinator that walks the manifest, spawns shapes with structured `harness-mode:` headers, and calls `harness` verbs. It never writes code, never touches run-authority files directly, and never runs raw git — the guards block those paths and point it back to the owned verbs.
 
@@ -310,7 +310,7 @@ ai-sdlc-harness/
 │   └── init-workspace/ · add-repo/ · migrate-workspace/ · workspace-config/ · workflow-status/ · repo-map-refresh/
 ├── bin/harness                  # wrapper script resolving the plugin venv (+ harness.cmd for Windows)
 ├── tools/                       # meta-tooling: line-budget checker, sandbox workspace generators
-└── tests/                       # 636 stdlib-unittest tests
+└── tests/                       # 639 stdlib-unittest tests
 ```
 
 Workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside *your* working directory by `/init-workspace` and the pipeline. They never live inside this plugin repo.
@@ -333,7 +333,7 @@ python -m venv .venv; .venv\Scripts\pip install pyyaml
 .venv\Scripts\python -m unittest discover -s tests
 ```
 
-The test suite (636 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of both pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (639 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of both pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 
