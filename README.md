@@ -122,7 +122,7 @@ flowchart LR
 
 **Full mode** has three unconditional human gates (plan, implementation, pre-PR), one conditional gate (security — fires only when the aggregate finding severity meets the configured threshold, default `medium`), and one multi-pick gate (comment selection, inside the on-demand PR-comments group). Before the plan ever reaches you, an **adversarial plan-review panel** runs: one lens reviewer per configured lens (`plan_review.lenses`, default *contradictions & collisions* + *gaps & completeness*; empty list = single reviewer) attacks the plan in parallel, and a synthesizer verifies their findings against the real code — never relaying them raw — groups them by root cause, checks the numbered acceptance criteria, the codebase's observed conventions, and the confirmed repo scope, and issues the one verdict the engine reads. A `CHANGES_REQUESTED` verdict mechanically forces a revision loop (bounded by `review_rounds.max`; exhaustion escalates to you *with* the failing report attached; every revision round re-runs the full panel), and that hook-captured verdict is what legalizes the step's exits, never the orchestrator's claim. **Quick mode** — trivial changes classified at fetch — keeps only the pre-PR gate. Everything between gates runs hands-off.
 
-**Lean mode** — chosen per work item (`Mode: lean`) or as the workspace `default_mode` — keeps full's entire rigor (scoped plan, adversarial panel, proven-red TDD, security scan) but gates by exception: the plan gate (`approve-plan-lean`) *self-skips* when the panel approved within budget and *fires* only on bound exhaustion, its predicate reading an **engine-recorded** outcome derived from the same verdict ledger that legalized the step's exits (an orchestrator cannot claim "approved" past a rejecting panel — it never writes the value); the impl gate is deliberately absent (per-task completion already requires hook-captured reviewer approval); `approve-pre-pr` remains the one guaranteed human stop. Happy path: a single interruption, right before the PR.
+**Lean mode** keeps full's entire rigor but gates by exception — the plan gate fires only if the panel exhausts its rounds, there's no implementation gate, and the pre-PR gate stays: one human stop on the happy path. Add `Mode: lean` to a work item, or set `default_mode: lean` for the workspace — see [Choosing a mode](#choosing-a-mode) and [Lean mode](#lean-mode--gating-by-exception).
 
 At **any** cursor position, an ad-hoc human request is legal: it spawns the reviewer in `request-triage` mode (a declared always-legal spawn), which classifies the request against the approved plan. Out-of-scope requests surface back to you with explicit options — never silently merged.
 
@@ -221,6 +221,50 @@ The property that matters — *the test genuinely failed before the fix existed*
 ### Owned git entry points
 
 Once a workspace has completed `/init-workspace`, raw commit-creating / history-rewriting git verbs (`commit`, `merge`, `rebase`, `cherry-pick`, `revert`, `am`, `pull`, `push`) are blocked for Claude for the life of that workspace — the guard cannot know a "harness" commit from any other, so it blocks the whole verb rather than trying to tell one commit's intent from another's (your own terminal outside Claude Code is unaffected, and a session that has never run `/init-workspace` sees ordinary git — see [Guardrail Hooks](#guardrail-hooks)). Mutations go through owned verbs that validate, execute, and ledger in one place: `commit` (declared classes `working`/`wip`, `--fixup-of`), `merge-task` (squash / `--autosquash` fold), `worktree-add`/`worktree-remove`, `sync-branch` (owned rebase), `push` (`--force-with-lease`), and `publish-mirror`. Branch and commit naming come from [config/defaults/naming.yaml](config/defaults/naming.yaml).
+
+### Choosing a mode
+
+Three modes, selected at fetch from declared data — never at the model's discretion:
+
+| Mode | Pipeline | Human gates |
+|---|---|---|
+| **full** | Everything: scoped plan, adversarial panel, proven-red TDD, harden, security | Plan, implementation, pre-PR (+ security when findings meet the threshold) |
+| **lean** | Identical rigor to full | **Pre-PR only** on the happy path — the plan gate fires only if the panel exhausts its rounds; no implementation gate |
+| **quick** | Short path: no plan step, no red-proof machinery | Pre-PR only |
+
+Pick one per work item with a **`Mode:` hint on its own line in the work item's description** (the story file for `local-markdown`, the issue body for github/gitlab/…):
+
+```
+## Description
+Mode: lean
+Refactor the notification service onto the new queue client.
+```
+
+The hint is matched case-insensitively (`Mode: lean`, `mode: lean`). Or set the workspace-wide fallback for items with no hint — in [config/defaults/workflow.yaml](config/defaults/workflow.yaml), overridable via `/workspace-config`:
+
+```yaml
+default_mode: lean    # shipped default: full
+```
+
+Precedence is **full > quick > lean > default**, resolved by the classifier and mapped to a mode by the manifest alone:
+
+- **`Mode: full`** always wins — the per-item escape *upward* out of a `default_mode: lean` workspace. An item asking for more gating always gets it.
+- **`Mode: quick`** needs eligibility: the hint *and* no risk keyword. A keyword-disqualified quick hint falls to lean/default — never past lean, because the keywords guard *skipping the plan machinery*, which lean keeps.
+- **`default_mode: quick` is not a thing** — quick requires per-item eligibility, never a standing workspace choice.
+
+`harness fetch` reports the resolved `mode`, and the `fetched` event records the `mode_verdict` plus why (`explicitly hinted` vs `workspace default_mode`), so mode selection is auditable rather than inferred.
+
+### Lean mode — gating by exception
+
+Lean keeps **all** of full's rigor — confirmed repo scope, the adversarial plan panel, proven-red TDD, harden, the security scan — and loosens only *when a human is interrupted*. On the happy path you are asked exactly once, right before the PR is opened:
+
+- **The plan gate self-skips** when the plan-review panel approved the plan within its round budget, and **fires only on bound exhaustion** — the case where the machines couldn't converge and the decision is genuinely yours. The skip is ledgered as a `gate-skipped` event, so "skipped by predicate" is never confused with "never evaluated".
+- **The implementation gate is absent** — deliberately: task completion already refuses without a hook-captured reviewer `APPROVED` per task, and the holistic pre-PR review plus its gate cover the aggregate.
+- **`approve-pre-pr` remains unconditional** — the one guaranteed stop.
+
+The skip predicate reads an outcome the **engine** records from the same verdict ledger that legalizes the step's exits — the orchestrator never writes it (the `artifact` verb refuses the name), so a drifting agent cannot skip you past a plan the panel rejected. Exhaustion also *latches*: once the panel burns its budget, a later approval can't retroactively re-open the skip.
+
+The trade to accept knowingly: on a lean happy path, the panel's approval is the plan's effective ratification — your scope confirmation and the plan's test-intents are never gate-ratified. That's the point of choosing it per item (or per workspace), and `Mode: full` buys the gates back on anything risky.
 
 ### Quick mode — with a mechanical escape hatch
 
@@ -353,7 +397,13 @@ The test suite (657 tests) covers the state engine, gate grammar, guard behavior
 
 **Why can't Claude run `git commit` in my harness workspace?** The guard can't distinguish a harness commit from any other, so it blocks the whole verb for the life of any workspace that has completed `/init-workspace` — regardless of whether a run is currently active. Your own terminal outside Claude Code is unaffected, and a project that has never run `/init-workspace` is unaffected too. If you need raw git inside a bootstrapped workspace, disable the plugin for that session.
 
+**How do I stop it interrupting me at every gate?** Run the item in **lean mode**: put `Mode: lean` on its own line in the work item's description, or set `default_mode: lean` in your workspace config to make it the standing choice for unhinted items. Lean keeps every guarantee full has (scoped plan, adversarial panel, proven-red TDD, security) and gates by exception instead — the plan gate fires only if the plan-review panel exhausts its round budget, there's no implementation gate, and the pre-PR gate stays. Happy path: one stop, right before the PR. `Mode: full` on a single item buys the full gates back — see [Choosing a mode](#choosing-a-mode).
+
+**Which mode will my work item run in?** Precedence is **full > quick > lean > default**: an explicit `Mode: full` hint always wins, `Mode: quick` needs the hint *and* no risk keyword, `Mode: lean` (or `default_mode: lean`) is next, and anything else lands on full. `harness fetch` reports the resolved `mode`, and the `fetched` event in `events.ndjson` records the `mode_verdict` and the reason it was chosen — so it's auditable, never a guess.
+
 **What if the reviewer keeps rejecting?** Rounds are bounded (`review_rounds.max`, default 5). Beyond that the rework transition is refused and you're escalated — persistent rejection signals plan drift, not code drift.
+
+**What if the plan-review panel keeps rejecting?** Same bound (`review_rounds.max`), applied per plan cycle: each `CHANGES_REQUESTED` verdict forces a revision loop back to the planner. Once the budget is exhausted, the plan reaches you at the plan gate **with the failing review attached** — in lean mode, that's exactly when its otherwise-skipped gate fires. Never an auto-approval, never a deadlock.
 
 **What if an agent stalls or returns garbage?** A missing/invalid status block is detected mechanically; the orchestrator re-invokes with a continuation prompt (bounded, default 2), then escalates to you (default 3). It never acts on the agent's behalf.
 
