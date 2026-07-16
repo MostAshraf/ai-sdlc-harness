@@ -30,14 +30,19 @@ The original harness works, but almost all of its accumulated complexity compens
 
 ## Install
 
-Not yet published to a plugin marketplace — run it from a local clone:
+This repo *is* a Claude Code plugin marketplace. Inside Claude Code:
 
-```sh
-git clone https://github.com/MostAshraf/ai-sdlc-harness.git
-claude --plugin-dir ./ai-sdlc-harness
+```
+/plugin marketplace add MostAshraf/ai-sdlc-harness
+/plugin install ai-sdlc-harness@ai-sdlc-harness
 ```
 
-(SSH works too: `git clone git@github.com:MostAshraf/ai-sdlc-harness.git`. `--plugin-dir` takes the clone's path — absolute or relative — so run `claude` from wherever suits you.)
+The repeated name isn't a typo — it's `plugin-name@marketplace-name`, and here they match. Restart Claude Code (or `/reload-plugins`) so the skills and hooks load. There's a non-interactive equivalent too, if you'd rather script it:
+
+```sh
+claude plugin marketplace add MostAshraf/ai-sdlc-harness
+claude plugin install ai-sdlc-harness@ai-sdlc-harness   # --scope user|project|local
+```
 
 Then, inside Claude Code:
 
@@ -370,6 +375,13 @@ ai-sdlc-harness/
 Workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside *your* working directory by `/init-workspace` and the pipeline. They never live inside this plugin repo.
 
 ## Development
+
+Working on the harness itself? Run it from a clone instead of the installed copy — `--plugin-dir` is per-session, so it never disturbs an installed version:
+
+```sh
+git clone https://github.com/MostAshraf/ai-sdlc-harness.git   # or git@github.com:MostAshraf/ai-sdlc-harness.git
+claude --plugin-dir ./ai-sdlc-harness
+```
 
 Requires Python 3.10+ and PyYAML. CI runs the suite on Linux, macOS, and Windows — all three lanes enforcing.
 
