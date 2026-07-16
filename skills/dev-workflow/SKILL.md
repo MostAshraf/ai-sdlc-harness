@@ -98,8 +98,8 @@ successful sibling of abort — the final step's file says exactly when).
   isn't a mirror target. So it only makes sense once a repo has a feature
   branch, i.e. **after `preflight`**. Rules:
   - **Before preflight** (`fetch`/`intake`/`plan`/`plan-review`/
-    ⟨approve-plan⟩): there is no branch yet — **skip the mirror entirely**,
-    don't guess a `--repo`.
+    ⟨approve-plan⟩/⟨approve-plan-lean⟩): there is no branch yet — **skip
+    the mirror entirely**, don't guess a `--repo`.
   - **After preflight** (task completion, and each later gate crossing):
     mirror into **every preflighted repo** (the `branches` artifact in
     `show` lists them) — one call per repo:

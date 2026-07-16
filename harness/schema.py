@@ -153,9 +153,12 @@ def validate_manifest(manifest: dict, surfaces: dict, config: dict, issues: Issu
                 issues.err(f"{where}: `verdict_bound` is not meaningful on a "
                            "gate step (gates derive from human input, not "
                            "reviewer verdicts)")
-            if not isinstance(vb, dict) or set(vb) != {"mode", "bound"}:
-                issues.err(f"{where}: `verdict_bound` must be exactly "
-                           "{mode, bound: {config: key}}")
+            if (not isinstance(vb, dict)
+                    or not {"mode", "bound"} <= set(vb)
+                    or set(vb) - {"mode", "bound", "outcome_artifact"}):
+                issues.err(f"{where}: `verdict_bound` must be "
+                           "{mode, bound: {config: key}} plus optional "
+                           "outcome_artifact")
             else:
                 spawn_modes = {s.get("mode")
                                for s in step.get("spawns", []) or []}
@@ -172,6 +175,13 @@ def validate_manifest(manifest: dict, surfaces: dict, config: dict, issues: Issu
                     issues.err(f"{where}: `verdict_bound` requires a "
                                "`returns_to` edge (the CHANGES_REQUESTED-"
                                "under-bound loop target)")
+                oa = vb.get("outcome_artifact")
+                if oa is not None and oa not in (step.get("produces") or []):
+                    # the engine records it via set_artifact, which refuses
+                    # names outside the step's produces — catch the
+                    # mismatch at validation, not on the first forward edge
+                    issues.err(f"{where}: verdict_bound.outcome_artifact "
+                               f"'{oa}' must be one of the step's produces")
                 # Two data features each claiming exclusive exit ownership
                 # would silently resolve by interpreter ordering — refuse
                 # the combination instead (half-enforced-vocabulary bar).
@@ -324,6 +334,14 @@ def validate_configs(config: dict, issues: Issues) -> None:
     for knob in ("review_rounds", "stall", "repo_map", "plan_review"):
         if knob not in config:
             issues.err(f"config: workflow defaults missing '{knob}'")
+
+    default_mode = config.get("default_mode", "full")
+    if default_mode not in ("full", "lean"):
+        # quick is deliberately not defaultable: it needs per-item
+        # eligibility (hint + no disqualifying keyword), never a standing
+        # workspace choice
+        issues.err("config: default_mode must be 'full' or 'lean' "
+                   f"(got {default_mode!r})")
 
     lenses = (config.get("plan_review") or {}).get("lenses")
     if not isinstance(lenses, list) or not all(

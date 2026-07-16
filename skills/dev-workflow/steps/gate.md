@@ -8,10 +8,12 @@ request; deterministic code decides (design.md RC3).
    `presents:` names it — plan.md, task summary, security report…), plus the
    options: plain gates → `APPROVED` / `rejected`; security gate →
    `[1] fix-now [2] waive [3] defer`.
-   ⟨approve-plan⟩ only: ALSO show `<run>/reports/plan-review.md` verbatim —
-   the independent review travels with the plan (and if it reached this
-   gate with the review bound exhausted, say so explicitly; the human is
-   deciding on a plan the reviewer still rejects).
+   ⟨approve-plan⟩ / ⟨approve-plan-lean⟩ only: ALSO show
+   `<run>/reports/plan-review.md` verbatim — the independent review
+   travels with the plan (and if it reached this gate with the review
+   bound exhausted, say so explicitly; the human is deciding on a plan
+   the panel still rejects — for ⟨approve-plan-lean⟩ that is the ONLY way
+   it fires at all: an approved panel self-skips it).
 3. Wait for the user's reply — it must arrive as a PLAIN TYPED CHAT
    MESSAGE. The capture hook anchors decisions to UserPromptSubmit events
    only; an AskUserQuestion answer arrives as a structured tool result,
@@ -47,9 +49,10 @@ request; deterministic code decides (design.md RC3).
 7. Publish the mirror after the crossing — **once per preflighted repo**
    (the `branches` artifact in `show` names them), never into the
    workspace: `${CLAUDE_PLUGIN_ROOT}/bin/harness publish-mirror --repo <preflighted-repo-path> --run <run>`.
-   **⟨approve-plan⟩ is BEFORE preflight** — no branch exists yet, so **skip
-   the mirror entirely at this gate** (there's nothing to snapshot into a
-   code branch). See SKILL.md's Publish rule. Best-effort/non-blocking.
+   **⟨approve-plan⟩ and ⟨approve-plan-lean⟩ are BEFORE preflight** — no
+   branch exists yet, so **skip the mirror entirely at these gates**
+   (there's nothing to snapshot into a code branch). See SKILL.md's
+   Publish rule. Best-effort/non-blocking.
 8. ⟨approve-impl⟩ only, BEFORE presenting: `${CLAUDE_PLUGIN_ROOT}/bin/harness
    write-back --milestone in_review --run <run>` (no-ops cleanly if
    `write_back.on_in_review` is off, or — for an MCP-transport provider —

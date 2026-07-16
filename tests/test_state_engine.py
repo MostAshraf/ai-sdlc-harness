@@ -444,6 +444,40 @@ class VerdictBoundExits(Harness):
             self._cands()
         self.assertIn("corrupt", str(ctx.exception))
 
+    def test_outcome_artifact_engine_recorded(self):
+        # `pending` was stamped on entry (advance_to walked us in), and the
+        # forward exit resolves it from the ledger — the value lean's
+        # exception gate trusts is never orchestrator-written.
+        self.assertEqual(self.st["artifacts"]["plan-review.outcome"],
+                         "pending")
+        support.seed_review_verdict(self.run, verdict="APPROVED")
+        transitions.advance_cursor(self.st, self.manifest, self.config,
+                                   "approve-plan", T0, run=self.run)
+        self.assertEqual(self.st["artifacts"]["plan-review.outcome"],
+                         "approved")
+
+    def test_outcome_artifact_exhausted_on_bound_exit(self):
+        for _ in range(self.config["review_rounds"]["max"]):
+            support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        transitions.advance_cursor(self.st, self.manifest, self.config,
+                                   "approve-plan", T0, run=self.run)
+        self.assertEqual(self.st["artifacts"]["plan-review.outcome"],
+                         "exhausted")
+
+    def test_outcome_stays_pending_across_the_revision_loop(self):
+        support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        transitions.advance_cursor(self.st, self.manifest, self.config,
+                                   "plan", T0, run=self.run)
+        self.assertEqual(self.st["artifacts"]["plan-review.outcome"],
+                         "pending")   # loop edge decides nothing
+        for t in self.st["tasks"]:   # unit shortcut for plan-register
+            t.pop("provisional", None)
+        transitions.advance_cursor(self.st, self.manifest, self.config,
+                                   "plan-review", T0, run=self.run)
+        self.assertEqual(self.st["artifacts"]["plan-review.outcome"],
+                         "pending")   # re-entry re-stamps
+
+
     def test_lens_verdicts_are_advisory_and_invisible_to_the_engine(self):
         # The adversarial panel's advisory/binding line, engine-pinned:
         # plan-attack records (task-less, a different reviewer mode) must
@@ -516,6 +550,94 @@ class VerdictBoundExits(Harness):
         self.assertEqual(transitions.cursor_candidates(
             self.st, self.manifest, self.config, run=self.run), {})
 
+
+class LeanModeGating(Harness):
+    """Lean's exception gate: an approved panel self-skips ⟨approve-plan-
+    lean⟩ (ledgered as gate-skipped), an exhausted one fires it — the
+    predicate reads the ENGINE-recorded outcome, so a drifting orchestrator
+    cannot skip a human past a rejecting panel."""
+
+    def setUp(self):
+        super().setUp()
+        self.run, self.st = _bootstrap(self.workspace, "lean")
+        self.advance_to(self.st, self.run, "plan-review")
+
+    def test_approved_panel_skips_the_exception_gate(self):
+        support.seed_review_verdict(self.run)   # panel APPROVED
+        cands = transitions.cursor_candidates(
+            self.st, self.manifest, self.config, run=self.run)
+        self.assertEqual(cands, {"preflight": "sequence"})   # gate skipped
+        skipped = transitions.advance_cursor(
+            self.st, self.manifest, self.config, "preflight", T0,
+            run=self.run)
+        self.assertEqual([s["step"] for s in skipped], ["approve-plan-lean"])
+
+    def test_exhausted_panel_fires_the_exception_gate(self):
+        for _ in range(self.config["review_rounds"]["max"]):
+            support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        cands = transitions.cursor_candidates(
+            self.st, self.manifest, self.config, run=self.run)
+        self.assertEqual(list(cands), ["approve-plan-lean"])   # gate REQUIRED
+        transitions.advance_cursor(self.st, self.manifest, self.config,
+                                   "approve-plan-lean", T0, run=self.run)
+        # undecided gate: nothing legal until the human decides
+        self.assertEqual(transitions.cursor_candidates(
+            self.st, self.manifest, self.config, run=self.run), {})
+        gates.present(self.st, "approve-plan-lean", T0)
+        self.st["gates"]["approve-plan-lean"]["decision"] = "rejected"
+        self.assertEqual(transitions.cursor_candidates(
+            self.st, self.manifest, self.config, run=self.run),
+            {"plan": "on_reject"})
+
+    def test_lean_walks_develop_to_harden_without_an_impl_gate(self):
+        support.seed_review_verdict(self.run)
+        self.advance_to(self.st, self.run, "develop")
+        for t in self.st["tasks"]:
+            t["status"] = "done"   # unit shortcut for the real TDD path
+        self.assertEqual(transitions.cursor_candidates(
+            self.st, self.manifest, self.config, run=self.run),
+            {"harden": "sequence"})
+
+    def test_exhaustion_latches_within_the_window(self):
+        # adversarial-review (lean round): once the bound is hit,
+        # returns_to is closed — no legitimate revision can exist in this
+        # window, so a later same-window APPROVED (stall re-spawn,
+        # manipulation) must NOT flip the outcome and self-skip the
+        # exception gate past a plan the panel rejected `bound` times.
+        for _ in range(self.config["review_rounds"]["max"]):
+            support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        support.seed_review_verdict(self.run, verdict="APPROVED")  # round 6
+        cands = transitions.cursor_candidates(
+            self.st, self.manifest, self.config, run=self.run)
+        self.assertEqual(list(cands), ["approve-plan-lean"])   # still fires
+        self.assertEqual(self.st["artifacts"]["plan-review.outcome"],
+                         "exhausted")
+
+    def test_second_cycle_skips_after_rejection_and_a_clean_panel(self):
+        # exhausted → gate fires → human rejects (fresh window opens at
+        # decided_at) → revise + re-register → panel approves → the
+        # exception gate self-skips on cycle 2. Pins the full interplay of
+        # decision consumption, window re-anchoring, registration re-arm,
+        # and the outcome refresh.
+        for _ in range(self.config["review_rounds"]["max"]):
+            support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        transitions.advance_cursor(self.st, self.manifest, self.config,
+                                   "approve-plan-lean", T0, run=self.run)
+        gates.present(self.st, "approve-plan-lean", T0)
+        self.st["gates"]["approve-plan-lean"].update(
+            decision="rejected", decided_at=ndjson.now_iso())
+        transitions.advance_cursor(self.st, self.manifest, self.config,
+                                   "plan", T0, run=self.run)
+        for t in self.st["tasks"]:   # unit shortcut for plan-register
+            t.pop("provisional", None)
+        transitions.advance_cursor(self.st, self.manifest, self.config,
+                                   "plan-review", T0, run=self.run)
+        support.seed_review_verdict(self.run, verdict="APPROVED")
+        self.assertEqual(transitions.cursor_candidates(
+            self.st, self.manifest, self.config, run=self.run),
+            {"preflight": "sequence"})   # cycle-2 skip
+        self.assertEqual(self.st["artifacts"]["plan-review.outcome"],
+                         "approved")
 
 class RunCompletion(Harness):
     """0.16.13 field class (e2e E2E-1): a run that exhausted its walk

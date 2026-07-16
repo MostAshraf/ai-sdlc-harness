@@ -1126,6 +1126,20 @@ def main(argv: list[str] | None = None) -> int:
                         "the 'scope' artifact is written only by `harness "
                         "scope-register` — the generic artifact verb would "
                         "bypass its validation")
+                engine_owned = {vb["outcome_artifact"]
+                                for s in manifest["steps"].values()
+                                for vb in [s.get("verdict_bound") or {}]
+                                if vb.get("outcome_artifact")}
+                if args.name in engine_owned:
+                    # verdict_bound outcomes are ENGINE-derived from the
+                    # verdict ledger (the exception gate's predicate trusts
+                    # them); an orchestrator-written value would lie on
+                    # every audit surface until the next cursor move
+                    # re-derives it.
+                    raise state_mod.StateError(
+                        f"'{args.name}' is engine-recorded from the "
+                        "reviewer-verdict ledger (verdict_bound."
+                        "outcome_artifact) — never written by hand")
                 transitions.set_artifact(st, manifest, args.name, args.value)
             elif args.cmd == "stall":
                 stall_key = args.task or f"step:{st['cursor']['current_step']}"

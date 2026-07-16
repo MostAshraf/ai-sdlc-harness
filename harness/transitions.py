@@ -95,6 +95,25 @@ def _verdict_bound_filter(cur_def: dict, state: dict, config: dict,
     vb = cur_def["verdict_bound"]
     if run is None:
         return {}  # no ledger access -> fail closed (CLI always passes run)
+    latest_verdict, rounds = _verdict_window(state, run, vb["mode"])
+    if latest_verdict is None:
+        return {}
+    bound = _config_get(config, vb["bound"]["config"])
+    ret = cur_def.get("returns_to")
+    if latest_verdict == "APPROVED" or rounds >= bound:
+        return {k: v for k, v in candidates.items() if k != ret}
+    return {ret: "returns_to"} if ret in candidates else {}
+
+
+def _verdict_window(state: dict, run: Path, mode: str) -> tuple[str | None, int]:
+    """(latest in-window verdict, CHANGES_REQUESTED count) for `mode` —
+    THE one computation both the exit filter and the outcome-artifact
+    recording read, so the gate a downstream `when` predicate consults can
+    never disagree with the exits that were actually derived. Window:
+    records strictly after the latest human gate decision. Timestamp ties
+    fail closed: two hook processes can stamp identical `at` (per-process
+    monotonic clamp, coarse OS clocks), and a plain max() is first-wins —
+    which would let an APPROVED beat a same-instant CHANGES_REQUESTED."""
     anchor = max((g.get("decided_at", "") or ""
                   for g in (state.get("gates") or {}).values()), default="")
     try:
@@ -102,15 +121,11 @@ def _verdict_bound_filter(cur_def: dict, state: dict, config: dict,
     except ndjson.LedgerCorruption as exc:
         raise TransitionError(
             "verdict_bound: reviewer-verdict ledger has a corrupt record — "
-            f"refusing to derive exits (fail closed): {exc}") from exc
+            f"refusing to derive from it (fail closed): {exc}") from exc
     qualifying = [r for r in records
-                  if r.get("mode") == vb["mode"] and r.get("at", "") > anchor]
+                  if r.get("mode") == mode and r.get("at", "") > anchor]
     if not qualifying:
-        return {}
-    # Timestamp ties fail closed: two hook processes can stamp identical
-    # `at` (per-process monotonic clamp, coarse OS clocks), and a plain
-    # max() is first-wins — which would let an APPROVED beat a same-instant
-    # CHANGES_REQUESTED. Any CR at the latest instant wins the tie.
+        return None, 0
     latest_at = max(r.get("at", "") for r in qualifying)
     at_tie = [r for r in qualifying if r.get("at", "") == latest_at]
     if any(r.get("verdict") == "CHANGES_REQUESTED" for r in at_tie):
@@ -119,11 +134,7 @@ def _verdict_bound_filter(cur_def: dict, state: dict, config: dict,
         latest_verdict = at_tie[-1].get("verdict")
     rounds = sum(1 for r in qualifying
                  if r.get("verdict") == "CHANGES_REQUESTED")
-    bound = _config_get(config, vb["bound"]["config"])
-    ret = cur_def.get("returns_to")
-    if latest_verdict == "APPROVED" or rounds >= bound:
-        return {k: v for k, v in candidates.items() if k != ret}
-    return {ret: "returns_to"} if ret in candidates else {}
+    return latest_verdict, rounds
 
 
 def cursor_candidates(state: dict, manifest: dict, config: dict,
@@ -136,6 +147,31 @@ def cursor_candidates(state: dict, manifest: dict, config: dict,
     artifacts = state.get("artifacts", {})
     candidates: dict[str, str] = {}
     cur_def = steps.get(current, {})
+
+    vb_cur = cur_def.get("verdict_bound") or {}
+    if vb_cur.get("outcome_artifact") and run is not None:
+        # Refresh the ledger-derived outcome BEFORE the sequence walk: a
+        # follower's `when` predicate (lean's exception gate) must see the
+        # CURRENT panel state, not the entry stamp — pending while
+        # undecided or mid-revision, approved/exhausted once the ledger
+        # says so. The caller persists state after advancing, so the value
+        # the gate later reads is exactly the one that legalized the move.
+        latest_verdict, rounds = _verdict_window(state, run, vb_cur["mode"])
+        # Exhaustion LATCHES within a window (adversarial-review, lean
+        # round: once the bound is hit, returns_to is closed — no
+        # legitimate revision can exist in this window — so a later
+        # same-window APPROVED is a stall re-spawn or manipulation, and
+        # letting it flip the outcome would self-skip lean's exception
+        # gate past a plan the panel rejected `bound` times). Only a gate
+        # decision re-anchors the window and clears the latch.
+        if (latest_verdict is not None
+                and rounds >= _config_get(config, vb_cur["bound"]["config"])):
+            outcome = "exhausted"
+        elif latest_verdict == "APPROVED":
+            outcome = "approved"
+        else:
+            outcome = "pending"
+        set_artifact(state, manifest, vb_cur["outcome_artifact"], outcome)
 
     # requires_tasks_registered gates EVERY exit, not just the sequence edge
     # (adversarial-review finding: the check below only suppressed the
@@ -305,6 +341,16 @@ def advance_cursor(state: dict, manifest: dict, config: dict, target: str,
         state["mode"] = reason.split(":", 1)[1]
     state["cursor"]["completed_steps"].append(current)
     state["cursor"]["current_step"] = target
+    tvb = manifest["steps"].get(target, {}).get("verdict_bound") or {}
+    if tvb.get("outcome_artifact"):
+        # ENTERING a verdict_bound step (first entry or a revision
+        # re-entry): the outcome is undecided — stamp `pending` so a
+        # downstream `when` predicate can always evaluate (a missing
+        # predicate artifact is a hard TransitionError by design, and the
+        # candidates walk evaluates the follower's `when` while the cursor
+        # still sits here). The forward exit overwrites it with the real
+        # ledger-derived value.
+        set_artifact(state, manifest, tvb["outcome_artifact"], "pending")
     state["metrics"].setdefault(current, {})["ended_at"] = now
     state["metrics"].setdefault(target, {})["started_at"] = now
     return skipped

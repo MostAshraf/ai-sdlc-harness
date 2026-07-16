@@ -1043,6 +1043,108 @@ class PlanRegisterValidation(BreadthHarness):
         self.assertIn("outside the confirmed scope", out["error"])
 
 
+class LeanModeEntry(BreadthHarness):
+    """Mode selection is declared data end to end: the work-item hint (or
+    the workspace default_mode) mints a classify verdict; the manifest's
+    selects_mode mapping alone turns it into the lean mode."""
+
+    def test_lean_hint_selects_lean_mode(self):
+        self.story("W-99", "routine change")
+        stories_file = self.stories / "W-99.md"
+        stories_file.write_text(stories_file.read_text(encoding="utf-8")
+                                .replace("## Description\n",
+                                         "## Description\nMode: lean\n"))
+        self.init()
+        out = self.cli("fetch", "--id", "W-99", "--date", "2026-02-01")
+        self.assertEqual(out["mode"], "lean")
+
+    def test_workspace_default_mode_lean(self):
+        self.story("W-98", "no hints at all")
+        self.init()
+        (self.workspace / ".claude" / "context" / "mode-override.yaml"
+         ).write_text("default_mode: lean\n")
+        out = self.cli("fetch", "--id", "W-98", "--date", "2026-02-01")
+        self.assertEqual(out["mode"], "lean")
+        # and the ledger records the verdict, not just the mode
+        run = Path(out["run"])
+        fetched = next(e for e in ndjson.read_records(run / "events.ndjson")
+                       if e["kind"] == "fetched")
+        self.assertEqual(fetched["mode_verdict"], "lean-requested")
+        self.assertEqual(fetched["classify_reason"], "workspace default_mode")
+
+    def test_full_hint_escapes_a_lean_workspace_default(self):
+        self.story("W-97", "risky payments change")
+        f = self.stories / "W-97.md"
+        f.write_text(f.read_text(encoding="utf-8")
+                     .replace("## Description\n", "## Description\nMode: full\n"))
+        self.init()
+        (self.workspace / ".claude" / "context" / "mode-override.yaml"
+         ).write_text("default_mode: lean\n")
+        out = self.cli("fetch", "--id", "W-97", "--date", "2026-02-01")
+        self.assertEqual(out["mode"], "full")
+
+    def test_outcome_artifact_is_engine_owned(self):
+        self.story("W-96", "outcome forgery attempt")
+        self.init()
+        run = Path(self.cli("fetch", "--id", "W-96",
+                            "--date", "2026-02-01")["run"])
+        out = self.cli("artifact", "--name", "plan-review.outcome",
+                       "--value", "approved", run=run, expect=1)
+        self.assertIn("engine-recorded", out["error"])
+
+
+class LeanWalk(BreadthHarness):
+    def test_lean_walk_one_gate_to_metrics(self):
+        """Lean end-to-end through the real CLI: the exception gate
+        self-skips on an approved panel (ledgered), develop flows into
+        harden with no impl gate, and the run's only human decision is
+        approve-pre-pr."""
+        self.story("W-95", "lean end to end")
+        f = self.stories / "W-95.md"
+        f.write_text(f.read_text(encoding="utf-8")
+                     .replace("## Description\n", "## Description\nMode: lean\n"))
+        self.init()
+        out = self.cli("fetch", "--id", "W-95", "--date", "2026-02-01")
+        self.assertEqual(out["mode"], "lean")
+        run = Path(out["run"])
+        self.cli("cursor", "--to", "intake", run=run)
+        self.cli("cursor", "--to", "plan", run=run)
+        self.scope(run)
+        (run / "plan.md").write_text("# Plan\n## T1\n")
+        self.cli("plan-register", "--tasks-json",
+                 json.dumps([{"id": "T1", "repo": str(self.repo)}]), run=run)
+        self.pass_plan_review(run)                     # panel APPROVED
+        self.cli("cursor", "--to", "preflight", run=run)   # gate self-skipped
+        skipped = [e for e in ndjson.read_records(run / "events.ndjson")
+                   if e["kind"] == "gate-skipped"]
+        self.assertEqual([e["step"] for e in skipped], ["approve-plan-lean"])
+        self.cli("preflight", "--repo", str(self.repo), run=run)
+        self.cli("cursor", "--to", "develop", run=run)
+        self._force_tasks_done(run)
+        self.cli("cursor", "--to", "harden", run=run)  # no impl gate in lean
+        self.cli("cursor", "--to", "security", run=run)
+        self.assertEqual(self.cli("security-scan", run=run)["max_severity"],
+                         "info")
+        self.cli("cursor", "--to", "pre-pr", run=run)  # security gate skipped
+        (run / "reports").mkdir(exist_ok=True)
+        (run / "reports" / "pre-pr.md").write_text("# Pre-PR\nok\n")
+        self.cli("cursor", "--to", "approve-pre-pr", run=run)
+        self.gate(run, "approve-pre-pr")               # THE one human gate
+        self.cli("cursor", "--to", "create-pr", run=run)
+        self.cli("create-pr", "--repo", str(self.repo), run=run)
+        self.cli("cursor", "--to", "reconcile", run=run)
+        self.cli("reconcile", run=run)
+        self.cli("cursor", "--to", "metrics", run=run)
+        self.cli("metrics", run=run)
+        self.cli("verify", run=run)                    # chain intact
+        state = self.cli("show", run=run)["state"]
+        self.assertNotIn("approve-impl",
+                         state["cursor"]["completed_steps"])
+        decided = [g for g, v in state["gates"].items()
+                   if v.get("decision") or v.get("consumed_decision")]
+        self.assertEqual(decided, ["approve-pre-pr"])
+
+
 class ScopeRegisterValidation(BreadthHarness):
     """The human-confirmed target-repo set is an owned entry point with
     fail-closed validation — never a prose convention the planner could

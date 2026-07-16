@@ -85,7 +85,33 @@ class ValidatorCatchesBrokenManifest(unittest.TestCase):
     def test_verdict_bound_wrong_shape_refused(self):
         broken = copy.deepcopy(self.manifest)
         broken["steps"]["plan-review"]["verdict_bound"] = {"mode": "plan-review"}
-        self.assertTrue(any("must be exactly" in e for e in self._errors(broken)))
+        self.assertTrue(any("`verdict_bound` must be" in e
+                            for e in self._errors(broken)))
+        broken["steps"]["plan-review"]["verdict_bound"] = {
+            "mode": "plan-review", "bound": {"config": "review_rounds.max"},
+            "surprise": True}   # unknown keys refused too
+        self.assertTrue(any("`verdict_bound` must be" in e
+                            for e in self._errors(broken)))
+
+    def test_verdict_bound_outcome_artifact_must_be_produced(self):
+        # the engine records it via set_artifact, which refuses names
+        # outside the step's produces — a mismatch must die at validation
+        broken = copy.deepcopy(self.manifest)
+        broken["steps"]["plan-review"]["verdict_bound"]["outcome_artifact"] = \
+            "not-a-produced-name"
+        self.assertTrue(any("must be one of the step's produces" in e
+                            for e in self._errors(broken)))
+
+    def test_default_mode_validated(self):
+        issues = schema.Issues()
+        broken = copy.deepcopy(self.config)
+        broken["default_mode"] = "laen"   # typo must refuse, never silently
+        schema.validate_configs(broken, issues)
+        self.assertTrue(any("default_mode" in e for e in issues.errors))
+        issues = schema.Issues()
+        broken["default_mode"] = "lean"
+        schema.validate_configs(broken, issues)
+        self.assertFalse(any("default_mode" in e for e in issues.errors))
 
     def test_verdict_bound_mode_must_be_spawned_by_the_step(self):
         # A step gated on a verdict it can never produce would deadlock at

@@ -72,6 +72,7 @@ flowchart LR
     P[plan]:::agent
     PR[plan-review — adversarial panel]:::agent
     G1{approve-plan}:::human
+    G1L{approve-plan-lean, only when the panel exhausted its rounds}:::human
     PF[preflight]:::orch
     D[develop — proven-red TDD per task]:::agent
     G2{approve-impl}:::human
@@ -89,14 +90,19 @@ flowchart LR
     RC[reconcile]:::output
     M[metrics]:::output
 
-    F -->|full| I --> P --> PR
-    PR -->|reviewer APPROVED, or round budget exhausted| G1
+    F -->|full / lean| I --> P --> PR
+    PR -->|full: panel APPROVED, or round budget exhausted| G1
     PR -->|CHANGES_REQUESTED — forced revision loop| P
+    PR -.->|lean: panel APPROVED — gate self-skips| PF
+    PR -->|lean: rounds exhausted| G1L
     G1 -->|approved| PF
     G1 -->|rejected| P
+    G1L -->|approved| PF
+    G1L -->|rejected| P
     F -->|quick| PF
     PF --> D
     D -->|full| G2
+    D -.->|lean — no impl gate| H
     G2 -->|approved| H --> S
     G2 -->|rejected| D
     S -->|below threshold| PP
@@ -115,6 +121,8 @@ flowchart LR
 ```
 
 **Full mode** has three unconditional human gates (plan, implementation, pre-PR), one conditional gate (security — fires only when the aggregate finding severity meets the configured threshold, default `medium`), and one multi-pick gate (comment selection, inside the on-demand PR-comments group). Before the plan ever reaches you, an **adversarial plan-review panel** runs: one lens reviewer per configured lens (`plan_review.lenses`, default *contradictions & collisions* + *gaps & completeness*; empty list = single reviewer) attacks the plan in parallel, and a synthesizer verifies their findings against the real code — never relaying them raw — groups them by root cause, checks the numbered acceptance criteria, the codebase's observed conventions, and the confirmed repo scope, and issues the one verdict the engine reads. A `CHANGES_REQUESTED` verdict mechanically forces a revision loop (bounded by `review_rounds.max`; exhaustion escalates to you *with* the failing report attached; every revision round re-runs the full panel), and that hook-captured verdict is what legalizes the step's exits, never the orchestrator's claim. **Quick mode** — trivial changes classified at fetch — keeps only the pre-PR gate. Everything between gates runs hands-off.
+
+**Lean mode** — chosen per work item (`Mode: lean`) or as the workspace `default_mode` — keeps full's entire rigor (scoped plan, adversarial panel, proven-red TDD, security scan) but gates by exception: the plan gate (`approve-plan-lean`) *self-skips* when the panel approved within budget and *fires* only on bound exhaustion, its predicate reading an **engine-recorded** outcome derived from the same verdict ledger that legalized the step's exits (an orchestrator cannot claim "approved" past a rejecting panel — it never writes the value); the impl gate is deliberately absent (per-task completion already requires hook-captured reviewer approval); `approve-pre-pr` remains the one guaranteed human stop. Happy path: a single interruption, right before the PR.
 
 At **any** cursor position, an ad-hoc human request is legal: it spawns the reviewer in `request-triage` mode (a declared always-legal spawn), which classifies the request against the approved plan. Out-of-scope requests surface back to you with explicit options — never silently merged.
 
@@ -310,7 +318,7 @@ ai-sdlc-harness/
 │   └── init-workspace/ · add-repo/ · migrate-workspace/ · workspace-config/ · workflow-status/ · repo-map-refresh/
 ├── bin/harness                  # wrapper script resolving the plugin venv (+ harness.cmd for Windows)
 ├── tools/                       # meta-tooling: line-budget checker, sandbox workspace generators
-└── tests/                       # 639 stdlib-unittest tests
+└── tests/                       # 657 stdlib-unittest tests
 ```
 
 Workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside *your* working directory by `/init-workspace` and the pipeline. They never live inside this plugin repo.
@@ -333,7 +341,7 @@ python -m venv .venv; .venv\Scripts\pip install pyyaml
 .venv\Scripts\python -m unittest discover -s tests
 ```
 
-The test suite (639 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of both pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (657 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 

@@ -49,8 +49,13 @@ independent evidence attached, not just the planner's word.
    re-check alone would miss; the round budget already bounds the cost.
 3. **Exits are derived, not chosen** (the manifest's `verdict_bound`; the
    cursor refuses anything else):
-   - Verdict `APPROVED` → forward: `${CLAUDE_PLUGIN_ROOT}/bin/harness
-     cursor --to approve-plan --run <run>`.
+   - Verdict `APPROVED` → forward (`show` + the manifest tell you which
+     step that is; a refused advance names the legal candidates): full
+     mode → `${CLAUDE_PLUGIN_ROOT}/bin/harness cursor --to approve-plan
+     --run <run>`; lean mode → the exception gate self-skips on an
+     approved panel (its `when` reads the ENGINE-recorded
+     `plan-review.outcome`; the skip lands in the ledger as a
+     gate-skipped event), so the forward target is `preflight` directly.
    - Verdict `CHANGES_REQUESTED`, rounds left → the ONLY legal move is
      back: `${CLAUDE_PLUGIN_ROOT}/bin/harness cursor --to plan --run
      <run>`. Re-enter plan per its step 0b
@@ -62,13 +67,16 @@ independent evidence attached, not just the planner's word.
      verbatim — they are the revision input.
    - Verdict `CHANGES_REQUESTED`, bound exhausted (`review_rounds.max`
      CHANGES_REQUESTED verdicts this cycle) → forward is legal again:
-     advance to ⟨approve-plan⟩ and present the FAILING report alongside
+     advance to the plan gate — ⟨approve-plan⟩ in full mode,
+     ⟨approve-plan-lean⟩ in lean (exhaustion is exactly when lean's
+     exception gate FIRES) — and present the FAILING report alongside
      the plan — round N+ signals plan drift, and that is the human's call,
      never an auto-approval and never a deadlock. Say explicitly at the
      gate that the review bound was exhausted.
-4. At ⟨approve-plan⟩ (`gate.md`): the gate presents the plan; ALSO show
-   `<run>/reports/plan-review.md` verbatim — approval should be made with
-   the independent review in view either way (passing or failing).
+4. At the plan gate (⟨approve-plan⟩ / ⟨approve-plan-lean⟩, `gate.md`): the
+   gate presents the plan; ALSO show `<run>/reports/plan-review.md`
+   verbatim — approval should be made with the independent review in view
+   either way (passing or failing).
 
 Stalls, per panel member — each spawn gets its OWN bounded counter (the
 declared bounds are calibrated per spawn; pooling three spawns into one
