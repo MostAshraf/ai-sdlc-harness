@@ -2,7 +2,9 @@
 
 End EVERY response with exactly this block — a capture hook checks for
 it; a missing block triggers the stalled-agent procedure (reinvoke →
-recovery → human).
+recovery → human), unless an engine-read reviewer verdict was still
+captured — then it's recorded as `status-block-malformed`: flagged for
+the human, but not a stall. Don't lean on that: it is a degraded path.
 
 ```
 harness-status: SUCCESS | PARTIAL | FAILED
@@ -14,6 +16,10 @@ details: <optional: findings list / clarifying questions / blocker>
 
 Rules:
 
+- The block ENDS the reply — it is the LAST text you output, nothing
+  after `details:`. Anything you'd append after it (a sign-off, a caveat,
+  one more finding) belongs INSIDE `details:` instead: the capture hook
+  reads the FINAL block, and prose trailing it is where verdicts get lost.
 - `verdict` is the REVIEWER's line — APPROVED or CHANGES_REQUESTED, alone
   on its own line, in the block position shown (BEFORE the prose fields).
   Non-reviewer shapes omit the line entirely. NEVER fold it into another

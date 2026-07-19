@@ -6,6 +6,23 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
+- A reviewer reply whose verdict was captured but whose status block was
+  missing no longer triggers the stalled-agent procedure — previously this
+  re-ran an entire review panel to re-derive a verdict the run already held
+  (observed in the field: ~1 hour paid twice in one run). The loose
+  formatting is now recorded as its own flagged event
+  (`status-block-malformed`), visible in `status` and the metrics report,
+  and the run proceeds on the captured verdict. Only verdicts the engine
+  actually consumes (per-task review and plan-review synthesis) qualify —
+  an advisory lens or pre-PR reply without a status block still stalls,
+  because its real deliverable is the report, not the verdict.
+- Agents are far less likely to drop the status block in the first place:
+  the block template is now inlined verbatim in the planner and reviewer
+  agent definitions (previously a one-line file pointer — the shape that
+  dropped it in ~80% of field replies), and the shared contract now states
+  the block must END the reply. An echoed template line no longer counts
+  as a real status block.
+
 ## [3.1.0] — 2026-07-17
 
 > **The plan is now the most-checked artifact in the pipeline — and the human is interrupted least where it's checked most.** v3.0 could plan against a stale guess at the target repos, and the planner's self-adversarial pass was the planner grading its own homework: the human at ⟨approve-plan⟩ was a plan's *first* reviewer. This release confirms the repo scope with you and enforces it mechanically, attacks every plan with an adversarial lens panel before you see it, gives the developer a plan they can act on without re-discovery — and then, with those machines carrying the load, adds a mode that only interrupts you when they couldn't agree.

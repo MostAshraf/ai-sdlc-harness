@@ -22,10 +22,19 @@ from .transitions import set_artifact
 # both `status` (count) and `metrics_report` (table). These used to be two
 # hand-maintained lists that drifted (field e2e E2E-1: status said 18
 # flagged, metrics.md said 23 — same run, same ledger, different filters).
+# `status-block-malformed` is flagged (shown) but is NOT a stall: it
+# records a reviewer reply whose engine-read verdict WAS captured despite
+# a missing status block, so the stalled-agent procedure must not re-spawn
+# (capture_post_spawn holds the emission rule). It stays IN this list
+# because that capture rode extract_verdict's no-block whole-text
+# fallback — the weakest path — and suppressing the stall also removed the
+# re-spawn whose fresh verdict used to supersede a false capture; showing
+# the event to the human is the replacing safeguard (adversarial-review
+# on this change, both lenses independently).
 FLAGGED_EVENT_KINDS = (
     "test-revision", "reviewer-rejected", "hook-blocked",
-    "missing-status-block", "quick-recheck", "contracts-check",
-    "verdict-uncaptured", "background-spawn-uncaptured",
+    "missing-status-block", "status-block-malformed", "quick-recheck",
+    "contracts-check", "verdict-uncaptured", "background-spawn-uncaptured",
     "coverage-skipped", "pr-recorded-manually", "secret-sweep-blocked",
     "gate-skipped", "deferral-pending")
 

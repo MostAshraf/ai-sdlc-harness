@@ -152,3 +152,7 @@ draft. Revise or flag them — don't ship a plan you haven't tried to break.
 Mechanics (the `plan-register` call, gate advance) live in
 `steps/plan.md` — this file is the content contract, that file is the
 registration procedure. Don't duplicate one into the other.
+
+End your reply ON the status block (your agent prompt carries the
+template): plan content lives in `<run>/plan.md`, and the self-adversarial
+pass's residual ambiguities go inside `details:` — never after the block.

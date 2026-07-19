@@ -305,7 +305,7 @@ One Python entry point ([hooks/guards.py](hooks/guards.py)) handles every event,
 | skill | PreToolUse · Skill | USER-ENTRY skills (`/dev-workflow`, `/init-workspace`, …) refuse invocation from subagents or autonomous triggering — they run only when you ran them. |
 | read | PreToolUse · Read/Grep | Red-proofs are readable by harness shapes only via `harness show-redproof` (chain-verified) — a raw `.redproof/` read skips integrity verification and is blocked. |
 | prompt capture | UserPromptSubmit | Verbatim capture of your replies into `human-input.ndjson` — the only evidence `gate --decide` accepts. |
-| verdict capture | PostToolUse · Agent/Task | The authoritative writer of `reviews.ndjson` (reviewer verdicts) and missing-status-block events — anchored here because this payload deterministically carries both the spawn prompt and the agent's final reply. |
+| verdict capture | PostToolUse · Agent/Task | The authoritative writer of `reviews.ndjson` (reviewer verdicts) and the missing-status-block / status-block-malformed events — anchored here because this payload deterministically carries both the spawn prompt and the agent's final reply. |
 | stop capture | SubagentStop | Per-invocation token accounting into `tokens.ndjson`; secondary status-block capture. |
 
 Every guard's fail-open/fail-closed policy is chosen deliberately and tested: recognised violations always block; the spawn guard is fail-closed even on ambiguity.
@@ -369,7 +369,7 @@ ai-sdlc-harness/
 │   └── init-workspace/ · add-repo/ · migrate-workspace/ · workspace-config/ · workflow-status/ · repo-map-refresh/
 ├── bin/harness                  # wrapper script resolving the plugin venv (+ harness.cmd for Windows)
 ├── tools/                       # meta-tooling: line-budget checker, sandbox workspace generators
-└── tests/                       # 657 stdlib-unittest tests
+└── tests/                       # 663 stdlib-unittest tests
 ```
 
 Workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside *your* working directory by `/init-workspace` and the pipeline. They never live inside this plugin repo.
@@ -399,7 +399,7 @@ python -m venv .venv; .venv\Scripts\pip install pyyaml
 .venv\Scripts\python -m unittest discover -s tests
 ```
 
-The test suite (657 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (663 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 
@@ -419,7 +419,7 @@ The test suite (657 tests) covers the state engine, gate grammar, guard behavior
 
 **What if the plan-review panel keeps rejecting?** Same bound (`review_rounds.max`), applied per plan cycle: each `CHANGES_REQUESTED` verdict forces a revision loop back to the planner. Once the budget is exhausted, the plan reaches you at the plan gate **with the failing review attached** — in lean mode, that's exactly when its otherwise-skipped gate fires. Never an auto-approval, never a deadlock.
 
-**What if an agent stalls or returns garbage?** A missing/invalid status block is detected mechanically; the orchestrator re-invokes with a continuation prompt (bounded, default 2), then escalates to you (default 3). It never acts on the agent's behalf.
+**What if an agent stalls or returns garbage?** A missing/invalid status block is detected mechanically; the orchestrator re-invokes with a continuation prompt (bounded, default 2), then escalates to you (default 3). It never acts on the agent's behalf. One carve-out: a reviewer reply whose engine-read verdict was captured despite a missing block is recorded (`status-block-malformed`, flagged) and the run proceeds on the ledger — no re-spawn to re-derive a verdict it already holds.
 
 **What if a test is genuinely wrong after it was proven red?** `harness verify-red --revise --reason "<why>"` — the revision is sealed and flagged in the events ledger, reviewer-visible. There is no silent path.
 

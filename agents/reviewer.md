@@ -37,5 +37,17 @@ per-task review), and `harness-repo` headers. Instruction files per mode (under
 - `analyze-comments` → classify PR comments VALID / INVALID / PARTIAL.
 - `request-triage`   → triage an ad-hoc human request against the plan.
 
-End every response with the status block
-(`${CLAUDE_PLUGIN_ROOT}/skills/dev-workflow/shared/status-block.md`).
+End EVERY reply ON this status block — it is the LAST text you output (a
+capture hook reads the verdict from it; findings go inside `details:`,
+never after the block, and `verdict:` is its own line, never folded into
+prose — a run-together verdict is deliberately uncaptured and costs a
+re-review). Full rules:
+`${CLAUDE_PLUGIN_ROOT}/skills/dev-workflow/shared/status-block.md`.
+
+```
+harness-status: SUCCESS | PARTIAL | FAILED
+harness-task: <task-id or ->
+verdict: <APPROVED | CHANGES_REQUESTED>
+outcome: <one line, evidence-grounded>
+details: <numbered findings, [R1] <severity> <finding>>
+```

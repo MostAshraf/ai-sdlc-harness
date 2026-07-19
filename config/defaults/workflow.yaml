@@ -7,9 +7,11 @@
 review_rounds:
   max: 5
 
-# Stalled-agent procedure (coverage B4): SubagentStop detects a missing/invalid
-# status block; never act on the agent's behalf; re-invoke with a continuation
-# prompt; bounded retries then escalate.
+# Stalled-agent procedure (coverage B4): the post-spawn capture hook detects
+# a missing status block (`missing-status-block`; a reviewer reply whose
+# engine-read verdict was still captured logs `status-block-malformed`
+# instead — flagged, NOT a stall); never act on the agent's behalf;
+# re-invoke with a continuation prompt; bounded retries then escalate.
 stall:
   recovery_after: 2
   human_after: 3

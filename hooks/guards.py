@@ -436,7 +436,15 @@ TASK_HEADER_RE = re.compile(r"^harness-task:\s*(?!<)(\S+)", re.MULTILINE)
 # contain spaces), so `\S+` stays correct there — and rightly refuses to
 # swallow trailing prose like `harness-status: SUCCESS — all good`.
 RUN_HEADER_RE = re.compile(r"^harness-run:[ \t]*(?![ \t<])(.*\S)", re.MULTILINE)
-STATUS_RE = re.compile(r"^harness-status:\s*(\S+)", re.MULTILINE)
+# The `(?![^\n]*\|)` guard makes the TEMPLATE's own line — `harness-status:
+# SUCCESS | PARTIAL | FAILED`, now inlined verbatim in the agent defs —
+# regex-invisible when echoed in a reply (same placeholder-invisibility
+# convention as the angle-bracket verdict; adversarial-review on this
+# change: an echoed template line satisfied the block check and silently
+# disabled stall detection for that reply). A real status value is one
+# token with no `|` after it on the line.
+STATUS_RE = re.compile(r"^harness-status:[ \t]*(\S+)(?![^\n]*\|)",
+                       re.MULTILINE)
 # The reviewer's verdict line (shared/status-block.md), captured by the
 # PostToolUse hook into reviews.ndjson. Lenient token: leading whitespace/
 # markdown bold (dogfood A2: an indented `details: |` block scalar hid a
@@ -456,6 +464,15 @@ VERDICT_RE = re.compile(
 # recover via SendMessage-resume, a channel NO capture hook sees.
 # This powers a signpost event naming the one sanctioned recovery.
 VERDICT_ANYWHERE_RE = re.compile(r"verdict:\**\s*(APPROVED|CHANGES_REQUESTED)\b")
+# The reviewer modes whose captured verdict the ENGINE actually reads:
+# `review` → the task FSM's reviewer-approved completion guard;
+# `plan-review` → the manifest's verdict_bound exits. Every other reviewer
+# mode's verdict is advisory (plan-attack lens verdicts are explicitly
+# engine-invisible; pre-pr / analyze-comments / request-triage deliver
+# report content, not a verdict) — so for those, a blockless reply is a
+# genuine stall even when a verdict token was captured: the deliverable is
+# likely missing (adversarial-review on this change, gaps lens).
+ENGINE_VERDICT_MODES = ("review", "plan-review")
 
 
 def extract_verdict(text: str) -> str | None:
@@ -1449,8 +1466,9 @@ def _response_text(resp) -> str:
 
 def capture_post_spawn(p: dict) -> None:
     """PostToolUse on Agent/Task — the authoritative writer of the
-    reviewer-verdict ledger (reviews.ndjson) and missing-status-block
-    events. Anchored here, not SubagentStop (dogfood finding: an entire
+    reviewer-verdict ledger (reviews.ndjson) and the missing-status-block /
+    status-block-malformed events. Anchored here, not SubagentStop (dogfood
+    finding: an entire
     run's SubagentStop captures silently no-opped — payload shape is
     version-dependent and its transcript_path is documented-ambiguous),
     because THIS payload deterministically carries the spawn prompt
@@ -1494,15 +1512,16 @@ def capture_post_spawn(p: dict) -> None:
                       "parallelism)"})
         return
     text = _response_text(p.get("tool_response"))
+    captured = None
     if shape == "reviewer":
-        verdict = extract_verdict(text)
-        if verdict:
+        captured = extract_verdict(text)
+        if captured:
             # The completion evidence the task FSM's `reviewer-approved`
             # guard requires: which task (spawn-prompt header), which
             # reviewer mode, what verdict. Written only here; scoped to the
             # final status block and conflict-fail-closed (extract_verdict).
             ndjson.append_record(run / "reviews.ndjson", {
-                "task": task, "mode": mode, "verdict": verdict})
+                "task": task, "mode": mode, "verdict": captured})
         elif VERDICT_ANYWHERE_RE.search(text):
             # A verdict exists but isn't line-anchored in the final status
             # block — correctly NOT captured (fail-closed), but say so and
@@ -1518,10 +1537,36 @@ def capture_post_spawn(p: dict) -> None:
                           "headers); never SendMessage/resume — those "
                           "replies bypass capture entirely"})
     if not STATUS_RE.search(text):
-        ndjson.append_record(run / "events.ndjson", {
-            "kind": "missing-status-block", "task": task, "actor": shape,
-            "reason": "subagent replied without a status block — "
-                      "stalled-agent procedure applies (coverage B4)"})
+        if captured and mode in ENGINE_VERDICT_MODES:
+            # An engine-read captured verdict IS the gate-critical signal,
+            # so this is NOT a stall (field run 459226: a reviewer reply
+            # carried a line-anchored verdict — captured above via
+            # extract_verdict's no-block whole-text fallback — yet this
+            # branch still fired missing-status-block at the same
+            # timestamp, and the stall procedure re-spawned the whole plan
+            # panel to re-derive a verdict the ledger already held, ~1h
+            # paid twice). Record a distinct event that the stall
+            # procedure must NOT act on — but keep it FLAGGED (it is in
+            # FLAGGED_EVENT_KINDS): the no-block capture rode the
+            # whole-text fallback, the weakest path, and suppressing the
+            # stall also suppressed the re-spawn whose fresh verdict used
+            # to supersede a false capture (latest-wins) — visibility to
+            # the human is the replacing safeguard (adversarial-review on
+            # this change, both lenses independently). The fail-closed
+            # floor is untouched — an inline (non-anchored) verdict is
+            # still uncaptured and still stalls below.
+            ndjson.append_record(run / "events.ndjson", {
+                "kind": "status-block-malformed", "task": task,
+                "actor": shape, "mode": mode,
+                "reason": "reviewer verdict captured, but the reply had no "
+                          "well-formed final status block — verdict "
+                          "recorded, no stall; end replies ON the block "
+                          "(shared/status-block.md)"})
+        else:
+            ndjson.append_record(run / "events.ndjson", {
+                "kind": "missing-status-block", "task": task, "actor": shape,
+                "reason": "subagent replied without a status block — "
+                          "stalled-agent procedure applies (coverage B4)"})
 
 
 GUARDS = {"bash": guard_bash, "write": guard_write, "read": guard_read,
