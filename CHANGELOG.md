@@ -51,7 +51,7 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 - `python -m harness.schema` — declared data valid
 - `python tools/budget_check.py` — line budget green
-- `python -m unittest discover -s tests` — 657 tests green
+- `python -m unittest discover -s tests` — 663 tests green
 
 ## [3.0.4] — 2026-07-12
 
