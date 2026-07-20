@@ -1042,6 +1042,130 @@ class PlanRegisterValidation(BreadthHarness):
         out = self._register([{"id": "T1"}], expect=1)
         self.assertIn("outside the confirmed scope", out["error"])
 
+    def test_above_low_risk_without_tests_or_reason_refused(self):
+        """Zero-test policy (field 459226): one medium-risk task shipped
+        with empty test_intents and no red-proof, justified only by an
+        unrecorded repo coverage convention — the gap surfaced only in a
+        manual post-mortem. The opt-out now needs a recorded why."""
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "risk": "medium", "test_intents": []}],
+                             expect=1)
+        self.assertIn("no_test_reason", out["error"])
+
+    def test_custom_risk_tier_fails_closed(self):
+        # risk is free-form vocabulary — anything other than "low" demands
+        # the reason, so a custom tier can't silently duck the policy
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "risk": "critical"}], expect=1)
+        self.assertIn("no_test_reason", out["error"])
+
+    def test_blank_no_test_reason_refused(self):
+        # whitespace is not a recorded decision
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "risk": "medium", "no_test_reason": "   "}],
+                             expect=1)
+        self.assertIn("no_test_reason", out["error"])
+
+    def test_recorded_no_test_reason_registers_stores_and_flags(self):
+        self._register([{"id": "T1", "repo": str(self.repo),
+                         "risk": "medium", "test_intents": [],
+                         "no_test_reason": "repo [ExcludeFromCodeCoverage] "
+                                           "convention for this layer"}])
+        st = state_mod.load(self.run_dir, self.workspace)
+        self.assertIn("ExcludeFromCodeCoverage",
+                      st["tasks"][0]["no_test_reason"])
+        events = ndjson.read_records(self.run_dir / "events.ndjson")
+        flagged = [e for e in events if e.get("kind") == "risk-without-tests"]
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0]["task"], "T1")
+        self.assertIn("ExcludeFromCodeCoverage", flagged[0]["reason"])
+        # and the kind is human-visible: in the shared flagged filter
+        from harness.workflow import FLAGGED_EVENT_KINDS, outstanding_flagged
+        self.assertIn("risk-without-tests", FLAGGED_EVENT_KINDS)
+        self.assertEqual(len(outstanding_flagged(events)), 1)
+
+    def test_low_risk_zero_test_opt_out_stays_silent(self):
+        # the docs/chore opt-out is unchanged: no reason demanded, no flag
+        self._register([{"id": "T1", "repo": str(self.repo),
+                         "risk": "low", "test_intents": []}])
+        events = ndjson.read_records(self.run_dir / "events.ndjson")
+        self.assertFalse([e for e in events
+                          if e.get("kind") == "risk-without-tests"])
+
+    def test_above_low_risk_with_tests_needs_no_reason(self):
+        self._register([{"id": "T1", "repo": str(self.repo),
+                         "risk": "high", "test_intents": ["test_x"]}])
+        events = ndjson.read_records(self.run_dir / "events.ndjson")
+        self.assertFalse([e for e in events
+                          if e.get("kind") == "risk-without-tests"])
+
+    def test_reregistration_supersedes_prior_risk_flags(self):
+        """Adversarial review of this change (both lenses, independently):
+        the event asserts live plan STATE, and registration replaces the
+        task list wholesale — so each `plan-registered` marker supersedes
+        every earlier `risk-without-tests` batch. A withdrawn opt-out must
+        not haunt the flagged gauge at later gates."""
+        from harness.workflow import outstanding_flagged
+        opt_out = {"id": "T1", "repo": str(self.repo), "risk": "medium",
+                   "test_intents": [], "no_test_reason": "layer convention"}
+        self._register([opt_out])
+        self._register([opt_out])   # unchanged decomposition, re-ratified
+        events = ndjson.read_records(self.run_dir / "events.ndjson")
+        live = [e for e in outstanding_flagged(events)
+                if e.get("kind") == "risk-without-tests"]
+        self.assertEqual(len(live), 1)   # latest batch only, not 2
+        # revision round adds the tests — the opt-out is withdrawn
+        self._register([{"id": "T1", "repo": str(self.repo),
+                         "risk": "medium", "test_intents": ["test_x"]}])
+        events = ndjson.read_records(self.run_dir / "events.ndjson")
+        self.assertFalse([e for e in outstanding_flagged(events)
+                          if e.get("kind") == "risk-without-tests"])
+
+    def test_default_risk_zero_test_task_registers_silently(self):
+        # the most common docs/chore shape: no risk key at all — defaults
+        # low, no reason demanded, no flag (pins the `t.get(risk, "low")`
+        # default against regression)
+        self._register([{"id": "T1", "repo": str(self.repo)}])
+        events = ndjson.read_records(self.run_dir / "events.ndjson")
+        self.assertFalse([e for e in events
+                          if e.get("kind") == "risk-without-tests"])
+
+    def test_low_risk_reason_stored_but_not_flagged(self):
+        # a volunteered reason on a low-risk opt-out is kept on the task
+        # (harmless context) but the policy demands nothing — no event
+        self._register([{"id": "T1", "repo": str(self.repo), "risk": "low",
+                         "no_test_reason": "pure docs move"}])
+        st = state_mod.load(self.run_dir, self.workspace)
+        self.assertEqual(st["tasks"][0]["no_test_reason"], "pure docs move")
+        events = ndjson.read_records(self.run_dir / "events.ndjson")
+        self.assertFalse([e for e in events
+                          if e.get("kind") == "risk-without-tests"])
+
+    def test_stale_reason_alongside_intents_normalized_away(self):
+        # a reason riding with declared intents is a self-contradictory
+        # record — normalized to None, never stored
+        self._register([{"id": "T1", "repo": str(self.repo),
+                         "risk": "medium", "test_intents": ["test_x"],
+                         "no_test_reason": "stale from an earlier draft"}])
+        st = state_mod.load(self.run_dir, self.workspace)
+        self.assertIsNone(st["tasks"][0]["no_test_reason"])
+
+    def test_non_list_test_intents_refused(self):
+        # a string would read as per-character intents at verify-red —
+        # refuse the shape at the owned entry point
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "test_intents": "test_x"}], expect=1)
+        self.assertIn("LIST", out["error"])
+
+    def test_non_string_no_test_reason_refused(self):
+        # a dict stringifies truthy — garbage must not become a
+        # "recorded decision"
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "risk": "medium",
+                               "no_test_reason": {"why": "nope"}}],
+                             expect=1)
+        self.assertIn("no_test_reason must be a string", out["error"])
+
 
 class LeanModeEntry(BreadthHarness):
     """Mode selection is declared data end to end: the work-item hint (or

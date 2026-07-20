@@ -865,7 +865,9 @@ def _tdd_block_reason(path: Path, workspace: Path) -> str | None:
     The exemption is the plan itself: a task with no declared intents
     (docs/config/chore, quick mode) is never subject to the ordering — the
     human approved that shape at the plan gate; `test_intents: []` IS the
-    opt-out, no second flag. Red-proof existence is a plain file check: a
+    opt-out, no second flag HERE (plan-register separately demands a
+    recorded `no_test_reason` for the opt-out at any risk other than low —
+    an upstream registration rule, not a develop-time gate). Red-proof existence is a plain file check: a
     developer cannot fabricate it (AUTHORITY_RE + the write-confinement
     block the run dir on both surfaces), and the authoritative seal +
     blob-SHA verification stays at set-state. Fail-OPEN on every

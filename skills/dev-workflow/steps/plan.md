@@ -84,7 +84,10 @@ When the planner's status block reports the plan ready:
    `risk` is free-form (defaults to `low` if omitted) — no enum is
    enforced, but use `low`/`medium`/`high` for consistency with what the
    plan itself declares. (`test_intents` is the plan's declared test
-   NAMES for that task, empty if none) — declare cross-repo contracts too if
+   NAMES for that task, empty if none.) A task at any risk other than
+   `low` with empty `test_intents` must also carry `no_test_reason` (the
+   plan's stated why — registration refuses the silent opt-out and flags
+   the recorded one as `risk-without-tests`) — declare cross-repo contracts too if
    the plan named any: `--contracts-json '[{"id":"C1","type":"http",
    "producer":"a","consumers":["b"],"signature":["POST /v2/items",
    "field: item_id"]}]'` (`type` is `http | service-bus | dto` — and `http`

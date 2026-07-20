@@ -20,7 +20,9 @@ transitions:
   # exactly when the task declares test_intents — the same condition the
   # hook-side pre-red write lock uses, so the invariant's two halves can't
   # disagree. Quick mode is exempt because its seed task declares no
-  # intents; `test_intents: []` is the plan-approved opt-out.
+  # intents; `test_intents: []` is the plan-approved opt-out — and at any
+  # risk other than low, plan-register refuses the opt-out without a recorded
+  # `no_test_reason` (flagged `risk-without-tests`): reviewed, never silent.
   - {from: in-progress, to: in-review, guard: verify-green-with-red-proof}
 
   # Completion out of review requires a hook-captured reviewer verdict

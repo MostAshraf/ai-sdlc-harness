@@ -75,6 +75,20 @@ fork identified: <why>` under the task table, visible either way.
   name) — `verify-red` mechanically checks these literal names appear in
   the actual test files (coverage B1); the orchestrator carries the name
   list, not the intent prose, into `plan-register`'s `test_intents` field.
+  Two structural rules: (1) a task at any risk OTHER THAN `low` that
+  declares NO test-intents must state its why as a literal line under the
+  empty Test-intents block — `No-test reason: <why>` (e.g. a cited repo
+  coverage-exclusion convention); the orchestrator carries it into
+  `plan-register`'s `no_test_reason` field, registration refuses the
+  opt-out without it, and the recorded reason is flagged for review.
+  (2) Every task WITH test-intents must create or modify at least one
+  file outside the repo's test paths: with no production change the task
+  dead-ends at develop — a test proving already-correct behavior can
+  never go red, one documenting an unfixed bug never goes green — past
+  every plan gate, at maximum cost. Fold coverage backfill into the task
+  that changes the code, or record it as a deferral — never plan it as
+  its own task. (A task whose PRODUCT is test infrastructure — shared
+  fixtures, harness code — is the judged exception.)
 - **`[API: <lib> v<X>]`** annotations where a task prescribes a library API
   — the developer verifies the real signature before writing call sites.
 - **≤2 pattern hints** per task: existing test files via bounded globbing

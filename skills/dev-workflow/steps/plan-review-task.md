@@ -79,6 +79,21 @@ Check, in order of importance:
    repo (the discovered `test_cmd` or a scoped subset of it); size budgets
    are declared and no task obviously blows past its own (an oversized
    task should have been split); the out-of-scope section exists.
+8. **Test-vs-production coherence** — two red-proof killers, both
+   `[blocking]`:
+   - A task at any risk other than `low` with NO test-intents must state
+     a SOUND `no_test_reason` (a cited repo convention qualifies; "low
+     value" or silence does not) — judge it, don't just check presence.
+   - A task WITH test-intents whose file-touch manifest has no
+     create/modify entry outside the repo's test paths
+     (`language.test_paths` — the same convention verify-red reads) is
+     coverage backfill: it dead-ends at develop, past every plan gate,
+     at maximum cost (a test proving already-correct behavior never goes
+     red; one documenting an unfixed bug never goes green — either way
+     verify-red/-green refuse, stall-escalating to the human). Add the
+     production change, fold the tests into the task that makes it, or
+     defer the backfill. Judged exception: a task whose product IS test
+     infrastructure (shared fixtures, harness code).
 
 Report shape: numbered findings, each `[blocking]` or `[note]`, with file/
 line/AC references — the planner revises against these verbatim, so vague

@@ -223,7 +223,7 @@ The property that matters — *the test genuinely failed before the fix existed*
 2. `harness verify-red` runs the test itself — it must fail — then seals a chained red-proof and blob-SHA-locks the test files plus their declared closure (shared fixtures, `conftest.py`, …).
 3. The completion transition runs `verify-green` **and** re-checks the locked SHAs: a quietly weakened assertion refuses the transition.
 4. A genuinely wrong test is revised via `verify-red --revise --reason "…"` — an explicit, reviewer-visible flagged event, never a silent edit.
-5. Tasks a plan explicitly marks with no test-intents (docs, chores) are the approved opt-out: verify-red refuses, the completion guard exempts, review still applies.
+5. Tasks a plan explicitly marks with no test-intents (docs, chores) are the approved opt-out: verify-red refuses, the completion guard exempts, review still applies. At any risk other than `low`, the opt-out must carry a recorded `no_test_reason` — registration refuses the silent form and flags the recorded one for review.
 
 ### Owned git entry points
 
@@ -369,7 +369,7 @@ ai-sdlc-harness/
 │   └── init-workspace/ · add-repo/ · migrate-workspace/ · workspace-config/ · workflow-status/ · repo-map-refresh/
 ├── bin/harness                  # wrapper script resolving the plugin venv (+ harness.cmd for Windows)
 ├── tools/                       # meta-tooling: line-budget checker, sandbox workspace generators
-└── tests/                       # 674 stdlib-unittest tests
+└── tests/                       # 686 stdlib-unittest tests
 ```
 
 Workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside *your* working directory by `/init-workspace` and the pipeline. They never live inside this plugin repo.
@@ -399,7 +399,7 @@ python -m venv .venv; .venv\Scripts\pip install pyyaml
 .venv\Scripts\python -m unittest discover -s tests
 ```
 
-The test suite (674 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (686 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 

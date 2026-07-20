@@ -35,8 +35,8 @@ FLAGGED_EVENT_KINDS = (
     "test-revision", "reviewer-rejected", "hook-blocked",
     "missing-status-block", "status-block-malformed", "quick-recheck",
     "contracts-check", "verdict-uncaptured", "background-spawn-uncaptured",
-    "coverage-skipped", "pr-recorded-manually", "secret-sweep-blocked",
-    "gate-skipped", "deferral-pending")
+    "coverage-skipped", "risk-without-tests", "pr-recorded-manually",
+    "secret-sweep-blocked", "gate-skipped", "deferral-pending")
 
 
 def outstanding_flagged(events: list[dict]) -> list[dict]:
@@ -53,9 +53,20 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
     A spurious, duplicate, or out-of-order `deferral-recorded` with no open
     pending ahead of it resolves nothing — fail-CLOSED, so a stray record
     (`log-event` is unvalidated) can never silently hide an unrelated
-    outstanding deferral (review finding: an audit gauge must not under-count)."""
+    outstanding deferral (review finding: an audit gauge must not under-count).
+
+    `risk-without-tests` gets the same live-gauge treatment with a different
+    resolver: each `plan-registered` marker supersedes EVERY earlier
+    `risk-without-tests` event, because plan-register replaces the task list
+    wholesale — only the latest registration's batch describes the current
+    plan (adversarial-review on this change, both lenses independently: the
+    append-only batch survived the revision round that withdrew the opt-out,
+    misreporting the approved plan at every later gate). The event asserts
+    live plan STATE, unlike gate-skipped/hook-blocked, which record
+    occurrences and stay permanent correctly."""
     flagged = [e for e in events if e.get("kind") in FLAGGED_EVENT_KINDS]
     open_pending: list[dict] = []
+    open_risk: list[dict] = []
     resolved: set[int] = set()
     for e in events:
         kind = e.get("kind")
@@ -63,6 +74,11 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
             open_pending.append(e)
         elif kind == "deferral-recorded" and open_pending:
             resolved.add(id(open_pending.pop(0)))   # resolve earliest open pending
+        elif kind == "risk-without-tests":
+            open_risk.append(e)
+        elif kind == "plan-registered":
+            resolved.update(id(x) for x in open_risk)  # superseded batch
+            open_risk.clear()
     return [e for e in flagged if id(e) not in resolved]
 
 
@@ -461,10 +477,56 @@ def plan_register(workspace: Path, run: Path, manifest: dict,
                 f"{', '.join(off_scope)} — widen the scope first (user-"
                 "confirmed `harness scope-register` at the plan step); an "
                 "unconfirmed repo never enters the task list silently")
+        # Shape checks for the two fields the zero-test policy below makes
+        # load-bearing (first change to read them for policy): garbage must
+        # refuse loudly at the owned entry point — a dict stringifies into
+        # a truthy "recorded decision", and a string test_intents reads as
+        # per-character intents at verify-red, dead-ending the task at
+        # develop (adversarial-review on this change).
+        for t in tasks:
+            if not isinstance(t.get("test_intents", []), list):
+                raise state_mod.StateError(
+                    f"plan-register: task {t['id']}: test_intents must be "
+                    "a LIST of test names (got "
+                    f"{type(t.get('test_intents')).__name__})")
+            if t.get("no_test_reason") is not None and not isinstance(
+                    t["no_test_reason"], str):
+                raise state_mod.StateError(
+                    f"plan-register: task {t['id']}: no_test_reason must "
+                    f"be a string (got {type(t['no_test_reason']).__name__})")
+        # Zero-test policy (field 459226): `test_intents: []` stays the
+        # plan-approved opt-out, but at any risk OTHER THAN "low" the
+        # opt-out must carry a RECORDED reason — one medium-risk task
+        # shipped with no tests and no red-proof, justified only by an
+        # unrecorded repo coverage convention, and the gap surfaced only
+        # in a manual post-mortem. Fail-closed over the free-form risk
+        # vocabulary: any value except the exact string "low" demands the
+        # reason (a custom or typo'd tier must not silently duck the
+        # policy). Tests are never forced — the reason is stored on the
+        # task and flagged (`risk-without-tests`, below) so plan-review
+        # judges it and status/metrics show it: a recorded, reviewed
+        # decision, never a silent gap.
+        for t in tasks:
+            if (t.get("risk", "low") != "low" and not t.get("test_intents")
+                    and not (t.get("no_test_reason") or "").strip()):
+                raise state_mod.StateError(
+                    f"plan-register: task {t['id']} declares risk "
+                    f"{t.get('risk')!r} with no test_intents and no "
+                    "no_test_reason — declare the tests, or record WHY "
+                    "none apply (e.g. a repo coverage-exclusion "
+                    "convention); the reason is flagged for plan-review "
+                    "and the human, never assumed")
         st["tasks"] = [
             {"id": t["id"], "repo": t.get("repo", "."), "status": "pending",
              "depends_on": t.get("depends_on", []), "risk": t.get("risk", "low"),
              "test_intents": t.get("test_intents", []),
+             # a reason only means something for a zero-test task — one
+             # riding alongside declared intents (planner confusion, or a
+             # revision that added tests without dropping the stale field)
+             # is normalized away, never stored as a self-contradictory
+             # record no surface would ever render
+             "no_test_reason": ((t.get("no_test_reason") or "").strip() or None)
+                               if not t.get("test_intents") else None,
              "commit_sha": None, "review_rounds": 0, "stalls": 0,
              "worktree": None}
             for t in tasks]
@@ -472,6 +534,22 @@ def plan_register(workspace: Path, run: Path, manifest: dict,
             _validate_contract(c)
         st["contracts"] = contracts or []
         state_mod.save(run, workspace, st)
+        # Events AFTER the save, matching every sibling verb — a failed
+        # save must not leave phantom ledger records (the module-wide
+        # trade: append-may-fail under-counts, never over-counts). The
+        # `plan-registered` marker lands FIRST: registration replaces the
+        # task list wholesale, so the marker supersedes every EARLIER
+        # `risk-without-tests` batch in outstanding_flagged and the gauge
+        # tracks the latest registration only; the fresh batch follows it.
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "plan-registered", "actor": "plan-register",
+            "count": len(ids)})
+        for t in st["tasks"]:
+            if (t["risk"] != "low" and not t["test_intents"]
+                    and t["no_test_reason"]):
+                ndjson.append_record(run / "events.ndjson", {
+                    "kind": "risk-without-tests", "task": t["id"],
+                    "actor": "plan-register", "reason": t["no_test_reason"]})
     return {"tasks": ids, "contracts": [c["id"] for c in contracts or []]}
 
 

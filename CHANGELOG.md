@@ -33,6 +33,17 @@ All notable changes to `ai-sdlc-harness` are documented here.
   Non-HTTP fragments keep exact literal matching. Planner guidance
   updated: declare http fragments as the route template — anchored with a
   literal segment — never one side's raw variable name.
+- A task at any risk other than `low` with no declared test intents can
+  no longer register silently: the plan must record WHY (`no_test_reason`
+  — e.g. a repo coverage-exclusion convention). Registration refuses the
+  silent opt-out, stores the reason on the task, and flags the recorded
+  one (`risk-without-tests`) in `status` and the metrics report — each
+  re-registration supersedes the previous batch, so the gauge always
+  reflects the latest approved plan; plan review judges the reason's
+  soundness. Low-risk docs/chore opt-outs are unchanged. Plan review
+  also now catches coverage-backfill tasks at plan time — a task whose
+  test intents come with no production file change dead-ends at develop
+  (in the field this forced a full run abort, past every plan gate).
 
 ## [3.1.0] — 2026-07-17
 
@@ -62,7 +73,7 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 - `python -m harness.schema` — declared data valid
 - `python tools/budget_check.py` — line budget green
-- `python -m unittest discover -s tests` — 674 tests green
+- `python -m unittest discover -s tests` — 686 tests green
 
 ## [3.0.4] — 2026-07-12
 
