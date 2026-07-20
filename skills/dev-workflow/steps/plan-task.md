@@ -86,7 +86,12 @@ fork identified: <why>` under the task table, visible either way.
 - **Cross-repo contracts**, multi-repo stories only: name the producer repo,
   consumer repo(s), and signature fragment(s) for anything one repo's task
   emits and another's depends on — the enriched shape in `steps/plan.md`'s
-  registration example.
+  registration example. For `type: http` routes, declare the fragment as
+  the ROUTE TEMPLATE (`users/{id}/authorization`), never one side's raw
+  variable name: each `{param}` matches any one path segment per repo,
+  while the literal path around it must appear verbatim on both sides.
+  Prefer a literal segment BEFORE the first `{param}` — it bounds what
+  the param can match; an all-param fragment (`{id}`) is rejected.
 - **File-touch manifest**: the files this task creates or modifies, each
   with a one-line why — from actually reading the code, not guessing
   (plan-review spot-checks that *modify* entries exist and *create*

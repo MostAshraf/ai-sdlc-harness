@@ -87,12 +87,18 @@ When the planner's status block reports the plan ready:
    NAMES for that task, empty if none) — declare cross-repo contracts too if
    the plan named any: `--contracts-json '[{"id":"C1","type":"http",
    "producer":"a","consumers":["b"],"signature":["POST /v2/items",
-   "field: item_id"]}]'` (`type` is `http | service-bus | dto`, descriptive
-   only; `signature` is one string or a list of fragments, and **each must be
+   "field: item_id"]}]'` (`type` is `http | service-bus | dto` — and `http`
+   also changes matching: each `{param}` token in a fragment matches any ONE
+   path segment per repo, so declare the route template — whichever shape,
+   directional or flat — as `"users/{id}/authorization"`, never one side's
+   raw variable name, and keep a literal segment before the first param
+   (an all-param fragment like `"{id}"` is rejected at registration);
+   `signature` is one string or a list of fragments, and **each must be
    a grep-able code token/signature that appears verbatim in source** —
    `archived`, `filter_notes(notes, tag)`, `POST /v2/items` — NOT an English
-   description: reconcile-contracts matches by literal source search, so a
-   prose fragment is rejected at plan-register and would false-report drift.
+   description: reconcile-contracts matches by literal source search
+   (route-structural only for http `{param}`s), so a prose fragment is
+   rejected at plan-register and would false-report drift.
    All fragments must be present; the flat legacy `"repos":["a","b"]` form
    still works in place of `producer`/`consumers`. Legal only at cursor `plan`.
 2. Check the diagrams: `${CLAUDE_PLUGIN_ROOT}/bin/harness validate-mermaid

@@ -65,7 +65,11 @@ Check, in order of importance:
 5. **Contract signatures.** Each declared cross-repo contract signature
    fragment must be a grep-able code token that appears (or will appear
    verbatim) in source — plan-register rejects prose fragments; catch them
-   here first.
+   here first. ONE sanctioned exception: an http route template's
+   `{param}` tokens (`users/{id}/authorization`) match any one path
+   segment per repo — the right declaration even though the param name
+   won't appear verbatim in a consumer; the literal path around the
+   params still must. An all-param fragment (`{id}`) is rejected.
 6. **File-touch manifest sanity.** Files listed as *modify* must exist
    (spot-check with Glob/Read); files listed as *create* must not. A
    manifest entry pointing at a path that isn't there means the planner

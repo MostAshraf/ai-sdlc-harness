@@ -288,20 +288,25 @@ def _validate_contract(c: dict) -> None:
     if not fragments or any(not f for f in fragments):
         raise state_mod.StateError("signature fragments must be non-empty")
     # F3 (validation-walk): reconcile-contracts matches each fragment by a
-    # LITERAL `git grep -F` in every named repo, so a fragment must be a
-    # grep-able code substring — a bare symbol or signature that appears
-    # verbatim in source (`archived`, `filter_notes(notes, tag)`), never an
-    # English description. A prose fragment matches nothing and false-reports
-    # drift on correctly-implemented code (E2E-1 false positive). An em/en-dash
-    # is a reliable prose tell (a code token never carries one), so reject it at
-    # declaration — fail-fast — rather than surfacing a phantom drift at pre-pr.
-    # (True semantic matching is the future upgrade noted in reconcile_contracts.)
+    # LITERAL `git grep -F` in every named repo — except a `type: http`
+    # fragment carrying a `{param}` token, whose params elide to one path
+    # segment each (_http_route_regex) while the surrounding route text
+    # still matches literally. So a fragment must be a grep-able code
+    # substring — a bare symbol, signature, or route template that appears
+    # in source (`archived`, `filter_notes(notes, tag)`,
+    # `{id}/authorization`), never an English description. A prose fragment
+    # matches nothing and false-reports drift on correctly-implemented code
+    # (E2E-1 false positive). An em/en-dash is a reliable prose tell (a code
+    # token never carries one), so reject it at declaration — fail-fast —
+    # rather than surfacing a phantom drift at pre-pr. (True semantic
+    # matching is the future upgrade noted in reconcile_contracts.)
     for f in fragments:
         if "—" in f or "–" in f:
             raise state_mod.StateError(
                 f"contract signature fragment {f!r} reads as prose (dash "
                 "separator) — reconcile-contracts matches fragments by literal "
-                "source search; declare a grep-able code token or signature "
+                "source search (route-structural only for http {param} "
+                "templates); declare a grep-able code token or signature "
                 "that appears verbatim in the repo (e.g. `archived`, "
                 "`filter_notes(notes, tag)`), not an English description")
     has_repos, has_directional = bool(c.get("repos")), bool(c.get("producer")) and bool(c.get("consumers"))
@@ -314,6 +319,25 @@ def _validate_contract(c: dict) -> None:
     if c.get("type") is not None and c["type"] not in CONTRACT_TYPES:
         raise state_mod.StateError(
             f"contract type must be one of {sorted(CONTRACT_TYPES)}")
+    if c.get("type") == "http":
+        # Same fail-fast slot as the em-dash prose tell above: an http
+        # fragment that is route-parameters ONLY (`{id}`, `{a}/{b}`)
+        # elides to an anchorless pattern that would report "present"
+        # everywhere — a vacuous check whose failure mode is invisible
+        # false CLEAN, strictly worse than the prose fragment's visible
+        # false drift (adversarial-review on this change, both lenses
+        # independently). Reject at declaration; _http_route_regex also
+        # refuses the shape at match time for pre-existing state.
+        for f in fragments:
+            parts = _HTTP_TOKEN_RE.split(f)
+            if len(parts) > 1 and not any(
+                    ch.isalnum() for p in parts[::2] for ch in p):
+                raise state_mod.StateError(
+                    f"http contract fragment {f!r} is route-parameters "
+                    "only — each {param} matches ANY one path segment, so "
+                    "this fragment would report present everywhere; anchor "
+                    "the template with a literal segment (`users/{id}`, "
+                    "not `{id}`)")
 
 
 def scope_register(workspace: Path, run: Path, manifest: dict, config: dict,
@@ -551,6 +575,75 @@ def security_scan(workspace: Path, run: Path, config: dict, manifest: dict) -> s
     return max_sev
 
 
+# ERE metacharacters to escape when a route fragment's LITERAL segments
+# are spliced into a regex. git grep -E is POSIX ERE — `-P` (PCRE) is not
+# guaranteed compiled in, so nothing below may use PCRE-only constructs.
+# Braces are handled separately in _ere_escape: a bare `\{` is not
+# portably a literal brace in ERE, so literal braces match via single-char
+# bracket classes (`[{]` / `[}]`).
+_ERE_META = re.compile(r"[.^$*+?()\[\]|\\]")
+# One elided route parameter: a still-braced segment (`{id}`, or a
+# consumer's inline interpolation like `{Uri.EscapeDataString(userId)}`)
+# OR a bare interpolated value — anything up to the next path separator,
+# closing brace, or string quote (quotes bound the match to one string
+# literal so it can't bleed across unrelated code). Plain capturing
+# group: ERE has no non-capturing `(?:…)`; under `grep -q` the group is
+# harmless.
+_HTTP_PARAM_SEG = "([{][^/}\"']*[}]|[^/}\"']+)"
+# A {param} token: brace-delimited, no separator and no QUOTE inside — the
+# same charset _HTTP_PARAM_SEG's braced alternative accepts, so a token the
+# split captures is always one the elided segment can re-match (adversarial-
+# review: the old split admitted quote-bearing tokens like `{"ok":true}`
+# that the seg then couldn't match — a JSON shape under an http contract
+# must stay a literal fragment, not become a route param).
+_HTTP_TOKEN_RE = re.compile(r"(\{[^/}\"']+\})")
+
+
+def _ere_escape(seg: str) -> str:
+    return (_ERE_META.sub(lambda m: "\\" + m.group(0), seg)
+            .replace("{", "[{]").replace("}", "[}]"))
+
+
+def _http_route_regex(frag: str) -> str | None:
+    """POSIX ERE matching `frag` with every `{param}` elided to one path
+    segment — or None when the caller must keep the exact literal `-F`
+    match (no `{param}` token, or a degenerate all-param template). Field
+    run 459226 (downstream fork report): a directional http contract
+    declared the producer's route template (`{id}/authorization`); the
+    consumer built the same path by interpolating a differently-named
+    variable, so the literal `{id}` never appeared there and a
+    byte-identical wire shape was reported as drift — both pre-PR
+    reviewers independently investigated and dismissed the same tooling
+    false positive. Only the param may vary: the literal route text
+    around it is ERE-escaped, so `/authz` vs `/authorization` still
+    drifts and a route `.` matches only a literal dot (`v2.1` never
+    matches `v2x1`).
+
+    Residual (documented): a `{param}` position is satisfied by ANY one
+    path segment, so `{id}/items` also matches prose like `docs/items` in
+    a non-test file — prefer templates carrying a literal segment before
+    the first param (`users/{id}/items`), which bounds the widening; the
+    fully anchorless shape is rejected at declaration below."""
+    parts = _HTTP_TOKEN_RE.split(frag)
+    if len(parts) == 1:
+        return None
+    # Degenerate template guard: no alphanumeric literal outside the
+    # {param} tokens (`{id}`, `{a}/{b}`) → the built ERE would have no
+    # anchor and match nearly any line — a guaranteed false CLEAN, the one
+    # forbidden direction (this checker may only ever fail toward visible
+    # drift). Keep the literal -F match instead; _validate_contract
+    # rejects the shape at declaration, this is belt-and-braces for
+    # contracts registered before that rule existed.
+    if not any(ch.isalnum() for p in parts[::2] for ch in p):
+        return None
+    # Captured tokens sit at ODD indices by re.split construction —
+    # classify by parity, never by re-testing the shape (adversarial-
+    # review: a brace-wrapped LITERAL part like `{a/b}` — never captured,
+    # it carries a separator — shape-matched and was wrongly elided).
+    return "".join(_HTTP_PARAM_SEG if i % 2 else _ere_escape(p)
+                   for i, p in enumerate(parts))
+
+
 def reconcile_contracts(workspace: Path, run: Path, config: dict,
                         repos: dict[str, str]) -> str:
     """Cross-repo contract check (M5 charter / coverage B6): every declared
@@ -565,12 +658,18 @@ def reconcile_contracts(workspace: Path, run: Path, config: dict,
     is REPORTED for the human at ⟨approve-pre-pr⟩ — never auto-fixed.
     Fragments are validated grep-able at declaration (`_validate_contract`
     rejects prose — validation-walk F3), closing the common false-positive
-    cheaply. True semantic/AST comparison remains a documented future upgrade,
-    not attempted here: it would need structured fragments (the symbol + its
-    kind, not a free string) plus a per-language matcher — stdlib `ast` for
-    Python, a parser or heuristic for JS, tree-sitter for universal coverage —
-    which trades the language-agnostic, near-zero-dependency stance `git grep`
-    was chosen for; hence deferred."""
+    cheaply. For `type: http` contracts only, a fragment carrying a
+    `{param}` token matches route-STRUCTURALLY (each param elides to one
+    path segment — `_http_route_regex`; field 459226: producer `{id}` vs
+    consumer `userId` false-drifted a byte-identical route); every other
+    fragment is an exact literal match. True semantic/AST comparison
+    remains a documented future upgrade, not attempted here: it would need
+    structured fragments (the symbol + its kind, not a free string) plus a
+    per-language matcher — stdlib `ast` for Python, a parser or heuristic
+    for JS, tree-sitter for universal coverage — which trades the
+    language-agnostic, near-zero-dependency stance `git grep` was chosen
+    for; hence deferred (the http-param elision is the cheap, targeted
+    slice of it that keeps that stance)."""
     st = state_mod.load(run, workspace)
     test_globs = config.get("language", {}).get("test_paths", ["tests/**"])
     # `glob` pathspec magic, not plain `:(exclude)`: git's non-glob pathspec
@@ -607,12 +706,25 @@ def reconcile_contracts(workspace: Path, run: Path, config: dict,
             role = f" ({c['type']})"
         else:
             role = ""
+        is_http = c.get("type") == "http"
         for repo_name in repo_names:
             repo = Path(repos.get(repo_name, repo_name))
             missing = []
             for frag in fragments:
+                # http fragments carrying a {param} token match
+                # route-structurally via -E (each param elides to one path
+                # segment — _http_route_regex); everything else stays an
+                # exact literal -F match. A malformed ERE exits non-zero
+                # and reads as MISSING — the safe direction: false drift
+                # for the human to dismiss, never false clean.
+                rx = _http_route_regex(frag) if is_http else None
                 try:
-                    gitops.run_git(repo, "grep", "-F", "-q", frag, "--", ".", *excludes)
+                    if rx is not None:
+                        gitops.run_git(repo, "grep", "-E", "-q", rx,
+                                       "--", ".", *excludes)
+                    else:
+                        gitops.run_git(repo, "grep", "-F", "-q", frag,
+                                       "--", ".", *excludes)
                 except gitops.GitError:
                     missing.append(frag)
             if missing:

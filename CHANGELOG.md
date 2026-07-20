@@ -22,6 +22,17 @@ All notable changes to `ai-sdlc-harness` are documented here.
   dropped it in ~80% of field replies), and the shared contract now states
   the block must END the reply. An echoed template line no longer counts
   as a real status block.
+- Cross-repo contract checks no longer false-report drift on HTTP route
+  parameters: a `type: http` fragment declared as the route template
+  (`users/{id}/authorization`) matches route-structurally — each `{param}`
+  token matches any one path segment, so the consumer may name the
+  parameter its own way — while the literal path around it still trips
+  genuine drift (`/authz` vs `/authorization`; a route `.` matches only a
+  literal dot). An all-param fragment (`{id}`) is rejected at plan
+  registration: it would match anything and turn the check vacuous.
+  Non-HTTP fragments keep exact literal matching. Planner guidance
+  updated: declare http fragments as the route template — anchored with a
+  literal segment — never one side's raw variable name.
 
 ## [3.1.0] — 2026-07-17
 
@@ -51,7 +62,7 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 - `python -m harness.schema` — declared data valid
 - `python tools/budget_check.py` — line budget green
-- `python -m unittest discover -s tests` — 663 tests green
+- `python -m unittest discover -s tests` — 674 tests green
 
 ## [3.0.4] — 2026-07-12
 
