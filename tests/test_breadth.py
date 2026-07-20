@@ -1667,6 +1667,86 @@ class DeferFollowThrough(BreadthHarness):
         self.assertGreaterEqual(flagged, 1)   # the real pending is still owed
 
 
+class RunHealth(BreadthHarness):
+    """The process-health verdict (field 459226 rec: a run 'completed
+    green' over 11 flagged events and 2 stalls, visible only via manual
+    post-mortem). One shared rule — workflow.run_health — read by both
+    `status` and metrics' leading '## Run health' section."""
+
+    def setUp(self):
+        super().setUp()
+        self.story("W-93", "health")
+        self.init()
+        self.run_dir = Path(self.cli("fetch", "--id", "W-93",
+                                     "--date", "2026-03-07")["run"])
+
+    def _status_health(self):
+        return next(r for r in self.cli("status")["runs"]
+                    if r["run"] == self.run_dir.name)["health"]
+
+    def _metrics_text(self):
+        return Path(self.cli("metrics", run=self.run_dir)["report"]).read_text(
+            encoding="utf-8")
+
+    def test_fresh_run_reads_healthy_in_status_and_metrics(self):
+        self.assertEqual(self._status_health(), "HEALTHY")
+        text = self._metrics_text()
+        self.assertIn("## Run health", text)
+        self.assertIn("**HEALTHY**", text)
+
+    def test_degrading_event_flips_both_surfaces(self):
+        ndjson.append_record(self.run_dir / "events.ndjson", {
+            "kind": "missing-status-block", "task": "T1", "actor": "planner"})
+        self.assertEqual(self._status_health(), "DEGRADED")
+        text = self._metrics_text()
+        self.assertIn("**DEGRADED**", text)
+        self.assertIn("missing-status-block: 1", text)
+
+    def test_every_declared_degrading_kind_flips_the_verdict(self):
+        # mutation-proofing (adversarial review of this change: shrinking
+        # the tuple passed the suite): pin the exact declared contents AND
+        # that each kind flips the shared rule
+        from harness.workflow import HEALTH_DEGRADING_KINDS, run_health
+        self.assertEqual(set(HEALTH_DEGRADING_KINDS),
+                         {"missing-status-block", "verdict-uncaptured",
+                          "background-spawn-uncaptured"})
+        for kind in HEALTH_DEGRADING_KINDS:
+            verdict, counts = run_health([{"kind": kind}])
+            self.assertEqual((verdict, counts), ("DEGRADED", {kind: 1}), kind)
+
+    def test_engaged_stall_procedure_degrades_without_any_event(self):
+        """Adversarial review of this change (both lenses): the stall
+        procedure can engage on paths that write no capture event at all
+        (hook attribution failure, a hung spawn with no PostToolUse
+        payload) — the verdict reads the state counters the stall verb
+        writes, so those stalls still degrade the run instead of hiding
+        behind a green completion."""
+        self.cli("stall", run=self.run_dir)   # task-less: step-keyed counter
+        self.assertEqual(self._status_health(), "DEGRADED")
+        text = self._metrics_text()
+        self.assertIn("**DEGRADED**", text)
+        self.assertIn("stalls: 1", text)
+
+    def test_flagged_but_healthy_kinds_never_degrade(self):
+        # the exclusions are the point: a captured-verdict formatting slip,
+        # a declared gate self-skip, and a recorded zero-test decision are
+        # all flagged for humans yet leave the machinery healthy — the
+        # fork's field runs read DEGRADED on every run until this split
+        for kind in ("status-block-malformed", "gate-skipped",
+                     "risk-without-tests"):
+            ndjson.append_record(self.run_dir / "events.ndjson",
+                                 {"kind": kind, "task": "T1"})
+        self.assertEqual(self._status_health(), "HEALTHY")
+        text = self._metrics_text()
+        self.assertIn("**HEALTHY**", text)
+        self.assertIn("status-block-malformed (non-degrading): 1", text)
+        # a degrading kind must always also be human-visible
+        from harness.workflow import (FLAGGED_EVENT_KINDS,
+                                      HEALTH_DEGRADING_KINDS)
+        for kind in HEALTH_DEGRADING_KINDS:
+            self.assertIn(kind, FLAGGED_EVENT_KINDS)
+
+
 class AbortRefetchSameDay(BreadthHarness):
     def test_same_day_abort_then_refetch_bootstraps_a_fresh_slot(self):
         """Field (session D phase 0, verbatim sequence): fetch → collision

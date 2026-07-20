@@ -7,7 +7,7 @@
 | `/init-workspace` | One-time setup interview: provider, repos, discovered toolchain, verification gate |
 | `/dev-workflow <work-item-id>` | Take a work item from requirements to merged PR end-to-end |
 | `/story-workflow <command> <work-item-id>` | Shape a story's quality before it's built: `analyze` · `refine` · `improve` · `groom` |
-| `/workflow-status` | Read-only dashboard: cursor, tasks, gates, flagged events per run |
+| `/workflow-status` | Read-only dashboard: cursor, tasks, gates, flagged events, run-health verdict per run |
 | `/workspace-config` | Change one config section without re-running the interview |
 | `/add-repo` | Register one new repo into an already-bootstrapped workspace |
 | `/migrate-workspace` | Adopt a v2.x workspace: config carries over, run history stays archived in place |
@@ -369,7 +369,7 @@ ai-sdlc-harness/
 │   └── init-workspace/ · add-repo/ · migrate-workspace/ · workspace-config/ · workflow-status/ · repo-map-refresh/
 ├── bin/harness                  # wrapper script resolving the plugin venv (+ harness.cmd for Windows)
 ├── tools/                       # meta-tooling: line-budget checker, sandbox workspace generators
-└── tests/                       # 686 stdlib-unittest tests
+└── tests/                       # 691 stdlib-unittest tests
 ```
 
 Workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside *your* working directory by `/init-workspace` and the pipeline. They never live inside this plugin repo.
@@ -399,7 +399,7 @@ python -m venv .venv; .venv\Scripts\pip install pyyaml
 .venv\Scripts\python -m unittest discover -s tests
 ```
 
-The test suite (686 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (691 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 

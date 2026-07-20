@@ -44,6 +44,17 @@ All notable changes to `ai-sdlc-harness` are documented here.
   also now catches coverage-backfill tasks at plan time — a task whose
   test intents come with no production file change dead-ends at develop
   (in the field this forced a full run abort, past every plan gate).
+- Every run now carries a process-health verdict: `status` reports
+  `health: HEALTHY | DEGRADED` per run, and the metrics report opens with
+  a `## Run health` section (degrading-event counts and stall counts —
+  both flip the verdict — plus the malformed-block count as non-degrading
+  context). DEGRADED means the run *machinery*
+  degraded — a stalled agent, lost verdict evidence, an uncapturable
+  background spawn — not that flagged content findings exist: a captured
+  engine-read verdict with loose formatting, a declared gate self-skip,
+  or a recorded zero-test decision never flips it. The field run that
+  motivated this masked two stalls and a full panel re-run behind a green
+  completion; it would have read DEGRADED at a glance.
 
 ## [3.1.0] — 2026-07-17
 
@@ -73,7 +84,7 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 - `python -m harness.schema` — declared data valid
 - `python tools/budget_check.py` — line budget green
-- `python -m unittest discover -s tests` — 686 tests green
+- `python -m unittest discover -s tests` — 691 tests green
 
 ## [3.0.4] — 2026-07-12
 

@@ -4,8 +4,9 @@
 ${CLAUDE_PLUGIN_ROOT}/bin/harness metrics --run <run>
 ```
 
-Deterministic aggregation — timings from state, tokens from the ledger,
-flagged events — into `<run>/reports/metrics.md`. No agent reasoning. Show
+Deterministic aggregation — run health (the leading HEALTHY | DEGRADED
+verdict), timings from state, tokens from the ledger, flagged events —
+into `<run>/reports/metrics.md`. No agent reasoning. Show
 the user the summary. Final mirror **once per preflighted repo** (SKILL.md's
 Publish rule — never the workspace), `--push` required so this closing
 snapshot (metrics report included) actually reaches each PR's remote

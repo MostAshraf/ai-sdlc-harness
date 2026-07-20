@@ -82,6 +82,51 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
     return [e for e in flagged if id(e) not in resolved]
 
 
+# Process-health filter over the same ledger: the kinds that mean the run
+# MACHINERY degraded — evidence lost or the stalled-agent procedure
+# engaged — as opposed to flagged-but-healthy signals a human reviews
+# (field 459226: a run "completed green" over 11 flagged events and 2
+# stalls, and the degradation surfaced only in a manual post-mortem).
+# Deliberately EXCLUDED: `status-block-malformed` (the verdict WAS
+# captured — loose formatting, run healthy; including it made every fork
+# field run read DEGRADED and the verdict uninformative), `gate-skipped`
+# (declared predicate self-skips are the mode working as designed),
+# `risk-without-tests` (a recorded, reviewed decision), `contracts-check`
+# and `hook-blocked` (content findings / guards doing their job).
+HEALTH_DEGRADING_KINDS = (
+    "missing-status-block", "verdict-uncaptured",
+    "background-spawn-uncaptured")
+
+
+def stall_count(st: dict) -> int:
+    """Total stalls recorded by the stalled-agent procedure — per-task
+    counters plus the step-keyed counters for task-less spawns. Counted
+    from STATE (the authority `record_stall` writes), not from a
+    self-reported event kind: the procedure can engage on paths that
+    write no capture event at all (hook attribution failure across
+    several live runs, a hung spawn with no PostToolUse payload —
+    adversarial-review on this change, both lenses), and those stalls
+    must still degrade the run."""
+    return (sum(t.get("stalls", 0) for t in st.get("tasks", []))
+            + sum((st.get("step_stalls") or {}).values()))
+
+
+def run_health(events: list[dict], stalls: int = 0) -> tuple[str, dict[str, int]]:
+    """(verdict, per-kind counts): HEALTHY unless a degrading event was
+    recorded or the stalled-agent procedure engaged (`stalls` — pass
+    stall_count(st)). ONE definition read by both `status` and
+    `metrics_report` — the same anti-drift rule as FLAGGED_EVENT_KINDS
+    above. Unlike outstanding_flagged, health is HISTORY, not a live
+    gauge: a stall the run later recovered from still degraded it, so
+    nothing pairs off."""
+    counts: dict[str, int] = {}
+    for e in events:
+        k = e.get("kind")
+        if k in HEALTH_DEGRADING_KINDS:
+            counts[k] = counts.get(k, 0) + 1
+    return ("DEGRADED" if counts or stalls else "HEALTHY", counts)
+
+
 def slug(title: str, limit: int = 30) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
     return s[:limit].rstrip("-") or "change"
@@ -1104,8 +1149,9 @@ def _fmt_duration(start: str | None, end: str | None) -> str:
 
 def metrics_report(workspace: Path, run: Path,
                    manifest: dict | None = None) -> Path:
-    """Deterministic aggregation rendered as human-readable tables: timings
-    from state, tokens from the ledger (aggregated per task × role),
+    """Deterministic aggregation rendered as human-readable tables: run
+    health (events + stall counters) leading, timings from state, tokens
+    from the ledger (aggregated per task × role),
     verdicts from reviews.ndjson, exceptions from events — no agent
     reasoning (a 'keeping'). The ndjson ledgers stay the machine-readable
     source of truth; this file is a regenerable VIEW, never parsed back and
@@ -1122,7 +1168,25 @@ def metrics_report(workspace: Path, run: Path,
     lines = [f"# Metrics — {st['work_item']['id']}", "",
              f"{st['work_item'].get('title') or ''} · mode `{st['mode']}` · "
              f"cursor `{st['cursor']['current_step']}` · generated "
-             f"{_fmt_when(ndjson.now_iso())} UTC", "", "## Step timings", ""]
+             f"{_fmt_when(ndjson.now_iso())} UTC", ""]
+    # Run health leads the report — the executive signal (field 459226: a
+    # run "completed green" over 11 flagged events and 2 stalls, visible
+    # only via manual post-mortem). The verdict flips on the declared
+    # HEALTH_DEGRADING_KINDS or an engaged stall procedure; the
+    # non-degrading malformed-block count rides as context only.
+    stalls = stall_count(st)
+    health, degrading = run_health(events, stalls)
+    malformed = sum(1 for e in events
+                    if e.get("kind") == "status-block-malformed")
+    parts = [f"{k}: {n}" for k, n in sorted(degrading.items())]
+    if stalls:
+        parts.append(f"stalls: {stalls}")
+    if malformed:
+        parts.append(f"status-block-malformed (non-degrading): {malformed}")
+    lines += ["## Run health", "",
+              f"**{health}**" + (" — " + " · ".join(parts) if parts
+                                 else " — no degrading events, no stalls"),
+              "", "## Step timings", ""]
     lines += _md_table(
         ["Step", "Started (UTC)", "Ended (UTC)", "Duration"],
         [[step, _fmt_when(m.get("started_at")), _fmt_when(m.get("ended_at")),

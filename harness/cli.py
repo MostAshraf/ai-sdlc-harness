@@ -572,8 +572,8 @@ def main(argv: list[str] | None = None) -> int:
                 # F5 (validation-walk): the shared outstanding-flagged filter
                 # pairs resolved deferrals off, so status.flagged_events matches
                 # metrics' "## Flagged events (N)" and both are a live gauge.
-                flagged = workflow.outstanding_flagged(
-                    ndjson.read_records(run / "events.ndjson"))
+                events = ndjson.read_records(run / "events.ndjson")
+                flagged = workflow.outstanding_flagged(events)
                 runs.append({
                     "run": run.name, "mode": st["mode"],
                     "cursor": st["cursor"]["current_step"],
@@ -589,7 +589,14 @@ def main(argv: list[str] | None = None) -> int:
                     "gates": {g: v.get("decision") or v.get("consumed_decision")
                               for g, v in st["gates"].items()
                               if v.get("decision") or v.get("consumed_decision")},
-                    "flagged_events": len(flagged)})
+                    "flagged_events": len(flagged),
+                    # process health, not content: HEALTHY unless the run
+                    # machinery degraded — evidence-loss events or an
+                    # engaged stall procedure (shared rule —
+                    # workflow.run_health, the same one metrics' "## Run
+                    # health" section reads)
+                    "health": workflow.run_health(
+                        events, workflow.stall_count(st))[0]})
             _emit({"ok": True, "runs": runs})
             return 0
 
