@@ -6,87 +6,31 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
-- A reviewer reply whose verdict was captured but whose status block was
-  missing no longer triggers the stalled-agent procedure — previously this
-  re-ran an entire review panel to re-derive a verdict the run already held
-  (observed in the field: ~1 hour paid twice in one run). The loose
-  formatting is now recorded as its own flagged event
-  (`status-block-malformed`), visible in `status` and the metrics report,
-  and the run proceeds on the captured verdict. Only verdicts the engine
-  actually consumes (per-task review and plan-review synthesis) qualify —
-  an advisory lens or pre-PR reply without a status block still stalls,
-  because its real deliverable is the report, not the verdict.
-- Agents are far less likely to drop the status block in the first place:
-  the block template is now inlined verbatim in the planner and reviewer
-  agent definitions (previously a one-line file pointer — the shape that
-  dropped it in ~80% of field replies), and the shared contract now states
-  the block must END the reply. An echoed template line no longer counts
-  as a real status block.
-- Cross-repo contract checks no longer false-report drift on HTTP route
-  parameters: a `type: http` fragment declared as the route template
-  (`users/{id}/authorization`) matches route-structurally — each `{param}`
-  token matches any one path segment, so the consumer may name the
-  parameter its own way — while the literal path around it still trips
-  genuine drift (`/authz` vs `/authorization`; a route `.` matches only a
-  literal dot). An all-param fragment (`{id}`) is rejected at plan
-  registration: it would match anything and turn the check vacuous.
-  Non-HTTP fragments keep exact literal matching. Planner guidance
-  updated: declare http fragments as the route template — anchored with a
-  literal segment — never one side's raw variable name.
-- A task at any risk other than `low` with no declared test intents can
-  no longer register silently: the plan must record WHY (`no_test_reason`
-  — e.g. a repo coverage-exclusion convention). Registration refuses the
-  silent opt-out, stores the reason on the task, and flags the recorded
-  one (`risk-without-tests`) in `status` and the metrics report — each
-  re-registration supersedes the previous batch, so the gauge always
-  reflects the latest approved plan; plan review judges the reason's
-  soundness. Low-risk docs/chore opt-outs are unchanged. Plan review
-  also now catches coverage-backfill tasks at plan time — a task whose
-  test intents come with no production file change dead-ends at develop
-  (in the field this forced a full run abort, past every plan gate).
-- Coverage backfill is now refused mechanically at registration, not just
-  by plan-review prose: a task WITH test intents must carry its file-touch
-  manifest (`plan-register`'s new per-task `files` field, repo-relative
-  paths — normalized to one form and persisted on the task record) naming
-  at least one path outside `language.test_paths` ∪ `test_closure` — the
-  full set verify-red SHA-locks with the red proof, so a file develop
-  would refuse to accept as the change can't pose as the production entry
-  at plan time. A missing or all-test manifest
-  refuses registration — the judged exception, a task whose *product* is
-  test infrastructure, registers via a recorded `test_only_reason` and is
-  flagged (`tests-without-production`, superseded per re-registration like
-  its `risk-without-tests` mirror, and never health-degrading). Directory-
-  shaped manifest entries (`.`, trailing slash) are refused, and the
-  supersession marker is actor-checked so a stray `log-event` record can't
-  silently clear outstanding plan flags. Orchestrator
-  prose that registers test-carrying tasks must now carry the manifest —
-  a deliberate contract widening; the shipped step prose does.
-- Every run now carries a process-health verdict: `status` reports
-  `health: HEALTHY | DEGRADED` per run, and the metrics report opens with
-  a `## Run health` section (degrading-event counts and stall counts —
-  both flip the verdict — plus the malformed-block count as non-degrading
-  context). DEGRADED means the run *machinery*
-  degraded — a stalled agent, lost verdict evidence, an uncapturable
-  background spawn — not that flagged content findings exist: a captured
-  engine-read verdict with loose formatting, a declared gate self-skip,
-  or a recorded zero-test decision never flips it. The field run that
-  motivated this masked two stalls and a full panel re-run behind a green
-  completion; it would have read DEGRADED at a glance.
-- The plan-review lens panel now scales to the change type: new
-  `plan_review.lenses_by_change_type` config — chore/docs runs ship with
-  an empty panel (the synthesizer still reviews the plan directly), an
-  unmapped change type keeps the full default panel — resolved by the new
-  `harness resolve-lenses` verb; mapping keys are schema-validated against
-  `change_types`, so a typo'd tier can't silently run the wrong panel.
-- Serialized lens panels are detected mechanically, not just prohibited
-  in prose: a lens spawn arriving after a sibling already completed the
-  same review round logs a flagged `panel-serialized` event (~13 minutes
-  of avoidable wall-clock per serialized panel in the field). Loud, never
-  blocking — the first lens's work is preserved.
-- Reviewer ergonomics: the agent definition now says to quote search
-  patterns (an unquoted `>` inside a grep pattern reads as a shell
-  redirect and trips the scratch-write guard), and the guard's block
-  message names that fix when it fires.
+## [3.1.1] — 2026-07-21
+
+> **v3.1.0 shipped the plan-review panel; this release closes the gaps it exposed running in the field.** A captured verdict was thrown away over a formatting slip, coverage backfill and low-risk test opt-outs could still slip past registration, a stalled agent or a serialized panel could hide behind a green completion, and a cross-repo contract check false-flagged legitimate HTTP route drift. Each is closed at the mechanism, not just in prose.
+
+### Release highlights
+
+| Theme | What changed |
+|---|---|
+| **A captured verdict is no longer discarded over formatting** | A reviewer reply whose verdict was captured but whose status block was missing no longer triggers the stalled-agent procedure — previously this re-ran an entire review panel to re-derive a verdict the run already held (observed in the field: ~1 hour paid twice in one run). The loose formatting is now recorded as its own flagged, non-degrading event (`status-block-malformed`), visible in `status` and the metrics report, and the run proceeds on the captured verdict — only for verdicts the engine actually consumes (per-task review, plan-review synthesis); an advisory lens or pre-PR reply without a status block still stalls. Agents are also far less likely to drop the block in the first place: the template is now inlined verbatim in the planner and reviewer agent definitions (previously a one-line file pointer — the shape that dropped it in ~80% of field replies), and the shared contract now states the block must END the reply; an echoed template line no longer counts as real. |
+| **Plan registration closes the coverage-backfill gap** | A task at any risk other than `low` with no declared test intents must now record why (`no_test_reason`) — the silent opt-out is refused, the reason is stored and flagged (`risk-without-tests`) in `status`/metrics, and plan review judges its soundness; low-risk docs/chore opt-outs are unchanged. A task *with* test intents must now carry a file-touch manifest (`plan-register`'s new per-task `files` field) naming at least one path outside the test closure — a missing or all-test manifest refuses registration, with a judged `test_only_reason` exception for tasks whose real product is test infrastructure (flagged `tests-without-production`, never health-degrading). Plan review also catches coverage-backfill tasks at plan time instead of dead-ending at develop. |
+| **Process health is now a first-class run verdict** | Every run carries a process-health verdict: `status` reports `health: HEALTHY \| DEGRADED`, and the metrics report opens with a `## Run health` section. DEGRADED means the run *machinery* degraded (a stalled agent, lost verdict evidence, an uncapturable background spawn) — not that flagged content findings exist; a loosely-formatted-but-captured verdict, a declared gate self-skip, or a recorded zero-test decision never flips it. The field run that motivated this masked two stalls and a full panel re-run behind a green completion. |
+| **Plan-review panel scales to the change and polices itself** | New `plan_review.lenses_by_change_type` config lets chore/docs runs ship with an empty lens panel (the synthesizer still reviews the plan directly) while an unmapped change type keeps the full default panel — resolved by the new `harness resolve-lenses` verb, with mapping keys schema-validated against `change_types`. Separately, a lens spawn arriving after a sibling already completed the same review round now logs a flagged `panel-serialized` event (~13 minutes of avoidable wall-clock per serialized panel in the field) instead of just being prohibited in prose — loud, never blocking. |
+| **Cross-repo contract checks understand HTTP route parameters** | A `type: http` fragment declared as the route template (`users/{id}/authorization`) now matches route-structurally — each `{param}` token matches any one path segment, so a consumer may name its parameter differently — while the literal path around it still trips genuine drift. An all-param fragment (`{id}`) is rejected at plan registration since it would match anything and turn the check vacuous; non-HTTP fragments keep exact literal matching. |
+| **Reviewer ergonomics** | The reviewer agent definition now says to quote search patterns (an unquoted `>` inside a grep pattern reads as a shell redirect and trips the scratch-write guard), and the guard's block message names that fix when it fires. |
+
+### Upgrade notes
+
+- **`plan-register` widened its contract, not just its prose.** Any risk-other-than-`low` task with no test intents must now carry `no_test_reason`, and any task with test intents must now carry a file-touch `files` manifest naming a non-test path (or a `test_only_reason`). Orchestrator prose that registers tasks already carries both — but custom automation calling `plan-register` directly will need to supply them; both refusals are mechanical, not advisory.
+- **New config knob, optional**: `plan_review.lenses_by_change_type` (default: unset, which keeps the full default panel for every change type — v3.1.0 behavior is preserved until you opt a change type into an empty panel).
+
+### Verification on tag tip
+
+- `python -m harness.schema` — declared data valid
+- `python tools/budget_check.py` — 0 errors (7 pre-existing soft-cap warnings)
+- `python -m unittest discover -s tests` — 725 tests green (skipped=13)
 
 ## [3.1.0] — 2026-07-17
 
