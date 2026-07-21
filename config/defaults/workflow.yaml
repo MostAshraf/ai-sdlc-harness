@@ -42,6 +42,20 @@ default_mode: full
 # lenses, the synthesizer reviews the plan directly.
 plan_review:
   lenses: [contradictions, gaps]
+  # Per-change_type panel override (field 459226 rec: lean ran the full
+  # adversarial panel, full round budget, for an all-low-risk chore). An
+  # UNMAPPED change_type gets the default panel above — fail toward MORE
+  # review, never less; a mapped EMPTY list is the single-reviewer
+  # fallback. Resolve via `harness resolve-lenses --run <run>` — the one
+  # control point — never hand-derive from these files. NOTE on
+  # overriding: config merges DEEP, so a workspace override of `lenses`
+  # alone keeps this mapping (chore/docs stay single-reviewer); to run
+  # the full panel for every change_type set
+  # `lenses_by_change_type: null` (an empty `{}` merges to no change),
+  # or re-map individual keys.
+  lenses_by_change_type:
+    chore: []
+    docs: []
 
 # Severity model for the security step + conditional gate predicate.
 security:

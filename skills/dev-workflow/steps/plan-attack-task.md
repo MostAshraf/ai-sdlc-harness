@@ -9,8 +9,9 @@ persisted by the orchestrator and consumed by a synthesizer reviewer — your
 `verdict:` line is an advisory recommendation, not the pipeline decision,
 so calibrate honestly rather than defensively.
 
-The lens vocabulary (config `plan_review.lenses` names which of these run —
-a configured name NOT defined below is a free-form hunt directive: attack
+The lens vocabulary (the RESOLVED lens list — change_type-aware, resolved
+by the orchestrator's resolve-lenses verb — names which of these run; a
+configured name NOT defined below is a free-form hunt directive: attack
 the plan through exactly the perspective the name and the spawn ask
 describe, same findings format, never a general review):
 

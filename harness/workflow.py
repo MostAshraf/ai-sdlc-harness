@@ -36,7 +36,8 @@ FLAGGED_EVENT_KINDS = (
     "missing-status-block", "status-block-malformed", "quick-recheck",
     "contracts-check", "verdict-uncaptured", "background-spawn-uncaptured",
     "coverage-skipped", "risk-without-tests", "pr-recorded-manually",
-    "secret-sweep-blocked", "gate-skipped", "deferral-pending")
+    "secret-sweep-blocked", "gate-skipped", "deferral-pending",
+    "panel-serialized")
 
 
 def outstanding_flagged(events: list[dict]) -> list[dict]:
@@ -92,7 +93,9 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
 # field run read DEGRADED and the verdict uninformative), `gate-skipped`
 # (declared predicate self-skips are the mode working as designed),
 # `risk-without-tests` (a recorded, reviewed decision), `contracts-check`
-# and `hook-blocked` (content findings / guards doing their job).
+# and `hook-blocked` (content findings / guards doing their job), and
+# `panel-serialized` (an efficiency miss — wall-clock wasted, nothing
+# lost or stalled).
 HEALTH_DEGRADING_KINDS = (
     "missing-status-block", "verdict-uncaptured",
     "background-spawn-uncaptured")
@@ -232,6 +235,25 @@ def resolve_subagent_model(config: dict, shape: str, mode: str) -> str:
     if isinstance(entry, dict):
         return entry.get(mode) or entry.get("default", "inherit")
     return entry
+
+
+def resolve_lenses(config: dict, change_type: str | None) -> list[str]:
+    """The plan-review lens panel for THIS run's change_type (field 459226
+    rec #3: lean ran the full adversarial panel, full round budget, for an
+    all-low-risk chore). `plan_review.lenses` is the default panel;
+    `lenses_by_change_type` overrides it per change_type. An explicitly
+    mapped EMPTY list is the declared single-reviewer fallback (the
+    synthesizer reviews the plan directly — plan-review.md step 1); an
+    UNMAPPED change_type gets the full default panel — fail toward MORE
+    review, never less. The orchestrator resolves this via
+    `harness resolve-lenses`, the single control point (mirror of
+    resolve_subagent_model above)."""
+    pr = config.get("plan_review") or {}
+    by_ct = pr.get("lenses_by_change_type") or {}
+    if change_type in by_ct:
+        return list(by_ct[change_type])
+    default = pr.get("lenses")
+    return list(default) if default is not None else ["contradictions", "gaps"]
 
 
 def bootstrap_gate(config: dict) -> None:

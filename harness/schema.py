@@ -297,6 +297,32 @@ def validate_configs(config: dict, issues: Issues) -> None:
     for wit, ct in (config.get("work_item_type_map", {}) or {}).items():
         if ct not in change_types:
             issues.err(f"config: work_item_type_map['{wit}'] -> '{ct}' not in change_types")
+    # Lens-panel override mapping (workflow.resolve_lenses): keys must be
+    # real change_types — a typo'd key would silently never match, and the
+    # full default panel would run where the override intended none (the
+    # same key-vocabulary rule work_item_type_map gets). Values are held
+    # to the SAME lens-slug rule as plan_review.lenses (below): mapped
+    # names become file paths (reports/plan-attack-<lens>) and spawn-ask
+    # text too (adversarial-review on this change: path-shaped mapped
+    # values validated clean while the default list was slug-checked).
+    by_ct = (config.get("plan_review", {}) or {}).get(
+        "lenses_by_change_type", {}) or {}
+    if not isinstance(by_ct, dict):
+        issues.err("config: plan_review.lenses_by_change_type must be a "
+                   "mapping of change_type -> lens list")
+    else:
+        for ct, ll in by_ct.items():
+            if change_types and ct not in change_types:
+                issues.err("config: plan_review.lenses_by_change_type key "
+                           f"'{ct}' not in change_types")
+            if not isinstance(ll, list) or not all(
+                    isinstance(x, str)
+                    and re.fullmatch(r"[a-z][a-z0-9-]{0,30}", x)
+                    for x in ll):
+                issues.err(f"config: plan_review.lenses_by_change_type['{ct}'] "
+                           "must be a list of lens-name slugs (lowercase "
+                           "[a-z0-9-], ≤31 chars; empty list = "
+                           "single-reviewer plan review)")
     for field, needed in (("branch", ("{type}", "{id}")), ("pr_title", ("{id}",))):
         template = naming.get(field, "")
         for ph in needed:

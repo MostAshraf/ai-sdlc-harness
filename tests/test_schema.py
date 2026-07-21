@@ -262,6 +262,33 @@ class ValidatorCatchesBrokenConfig(unittest.TestCase):
         broken["subagent_models"]["reviewer"] = {"pre-pr": "claude-opus-4-8"}
         self.assertTrue(any("needs 'default'" in e for e in self._errors(broken)))
 
+    def test_lenses_by_change_type_keys_must_be_change_types(self):
+        # a typo'd key would silently never match, and the full default
+        # panel would run where the override intended none
+        broken = copy.deepcopy(self.config)
+        broken.setdefault("plan_review", {})["lenses_by_change_type"] = {
+            "hotdog": []}
+        self.assertTrue(any(
+            "lenses_by_change_type key 'hotdog' not in change_types" in e
+            for e in self._errors(broken)))
+
+    def test_lenses_by_change_type_values_must_be_lens_lists(self):
+        broken = copy.deepcopy(self.config)
+        broken.setdefault("plan_review", {})["lenses_by_change_type"] = {
+            "chore": "gaps"}
+        self.assertTrue(any("must be a list of lens-name slugs" in e
+                            for e in self._errors(broken)))
+
+    def test_lenses_by_change_type_values_held_to_the_slug_rule(self):
+        # mapped lens names become file paths (reports/plan-attack-<lens>)
+        # and spawn-ask text, exactly like the default list — a path-shaped
+        # value must not validate clean where the default would not
+        broken = copy.deepcopy(self.config)
+        broken.setdefault("plan_review", {})["lenses_by_change_type"] = {
+            "fix": ["../../../evil path"]}
+        self.assertTrue(any("must be a list of lens-name slugs" in e
+                            for e in self._errors(broken)))
+
 
 if __name__ == "__main__":
     unittest.main()

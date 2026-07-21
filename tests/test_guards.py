@@ -1123,6 +1123,73 @@ class SpawnGuard(GuardHarness):
             "reviewer", f"harness-mode: plan-attack\nharness-run: {run3}\ngo"),
             "spawn-set")
 
+    def test_serial_lens_spawn_flags_panel_serialized(self):
+        """Field 459226 F-3: the orchestrator narrated 'spawning both
+        lenses in parallel' then issued them one at a time — twice. Prose
+        can't self-enforce parallelism, ordering can detect it: a lens
+        spawn arriving after a sibling completed THIS round (batched
+        spawns all clear PreToolUse before any PostToolUse) logs a loud,
+        NON-blocking panel-serialized event."""
+        run = self.make_run(to_step="plan-review", run_name="2026-01-04-G-5",
+                            item_id="G-5")
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "plan-registered", "actor": "plan-register", "count": 2})
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "lens-complete", "actor": "reviewer",
+            "mode": "plan-attack"})
+        self.assert_allows("spawn", spawn(
+            "reviewer", f"harness-mode: plan-attack\nharness-run: {run}\n"
+                        "lens: gaps\ngo"))
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertIn("panel-serialized", kinds)
+
+    def test_first_lens_spawn_of_a_round_not_flagged(self):
+        # batched spawns: every lens clears PreToolUse before any
+        # completion — no sibling has completed, nothing to flag
+        run = self.make_run(to_step="plan-review", run_name="2026-01-05-G-6",
+                            item_id="G-6")
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "plan-registered", "actor": "plan-register", "count": 2})
+        self.assert_allows("spawn", spawn(
+            "reviewer", f"harness-mode: plan-attack\nharness-run: {run}\n"
+                        "lens: contradictions\ngo"))
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertNotIn("panel-serialized", kinds)
+
+    def test_synthesizer_spawn_after_lens_completions_never_flags(self):
+        # the synthesizer ALWAYS arrives after every lens completed — the
+        # detector's plan-attack scoping on the SPAWN side is the only
+        # thing between it and a false flag on every single panel; pin it
+        # (adversarial review of this change, gaps lens)
+        run = self.make_run(to_step="plan-review", run_name="2026-01-07-G-8",
+                            item_id="G-8")
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "plan-registered", "actor": "plan-register", "count": 2})
+        for _ in range(2):
+            ndjson.append_record(run / "events.ndjson", {
+                "kind": "lens-complete", "actor": "reviewer",
+                "mode": "plan-attack"})
+        self.assert_allows("spawn", spawn(
+            "reviewer", f"harness-mode: plan-review\nharness-run: {run}\ngo"))
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertNotIn("panel-serialized", kinds)
+
+    def test_new_round_resets_the_serialization_window(self):
+        # a revision round re-registers (plan-registered re-arms): round
+        # 1's completions must not flag round 2's first batched spawn
+        run = self.make_run(to_step="plan-review", run_name="2026-01-06-G-7",
+                            item_id="G-7")
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "lens-complete", "actor": "reviewer",
+            "mode": "plan-attack"})   # round 1
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "plan-registered", "actor": "plan-register", "count": 2})
+        self.assert_allows("spawn", spawn(
+            "reviewer", f"harness-mode: plan-attack\nharness-run: {run}\n"
+                        "lens: gaps\ngo"))
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertNotIn("panel-serialized", kinds)
+
     def test_always_legal_request_triage(self):
         self.make_run(to_step="develop")
         self.assert_allows("spawn",
@@ -1702,6 +1769,33 @@ class CaptureHooks(GuardHarness):
         kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
         self.assertIn("missing-status-block", kinds)
         self.assertNotIn("status-block-malformed", kinds)
+
+    def test_post_spawn_records_lens_completion(self):
+        # the panel-serialization detector's completion signal: every
+        # plan-attack reply — even a clean one that leaves no verdict or
+        # status trace — marks its lens complete for this round (spawn is
+        # task-LESS, per plan-review.md's mandated lens spawn shape)
+        run = self.make_run()
+        prompt = f"harness-mode: plan-attack\nharness-run: {run}\ngo"
+        self.assert_allows("post-spawn", {
+            "tool_name": "Agent",
+            "tool_input": {"subagent_type": "x:reviewer", "prompt": prompt},
+            "tool_response": "harness-status: SUCCESS\nharness-task: T1\n"
+                             "outcome: lens report delivered\n"
+                             "details: [R1] SUGGESTION tighten AC3"})
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertIn("lens-complete", kinds)
+
+    def test_post_spawn_engine_mode_completion_not_marked_as_lens(self):
+        # the completion marker is plan-attack-scoped — a task review
+        # completing must not arm the serialization window
+        run = self.make_run()
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "reviewer",
+            reply="harness-status: SUCCESS\nharness-task: T1\n"
+                  "verdict: APPROVED\noutcome: reviewed"))
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertNotIn("lens-complete", kinds)
 
     def test_post_spawn_planner_blockless_reply_still_stalls(self):
         # the non-reviewer path must be shape-complete: planner (like the

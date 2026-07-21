@@ -55,6 +55,21 @@ All notable changes to `ai-sdlc-harness` are documented here.
   or a recorded zero-test decision never flips it. The field run that
   motivated this masked two stalls and a full panel re-run behind a green
   completion; it would have read DEGRADED at a glance.
+- The plan-review lens panel now scales to the change type: new
+  `plan_review.lenses_by_change_type` config — chore/docs runs ship with
+  an empty panel (the synthesizer still reviews the plan directly), an
+  unmapped change type keeps the full default panel — resolved by the new
+  `harness resolve-lenses` verb; mapping keys are schema-validated against
+  `change_types`, so a typo'd tier can't silently run the wrong panel.
+- Serialized lens panels are detected mechanically, not just prohibited
+  in prose: a lens spawn arriving after a sibling already completed the
+  same review round logs a flagged `panel-serialized` event (~13 minutes
+  of avoidable wall-clock per serialized panel in the field). Loud, never
+  blocking — the first lens's work is preserved.
+- Reviewer ergonomics: the agent definition now says to quote search
+  patterns (an unquoted `>` inside a grep pattern reads as a shell
+  redirect and trips the scratch-write guard), and the guard's block
+  message names that fix when it fires.
 
 ## [3.1.0] — 2026-07-17
 
@@ -84,7 +99,7 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 - `python -m harness.schema` — declared data valid
 - `python tools/budget_check.py` — line budget green
-- `python -m unittest discover -s tests` — 691 tests green
+- `python -m unittest discover -s tests` — 702 tests green
 
 ## [3.0.4] — 2026-07-12
 

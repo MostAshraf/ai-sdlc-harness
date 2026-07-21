@@ -1747,6 +1747,37 @@ class RunHealth(BreadthHarness):
             self.assertIn(kind, FLAGGED_EVENT_KINDS)
 
 
+class LensResolution(BreadthHarness):
+    """Per-change_type plan-review panels (field 459226 rec #3: lean ran
+    the full adversarial panel, full round budget, for an all-low-risk
+    chore). One resolution rule — workflow.resolve_lenses — surfaced by
+    the resolve-lenses verb the orchestrator calls."""
+
+    def test_resolve_lenses_change_type_mapping(self):
+        from harness.workflow import resolve_lenses
+        cfg = {"plan_review": {"lenses": ["contradictions", "gaps"],
+                               "lenses_by_change_type": {"chore": [],
+                                                         "fix": ["gaps"]}}}
+        self.assertEqual(resolve_lenses(cfg, "chore"), [])       # mapped empty
+        self.assertEqual(resolve_lenses(cfg, "fix"), ["gaps"])   # mapped override
+        self.assertEqual(resolve_lenses(cfg, "feature"),         # unmapped →
+                         ["contradictions", "gaps"])             # full default
+        self.assertEqual(resolve_lenses({}, "feature"),          # no config →
+                         ["contradictions", "gaps"])             # shipped pair
+
+    def test_resolve_lenses_cli_reads_the_runs_change_type(self):
+        self.story("W-92", "lenses")
+        self.init()
+        run = Path(self.cli("fetch", "--id", "W-92",
+                            "--date", "2026-03-08")["run"])
+        st = state_mod.load(run, self.workspace)
+        out = self.cli("resolve-lenses", run=run)
+        self.assertEqual(out["change_type"], st["change_type"])
+        expected = ([] if st["change_type"] in ("chore", "docs")
+                    else ["contradictions", "gaps"])
+        self.assertEqual(out["lenses"], expected)
+
+
 class AbortRefetchSameDay(BreadthHarness):
     def test_same_day_abort_then_refetch_bootstraps_a_fresh_slot(self):
         """Field (session D phase 0, verbatim sequence): fetch → collision

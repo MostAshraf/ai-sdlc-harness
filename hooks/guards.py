@@ -615,7 +615,12 @@ def guard_bash(p: dict) -> None:
                 block("the reviewer is read-only (design.md piece 3): builds/"
                       "tests may run, and capturing their output under /tmp "
                       "(or > /dev/null) is fine — but "
-                      f"{why} mutates outside scratch and is blocked.", cwd)
+                      f"{why} mutates outside scratch and is blocked. If "
+                      "this fired on a grep/search whose PATTERN contains "
+                      "'>' or '<>', QUOTE the pattern — unquoted, the shell "
+                      "reads it as a redirect (field: a C# compiler "
+                      "closure name '<>c__DisplayClass' tripped exactly "
+                      "this).", cwd)
         if shape_of(p.get("agent_type")) == "developer":
             # bash-side analogue of the Write/Edit confinement: a write
             # targeting an ABSOLUTE path outside the developer's allowed
@@ -1014,6 +1019,55 @@ def guard_write(p: dict) -> None:
 
 # --------------------------------------------------------- spawn / skill
 
+def _flag_serialized_panel(run: Path) -> None:
+    """A plan-attack spawn arriving AFTER a sibling lens completed THIS
+    round was issued serially — batched spawns all clear PreToolUse
+    before any PostToolUse fires (field 459226 F-3: the orchestrator
+    narrated "spawning both lenses in parallel" and then issued them one
+    at a time — twice, ~13 min avoidable wall-clock per serialized
+    panel; plan-review.md states the batch rule three times and the
+    model violated it in the same breath, so prose can't self-enforce —
+    ordering can detect). Round boundary = everything after the LAST
+    `plan-registered` marker (a revision round re-registers, re-arming
+    the window — same boundary the risk-flag supersession uses). Loud
+    and NEVER blocking: the first lens's work is real, and blocking the
+    second spawn would waste it. Known benign false positive, named in
+    the reason: a stall-recovery re-spawn of ONE lens legitimately
+    arrives after its siblings. Premise (field-consistent, not provable
+    from this repo): batched spawns all clear PreToolUse before any
+    PostToolUse fires — holds for panels under the platform concurrency
+    cap (~14), far above any real panel; a panel larger than the cap
+    could edge-case a false flag (postmortem F-3's stated bound)."""
+    try:
+        events = ndjson.read_records(run / "events.ndjson")
+    except OSError:
+        return
+    completed_this_round = False
+    for e in events:
+        if e.get("kind") == "plan-registered":
+            completed_this_round = False
+        elif e.get("kind") == "lens-complete":
+            completed_this_round = True
+    if completed_this_round:
+        try:
+            ndjson.append_record(run / "events.ndjson", {
+                "kind": "panel-serialized", "actor": "guard-spawn",
+                "reason": "this plan-attack spawn arrived after a sibling "
+                          "lens had already completed this round — lens "
+                          "spawns were issued serially, not batched in ONE "
+                          "message (plan-review.md step 1; ~13 min avoidable "
+                          "wall-clock per panel). Benign if this is a "
+                          "stall-recovery re-spawn of a single lens."})
+        except OSError:
+            # best-effort telemetry, never a precondition (same pattern as
+            # block()'s ledger append): the spawn guard dispatch fails
+            # CLOSED, so an unguarded ENOSPC/EACCES here would BLOCK the
+            # legal spawn this detector promises never to block
+            # (adversarial-review on this change, both lenses — reproduced
+            # with a read-only events file).
+            pass
+
+
 def guard_spawn(p: dict) -> None:
     surfaces = load_yaml(PLUGIN_ROOT / "pipeline" / "surfaces.yaml")
     manifest = load_yaml(PLUGIN_ROOT / "pipeline" / "manifest.yaml")
@@ -1087,6 +1141,8 @@ def guard_spawn(p: dict) -> None:
                 step_would_match = True  # legal step, but unattributable
                 continue
             if run.resolve() == header_run:
+                if mode == "plan-attack":
+                    _flag_serialized_panel(run)
                 return
     # Declared out-of-run exceptions are a standing allowance, not one
     # conditioned on the workspace having zero run directories: `ai/*/`
@@ -1569,6 +1625,16 @@ def capture_post_spawn(p: dict) -> None:
                 "kind": "missing-status-block", "task": task, "actor": shape,
                 "reason": "subagent replied without a status block — "
                           "stalled-agent procedure applies (coverage B4)"})
+    if shape == "reviewer" and mode == "plan-attack":
+        # Non-flagged completion marker for the panel-serialization
+        # detector (guard_spawn): a captured verdict or a reviews.ndjson
+        # record is NOT a reliable completion signal (a lens can finish
+        # with a well-formed block and no verdict line and leave no trace
+        # at all), so completion gets its own event. Round-scoped by the
+        # plan-registered marker, same boundary the risk-flag supersession
+        # uses.
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "lens-complete", "actor": shape, "mode": mode})
 
 
 GUARDS = {"bash": guard_bash, "write": guard_write, "read": guard_read,

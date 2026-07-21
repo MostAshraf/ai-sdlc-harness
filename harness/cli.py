@@ -148,6 +148,11 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
     rm.add_argument("--shape", required=True)
     rm.add_argument("--mode", required=True)
 
+    sub.add_parser("resolve-lenses", parents=[common],
+                   help="resolve the plan-review lens panel for a run's "
+                        "change_type (plan_review.lenses overlaid by "
+                        "lenses_by_change_type)")
+
     rcc = sub.add_parser("resolve-coverage-cmd", parents=[common],
                          help="resolve the per-repo coverage command "
                               "(language.repos.<name>.coverage_cmd)")
@@ -459,6 +464,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "resolve-model":
             model = workflow.resolve_subagent_model(config, args.shape, args.mode)
             _emit({"ok": True, "model": model})
+            return 0
+
+        if args.cmd == "resolve-lenses":
+            with state_mod.locked_read(args.run):   # torn-read guard
+                st = state_mod.load(args.run, args.workspace)
+            lenses = workflow.resolve_lenses(config, st.get("change_type"))
+            _emit({"ok": True, "change_type": st.get("change_type"),
+                   "lenses": lenses})
             return 0
 
         if args.cmd == "resolve-coverage-cmd":
