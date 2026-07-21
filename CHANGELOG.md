@@ -6,6 +6,8 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
+- **The harness's hooks now understand Qwen Code's payload encodings, not just Claude Code's.** Running the harness under Qwen Code previously misread every subagent reply as empty: each foreground spawn logged a false `missing-status-block` stall, reviewer verdicts were never captured (so plan-review panels were re-spawned to re-derive a verdict the run already held), and the token ledger recorded null task/mode attribution with zero counts. Status-block and verdict capture now work under Qwen — ending those every-spawn false stalls and review-panel re-spawns — and token accounting recovers both task/mode attribution and the real input/output/cache counts (read from the Task tool's own execution summary). Claude Code behavior is unchanged. Known limitation: Qwen does not report a model name for a spawn, so the `model` field stays blank on Qwen runs (counts and attribution are still recorded).
+
 ## [3.2.0] — 2026-07-21
 
 > **`harness show` becomes an honest compass.** Field motive: an orchestrator polling `show` after a plan-review verdict had landed in `reviews.ndjson` saw a stale `pending` outcome and no hint that the forward exit was already the sole legal move — a gap confusing enough that one session escalated it into a plausible-sounding false bug report. This release surfaces the engine-legal next moves and ledger-fresh verdict outcomes directly in `show`, strictly read-only, with the new surface adversarially reviewed and hardened before landing.

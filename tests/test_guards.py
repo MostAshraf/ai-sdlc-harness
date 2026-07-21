@@ -2037,6 +2037,83 @@ class CaptureHooks(GuardHarness):
         self.assertEqual(ndjson.read_records(run / "tokens.ndjson"), before_tokens)
         self.assertEqual(ndjson.read_records(run / "events.ndjson"), before_events)
 
+    def test_post_spawn_captures_qwen_execution_summary_tokens(self):
+        """Qwen Code: a Task/Agent spawn's token counts arrive via PostToolUse
+        (tool_response.returnDisplay.executionSummary), NOT the usage-less
+        Gemini SubagentStop transcript. capture_post_spawn writes them to
+        tokens.ndjson with task/mode from the spawn-prompt headers and role from
+        the spawn shape; model stays None (Qwen carries none), cache_write 0."""
+        run = self.make_run()
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "developer",
+            response={
+                "llmContent": [{"text": "harness-status: SUCCESS"}],
+                "returnDisplay": {"executionSummary": {
+                    "inputTokens": 1200, "outputTokens": 300,
+                    "thoughtTokens": 50, "cachedTokens": 800,
+                    "totalTokens": 2350, "totalToolCalls": 3}}}))
+        rec = ndjson.read_records(run / "tokens.ndjson")[-1]
+        # thoughtTokens (50) is deliberately excluded — output stays 300, not
+        # 350 — so the ledger records only actual billed input/output.
+        self.assertEqual(
+            (rec["task"], rec["mode"], rec["role"], rec["model"],
+             rec["input"], rec["output"], rec["cache_read"], rec["cache_write"]),
+            ("T1", "develop", "developer", None, 1200, 300, 800, 0))
+
+    def test_qwen_post_spawn_and_subagent_stop_write_one_token_row(self):
+        """Under Qwen BOTH PostToolUse and SubagentStop fire for one spawn:
+        post-spawn writes the real executionSummary row; subagent-stop parses
+        the usage-less Gemini transcript and must NOT append a duplicate
+        all-zero row (double-write guard)."""
+        run = self.make_run()
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "developer",
+            response={
+                "llmContent": [{"text": "harness-status: SUCCESS"}],
+                "returnDisplay": {"executionSummary": {
+                    "inputTokens": 1200, "outputTokens": 300,
+                    "cachedTokens": 800, "totalTokens": 2300}}}))
+        transcript = self.workspace / "gemini.jsonl"
+        lines = [
+            {"type": "user", "message": {"role": "user", "parts": [
+                {"text": f"harness-mode: develop\nharness-task: T1\n"
+                         f"harness-run: {run}\ngo"}]}},
+            {"type": "assistant", "message": {"role": "model", "parts": [
+                {"text": "done\nharness-status: SUCCESS"}]}},
+        ]
+        transcript.write_text("\n".join(json.dumps(l) for l in lines))
+        self.assert_allows("subagent-stop",
+                           {"agent_type": "x:developer",
+                            "agent_transcript_path": str(transcript)})
+        recs = ndjson.read_records(run / "tokens.ndjson")
+        self.assertEqual(len(recs), 1)
+        self.assertEqual((recs[0]["input"], recs[0]["output"],
+                          recs[0]["cache_read"]), (1200, 300, 800))
+
+    def test_subagent_stop_zero_usage_claude_row_still_written(self):
+        """The Qwen double-write skip must NOT suppress a Claude row: a real
+        Claude transcript always names a model, so even a degenerate empty-usage
+        turn (model present, all-zero counts) is still recorded. Only the Qwen
+        signature (all-zero counts AND no model) is skipped."""
+        run = self.make_run()
+        transcript = self.workspace / "claude_zero.jsonl"
+        lines = [
+            {"type": "user", "message": {"content": [
+                {"type": "text", "text": "harness-mode: develop\n"
+                                         "harness-task: T1\ngo"}]}},
+            {"type": "assistant", "message": {
+                "model": "claude-opus-4-8", "usage": {},
+                "content": [{"type": "text",
+                             "text": "done\nharness-status: SUCCESS"}]}},
+        ]
+        transcript.write_text("\n".join(json.dumps(l) for l in lines))
+        self.assert_allows("subagent-stop",
+                           {"agent_type": "x:developer",
+                            "agent_transcript_path": str(transcript)})
+        rec = ndjson.read_records(run / "tokens.ndjson")[-1]
+        self.assertEqual((rec["model"], rec["input"], rec["output"]),
+                         ("claude-opus-4-8", 0, 0))
+
 
 def _yamlless_python() -> str | None:
     """An interpreter WITHOUT PyYAML (e.g. macOS system python3) — the exact
@@ -2137,6 +2214,108 @@ class ShapeOfConvention(unittest.TestCase):
         self.assertEqual(s("reviewer"), "reviewer")
         self.assertEqual(s("ai-sdlc-harness:reviewer"), "reviewer")
         self.assertEqual(s(None), "")
+
+
+class QwenPayloadShapes(unittest.TestCase):
+    """Qwen Code fires the same hook events as Claude Code but with different
+    payload encodings (memory: qwen-hook-payload-shapes, field-verified in the
+    installed @qwen-code bundle). The reply-text and transcript parsers must
+    read both encodings, and Claude-shaped inputs must parse byte-identically."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("guards_qwen_mod", GUARDS)
+        cls.guards = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.guards)
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        support.rmtree(self.tmp)
+
+    def test_response_text_reads_qwen_llmcontent_list(self):
+        # Qwen tool_response = {"llmContent": [{"text": ...}], "returnDisplay": …}
+        rt = self.guards._response_text
+        self.assertEqual(
+            rt({"llmContent": [{"text": "harness-status: SUCCESS"}],
+                "returnDisplay": {}}),
+            "harness-status: SUCCESS")
+
+    def test_response_text_reads_qwen_llmcontent_string(self):
+        # Qwen's ERROR/CANCELLED terminate path makes llmContent a plain string
+        rt = self.guards._response_text
+        self.assertEqual(rt({"llmContent": "terminated: deadline exceeded"}),
+                         "terminated: deadline exceeded")
+
+    def test_response_text_dict_without_known_keys_is_empty(self):
+        # neither content nor llmContent nor text → "" (unchanged fallback)
+        rt = self.guards._response_text
+        self.assertEqual(rt({"returnDisplay": {"executionSummary": {}}}), "")
+
+    def test_response_text_prefers_content_over_llmcontent(self):
+        # Claude precedence: `content` wins when both are present, so a payload
+        # that carries both flattens to the Claude value byte-identically.
+        rt = self.guards._response_text
+        self.assertEqual(
+            rt({"content": [{"text": "claude-side"}],
+                "llmContent": [{"text": "qwen-side"}]}),
+            "claude-side")
+
+    def test_parse_transcript_reads_gemini_format(self):
+        # Qwen SubagentStop transcript: {type: assistant|user, message:
+        # {role: model|user, parts: [{text}]}} — no content/usage/model.
+        t = self.tmp / "gemini.jsonl"
+        lines = [
+            {"type": "user", "message": {"role": "user", "parts": [
+                {"text": "harness-run: /r\nharness-mode: plan\n"
+                         "harness-task: T1\ndo it"}]}},
+            {"type": "assistant", "message": {"role": "model", "parts": [
+                {"text": "let me check"}, {"text": "harness-status: SUCCESS"}]}},
+        ]
+        t.write_text("\n".join(json.dumps(l) for l in lines))
+        data = self.guards._parse_transcript(t)
+        # first_user resolves the mandated headers (task/mode attribution)
+        self.assertIn("harness-mode: plan", data["first_user"])
+        self.assertIn("harness-task: T1", data["first_user"])
+        # parts NEWLINE-joined, not glued: the status line stays line-anchored
+        self.assertIn("check\nharness-status: SUCCESS", data["text"])
+        self.assertTrue(self.guards.STATUS_RE.search(data["text"]))
+        # Gemini records carry no usage/model
+        self.assertEqual(data["usage"], {})
+        self.assertIsNone(data["model"])
+
+    def test_claude_shapes_parse_byte_identically(self):
+        # the Qwen additions must not perturb Claude parsing — guards the
+        # _response_text precedence order and the _parse_transcript branch order
+        rt = self.guards._response_text
+        self.assertEqual(rt("plain reply"), "plain reply")
+        self.assertEqual(rt([{"text": "a"}, {"text": "b"}]), "a\nb")
+        self.assertEqual(rt({"content": [{"text": "verdict: APPROVED"}]}),
+                         "verdict: APPROVED")
+        self.assertEqual(rt({"text": "fallback"}), "fallback")
+        t = self.tmp / "claude.jsonl"
+        lines = [
+            {"type": "user", "message": {"content": [
+                {"type": "text", "text": "harness-mode: develop\n"
+                                         "harness-task: T1\ngo"}]}},
+            {"type": "assistant", "message": {
+                "model": "claude-opus-4-8",
+                "usage": {"input_tokens": 100, "output_tokens": 40,
+                          "cache_read_input_tokens": 20,
+                          "cache_creation_input_tokens": 10},
+                "content": [{"type": "text",
+                             "text": "done\nharness-status: SUCCESS"}]}},
+        ]
+        t.write_text("\n".join(json.dumps(l) for l in lines))
+        data = self.guards._parse_transcript(t)
+        self.assertIn("harness-task: T1", data["first_user"])
+        self.assertEqual(data["model"], "claude-opus-4-8")
+        self.assertEqual(data["usage"], {
+            "input_tokens": 100, "output_tokens": 40,
+            "cache_read_input_tokens": 20, "cache_creation_input_tokens": 10})
+        self.assertIn("harness-status: SUCCESS", data["text"])
 
 
 @unittest.skipUnless(os.name == "nt", "Windows-only path shapes")
