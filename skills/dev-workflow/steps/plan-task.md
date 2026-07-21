@@ -75,6 +75,29 @@ fork identified: <why>` under the task table, visible either way.
   name) — `verify-red` mechanically checks these literal names appear in
   the actual test files (coverage B1); the orchestrator carries the name
   list, not the intent prose, into `plan-register`'s `test_intents` field.
+  Two structural rules: (1) a task at any risk OTHER THAN `low` that
+  declares NO test-intents must state its why as a literal line under the
+  empty Test-intents block — `No-test reason: <why>` (e.g. a cited repo
+  coverage-exclusion convention); the orchestrator carries it into
+  `plan-register`'s `no_test_reason` field, registration refuses the
+  opt-out without it, and the recorded reason is flagged for review.
+  (2) Every task WITH test-intents must create or modify at least one
+  file outside the repo's test set (`language.test_paths` +
+  `test_closure`) — enforced: the orchestrator carries the file-touch
+  manifest's paths into `plan-register`'s `files` field, and registration
+  refuses a test-carrying task whose manifest is missing or all-test.
+  With no production change the task dead-ends at develop — a test
+  proving already-correct behavior can never go red, one documenting an
+  unfixed bug never goes green. Fold coverage backfill into the task
+  that changes the code, or record it as a deferral — never plan it as
+  its own task. The judged exception — a task whose PRODUCT is test
+  infrastructure (shared fixtures, harness code) — is a literal
+  `Test-only reason: <why>` line under the Files block, carried into
+  `test_only_reason` and flagged for review. Shape the exception around
+  *create* entries: a task that only MODIFIES a fixture inside
+  `test_closure` can't survive develop (the file is SHA-locked at red,
+  so green refuses the edit) — scope its intents so red is achievable,
+  or plan the new fixture as a create.
 - **`[API: <lib> v<X>]`** annotations where a task prescribes a library API
   — the developer verifies the real signature before writing call sites.
 - **≤2 pattern hints** per task: existing test files via bounded globbing
@@ -86,12 +109,19 @@ fork identified: <why>` under the task table, visible either way.
 - **Cross-repo contracts**, multi-repo stories only: name the producer repo,
   consumer repo(s), and signature fragment(s) for anything one repo's task
   emits and another's depends on — the enriched shape in `steps/plan.md`'s
-  registration example.
+  registration example. For `type: http` routes, declare the fragment as
+  the ROUTE TEMPLATE (`users/{id}/authorization`), never one side's raw
+  variable name: each `{param}` matches any one path segment per repo,
+  while the literal path around it must appear verbatim on both sides.
+  Prefer a literal segment BEFORE the first `{param}` — it bounds what
+  the param can match; an all-param fragment (`{id}`) is rejected.
 - **File-touch manifest**: the files this task creates or modifies, each
   with a one-line why — from actually reading the code, not guessing
   (plan-review spot-checks that *modify* entries exist and *create*
   entries don't). This is the single biggest developer accelerant in the
-  plan: the developer starts editing instead of re-discovering.
+  plan: the developer starts editing instead of re-discovering. The
+  orchestrator carries the paths (not the whys) into `plan-register`'s
+  `files` field — the same carry-over the test-intent names get.
   ```
   Files:
   - modify src/auth/service.py — add the token-refresh branch
@@ -152,3 +182,7 @@ draft. Revise or flag them — don't ship a plan you haven't tried to break.
 Mechanics (the `plan-register` call, gate advance) live in
 `steps/plan.md` — this file is the content contract, that file is the
 registration procedure. Don't duplicate one into the other.
+
+End your reply ON the status block (your agent prompt carries the
+template): plan content lives in `<run>/plan.md`, and the self-adversarial
+pass's residual ambiguities go inside `details:` — never after the block.

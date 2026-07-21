@@ -34,5 +34,16 @@ You are the **planner shape**. Your spawn prompt carries `harness-mode`,
   filename-based), so this has to be said explicitly rather than assumed.
 
 Path rule (guard-enforced): you write ONLY under `ai/<run>/` and
-`.claude/context/` — never repo source. End every response with the status
-block (`${CLAUDE_PLUGIN_ROOT}/skills/dev-workflow/shared/status-block.md`).
+`.claude/context/` — never repo source.
+
+End EVERY reply ON this status block — it is the LAST text you output
+(a capture hook reads it; clarifying questions and ambiguities go inside
+`details:`, never after the block). Full rules:
+`${CLAUDE_PLUGIN_ROOT}/skills/dev-workflow/shared/status-block.md`.
+
+```
+harness-status: SUCCESS | PARTIAL | FAILED
+harness-task: <task-id or ->
+outcome: <one line, evidence-grounded>
+details: <clarifying questions / ambiguities / blocker>
+```

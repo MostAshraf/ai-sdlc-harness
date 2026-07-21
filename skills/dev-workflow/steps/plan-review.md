@@ -6,9 +6,11 @@ this step is a panel of hostile perspectives plus a synthesizer with a
 hook-captured verdict. The human at ⟨approve-plan⟩ then approves with
 independent evidence attached, not just the planner's word.
 
-1. **The lens panel.** Read `plan_review.lenses` from config — the merged
-   view: shipped defaults (`contradictions`, `gaps`) overlaid by this
-   workspace's `.claude/context/*.yaml` overrides; an override wins.
+1. **The lens panel.** Resolve THIS run's panel:
+   `${CLAUDE_PLUGIN_ROOT}/bin/harness resolve-lenses --run <run>` —
+   change_type-aware declared data (`plan_review.lenses` overlaid per
+   `lenses_by_change_type`; chore/docs ship with an empty panel by
+   default). Never hand-derive the list from config files.
    FIRST, if any `<run>/reports/plan-attack-*.md` exist from a previous
    round, snapshot them aside (`plan-attack-<lens>-r<n>.md`, same
    convention as plan-r<n>) — a stale lens report left at the live path
@@ -17,7 +19,9 @@ independent evidence attached, not just the planner's word.
    `harness-run`, `harness-repo` — NO `harness-task`), naming the lens in
    the ask; each follows `steps/plan-attack-task.md` (the lens vocabulary
    and findings format). Batch ALL lens spawns in ONE message (foreground
-   — the standard parallelism rule). Lenses are read-only: persist each
+   — the standard parallelism rule; hook-CHECKED, not just stated: a lens
+   spawn arriving after a sibling completed this round logs a flagged
+   `panel-serialized` event). Lenses are read-only: persist each
    report verbatim to `<run>/reports/plan-attack-<lens>.md`. A lens's
    `verdict:` line is its advisory recommendation — the engine never
    reads it (verdict_bound filters on mode `plan-review`), so it can
@@ -85,6 +89,10 @@ counter would hit `human_after` on unrelated hiccups):
 - **Synthesizer** stalled (no status block, or an uncaptured verdict —
   its verdict is the one the engine needs): `${CLAUDE_PLUGIN_ROOT}/bin/harness
   stall --run <run>` (no `--task` → counted as `step:plan-review`).
+  EXCEPT: a `status-block-malformed` event in `<run>/events.ndjson` means
+  the verdict WAS captured despite the loose block — proceed on the
+  ledger, never stall (a stall here re-runs the whole panel to re-derive
+  a verdict the engine already holds).
 - **A lens** stalled (no status block / no report — an oddly-formatted
   advisory verdict alone is NOT a stall; the engine never reads lens
   verdicts): `${CLAUDE_PLUGIN_ROOT}/bin/harness stall --run <run>

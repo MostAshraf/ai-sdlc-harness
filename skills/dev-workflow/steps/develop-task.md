@@ -10,7 +10,8 @@ machinery is inactive and `task --to in-review` skips both verify-red and
 verify-green entirely — step 3 below does not apply; write tests and
 implementation together, then go straight to step 4. In practice:
 plan-registered tasks carry intents unless the plan opted out
-(`test_intents: []`, docs/chore); quick mode's fetch-seeded task declares
+(`test_intents: []` — docs/chore, or a risk-flagged opt-out carrying its
+plan-recorded `no_test_reason`); quick mode's fetch-seeded task declares
 none — that's why quick runs are relaxed by design, not an oversight.
 
 1. **Read** the task's plan section (description, edge cases, test-intents,

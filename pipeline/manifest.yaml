@@ -111,8 +111,9 @@ steps:
 
   plan-review:
     # Independent pre-gate plan review, run as an ADVERSARIAL PANEL: one
-    # `plan-attack` reviewer per configured lens (config plan_review.lenses
-    # — contradictions & collisions, gaps & completeness by default; empty
+    # `plan-attack` reviewer per RESOLVED lens (`harness resolve-lenses`:
+    # config plan_review.lenses overlaid per lenses_by_change_type —
+    # contradictions & collisions, gaps & completeness by default; empty
     # list = single-reviewer fallback), batched in one message, then a
     # `plan-review` synthesizer that reads the lens reports, spot-verifies
     # against real code, groups findings by root cause, and issues THE

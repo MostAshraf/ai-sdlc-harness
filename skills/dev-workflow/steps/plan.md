@@ -71,7 +71,8 @@ When the planner's status block reports the plan ready:
 1. Register the tasks it declared (replaces the single fetch-seeded task):
    `${CLAUDE_PLUGIN_ROOT}/bin/harness plan-register --run <run> --tasks-json
    '[{"id":"T1","repo":"<path>","risk":"low","test_intents":["test_name_one",
-   "test_name_two"]}, …]'` — `repo` must be the exact path string from this
+   "test_name_two"],"files":["src/api/users.py","tests/test_users.py"]}, …]'`
+   — `repo` must be the exact path string from this
    workspace's `repos.yaml` (i.e. `config["repos"]`'s VALUE, e.g.
    `/abs/path/to/backend`), never the short registered NAME (`backend`) —
    a name instead of a path resolves to no registered repo and fails
@@ -84,15 +85,31 @@ When the planner's status block reports the plan ready:
    `risk` is free-form (defaults to `low` if omitted) — no enum is
    enforced, but use `low`/`medium`/`high` for consistency with what the
    plan itself declares. (`test_intents` is the plan's declared test
-   NAMES for that task, empty if none) — declare cross-repo contracts too if
+   NAMES for that task, empty if none.) A task at any risk other than
+   `low` with empty `test_intents` must also carry `no_test_reason` (the
+   plan's stated why — registration refuses the silent opt-out and flags
+   the recorded one as `risk-without-tests`). A task WITH `test_intents`
+   must carry `files` — that task's file-touch manifest, repo-relative
+   paths — with at least one entry outside `language.test_paths` and
+   `test_closure`: an all-test manifest is coverage backfill (it can
+   never satisfy the red-proof) and is refused unless the plan records
+   `test_only_reason`
+   (the judged test-infrastructure exception, flagged as
+   `tests-without-production`) — declare cross-repo contracts too if
    the plan named any: `--contracts-json '[{"id":"C1","type":"http",
    "producer":"a","consumers":["b"],"signature":["POST /v2/items",
-   "field: item_id"]}]'` (`type` is `http | service-bus | dto`, descriptive
-   only; `signature` is one string or a list of fragments, and **each must be
+   "field: item_id"]}]'` (`type` is `http | service-bus | dto` — and `http`
+   also changes matching: each `{param}` token in a fragment matches any ONE
+   path segment per repo, so declare the route template — whichever shape,
+   directional or flat — as `"users/{id}/authorization"`, never one side's
+   raw variable name, and keep a literal segment before the first param
+   (an all-param fragment like `"{id}"` is rejected at registration);
+   `signature` is one string or a list of fragments, and **each must be
    a grep-able code token/signature that appears verbatim in source** —
    `archived`, `filter_notes(notes, tag)`, `POST /v2/items` — NOT an English
-   description: reconcile-contracts matches by literal source search, so a
-   prose fragment is rejected at plan-register and would false-report drift.
+   description: reconcile-contracts matches by literal source search
+   (route-structural only for http `{param}`s), so a prose fragment is
+   rejected at plan-register and would false-report drift.
    All fragments must be present; the flat legacy `"repos":["a","b"]` form
    still works in place of `producer`/`consumers`. Legal only at cursor `plan`.
 2. Check the diagrams: `${CLAUDE_PLUGIN_ROOT}/bin/harness validate-mermaid

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import posixpath
 import re
 from pathlib import Path
 
@@ -22,12 +23,22 @@ from .transitions import set_artifact
 # both `status` (count) and `metrics_report` (table). These used to be two
 # hand-maintained lists that drifted (field e2e E2E-1: status said 18
 # flagged, metrics.md said 23 — same run, same ledger, different filters).
+# `status-block-malformed` is flagged (shown) but is NOT a stall: it
+# records a reviewer reply whose engine-read verdict WAS captured despite
+# a missing status block, so the stalled-agent procedure must not re-spawn
+# (capture_post_spawn holds the emission rule). It stays IN this list
+# because that capture rode extract_verdict's no-block whole-text
+# fallback — the weakest path — and suppressing the stall also removed the
+# re-spawn whose fresh verdict used to supersede a false capture; showing
+# the event to the human is the replacing safeguard (adversarial-review
+# on this change, both lenses independently).
 FLAGGED_EVENT_KINDS = (
     "test-revision", "reviewer-rejected", "hook-blocked",
-    "missing-status-block", "quick-recheck", "contracts-check",
-    "verdict-uncaptured", "background-spawn-uncaptured",
-    "coverage-skipped", "pr-recorded-manually", "secret-sweep-blocked",
-    "gate-skipped", "deferral-pending")
+    "missing-status-block", "status-block-malformed", "quick-recheck",
+    "contracts-check", "verdict-uncaptured", "background-spawn-uncaptured",
+    "coverage-skipped", "risk-without-tests", "tests-without-production",
+    "pr-recorded-manually", "secret-sweep-blocked", "gate-skipped",
+    "deferral-pending", "panel-serialized")
 
 
 def outstanding_flagged(events: list[dict]) -> list[dict]:
@@ -44,9 +55,21 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
     A spurious, duplicate, or out-of-order `deferral-recorded` with no open
     pending ahead of it resolves nothing — fail-CLOSED, so a stray record
     (`log-event` is unvalidated) can never silently hide an unrelated
-    outstanding deferral (review finding: an audit gauge must not under-count)."""
+    outstanding deferral (review finding: an audit gauge must not under-count).
+
+    `risk-without-tests` and `tests-without-production` get the same
+    live-gauge treatment with a different resolver: each `plan-registered`
+    marker supersedes EVERY earlier event of both kinds, because
+    plan-register replaces the task list wholesale — only the latest
+    registration's batch describes the current plan (adversarial-review on
+    the zero-test change, both lenses independently: the append-only batch
+    survived the revision round that withdrew the opt-out, misreporting the
+    approved plan at every later gate). Both events assert live plan STATE,
+    unlike gate-skipped/hook-blocked, which record occurrences and stay
+    permanent correctly."""
     flagged = [e for e in events if e.get("kind") in FLAGGED_EVENT_KINDS]
     open_pending: list[dict] = []
+    open_plan: list[dict] = []
     resolved: set[int] = set()
     for e in events:
         kind = e.get("kind")
@@ -54,7 +77,66 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
             open_pending.append(e)
         elif kind == "deferral-recorded" and open_pending:
             resolved.add(id(open_pending.pop(0)))   # resolve earliest open pending
+        elif kind in ("risk-without-tests", "tests-without-production"):
+            open_plan.append(e)
+        elif (kind == "plan-registered"
+                and e.get("actor") == "plan-register"):
+            # actor-checked (adversarial-review on the backfill change): a
+            # stray `log-event` record with this kind must not silently
+            # clear the live gauge — the same fail-closed stance the
+            # deferral resolver states above; real markers always carry
+            # the actor (emitted in plan_register, nowhere else)
+            resolved.update(id(x) for x in open_plan)  # superseded batch
+            open_plan.clear()
     return [e for e in flagged if id(e) not in resolved]
+
+
+# Process-health filter over the same ledger: the kinds that mean the run
+# MACHINERY degraded — evidence lost or the stalled-agent procedure
+# engaged — as opposed to flagged-but-healthy signals a human reviews
+# (field 459226: a run "completed green" over 11 flagged events and 2
+# stalls, and the degradation surfaced only in a manual post-mortem).
+# Deliberately EXCLUDED: `status-block-malformed` (the verdict WAS
+# captured — loose formatting, run healthy; including it made every fork
+# field run read DEGRADED and the verdict uninformative), `gate-skipped`
+# (declared predicate self-skips are the mode working as designed),
+# `risk-without-tests` / `tests-without-production` (recorded, reviewed
+# decisions), `contracts-check`
+# and `hook-blocked` (content findings / guards doing their job), and
+# `panel-serialized` (an efficiency miss — wall-clock wasted, nothing
+# lost or stalled).
+HEALTH_DEGRADING_KINDS = (
+    "missing-status-block", "verdict-uncaptured",
+    "background-spawn-uncaptured")
+
+
+def stall_count(st: dict) -> int:
+    """Total stalls recorded by the stalled-agent procedure — per-task
+    counters plus the step-keyed counters for task-less spawns. Counted
+    from STATE (the authority `record_stall` writes), not from a
+    self-reported event kind: the procedure can engage on paths that
+    write no capture event at all (hook attribution failure across
+    several live runs, a hung spawn with no PostToolUse payload —
+    adversarial-review on this change, both lenses), and those stalls
+    must still degrade the run."""
+    return (sum(t.get("stalls", 0) for t in st.get("tasks", []))
+            + sum((st.get("step_stalls") or {}).values()))
+
+
+def run_health(events: list[dict], stalls: int = 0) -> tuple[str, dict[str, int]]:
+    """(verdict, per-kind counts): HEALTHY unless a degrading event was
+    recorded or the stalled-agent procedure engaged (`stalls` — pass
+    stall_count(st)). ONE definition read by both `status` and
+    `metrics_report` — the same anti-drift rule as FLAGGED_EVENT_KINDS
+    above. Unlike outstanding_flagged, health is HISTORY, not a live
+    gauge: a stall the run later recovered from still degraded it, so
+    nothing pairs off."""
+    counts: dict[str, int] = {}
+    for e in events:
+        k = e.get("kind")
+        if k in HEALTH_DEGRADING_KINDS:
+            counts[k] = counts.get(k, 0) + 1
+    return ("DEGRADED" if counts or stalls else "HEALTHY", counts)
 
 
 def slug(title: str, limit: int = 30) -> str:
@@ -162,6 +244,25 @@ def resolve_subagent_model(config: dict, shape: str, mode: str) -> str:
     if isinstance(entry, dict):
         return entry.get(mode) or entry.get("default", "inherit")
     return entry
+
+
+def resolve_lenses(config: dict, change_type: str | None) -> list[str]:
+    """The plan-review lens panel for THIS run's change_type (field 459226
+    rec #3: lean ran the full adversarial panel, full round budget, for an
+    all-low-risk chore). `plan_review.lenses` is the default panel;
+    `lenses_by_change_type` overrides it per change_type. An explicitly
+    mapped EMPTY list is the declared single-reviewer fallback (the
+    synthesizer reviews the plan directly — plan-review.md step 1); an
+    UNMAPPED change_type gets the full default panel — fail toward MORE
+    review, never less. The orchestrator resolves this via
+    `harness resolve-lenses`, the single control point (mirror of
+    resolve_subagent_model above)."""
+    pr = config.get("plan_review") or {}
+    by_ct = pr.get("lenses_by_change_type") or {}
+    if change_type in by_ct:
+        return list(by_ct[change_type])
+    default = pr.get("lenses")
+    return list(default) if default is not None else ["contradictions", "gaps"]
 
 
 def bootstrap_gate(config: dict) -> None:
@@ -279,20 +380,25 @@ def _validate_contract(c: dict) -> None:
     if not fragments or any(not f for f in fragments):
         raise state_mod.StateError("signature fragments must be non-empty")
     # F3 (validation-walk): reconcile-contracts matches each fragment by a
-    # LITERAL `git grep -F` in every named repo, so a fragment must be a
-    # grep-able code substring — a bare symbol or signature that appears
-    # verbatim in source (`archived`, `filter_notes(notes, tag)`), never an
-    # English description. A prose fragment matches nothing and false-reports
-    # drift on correctly-implemented code (E2E-1 false positive). An em/en-dash
-    # is a reliable prose tell (a code token never carries one), so reject it at
-    # declaration — fail-fast — rather than surfacing a phantom drift at pre-pr.
-    # (True semantic matching is the future upgrade noted in reconcile_contracts.)
+    # LITERAL `git grep -F` in every named repo — except a `type: http`
+    # fragment carrying a `{param}` token, whose params elide to one path
+    # segment each (_http_route_regex) while the surrounding route text
+    # still matches literally. So a fragment must be a grep-able code
+    # substring — a bare symbol, signature, or route template that appears
+    # in source (`archived`, `filter_notes(notes, tag)`,
+    # `{id}/authorization`), never an English description. A prose fragment
+    # matches nothing and false-reports drift on correctly-implemented code
+    # (E2E-1 false positive). An em/en-dash is a reliable prose tell (a code
+    # token never carries one), so reject it at declaration — fail-fast —
+    # rather than surfacing a phantom drift at pre-pr. (True semantic
+    # matching is the future upgrade noted in reconcile_contracts.)
     for f in fragments:
         if "—" in f or "–" in f:
             raise state_mod.StateError(
                 f"contract signature fragment {f!r} reads as prose (dash "
                 "separator) — reconcile-contracts matches fragments by literal "
-                "source search; declare a grep-able code token or signature "
+                "source search (route-structural only for http {param} "
+                "templates); declare a grep-able code token or signature "
                 "that appears verbatim in the repo (e.g. `archived`, "
                 "`filter_notes(notes, tag)`), not an English description")
     has_repos, has_directional = bool(c.get("repos")), bool(c.get("producer")) and bool(c.get("consumers"))
@@ -305,6 +411,25 @@ def _validate_contract(c: dict) -> None:
     if c.get("type") is not None and c["type"] not in CONTRACT_TYPES:
         raise state_mod.StateError(
             f"contract type must be one of {sorted(CONTRACT_TYPES)}")
+    if c.get("type") == "http":
+        # Same fail-fast slot as the em-dash prose tell above: an http
+        # fragment that is route-parameters ONLY (`{id}`, `{a}/{b}`)
+        # elides to an anchorless pattern that would report "present"
+        # everywhere — a vacuous check whose failure mode is invisible
+        # false CLEAN, strictly worse than the prose fragment's visible
+        # false drift (adversarial-review on this change, both lenses
+        # independently). Reject at declaration; _http_route_regex also
+        # refuses the shape at match time for pre-existing state.
+        for f in fragments:
+            parts = _HTTP_TOKEN_RE.split(f)
+            if len(parts) > 1 and not any(
+                    ch.isalnum() for p in parts[::2] for ch in p):
+                raise state_mod.StateError(
+                    f"http contract fragment {f!r} is route-parameters "
+                    "only — each {param} matches ANY one path segment, so "
+                    "this fragment would report present everywhere; anchor "
+                    "the template with a literal segment (`users/{id}`, "
+                    "not `{id}`)")
 
 
 def scope_register(workspace: Path, run: Path, manifest: dict, config: dict,
@@ -369,10 +494,15 @@ def scope_register(workspace: Path, run: Path, manifest: dict, config: dict,
 
 
 def plan_register(workspace: Path, run: Path, manifest: dict,
-                  tasks: list[dict], contracts: list[dict] | None = None) -> dict:
+                  tasks: list[dict], contracts: list[dict] | None = None,
+                  config: dict | None = None) -> dict:
     """Replace the fetch-seeded task list with the approved plan's tasks
     (+ declared cross-repo contracts). Legal only while the cursor is at
-    `plan` — the plan is what the gate will approve."""
+    `plan` — the plan is what the gate will approve. `config` feeds the
+    coverage-backfill policy's `language.test_paths`/`test_closure`
+    vocabulary; absent, the same `["tests/**"]` default verify-red's
+    test-set falls back to (config-less callers only exist in unit
+    harnesses — the CLI always threads the merged config)."""
     from .transitions import ensure_live
     with state_mod.locked(run):
         st = state_mod.load(run, workspace)
@@ -428,10 +558,171 @@ def plan_register(workspace: Path, run: Path, manifest: dict,
                 f"{', '.join(off_scope)} — widen the scope first (user-"
                 "confirmed `harness scope-register` at the plan step); an "
                 "unconfirmed repo never enters the task list silently")
+        # Shape checks for the two fields the zero-test policy below makes
+        # load-bearing (first change to read them for policy): garbage must
+        # refuse loudly at the owned entry point — a dict stringifies into
+        # a truthy "recorded decision", and a string test_intents reads as
+        # per-character intents at verify-red, dead-ending the task at
+        # develop (adversarial-review on this change).
+        for t in tasks:
+            if not isinstance(t.get("test_intents", []), list):
+                raise state_mod.StateError(
+                    f"plan-register: task {t['id']}: test_intents must be "
+                    "a LIST of test names (got "
+                    f"{type(t.get('test_intents')).__name__})")
+            if t.get("no_test_reason") is not None and not isinstance(
+                    t["no_test_reason"], str):
+                raise state_mod.StateError(
+                    f"plan-register: task {t['id']}: no_test_reason must "
+                    f"be a string (got {type(t['no_test_reason']).__name__})")
+            if t.get("files") is not None and not isinstance(
+                    t["files"], list):
+                raise state_mod.StateError(
+                    f"plan-register: task {t['id']}: files must be a LIST "
+                    "of path strings (the plan's file-touch manifest; got "
+                    f"{type(t['files']).__name__})")
+            for f in t.get("files") or []:
+                if not isinstance(f, str) or not f.strip():
+                    raise state_mod.StateError(
+                        f"plan-register: task {t['id']}: files must be a "
+                        f"LIST of non-empty path strings ({f!r} isn't)")
+                # repo-relative FILE paths only: an absolute, escaping, or
+                # directory-shaped entry can't be honestly classified
+                # against the repo's test globs and would satisfy (or
+                # defeat) the backfill policy below vacuously. Checked on
+                # the raw slash-normalized form — `_norm_file` collapses
+                # `./` after this, and normpath never introduces `..`.
+                raw = f.strip().replace("\\", "/")
+                if (raw.startswith("/") or re.match(r"^[A-Za-z]:", raw)
+                        or ".." in raw.split("/")):
+                    raise state_mod.StateError(
+                        f"plan-register: task {t['id']}: files entry "
+                        f"{f!r} must be a repo-relative path (no absolute "
+                        "paths, drive letters, or '..' segments)")
+                if raw.endswith("/") or posixpath.normpath(raw) == ".":
+                    raise state_mod.StateError(
+                        f"plan-register: task {t['id']}: files entry "
+                        f"{f!r} is a directory, not a file — manifest "
+                        "entries name the specific files the task "
+                        "creates or modifies")
+            if t.get("test_only_reason") is not None and not isinstance(
+                    t["test_only_reason"], str):
+                raise state_mod.StateError(
+                    f"plan-register: task {t['id']}: test_only_reason must "
+                    "be a string (got "
+                    f"{type(t['test_only_reason']).__name__})")
+        # Zero-test policy (field 459226): `test_intents: []` stays the
+        # plan-approved opt-out, but at any risk OTHER THAN "low" the
+        # opt-out must carry a RECORDED reason — one medium-risk task
+        # shipped with no tests and no red-proof, justified only by an
+        # unrecorded repo coverage convention, and the gap surfaced only
+        # in a manual post-mortem. Fail-closed over the free-form risk
+        # vocabulary: any value except the exact string "low" demands the
+        # reason (a custom or typo'd tier must not silently duck the
+        # policy). Tests are never forced — the reason is stored on the
+        # task and flagged (`risk-without-tests`, below) so plan-review
+        # judges it and status/metrics show it: a recorded, reviewed
+        # decision, never a silent gap.
+        for t in tasks:
+            if (t.get("risk", "low") != "low" and not t.get("test_intents")
+                    and not (t.get("no_test_reason") or "").strip()):
+                raise state_mod.StateError(
+                    f"plan-register: task {t['id']} declares risk "
+                    f"{t.get('risk')!r} with no test_intents and no "
+                    "no_test_reason — declare the tests, or record WHY "
+                    "none apply (e.g. a repo coverage-exclusion "
+                    "convention); the reason is flagged for plan-review "
+                    "and the human, never assumed")
+        # Coverage-backfill policy (field 459226 postmortem F-2 — the
+        # mechanical half; the prompt half shipped in plan-task.md rule 2):
+        # a task WITH test intents must touch at least one file OUTSIDE
+        # the repo's test set, or it dead-ends at develop — a test
+        # proving already-correct behavior never goes red, one documenting
+        # an unfixed bug never goes green — past every plan gate, at
+        # maximum cost (the field run ended in a full run abort).
+        # Classification is `language.test_paths` ∪ `test_closure` — the
+        # full set verify-red SHA-locks with the red proof — so a file
+        # whose post-red edit develop would refuse (a locked shared
+        # fixture, root `conftest.py`) can never pose as the production
+        # entry at plan time (adversarial-review on this change: with
+        # test_paths alone, the fixture-layer exception under-fired by
+        # directory layout). The gate's reach equals this vocabulary's
+        # coverage — a layout it doesn't name (e.g. rspec `spec/`) needs
+        # the workspace `language.test_paths` override, the same
+        # precondition the whole TDD apparatus already has. Fail-closed:
+        # a test-carrying task with NO recorded manifest refuses too (an
+        # absent manifest must not duck the policy — the custom-risk-tier
+        # stance). The judged exception — a task whose PRODUCT is test
+        # infrastructure — is a recorded `test_only_reason`, stored on the
+        # task and flagged (`tests-without-production`) for plan-review
+        # and the human, mirroring `no_test_reason`. The gate proves the
+        # manifest's STRUCTURE, not its honesty — a fabricated production
+        # entry passes here; manifest honesty stays plan-review's
+        # spot-check job.
+        lang = (config or {}).get("language", {})
+        test_globs = (lang.get("test_paths", ["tests/**"])
+                      + (lang.get("test_closure") or []))
+
+        def _norm_file(f: str) -> str:
+            # ONE normal form for classification AND persistence: slashes
+            # forward, `./` collapsed (adversarial-review: a literal
+            # `./tests/…` entry classified as production — two characters
+            # re-opened the dead-end this policy closes)
+            return posixpath.normpath(f.strip().replace("\\", "/"))
+
+        def _prod_files(t: dict) -> list[str]:
+            return [f for f in (t.get("files") or [])
+                    if not gitops.matches_any(_norm_file(f), test_globs)]
+
+        for t in tasks:
+            if not t.get("test_intents"):
+                continue
+            if not t.get("files"):
+                raise state_mod.StateError(
+                    f"plan-register: task {t['id']} declares test_intents "
+                    "but no `files` manifest — carry the plan's file-touch "
+                    "manifest (repo-relative paths) so registration can "
+                    "prove a production change exists alongside the tests")
+            if not _prod_files(t) and not (
+                    t.get("test_only_reason") or "").strip():
+                raise state_mod.StateError(
+                    f"plan-register: task {t['id']}: every files entry "
+                    "matches language.test_paths/test_closure — a "
+                    "coverage-backfill task can never satisfy the "
+                    "red-proof (a test proving already-correct behavior "
+                    "never goes red). Fold the tests into the task that "
+                    "changes production code, defer the backfill, or — if "
+                    "this task's PRODUCT is test infrastructure — record "
+                    "test_only_reason; the reason is flagged for "
+                    "plan-review and the human, never assumed. (A "
+                    "PRODUCTION file merely NAMED like a test — e.g. "
+                    "src/load_test.py under **/*_test.* — means the glob "
+                    "overmatches: narrow the workspace "
+                    "language.test_paths override instead of recording a "
+                    "reason that isn't true)")
         st["tasks"] = [
             {"id": t["id"], "repo": t.get("repo", "."), "status": "pending",
              "depends_on": t.get("depends_on", []), "risk": t.get("risk", "low"),
              "test_intents": t.get("test_intents", []),
+             # the SAME normal form the policy judged — a stored
+             # backslashed/`./` spelling would hand the first future
+             # consumer a classification the policy already solved
+             "files": [_norm_file(f) for f in (t.get("files") or [])],
+             # a reason only means something for a zero-test task — one
+             # riding alongside declared intents (planner confusion, or a
+             # revision that added tests without dropping the stale field)
+             # is normalized away, never stored as a self-contradictory
+             # record no surface would ever render
+             "no_test_reason": ((t.get("no_test_reason") or "").strip() or None)
+                               if not t.get("test_intents") else None,
+             # the same stale-reason rule for the backfill mirror: the
+             # reason only means something for a test-carrying task whose
+             # manifest has NO production entry — any other combination
+             # normalizes away
+             "test_only_reason": ((t.get("test_only_reason") or "").strip()
+                                  or None)
+                                 if (t.get("test_intents")
+                                     and not _prod_files(t)) else None,
              "commit_sha": None, "review_rounds": 0, "stalls": 0,
              "worktree": None}
             for t in tasks]
@@ -439,6 +730,29 @@ def plan_register(workspace: Path, run: Path, manifest: dict,
             _validate_contract(c)
         st["contracts"] = contracts or []
         state_mod.save(run, workspace, st)
+        # Events AFTER the save, matching every sibling verb — a failed
+        # save must not leave phantom ledger records (the module-wide
+        # trade: append-may-fail under-counts, never over-counts). The
+        # `plan-registered` marker lands FIRST: registration replaces the
+        # task list wholesale, so the marker supersedes every EARLIER
+        # `risk-without-tests` batch in outstanding_flagged and the gauge
+        # tracks the latest registration only; the fresh batch follows it.
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "plan-registered", "actor": "plan-register",
+            "count": len(ids)})
+        for t in st["tasks"]:
+            if (t["risk"] != "low" and not t["test_intents"]
+                    and t["no_test_reason"]):
+                ndjson.append_record(run / "events.ndjson", {
+                    "kind": "risk-without-tests", "task": t["id"],
+                    "actor": "plan-register", "reason": t["no_test_reason"]})
+            # normalization above guarantees: stored reason ⟺ test-carrying
+            # task whose whole manifest is test paths — flag exactly those
+            if t["test_only_reason"]:
+                ndjson.append_record(run / "events.ndjson", {
+                    "kind": "tests-without-production", "task": t["id"],
+                    "actor": "plan-register",
+                    "reason": t["test_only_reason"]})
     return {"tasks": ids, "contracts": [c["id"] for c in contracts or []]}
 
 
@@ -542,6 +856,75 @@ def security_scan(workspace: Path, run: Path, config: dict, manifest: dict) -> s
     return max_sev
 
 
+# ERE metacharacters to escape when a route fragment's LITERAL segments
+# are spliced into a regex. git grep -E is POSIX ERE — `-P` (PCRE) is not
+# guaranteed compiled in, so nothing below may use PCRE-only constructs.
+# Braces are handled separately in _ere_escape: a bare `\{` is not
+# portably a literal brace in ERE, so literal braces match via single-char
+# bracket classes (`[{]` / `[}]`).
+_ERE_META = re.compile(r"[.^$*+?()\[\]|\\]")
+# One elided route parameter: a still-braced segment (`{id}`, or a
+# consumer's inline interpolation like `{Uri.EscapeDataString(userId)}`)
+# OR a bare interpolated value — anything up to the next path separator,
+# closing brace, or string quote (quotes bound the match to one string
+# literal so it can't bleed across unrelated code). Plain capturing
+# group: ERE has no non-capturing `(?:…)`; under `grep -q` the group is
+# harmless.
+_HTTP_PARAM_SEG = "([{][^/}\"']*[}]|[^/}\"']+)"
+# A {param} token: brace-delimited, no separator and no QUOTE inside — the
+# same charset _HTTP_PARAM_SEG's braced alternative accepts, so a token the
+# split captures is always one the elided segment can re-match (adversarial-
+# review: the old split admitted quote-bearing tokens like `{"ok":true}`
+# that the seg then couldn't match — a JSON shape under an http contract
+# must stay a literal fragment, not become a route param).
+_HTTP_TOKEN_RE = re.compile(r"(\{[^/}\"']+\})")
+
+
+def _ere_escape(seg: str) -> str:
+    return (_ERE_META.sub(lambda m: "\\" + m.group(0), seg)
+            .replace("{", "[{]").replace("}", "[}]"))
+
+
+def _http_route_regex(frag: str) -> str | None:
+    """POSIX ERE matching `frag` with every `{param}` elided to one path
+    segment — or None when the caller must keep the exact literal `-F`
+    match (no `{param}` token, or a degenerate all-param template). Field
+    run 459226 (downstream fork report): a directional http contract
+    declared the producer's route template (`{id}/authorization`); the
+    consumer built the same path by interpolating a differently-named
+    variable, so the literal `{id}` never appeared there and a
+    byte-identical wire shape was reported as drift — both pre-PR
+    reviewers independently investigated and dismissed the same tooling
+    false positive. Only the param may vary: the literal route text
+    around it is ERE-escaped, so `/authz` vs `/authorization` still
+    drifts and a route `.` matches only a literal dot (`v2.1` never
+    matches `v2x1`).
+
+    Residual (documented): a `{param}` position is satisfied by ANY one
+    path segment, so `{id}/items` also matches prose like `docs/items` in
+    a non-test file — prefer templates carrying a literal segment before
+    the first param (`users/{id}/items`), which bounds the widening; the
+    fully anchorless shape is rejected at declaration below."""
+    parts = _HTTP_TOKEN_RE.split(frag)
+    if len(parts) == 1:
+        return None
+    # Degenerate template guard: no alphanumeric literal outside the
+    # {param} tokens (`{id}`, `{a}/{b}`) → the built ERE would have no
+    # anchor and match nearly any line — a guaranteed false CLEAN, the one
+    # forbidden direction (this checker may only ever fail toward visible
+    # drift). Keep the literal -F match instead; _validate_contract
+    # rejects the shape at declaration, this is belt-and-braces for
+    # contracts registered before that rule existed.
+    if not any(ch.isalnum() for p in parts[::2] for ch in p):
+        return None
+    # Captured tokens sit at ODD indices by re.split construction —
+    # classify by parity, never by re-testing the shape (adversarial-
+    # review: a brace-wrapped LITERAL part like `{a/b}` — never captured,
+    # it carries a separator — shape-matched and was wrongly elided).
+    return "".join(_HTTP_PARAM_SEG if i % 2 else _ere_escape(p)
+                   for i, p in enumerate(parts))
+
+
 def reconcile_contracts(workspace: Path, run: Path, config: dict,
                         repos: dict[str, str]) -> str:
     """Cross-repo contract check (M5 charter / coverage B6): every declared
@@ -556,12 +939,18 @@ def reconcile_contracts(workspace: Path, run: Path, config: dict,
     is REPORTED for the human at ⟨approve-pre-pr⟩ — never auto-fixed.
     Fragments are validated grep-able at declaration (`_validate_contract`
     rejects prose — validation-walk F3), closing the common false-positive
-    cheaply. True semantic/AST comparison remains a documented future upgrade,
-    not attempted here: it would need structured fragments (the symbol + its
-    kind, not a free string) plus a per-language matcher — stdlib `ast` for
-    Python, a parser or heuristic for JS, tree-sitter for universal coverage —
-    which trades the language-agnostic, near-zero-dependency stance `git grep`
-    was chosen for; hence deferred."""
+    cheaply. For `type: http` contracts only, a fragment carrying a
+    `{param}` token matches route-STRUCTURALLY (each param elides to one
+    path segment — `_http_route_regex`; field 459226: producer `{id}` vs
+    consumer `userId` false-drifted a byte-identical route); every other
+    fragment is an exact literal match. True semantic/AST comparison
+    remains a documented future upgrade, not attempted here: it would need
+    structured fragments (the symbol + its kind, not a free string) plus a
+    per-language matcher — stdlib `ast` for Python, a parser or heuristic
+    for JS, tree-sitter for universal coverage — which trades the
+    language-agnostic, near-zero-dependency stance `git grep` was chosen
+    for; hence deferred (the http-param elision is the cheap, targeted
+    slice of it that keeps that stance)."""
     st = state_mod.load(run, workspace)
     test_globs = config.get("language", {}).get("test_paths", ["tests/**"])
     # `glob` pathspec magic, not plain `:(exclude)`: git's non-glob pathspec
@@ -598,12 +987,25 @@ def reconcile_contracts(workspace: Path, run: Path, config: dict,
             role = f" ({c['type']})"
         else:
             role = ""
+        is_http = c.get("type") == "http"
         for repo_name in repo_names:
             repo = Path(repos.get(repo_name, repo_name))
             missing = []
             for frag in fragments:
+                # http fragments carrying a {param} token match
+                # route-structurally via -E (each param elides to one path
+                # segment — _http_route_regex); everything else stays an
+                # exact literal -F match. A malformed ERE exits non-zero
+                # and reads as MISSING — the safe direction: false drift
+                # for the human to dismiss, never false clean.
+                rx = _http_route_regex(frag) if is_http else None
                 try:
-                    gitops.run_git(repo, "grep", "-F", "-q", frag, "--", ".", *excludes)
+                    if rx is not None:
+                        gitops.run_git(repo, "grep", "-E", "-q", rx,
+                                       "--", ".", *excludes)
+                    else:
+                        gitops.run_git(repo, "grep", "-F", "-q", frag,
+                                       "--", ".", *excludes)
                 except gitops.GitError:
                     missing.append(frag)
             if missing:
@@ -905,8 +1307,9 @@ def _fmt_duration(start: str | None, end: str | None) -> str:
 
 def metrics_report(workspace: Path, run: Path,
                    manifest: dict | None = None) -> Path:
-    """Deterministic aggregation rendered as human-readable tables: timings
-    from state, tokens from the ledger (aggregated per task × role),
+    """Deterministic aggregation rendered as human-readable tables: run
+    health (events + stall counters) leading, timings from state, tokens
+    from the ledger (aggregated per task × role),
     verdicts from reviews.ndjson, exceptions from events — no agent
     reasoning (a 'keeping'). The ndjson ledgers stay the machine-readable
     source of truth; this file is a regenerable VIEW, never parsed back and
@@ -923,7 +1326,25 @@ def metrics_report(workspace: Path, run: Path,
     lines = [f"# Metrics — {st['work_item']['id']}", "",
              f"{st['work_item'].get('title') or ''} · mode `{st['mode']}` · "
              f"cursor `{st['cursor']['current_step']}` · generated "
-             f"{_fmt_when(ndjson.now_iso())} UTC", "", "## Step timings", ""]
+             f"{_fmt_when(ndjson.now_iso())} UTC", ""]
+    # Run health leads the report — the executive signal (field 459226: a
+    # run "completed green" over 11 flagged events and 2 stalls, visible
+    # only via manual post-mortem). The verdict flips on the declared
+    # HEALTH_DEGRADING_KINDS or an engaged stall procedure; the
+    # non-degrading malformed-block count rides as context only.
+    stalls = stall_count(st)
+    health, degrading = run_health(events, stalls)
+    malformed = sum(1 for e in events
+                    if e.get("kind") == "status-block-malformed")
+    parts = [f"{k}: {n}" for k, n in sorted(degrading.items())]
+    if stalls:
+        parts.append(f"stalls: {stalls}")
+    if malformed:
+        parts.append(f"status-block-malformed (non-degrading): {malformed}")
+    lines += ["## Run health", "",
+              f"**{health}**" + (" — " + " · ".join(parts) if parts
+                                 else " — no degrading events, no stalls"),
+              "", "## Step timings", ""]
     lines += _md_table(
         ["Step", "Started (UTC)", "Ended (UTC)", "Duration"],
         [[step, _fmt_when(m.get("started_at")), _fmt_when(m.get("ended_at")),

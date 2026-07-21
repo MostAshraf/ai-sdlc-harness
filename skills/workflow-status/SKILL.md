@@ -9,7 +9,9 @@ description: >
 # workflow-status (read-only)
 
 1. `${CLAUDE_PLUGIN_ROOT}/bin/harness status` — every run: cursor, mode, work item, task statuses,
-   decided gates, flagged-event count. An `aborted` field marks a run ended
+   decided gates, flagged-event count, and a `health` verdict (`HEALTHY` |
+   `DEGRADED`: did the run MACHINERY degrade — stalls, lost evidence;
+   flagged events alone don't flip it). An `aborted` field marks a run ended
    by the abort verb (terminal); an `error` field marks a run whose state
    failed integrity verification (its `remediation` names the reseal
    command) — the rest of the dashboard still renders.
@@ -20,7 +22,8 @@ description: >
    flagged events + gate evidence.
 3. Offer `${CLAUDE_PLUGIN_ROOT}/bin/harness metrics --run <run>` — regenerates
    `reports/metrics.md`, the human-readable table view of the same ledgers
-   (timings, tasks, verdicts, aggregated tokens, flagged events). Works at
+   (run health, timings, tasks, verdicts, aggregated tokens, flagged
+   events). Works at
    any live step, not just the terminal metrics step; it's a deterministic
    projection, so regenerating is always safe.
 4. Otherwise STRICTLY read-only: no state changes, no cursor moves, no

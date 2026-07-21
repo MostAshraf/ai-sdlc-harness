@@ -85,14 +85,38 @@ class ContractSchema(_ContractHarness):
 
     def test_prose_fragment_rejected(self):
         """Validation-walk F3: reconcile-contracts matches fragments by literal
-        `git grep -F`, so a prose fragment (an English description with the
-        tell-tale em/en-dash) matches nothing and false-reports drift on
-        correctly-implemented code. Reject it at declaration; the dash-free
-        signatures the other schema tests register still validate fine."""
+        `git grep -F` (route-structurally for http `{param}` templates), so a
+        prose fragment (an English description with the tell-tale em/en-dash)
+        matches nothing and false-reports drift on correctly-implemented
+        code. Reject it at declaration; the dash-free signatures the other
+        schema tests register still validate fine."""
         with self.assertRaises(state_mod.StateError):
             self._register([{"id": "C1", "repos": ["repo-a", "repo-b"],
                              "signature": ["filter_notes(notes, tag) — exact "
                                            "case-sensitive membership"]}])
+
+    def test_param_only_http_fragment_rejected(self):
+        """Adversarial review of the route-aware matcher (both lenses,
+        independently): an all-param http fragment (`{id}`, `{a}/{b}`)
+        elides to an anchorless pattern that matches ANY line — the check
+        turns vacuous and fails toward invisible false CLEAN, strictly
+        worse than the em-dash prose tell's visible false drift. Same
+        fail-fast slot: reject at declaration."""
+        for frag in ("{id}", "{a}/{b}"):
+            with self.assertRaises(state_mod.StateError):
+                self._register([{"id": "C1", "type": "http",
+                                 "producer": "repo-a",
+                                 "consumers": ["repo-b"],
+                                 "signature": [frag]}])
+
+    def test_anchored_http_fragment_still_validates(self):
+        # the positive control for the all-param rejection: one literal
+        # segment is enough of an anchor
+        self._register([{"id": "C1", "type": "http", "producer": "repo-a",
+                         "consumers": ["repo-b"],
+                         "signature": ["users/{id}"]}])
+        c = state_mod.load(self.run, self.workspace)["contracts"][0]
+        self.assertEqual(c["signature"], ["users/{id}"])
 
     def test_directional_enriched_shape_round_trips(self):
         self._register([{"id": "C1", "type": "http", "producer": "repo-a",
@@ -176,6 +200,107 @@ class ContractReconciliation(_ContractHarness):
         report = (self.run / "reports" / "contracts.md").read_text(encoding="utf-8")
         self.assertEqual(report.count("@ repo-b"), 1)  # one line, not one per duplicate
         self.assertIn("repo-a → repo-b)", report)      # role text also deduped
+
+
+class HttpRouteReconciliation(_ContractHarness):
+    """Field run 459226 (downstream fork report): a `type: http` fragment
+    carrying a `{param}` token matches route-STRUCTURALLY — each param
+    elides to one path segment, so the two sides may name it differently —
+    while the literal route text around it still trips genuine drift.
+    Everything without a `{param}`, and every non-http contract, keeps the
+    exact literal `-F` match."""
+
+    def _http(self, signature):
+        self._register([{"id": "C1", "type": "http", "producer": "repo-a",
+                         "consumers": ["repo-b"], "signature": signature}])
+
+    def _verdict(self):
+        return workflow.reconcile_contracts(self.workspace, self.run,
+                                            self.config, self._repos())
+
+    def test_param_named_differently_across_repos_is_clean(self):
+        # the 459226 case verbatim: producer declares the route template
+        # (`{id}`), the consumer interpolates a differently-named variable —
+        # byte-identical wire shape, previously reported as drift
+        self._http(["{id}/authorization"])
+        self._write(self.repo_a, "controller.cs",
+                    '[Route("{id}/authorization")]\n')
+        self._write(self.repo_b, "client.cs",
+                    '$"{UsersV5Route}/{Uri.EscapeDataString(userId)}'
+                    '/authorization"\n')
+        self.assertEqual(self._verdict(), "clean")
+
+    def test_genuinely_divergent_path_still_drifts(self):
+        self._http(["{id}/authorization"])
+        self._write(self.repo_a, "controller.cs",
+                    '[Route("{id}/authorization")]\n')
+        self._write(self.repo_b, "client.cs",
+                    '$"{UsersV5Route}/{userId}/authz"\n')  # authz ≠ authorization
+        self.assertEqual(self._verdict(), "drift")
+
+    def test_non_http_contract_with_braces_stays_literal(self):
+        # elision is keyed on `type: http` — a dto fragment with braces
+        # still requires the verbatim text on both sides
+        self._register([{"id": "C1", "type": "dto", "producer": "repo-a",
+                         "consumers": ["repo-b"],
+                         "signature": ["{id}/authorization"]}])
+        self._write(self.repo_a, "shape.cs", '"{id}/authorization"\n')
+        self._write(self.repo_b, "client.cs",
+                    '$"{UsersV5Route}/{Uri.EscapeDataString(userId)}'
+                    '/authorization"\n')  # no literal {id} → MISSING
+        self.assertEqual(self._verdict(), "drift")
+
+    def test_route_metacharacter_matches_only_literally(self):
+        # the `.` in a route is ERE-escaped when literal segments are
+        # spliced into the regex: `v2x1` must NOT satisfy `v2.1`
+        self._http(["v2.1/{id}/items"])
+        self._write(self.repo_a, "controller.cs",
+                    '[Route("v2.1/{id}/items")]\n')
+        self._write(self.repo_b, "client.cs",
+                    '"v2x1/" + userId + "/items"\n')
+        self.assertEqual(self._verdict(), "drift")
+        report = (self.run / "reports" / "contracts.md").read_text(encoding="utf-8")
+        self.assertIn("@ repo-a: present", report)     # template side matched
+        self.assertIn("@ repo-b: **MISSING**", report)  # x ≠ literal dot
+
+    def test_http_fragment_without_param_stays_literal(self):
+        # the other boundary of the switch: `type: http` alone does not
+        # opt a fragment into -E — no {param} token, no elision
+        self._http(["POST /v2/items"])
+        self._write(self.repo_a, "api.py", "POST /v2/items\n")
+        self._write(self.repo_b, "client.py", "POST /v2/orders\n")  # not verbatim
+        self.assertEqual(self._verdict(), "drift")
+
+    def test_route_constraint_param_still_matches(self):
+        # ASP.NET-style constraint syntax: the producer's `{id:int}` is one
+        # braced segment to the elision — the declared `{id}` matches it
+        self._http(["users/{id}/items"])
+        self._write(self.repo_a, "controller.cs",
+                    '[Route("users/{id:int}/items")]\n')
+        self._write(self.repo_b, "client.cs", '$"users/{uid}/items"\n')
+        self.assertEqual(self._verdict(), "clean")
+
+
+class HttpRouteRegexUnit(unittest.TestCase):
+    """The pure-function edges of _http_route_regex the repo-level tests
+    don't reach (all adversarial-review findings on this change)."""
+
+    def test_degenerate_all_param_template_falls_back_to_literal(self):
+        # anchorless ERE would match anything (false CLEAN) — refuse and
+        # let the caller keep -F, which fails toward visible drift
+        self.assertIsNone(workflow._http_route_regex("{id}"))
+        self.assertIsNone(workflow._http_route_regex("{a}/{b}"))
+
+    def test_quote_bearing_brace_text_is_not_a_param(self):
+        # a JSON shape under an http contract stays a literal fragment —
+        # the token charset excludes quotes, same as the elided segment's
+        self.assertIsNone(workflow._http_route_regex('{"ok":true}'))
+
+    def test_brace_wrapped_literal_with_separator_stays_literal(self):
+        # `{a/b}` is never captured as a token (it carries a separator) —
+        # parity classification must keep it literal, not shape-match it
+        rx = workflow._http_route_regex("{a/b}/{id}")
+        self.assertIn("[{]a/b[}]", rx)
 
 
 if __name__ == "__main__":

@@ -148,6 +148,11 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
     rm.add_argument("--shape", required=True)
     rm.add_argument("--mode", required=True)
 
+    sub.add_parser("resolve-lenses", parents=[common],
+                   help="resolve the plan-review lens panel for a run's "
+                        "change_type (plan_review.lenses overlaid by "
+                        "lenses_by_change_type)")
+
     rcc = sub.add_parser("resolve-coverage-cmd", parents=[common],
                          help="resolve the per-repo coverage command "
                               "(language.repos.<name>.coverage_cmd)")
@@ -461,6 +466,14 @@ def main(argv: list[str] | None = None) -> int:
             _emit({"ok": True, "model": model})
             return 0
 
+        if args.cmd == "resolve-lenses":
+            with state_mod.locked_read(args.run):   # torn-read guard
+                st = state_mod.load(args.run, args.workspace)
+            lenses = workflow.resolve_lenses(config, st.get("change_type"))
+            _emit({"ok": True, "change_type": st.get("change_type"),
+                   "lenses": lenses})
+            return 0
+
         if args.cmd == "resolve-coverage-cmd":
             from . import initws
             cmd = initws.resolve_coverage_cmd(config, args.repo)
@@ -572,8 +585,8 @@ def main(argv: list[str] | None = None) -> int:
                 # F5 (validation-walk): the shared outstanding-flagged filter
                 # pairs resolved deferrals off, so status.flagged_events matches
                 # metrics' "## Flagged events (N)" and both are a live gauge.
-                flagged = workflow.outstanding_flagged(
-                    ndjson.read_records(run / "events.ndjson"))
+                events = ndjson.read_records(run / "events.ndjson")
+                flagged = workflow.outstanding_flagged(events)
                 runs.append({
                     "run": run.name, "mode": st["mode"],
                     "cursor": st["cursor"]["current_step"],
@@ -589,7 +602,14 @@ def main(argv: list[str] | None = None) -> int:
                     "gates": {g: v.get("decision") or v.get("consumed_decision")
                               for g, v in st["gates"].items()
                               if v.get("decision") or v.get("consumed_decision")},
-                    "flagged_events": len(flagged)})
+                    "flagged_events": len(flagged),
+                    # process health, not content: HEALTHY unless the run
+                    # machinery degraded — evidence-loss events or an
+                    # engaged stall procedure (shared rule —
+                    # workflow.run_health, the same one metrics' "## Run
+                    # health" section reads)
+                    "health": workflow.run_health(
+                        events, workflow.stall_count(st))[0]})
             _emit({"ok": True, "runs": runs})
             return 0
 
@@ -637,7 +657,7 @@ def main(argv: list[str] | None = None) -> int:
             contracts = _json_source("--contracts-json", args.contracts_json,
                                      args.contracts_json_file, [])
             result = workflow.plan_register(args.workspace, args.run, manifest,
-                                            tasks, contracts)
+                                            tasks, contracts, config)
             _emit({"ok": True, **result})
             return 0
 

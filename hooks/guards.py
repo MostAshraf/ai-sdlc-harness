@@ -436,7 +436,15 @@ TASK_HEADER_RE = re.compile(r"^harness-task:\s*(?!<)(\S+)", re.MULTILINE)
 # contain spaces), so `\S+` stays correct there — and rightly refuses to
 # swallow trailing prose like `harness-status: SUCCESS — all good`.
 RUN_HEADER_RE = re.compile(r"^harness-run:[ \t]*(?![ \t<])(.*\S)", re.MULTILINE)
-STATUS_RE = re.compile(r"^harness-status:\s*(\S+)", re.MULTILINE)
+# The `(?![^\n]*\|)` guard makes the TEMPLATE's own line — `harness-status:
+# SUCCESS | PARTIAL | FAILED`, now inlined verbatim in the agent defs —
+# regex-invisible when echoed in a reply (same placeholder-invisibility
+# convention as the angle-bracket verdict; adversarial-review on this
+# change: an echoed template line satisfied the block check and silently
+# disabled stall detection for that reply). A real status value is one
+# token with no `|` after it on the line.
+STATUS_RE = re.compile(r"^harness-status:[ \t]*(\S+)(?![^\n]*\|)",
+                       re.MULTILINE)
 # The reviewer's verdict line (shared/status-block.md), captured by the
 # PostToolUse hook into reviews.ndjson. Lenient token: leading whitespace/
 # markdown bold (dogfood A2: an indented `details: |` block scalar hid a
@@ -456,6 +464,15 @@ VERDICT_RE = re.compile(
 # recover via SendMessage-resume, a channel NO capture hook sees.
 # This powers a signpost event naming the one sanctioned recovery.
 VERDICT_ANYWHERE_RE = re.compile(r"verdict:\**\s*(APPROVED|CHANGES_REQUESTED)\b")
+# The reviewer modes whose captured verdict the ENGINE actually reads:
+# `review` → the task FSM's reviewer-approved completion guard;
+# `plan-review` → the manifest's verdict_bound exits. Every other reviewer
+# mode's verdict is advisory (plan-attack lens verdicts are explicitly
+# engine-invisible; pre-pr / analyze-comments / request-triage deliver
+# report content, not a verdict) — so for those, a blockless reply is a
+# genuine stall even when a verdict token was captured: the deliverable is
+# likely missing (adversarial-review on this change, gaps lens).
+ENGINE_VERDICT_MODES = ("review", "plan-review")
 
 
 def extract_verdict(text: str) -> str | None:
@@ -598,7 +615,12 @@ def guard_bash(p: dict) -> None:
                 block("the reviewer is read-only (design.md piece 3): builds/"
                       "tests may run, and capturing their output under /tmp "
                       "(or > /dev/null) is fine — but "
-                      f"{why} mutates outside scratch and is blocked.", cwd)
+                      f"{why} mutates outside scratch and is blocked. If "
+                      "this fired on a grep/search whose PATTERN contains "
+                      "'>' or '<>', QUOTE the pattern — unquoted, the shell "
+                      "reads it as a redirect (field: a C# compiler "
+                      "closure name '<>c__DisplayClass' tripped exactly "
+                      "this).", cwd)
         if shape_of(p.get("agent_type")) == "developer":
             # bash-side analogue of the Write/Edit confinement: a write
             # targeting an ABSOLUTE path outside the developer's allowed
@@ -848,7 +870,9 @@ def _tdd_block_reason(path: Path, workspace: Path) -> str | None:
     The exemption is the plan itself: a task with no declared intents
     (docs/config/chore, quick mode) is never subject to the ordering — the
     human approved that shape at the plan gate; `test_intents: []` IS the
-    opt-out, no second flag. Red-proof existence is a plain file check: a
+    opt-out, no second flag HERE (plan-register separately demands a
+    recorded `no_test_reason` for the opt-out at any risk other than low —
+    an upstream registration rule, not a develop-time gate). Red-proof existence is a plain file check: a
     developer cannot fabricate it (AUTHORITY_RE + the write-confinement
     block the run dir on both surfaces), and the authoritative seal +
     blob-SHA verification stays at set-state. Fail-OPEN on every
@@ -995,6 +1019,57 @@ def guard_write(p: dict) -> None:
 
 # --------------------------------------------------------- spawn / skill
 
+def _flag_serialized_panel(run: Path) -> None:
+    """A plan-attack spawn arriving AFTER a sibling lens completed THIS
+    round was issued serially — batched spawns all clear PreToolUse
+    before any PostToolUse fires (field 459226 F-3: the orchestrator
+    narrated "spawning both lenses in parallel" and then issued them one
+    at a time — twice, ~13 min avoidable wall-clock per serialized
+    panel; plan-review.md states the batch rule three times and the
+    model violated it in the same breath, so prose can't self-enforce —
+    ordering can detect). Round boundary = everything after the LAST
+    `plan-registered` marker (a revision round re-registers, re-arming
+    the window — same actor-checked boundary the plan-flag supersession
+    uses, so a stray `log-event` record can't reset the window). Loud
+    and NEVER blocking: the first lens's work is real, and blocking the
+    second spawn would waste it. Known benign false positive, named in
+    the reason: a stall-recovery re-spawn of ONE lens legitimately
+    arrives after its siblings. Premise (field-consistent, not provable
+    from this repo): batched spawns all clear PreToolUse before any
+    PostToolUse fires — holds for panels under the platform concurrency
+    cap (~14), far above any real panel; a panel larger than the cap
+    could edge-case a false flag (postmortem F-3's stated bound)."""
+    try:
+        events = ndjson.read_records(run / "events.ndjson")
+    except OSError:
+        return
+    completed_this_round = False
+    for e in events:
+        if (e.get("kind") == "plan-registered"
+                and e.get("actor") == "plan-register"):
+            completed_this_round = False
+        elif e.get("kind") == "lens-complete":
+            completed_this_round = True
+    if completed_this_round:
+        try:
+            ndjson.append_record(run / "events.ndjson", {
+                "kind": "panel-serialized", "actor": "guard-spawn",
+                "reason": "this plan-attack spawn arrived after a sibling "
+                          "lens had already completed this round — lens "
+                          "spawns were issued serially, not batched in ONE "
+                          "message (plan-review.md step 1; ~13 min avoidable "
+                          "wall-clock per panel). Benign if this is a "
+                          "stall-recovery re-spawn of a single lens."})
+        except OSError:
+            # best-effort telemetry, never a precondition (same pattern as
+            # block()'s ledger append): the spawn guard dispatch fails
+            # CLOSED, so an unguarded ENOSPC/EACCES here would BLOCK the
+            # legal spawn this detector promises never to block
+            # (adversarial-review on this change, both lenses — reproduced
+            # with a read-only events file).
+            pass
+
+
 def guard_spawn(p: dict) -> None:
     surfaces = load_yaml(PLUGIN_ROOT / "pipeline" / "surfaces.yaml")
     manifest = load_yaml(PLUGIN_ROOT / "pipeline" / "manifest.yaml")
@@ -1068,6 +1143,8 @@ def guard_spawn(p: dict) -> None:
                 step_would_match = True  # legal step, but unattributable
                 continue
             if run.resolve() == header_run:
+                if mode == "plan-attack":
+                    _flag_serialized_panel(run)
                 return
     # Declared out-of-run exceptions are a standing allowance, not one
     # conditioned on the workspace having zero run directories: `ai/*/`
@@ -1449,8 +1526,9 @@ def _response_text(resp) -> str:
 
 def capture_post_spawn(p: dict) -> None:
     """PostToolUse on Agent/Task — the authoritative writer of the
-    reviewer-verdict ledger (reviews.ndjson) and missing-status-block
-    events. Anchored here, not SubagentStop (dogfood finding: an entire
+    reviewer-verdict ledger (reviews.ndjson) and the missing-status-block /
+    status-block-malformed events. Anchored here, not SubagentStop (dogfood
+    finding: an entire
     run's SubagentStop captures silently no-opped — payload shape is
     version-dependent and its transcript_path is documented-ambiguous),
     because THIS payload deterministically carries the spawn prompt
@@ -1494,15 +1572,16 @@ def capture_post_spawn(p: dict) -> None:
                       "parallelism)"})
         return
     text = _response_text(p.get("tool_response"))
+    captured = None
     if shape == "reviewer":
-        verdict = extract_verdict(text)
-        if verdict:
+        captured = extract_verdict(text)
+        if captured:
             # The completion evidence the task FSM's `reviewer-approved`
             # guard requires: which task (spawn-prompt header), which
             # reviewer mode, what verdict. Written only here; scoped to the
             # final status block and conflict-fail-closed (extract_verdict).
             ndjson.append_record(run / "reviews.ndjson", {
-                "task": task, "mode": mode, "verdict": verdict})
+                "task": task, "mode": mode, "verdict": captured})
         elif VERDICT_ANYWHERE_RE.search(text):
             # A verdict exists but isn't line-anchored in the final status
             # block — correctly NOT captured (fail-closed), but say so and
@@ -1518,10 +1597,46 @@ def capture_post_spawn(p: dict) -> None:
                           "headers); never SendMessage/resume — those "
                           "replies bypass capture entirely"})
     if not STATUS_RE.search(text):
+        if captured and mode in ENGINE_VERDICT_MODES:
+            # An engine-read captured verdict IS the gate-critical signal,
+            # so this is NOT a stall (field run 459226: a reviewer reply
+            # carried a line-anchored verdict — captured above via
+            # extract_verdict's no-block whole-text fallback — yet this
+            # branch still fired missing-status-block at the same
+            # timestamp, and the stall procedure re-spawned the whole plan
+            # panel to re-derive a verdict the ledger already held, ~1h
+            # paid twice). Record a distinct event that the stall
+            # procedure must NOT act on — but keep it FLAGGED (it is in
+            # FLAGGED_EVENT_KINDS): the no-block capture rode the
+            # whole-text fallback, the weakest path, and suppressing the
+            # stall also suppressed the re-spawn whose fresh verdict used
+            # to supersede a false capture (latest-wins) — visibility to
+            # the human is the replacing safeguard (adversarial-review on
+            # this change, both lenses independently). The fail-closed
+            # floor is untouched — an inline (non-anchored) verdict is
+            # still uncaptured and still stalls below.
+            ndjson.append_record(run / "events.ndjson", {
+                "kind": "status-block-malformed", "task": task,
+                "actor": shape, "mode": mode,
+                "reason": "reviewer verdict captured, but the reply had no "
+                          "well-formed final status block — verdict "
+                          "recorded, no stall; end replies ON the block "
+                          "(shared/status-block.md)"})
+        else:
+            ndjson.append_record(run / "events.ndjson", {
+                "kind": "missing-status-block", "task": task, "actor": shape,
+                "reason": "subagent replied without a status block — "
+                          "stalled-agent procedure applies (coverage B4)"})
+    if shape == "reviewer" and mode == "plan-attack":
+        # Non-flagged completion marker for the panel-serialization
+        # detector (guard_spawn): a captured verdict or a reviews.ndjson
+        # record is NOT a reliable completion signal (a lens can finish
+        # with a well-formed block and no verdict line and leave no trace
+        # at all), so completion gets its own event. Round-scoped by the
+        # actor-checked plan-registered marker, the same boundary the
+        # plan-flag supersession uses.
         ndjson.append_record(run / "events.ndjson", {
-            "kind": "missing-status-block", "task": task, "actor": shape,
-            "reason": "subagent replied without a status block — "
-                      "stalled-agent procedure applies (coverage B4)"})
+            "kind": "lens-complete", "actor": shape, "mode": mode})
 
 
 GUARDS = {"bash": guard_bash, "write": guard_write, "read": guard_read,

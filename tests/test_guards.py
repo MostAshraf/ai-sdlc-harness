@@ -1123,6 +1123,73 @@ class SpawnGuard(GuardHarness):
             "reviewer", f"harness-mode: plan-attack\nharness-run: {run3}\ngo"),
             "spawn-set")
 
+    def test_serial_lens_spawn_flags_panel_serialized(self):
+        """Field 459226 F-3: the orchestrator narrated 'spawning both
+        lenses in parallel' then issued them one at a time — twice. Prose
+        can't self-enforce parallelism, ordering can detect it: a lens
+        spawn arriving after a sibling completed THIS round (batched
+        spawns all clear PreToolUse before any PostToolUse) logs a loud,
+        NON-blocking panel-serialized event."""
+        run = self.make_run(to_step="plan-review", run_name="2026-01-04-G-5",
+                            item_id="G-5")
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "plan-registered", "actor": "plan-register", "count": 2})
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "lens-complete", "actor": "reviewer",
+            "mode": "plan-attack"})
+        self.assert_allows("spawn", spawn(
+            "reviewer", f"harness-mode: plan-attack\nharness-run: {run}\n"
+                        "lens: gaps\ngo"))
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertIn("panel-serialized", kinds)
+
+    def test_first_lens_spawn_of_a_round_not_flagged(self):
+        # batched spawns: every lens clears PreToolUse before any
+        # completion — no sibling has completed, nothing to flag
+        run = self.make_run(to_step="plan-review", run_name="2026-01-05-G-6",
+                            item_id="G-6")
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "plan-registered", "actor": "plan-register", "count": 2})
+        self.assert_allows("spawn", spawn(
+            "reviewer", f"harness-mode: plan-attack\nharness-run: {run}\n"
+                        "lens: contradictions\ngo"))
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertNotIn("panel-serialized", kinds)
+
+    def test_synthesizer_spawn_after_lens_completions_never_flags(self):
+        # the synthesizer ALWAYS arrives after every lens completed — the
+        # detector's plan-attack scoping on the SPAWN side is the only
+        # thing between it and a false flag on every single panel; pin it
+        # (adversarial review of this change, gaps lens)
+        run = self.make_run(to_step="plan-review", run_name="2026-01-07-G-8",
+                            item_id="G-8")
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "plan-registered", "actor": "plan-register", "count": 2})
+        for _ in range(2):
+            ndjson.append_record(run / "events.ndjson", {
+                "kind": "lens-complete", "actor": "reviewer",
+                "mode": "plan-attack"})
+        self.assert_allows("spawn", spawn(
+            "reviewer", f"harness-mode: plan-review\nharness-run: {run}\ngo"))
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertNotIn("panel-serialized", kinds)
+
+    def test_new_round_resets_the_serialization_window(self):
+        # a revision round re-registers (plan-registered re-arms): round
+        # 1's completions must not flag round 2's first batched spawn
+        run = self.make_run(to_step="plan-review", run_name="2026-01-06-G-7",
+                            item_id="G-7")
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "lens-complete", "actor": "reviewer",
+            "mode": "plan-attack"})   # round 1
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "plan-registered", "actor": "plan-register", "count": 2})
+        self.assert_allows("spawn", spawn(
+            "reviewer", f"harness-mode: plan-attack\nharness-run: {run}\n"
+                        "lens: gaps\ngo"))
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertNotIn("panel-serialized", kinds)
+
     def test_always_legal_request_triage(self):
         self.make_run(to_step="develop")
         self.assert_allows("spawn",
@@ -1651,6 +1718,130 @@ class CaptureHooks(GuardHarness):
                  if e.get("kind") == "missing-status-block"]
         self.assertEqual(len(stall), 1)
         self.assertEqual(stall[0]["task"], "T1")
+
+    def test_post_spawn_captured_verdict_without_block_is_not_a_stall(self):
+        """Field run 459226 (downstream fork report): a reviewer reply
+        carried a line-anchored verdict — captured via extract_verdict's
+        no-block whole-text fallback — yet missing-status-block still
+        fired at the same timestamp, and the stall procedure re-spawned
+        the whole plan panel to re-derive a verdict the ledger already
+        held (~1h paid twice, twice in one run). An engine-read captured
+        verdict IS the gate-critical signal: record status-block-malformed
+        (flagged for visibility, but NOT a stall trigger), never
+        missing-status-block."""
+        run = self.make_run()
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "reviewer",
+            reply="Reviewed all three files against the plan; all clean.\n"
+                  "verdict: APPROVED"))
+        rec = ndjson.read_records(run / "reviews.ndjson")[-1]
+        self.assertEqual(rec["verdict"], "APPROVED")
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertNotIn("missing-status-block", kinds)
+        self.assertIn("status-block-malformed", kinds)
+
+    def test_post_spawn_reviewer_without_verdict_or_block_still_stalls(self):
+        # the suppression must not over-reach: with NO captured verdict a
+        # blockless reviewer reply is a genuine stall — and no malformed
+        # event may pretend a verdict existed
+        run = self.make_run()
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "reviewer", reply="I read the diff and have thoughts…"))
+        self.assertFalse((run / "reviews.ndjson").exists())
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertIn("missing-status-block", kinds)
+        self.assertNotIn("status-block-malformed", kinds)
+
+    def test_post_spawn_advisory_mode_verdict_does_not_suppress_stall(self):
+        """Adversarial review of the suppression (gaps lens): only `review`
+        and `plan-review` verdicts are engine-read (reviewer-approved guard
+        / verdict_bound). A plan-attack lens's verdict is advisory — its
+        deliverable is the report text — so a blockless lens reply is a
+        genuine stall even though a verdict token was captured."""
+        run = self.make_run()
+        prompt = (f"harness-mode: plan-attack\nharness-task: T1\n"
+                  f"harness-run: {run}\ngo")
+        self.assert_allows("post-spawn", {
+            "tool_name": "Agent",
+            "tool_input": {"subagent_type": "x:reviewer", "prompt": prompt},
+            "tool_response": "Attacked the plan, one soft spot.\n"
+                             "verdict: APPROVED"})
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertIn("missing-status-block", kinds)
+        self.assertNotIn("status-block-malformed", kinds)
+
+    def test_post_spawn_records_lens_completion(self):
+        # the panel-serialization detector's completion signal: every
+        # plan-attack reply — even a clean one that leaves no verdict or
+        # status trace — marks its lens complete for this round (spawn is
+        # task-LESS, per plan-review.md's mandated lens spawn shape)
+        run = self.make_run()
+        prompt = f"harness-mode: plan-attack\nharness-run: {run}\ngo"
+        self.assert_allows("post-spawn", {
+            "tool_name": "Agent",
+            "tool_input": {"subagent_type": "x:reviewer", "prompt": prompt},
+            "tool_response": "harness-status: SUCCESS\nharness-task: T1\n"
+                             "outcome: lens report delivered\n"
+                             "details: [R1] SUGGESTION tighten AC3"})
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertIn("lens-complete", kinds)
+
+    def test_post_spawn_engine_mode_completion_not_marked_as_lens(self):
+        # the completion marker is plan-attack-scoped — a task review
+        # completing must not arm the serialization window
+        run = self.make_run()
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "reviewer",
+            reply="harness-status: SUCCESS\nharness-task: T1\n"
+                  "verdict: APPROVED\noutcome: reviewed"))
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertNotIn("lens-complete", kinds)
+
+    def test_post_spawn_planner_blockless_reply_still_stalls(self):
+        # the non-reviewer path must be shape-complete: planner (like the
+        # developer case above) can never have a captured verdict, so a
+        # blockless reply is always the genuine stall signal
+        run = self.make_run()
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "planner", reply="drafted half the plan then wandered off"))
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertIn("missing-status-block", kinds)
+        self.assertNotIn("status-block-malformed", kinds)
+
+    def test_post_spawn_well_formed_block_emits_no_status_events(self):
+        # the intended steady state, pinned: verdict captured from a
+        # well-formed final block → ledger written, NEITHER status event
+        run = self.make_run()
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "reviewer",
+            reply="harness-status: SUCCESS\nharness-task: T1\n"
+                  "verdict: APPROVED\noutcome: reviewed\ndetails: none"))
+        rec = ndjson.read_records(run / "reviews.ndjson")[-1]
+        self.assertEqual(rec["verdict"], "APPROVED")
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertNotIn("missing-status-block", kinds)
+        self.assertNotIn("status-block-malformed", kinds)
+
+    def test_post_spawn_echoed_status_template_line_is_not_a_block(self):
+        """The template's own status line (`harness-status: SUCCESS |
+        PARTIAL | FAILED`) is now inlined verbatim in the agent defs — an
+        agent that ECHOES it and then genuinely stalls used to satisfy
+        STATUS_RE and silently disable stall detection for that reply
+        (adversarial review of this change, both lenses). The `|`
+        continuation is the placeholder tell, same convention as the
+        angle-bracket verdict."""
+        run = self.make_run()
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "reviewer",
+            reply="I will end with the block:\n"
+                  "harness-status: SUCCESS | PARTIAL | FAILED\n"
+                  "harness-task: <task-id or ->\n"
+                  "verdict: <APPROVED | CHANGES_REQUESTED>\n"
+                  "…but I never got to the real one"))
+        self.assertFalse((run / "reviews.ndjson").exists())
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertIn("missing-status-block", kinds)
+        self.assertNotIn("status-block-malformed", kinds)
 
     def test_post_spawn_ignores_non_harness_shapes(self):
         run = self.make_run()

@@ -7,7 +7,7 @@
 | `/init-workspace` | One-time setup interview: provider, repos, discovered toolchain, verification gate |
 | `/dev-workflow <work-item-id>` | Take a work item from requirements to merged PR end-to-end |
 | `/story-workflow <command> <work-item-id>` | Shape a story's quality before it's built: `analyze` · `refine` · `improve` · `groom` |
-| `/workflow-status` | Read-only dashboard: cursor, tasks, gates, flagged events per run |
+| `/workflow-status` | Read-only dashboard: cursor, tasks, gates, flagged events, run-health verdict per run |
 | `/workspace-config` | Change one config section without re-running the interview |
 | `/add-repo` | Register one new repo into an already-bootstrapped workspace |
 | `/migrate-workspace` | Adopt a v2.x workspace: config carries over, run history stays archived in place |
@@ -127,7 +127,7 @@ flowchart LR
     AF -.->|new comments| AC
 ```
 
-**Full mode** has three unconditional human gates (plan, implementation, pre-PR), one conditional gate (security — fires only when the aggregate finding severity meets the configured threshold, default `medium`), and one multi-pick gate (comment selection, inside the on-demand PR-comments group). Before the plan ever reaches you, an **adversarial plan-review panel** runs: one lens reviewer per configured lens (`plan_review.lenses`, default *contradictions & collisions* + *gaps & completeness*; empty list = single reviewer) attacks the plan in parallel, and a synthesizer verifies their findings against the real code — never relaying them raw — groups them by root cause, checks the numbered acceptance criteria, the codebase's observed conventions, and the confirmed repo scope, and issues the one verdict the engine reads. A `CHANGES_REQUESTED` verdict mechanically forces a revision loop (bounded by `review_rounds.max`; exhaustion escalates to you *with* the failing report attached; every revision round re-runs the full panel), and that hook-captured verdict is what legalizes the step's exits, never the orchestrator's claim. **Quick mode** — trivial changes classified at fetch — keeps only the pre-PR gate. Everything between gates runs hands-off.
+**Full mode** has three unconditional human gates (plan, implementation, pre-PR), one conditional gate (security — fires only when the aggregate finding severity meets the configured threshold, default `medium`), and one multi-pick gate (comment selection, inside the on-demand PR-comments group). Before the plan ever reaches you, an **adversarial plan-review panel** runs: one lens reviewer per resolved lens (`plan_review.lenses` overlaid per change type by `lenses_by_change_type` — default *contradictions & collisions* + *gaps & completeness* for feature/fix/refactor; chore/docs default to the single-reviewer fallback; empty list = single reviewer) attacks the plan in parallel, and a synthesizer verifies their findings against the real code — never relaying them raw — groups them by root cause, checks the numbered acceptance criteria, the codebase's observed conventions, and the confirmed repo scope, and issues the one verdict the engine reads. A `CHANGES_REQUESTED` verdict mechanically forces a revision loop (bounded by `review_rounds.max`; exhaustion escalates to you *with* the failing report attached; every revision round re-runs the full panel), and that hook-captured verdict is what legalizes the step's exits, never the orchestrator's claim. **Quick mode** — trivial changes classified at fetch — keeps only the pre-PR gate. Everything between gates runs hands-off.
 
 **Lean mode** keeps full's entire rigor but gates by exception — the plan gate fires only if the panel exhausts its rounds, there's no implementation gate, and the pre-PR gate stays: one human stop on the happy path. Add `Mode: lean` to a work item, or set `default_mode: lean` for the workspace — see [Choosing a mode](#choosing-a-mode) and [Lean mode](#lean-mode--gating-by-exception).
 
@@ -223,7 +223,7 @@ The property that matters — *the test genuinely failed before the fix existed*
 2. `harness verify-red` runs the test itself — it must fail — then seals a chained red-proof and blob-SHA-locks the test files plus their declared closure (shared fixtures, `conftest.py`, …).
 3. The completion transition runs `verify-green` **and** re-checks the locked SHAs: a quietly weakened assertion refuses the transition.
 4. A genuinely wrong test is revised via `verify-red --revise --reason "…"` — an explicit, reviewer-visible flagged event, never a silent edit.
-5. Tasks a plan explicitly marks with no test-intents (docs, chores) are the approved opt-out: verify-red refuses, the completion guard exempts, review still applies.
+5. Tasks a plan explicitly marks with no test-intents (docs, chores) are the approved opt-out: verify-red refuses, the completion guard exempts, review still applies. At any risk other than `low`, the opt-out must carry a recorded `no_test_reason` — registration refuses the silent form and flags the recorded one for review. The mirror is enforced too: a task WITH test-intents must register its file-touch manifest (`files`) naming at least one non-test path — coverage backfill can never satisfy the red-proof, so registration refuses it up front unless a `test_only_reason` records the test-infrastructure exception (flagged `tests-without-production`).
 
 ### Owned git entry points
 
@@ -283,7 +283,7 @@ Trivial changes (explicit `Mode: quick` hint in the work item, no risk keywords)
 
 ### Multi-repo runs
 
-A work item spanning repos gets per-repo task lanes; cross-repo API contracts are declared in the plan and mechanically re-checked at reconcile time (`reconcile-contracts` greps each declared fragment across the other repos' sources, excluding test paths and the committed `ai/**` mirrors). Sync points fail closed: the cursor cannot leave `develop` while any task in any lane is non-terminal.
+A work item spanning repos gets per-repo task lanes; cross-repo API contracts are declared in the plan and mechanically re-checked at reconcile time (`reconcile-contracts` greps each declared fragment across the other repos' sources, excluding test paths and the committed `ai/**` mirrors; `{param}` tokens in `http` route fragments match any one path segment, so each repo may name a route parameter its own way without false drift). Sync points fail closed: the cursor cannot leave `develop` while any task in any lane is non-terminal.
 
 ### The repo map
 
@@ -305,7 +305,7 @@ One Python entry point ([hooks/guards.py](hooks/guards.py)) handles every event,
 | skill | PreToolUse · Skill | USER-ENTRY skills (`/dev-workflow`, `/init-workspace`, …) refuse invocation from subagents or autonomous triggering — they run only when you ran them. |
 | read | PreToolUse · Read/Grep | Red-proofs are readable by harness shapes only via `harness show-redproof` (chain-verified) — a raw `.redproof/` read skips integrity verification and is blocked. |
 | prompt capture | UserPromptSubmit | Verbatim capture of your replies into `human-input.ndjson` — the only evidence `gate --decide` accepts. |
-| verdict capture | PostToolUse · Agent/Task | The authoritative writer of `reviews.ndjson` (reviewer verdicts) and missing-status-block events — anchored here because this payload deterministically carries both the spawn prompt and the agent's final reply. |
+| verdict capture | PostToolUse · Agent/Task | The authoritative writer of `reviews.ndjson` (reviewer verdicts) and the missing-status-block / status-block-malformed events — anchored here because this payload deterministically carries both the spawn prompt and the agent's final reply. |
 | stop capture | SubagentStop | Per-invocation token accounting into `tokens.ndjson`; secondary status-block capture. |
 
 Every guard's fail-open/fail-closed policy is chosen deliberately and tested: recognised violations always block; the spawn guard is fail-closed even on ambiguity.
@@ -369,7 +369,7 @@ ai-sdlc-harness/
 │   └── init-workspace/ · add-repo/ · migrate-workspace/ · workspace-config/ · workflow-status/ · repo-map-refresh/
 ├── bin/harness                  # wrapper script resolving the plugin venv (+ harness.cmd for Windows)
 ├── tools/                       # meta-tooling: line-budget checker, sandbox workspace generators
-└── tests/                       # 657 stdlib-unittest tests
+└── tests/                       # 725 stdlib-unittest tests
 ```
 
 Workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside *your* working directory by `/init-workspace` and the pipeline. They never live inside this plugin repo.
@@ -399,7 +399,7 @@ python -m venv .venv; .venv\Scripts\pip install pyyaml
 .venv\Scripts\python -m unittest discover -s tests
 ```
 
-The test suite (657 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (725 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 
@@ -411,7 +411,7 @@ The test suite (657 tests) covers the state engine, gate grammar, guard behavior
 
 **Why can't Claude run `git commit` in my harness workspace?** The guard can't distinguish a harness commit from any other, so it blocks the whole verb for the life of any workspace that has completed `/init-workspace` — regardless of whether a run is currently active. Your own terminal outside Claude Code is unaffected, and a project that has never run `/init-workspace` is unaffected too. If you need raw git inside a bootstrapped workspace, disable the plugin for that session.
 
-**How do I stop it interrupting me at every gate?** Run the item in **lean mode**: put `Mode: lean` on its own line in the work item's description, or set `default_mode: lean` in your workspace config to make it the standing choice for unhinted items. Lean keeps every guarantee full has (scoped plan, adversarial panel, proven-red TDD, security) and gates by exception instead — the plan gate fires only if the plan-review panel exhausts its round budget, there's no implementation gate, and the pre-PR gate stays. Happy path: one stop, right before the PR. `Mode: full` on a single item buys the full gates back — see [Choosing a mode](#choosing-a-mode).
+**How do I stop it interrupting me at every gate?** Run the item in **lean mode**: put `Mode: lean` on its own line in the work item's description, or set `default_mode: lean` in your workspace config to make it the standing choice for unhinted items. Lean keeps every guarantee full has (scoped plan, change_type-scaled adversarial panel, proven-red TDD, security) and gates by exception instead — the plan gate fires only if the plan-review panel exhausts its round budget, there's no implementation gate, and the pre-PR gate stays. Happy path: one stop, right before the PR. `Mode: full` on a single item buys the full gates back — see [Choosing a mode](#choosing-a-mode).
 
 **Which mode will my work item run in?** Precedence is **full > quick > lean > default**: an explicit `Mode: full` hint always wins, `Mode: quick` needs the hint *and* no risk keyword, `Mode: lean` (or `default_mode: lean`) is next, and anything else lands on full. `harness fetch` reports the resolved `mode`, and the `fetched` event in `events.ndjson` records the `mode_verdict` and the reason it was chosen — so it's auditable, never a guess.
 
@@ -419,7 +419,7 @@ The test suite (657 tests) covers the state engine, gate grammar, guard behavior
 
 **What if the plan-review panel keeps rejecting?** Same bound (`review_rounds.max`), applied per plan cycle: each `CHANGES_REQUESTED` verdict forces a revision loop back to the planner. Once the budget is exhausted, the plan reaches you at the plan gate **with the failing review attached** — in lean mode, that's exactly when its otherwise-skipped gate fires. Never an auto-approval, never a deadlock.
 
-**What if an agent stalls or returns garbage?** A missing/invalid status block is detected mechanically; the orchestrator re-invokes with a continuation prompt (bounded, default 2), then escalates to you (default 3). It never acts on the agent's behalf.
+**What if an agent stalls or returns garbage?** A missing/invalid status block is detected mechanically; the orchestrator re-invokes with a continuation prompt (bounded, default 2), then escalates to you (default 3). It never acts on the agent's behalf. One carve-out: a reviewer reply whose engine-read verdict was captured despite a missing block is recorded (`status-block-malformed`, flagged) and the run proceeds on the ledger — no re-spawn to re-derive a verdict it already holds.
 
 **What if a test is genuinely wrong after it was proven red?** `harness verify-red --revise --reason "<why>"` — the revision is sealed and flagged in the events ledger, reviewer-visible. There is no silent path.
 
