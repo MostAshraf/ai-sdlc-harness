@@ -23,6 +23,10 @@ transitions:
   # intents; `test_intents: []` is the plan-approved opt-out — and at any
   # risk other than low, plan-register refuses the opt-out without a recorded
   # `no_test_reason` (flagged `risk-without-tests`): reviewed, never silent.
+  # The mirror holds too: a task WITH intents must carry a `files` manifest
+  # naming a non-test path, or a recorded `test_only_reason` (flagged
+  # `tests-without-production`) — coverage backfill can never go red, so
+  # it is refused at plan-register instead of dead-ending at this guard.
   - {from: in-progress, to: in-review, guard: verify-green-with-red-proof}
 
   # Completion out of review requires a hook-captured reviewer verdict

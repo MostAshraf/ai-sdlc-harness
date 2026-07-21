@@ -71,7 +71,8 @@ When the planner's status block reports the plan ready:
 1. Register the tasks it declared (replaces the single fetch-seeded task):
    `${CLAUDE_PLUGIN_ROOT}/bin/harness plan-register --run <run> --tasks-json
    '[{"id":"T1","repo":"<path>","risk":"low","test_intents":["test_name_one",
-   "test_name_two"]}, …]'` — `repo` must be the exact path string from this
+   "test_name_two"],"files":["src/api/users.py","tests/test_users.py"]}, …]'`
+   — `repo` must be the exact path string from this
    workspace's `repos.yaml` (i.e. `config["repos"]`'s VALUE, e.g.
    `/abs/path/to/backend`), never the short registered NAME (`backend`) —
    a name instead of a path resolves to no registered repo and fails
@@ -87,7 +88,14 @@ When the planner's status block reports the plan ready:
    NAMES for that task, empty if none.) A task at any risk other than
    `low` with empty `test_intents` must also carry `no_test_reason` (the
    plan's stated why — registration refuses the silent opt-out and flags
-   the recorded one as `risk-without-tests`) — declare cross-repo contracts too if
+   the recorded one as `risk-without-tests`). A task WITH `test_intents`
+   must carry `files` — that task's file-touch manifest, repo-relative
+   paths — with at least one entry outside `language.test_paths` and
+   `test_closure`: an all-test manifest is coverage backfill (it can
+   never satisfy the red-proof) and is refused unless the plan records
+   `test_only_reason`
+   (the judged test-infrastructure exception, flagged as
+   `tests-without-production`) — declare cross-repo contracts too if
    the plan named any: `--contracts-json '[{"id":"C1","type":"http",
    "producer":"a","consumers":["b"],"signature":["POST /v2/items",
    "field: item_id"]}]'` (`type` is `http | service-bus | dto` — and `http`

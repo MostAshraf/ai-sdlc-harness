@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import posixpath
 import re
 from pathlib import Path
 
@@ -35,9 +36,9 @@ FLAGGED_EVENT_KINDS = (
     "test-revision", "reviewer-rejected", "hook-blocked",
     "missing-status-block", "status-block-malformed", "quick-recheck",
     "contracts-check", "verdict-uncaptured", "background-spawn-uncaptured",
-    "coverage-skipped", "risk-without-tests", "pr-recorded-manually",
-    "secret-sweep-blocked", "gate-skipped", "deferral-pending",
-    "panel-serialized")
+    "coverage-skipped", "risk-without-tests", "tests-without-production",
+    "pr-recorded-manually", "secret-sweep-blocked", "gate-skipped",
+    "deferral-pending", "panel-serialized")
 
 
 def outstanding_flagged(events: list[dict]) -> list[dict]:
@@ -56,18 +57,19 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
     (`log-event` is unvalidated) can never silently hide an unrelated
     outstanding deferral (review finding: an audit gauge must not under-count).
 
-    `risk-without-tests` gets the same live-gauge treatment with a different
-    resolver: each `plan-registered` marker supersedes EVERY earlier
-    `risk-without-tests` event, because plan-register replaces the task list
-    wholesale — only the latest registration's batch describes the current
-    plan (adversarial-review on this change, both lenses independently: the
-    append-only batch survived the revision round that withdrew the opt-out,
-    misreporting the approved plan at every later gate). The event asserts
-    live plan STATE, unlike gate-skipped/hook-blocked, which record
-    occurrences and stay permanent correctly."""
+    `risk-without-tests` and `tests-without-production` get the same
+    live-gauge treatment with a different resolver: each `plan-registered`
+    marker supersedes EVERY earlier event of both kinds, because
+    plan-register replaces the task list wholesale — only the latest
+    registration's batch describes the current plan (adversarial-review on
+    the zero-test change, both lenses independently: the append-only batch
+    survived the revision round that withdrew the opt-out, misreporting the
+    approved plan at every later gate). Both events assert live plan STATE,
+    unlike gate-skipped/hook-blocked, which record occurrences and stay
+    permanent correctly."""
     flagged = [e for e in events if e.get("kind") in FLAGGED_EVENT_KINDS]
     open_pending: list[dict] = []
-    open_risk: list[dict] = []
+    open_plan: list[dict] = []
     resolved: set[int] = set()
     for e in events:
         kind = e.get("kind")
@@ -75,11 +77,17 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
             open_pending.append(e)
         elif kind == "deferral-recorded" and open_pending:
             resolved.add(id(open_pending.pop(0)))   # resolve earliest open pending
-        elif kind == "risk-without-tests":
-            open_risk.append(e)
-        elif kind == "plan-registered":
-            resolved.update(id(x) for x in open_risk)  # superseded batch
-            open_risk.clear()
+        elif kind in ("risk-without-tests", "tests-without-production"):
+            open_plan.append(e)
+        elif (kind == "plan-registered"
+                and e.get("actor") == "plan-register"):
+            # actor-checked (adversarial-review on the backfill change): a
+            # stray `log-event` record with this kind must not silently
+            # clear the live gauge — the same fail-closed stance the
+            # deferral resolver states above; real markers always carry
+            # the actor (emitted in plan_register, nowhere else)
+            resolved.update(id(x) for x in open_plan)  # superseded batch
+            open_plan.clear()
     return [e for e in flagged if id(e) not in resolved]
 
 
@@ -92,7 +100,8 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
 # captured — loose formatting, run healthy; including it made every fork
 # field run read DEGRADED and the verdict uninformative), `gate-skipped`
 # (declared predicate self-skips are the mode working as designed),
-# `risk-without-tests` (a recorded, reviewed decision), `contracts-check`
+# `risk-without-tests` / `tests-without-production` (recorded, reviewed
+# decisions), `contracts-check`
 # and `hook-blocked` (content findings / guards doing their job), and
 # `panel-serialized` (an efficiency miss — wall-clock wasted, nothing
 # lost or stalled).
@@ -485,10 +494,15 @@ def scope_register(workspace: Path, run: Path, manifest: dict, config: dict,
 
 
 def plan_register(workspace: Path, run: Path, manifest: dict,
-                  tasks: list[dict], contracts: list[dict] | None = None) -> dict:
+                  tasks: list[dict], contracts: list[dict] | None = None,
+                  config: dict | None = None) -> dict:
     """Replace the fetch-seeded task list with the approved plan's tasks
     (+ declared cross-repo contracts). Legal only while the cursor is at
-    `plan` — the plan is what the gate will approve."""
+    `plan` — the plan is what the gate will approve. `config` feeds the
+    coverage-backfill policy's `language.test_paths`/`test_closure`
+    vocabulary; absent, the same `["tests/**"]` default verify-red's
+    test-set falls back to (config-less callers only exist in unit
+    harnesses — the CLI always threads the merged config)."""
     from .transitions import ensure_live
     with state_mod.locked(run):
         st = state_mod.load(run, workspace)
@@ -561,6 +575,42 @@ def plan_register(workspace: Path, run: Path, manifest: dict,
                 raise state_mod.StateError(
                     f"plan-register: task {t['id']}: no_test_reason must "
                     f"be a string (got {type(t['no_test_reason']).__name__})")
+            if t.get("files") is not None and not isinstance(
+                    t["files"], list):
+                raise state_mod.StateError(
+                    f"plan-register: task {t['id']}: files must be a LIST "
+                    "of path strings (the plan's file-touch manifest; got "
+                    f"{type(t['files']).__name__})")
+            for f in t.get("files") or []:
+                if not isinstance(f, str) or not f.strip():
+                    raise state_mod.StateError(
+                        f"plan-register: task {t['id']}: files must be a "
+                        f"LIST of non-empty path strings ({f!r} isn't)")
+                # repo-relative FILE paths only: an absolute, escaping, or
+                # directory-shaped entry can't be honestly classified
+                # against the repo's test globs and would satisfy (or
+                # defeat) the backfill policy below vacuously. Checked on
+                # the raw slash-normalized form — `_norm_file` collapses
+                # `./` after this, and normpath never introduces `..`.
+                raw = f.strip().replace("\\", "/")
+                if (raw.startswith("/") or re.match(r"^[A-Za-z]:", raw)
+                        or ".." in raw.split("/")):
+                    raise state_mod.StateError(
+                        f"plan-register: task {t['id']}: files entry "
+                        f"{f!r} must be a repo-relative path (no absolute "
+                        "paths, drive letters, or '..' segments)")
+                if raw.endswith("/") or posixpath.normpath(raw) == ".":
+                    raise state_mod.StateError(
+                        f"plan-register: task {t['id']}: files entry "
+                        f"{f!r} is a directory, not a file — manifest "
+                        "entries name the specific files the task "
+                        "creates or modifies")
+            if t.get("test_only_reason") is not None and not isinstance(
+                    t["test_only_reason"], str):
+                raise state_mod.StateError(
+                    f"plan-register: task {t['id']}: test_only_reason must "
+                    "be a string (got "
+                    f"{type(t['test_only_reason']).__name__})")
         # Zero-test policy (field 459226): `test_intents: []` stays the
         # plan-approved opt-out, but at any risk OTHER THAN "low" the
         # opt-out must carry a RECORDED reason — one medium-risk task
@@ -583,10 +633,81 @@ def plan_register(workspace: Path, run: Path, manifest: dict,
                     "none apply (e.g. a repo coverage-exclusion "
                     "convention); the reason is flagged for plan-review "
                     "and the human, never assumed")
+        # Coverage-backfill policy (field 459226 postmortem F-2 — the
+        # mechanical half; the prompt half shipped in plan-task.md rule 2):
+        # a task WITH test intents must touch at least one file OUTSIDE
+        # the repo's test set, or it dead-ends at develop — a test
+        # proving already-correct behavior never goes red, one documenting
+        # an unfixed bug never goes green — past every plan gate, at
+        # maximum cost (the field run ended in a full run abort).
+        # Classification is `language.test_paths` ∪ `test_closure` — the
+        # full set verify-red SHA-locks with the red proof — so a file
+        # whose post-red edit develop would refuse (a locked shared
+        # fixture, root `conftest.py`) can never pose as the production
+        # entry at plan time (adversarial-review on this change: with
+        # test_paths alone, the fixture-layer exception under-fired by
+        # directory layout). The gate's reach equals this vocabulary's
+        # coverage — a layout it doesn't name (e.g. rspec `spec/`) needs
+        # the workspace `language.test_paths` override, the same
+        # precondition the whole TDD apparatus already has. Fail-closed:
+        # a test-carrying task with NO recorded manifest refuses too (an
+        # absent manifest must not duck the policy — the custom-risk-tier
+        # stance). The judged exception — a task whose PRODUCT is test
+        # infrastructure — is a recorded `test_only_reason`, stored on the
+        # task and flagged (`tests-without-production`) for plan-review
+        # and the human, mirroring `no_test_reason`. The gate proves the
+        # manifest's STRUCTURE, not its honesty — a fabricated production
+        # entry passes here; manifest honesty stays plan-review's
+        # spot-check job.
+        lang = (config or {}).get("language", {})
+        test_globs = (lang.get("test_paths", ["tests/**"])
+                      + (lang.get("test_closure") or []))
+
+        def _norm_file(f: str) -> str:
+            # ONE normal form for classification AND persistence: slashes
+            # forward, `./` collapsed (adversarial-review: a literal
+            # `./tests/…` entry classified as production — two characters
+            # re-opened the dead-end this policy closes)
+            return posixpath.normpath(f.strip().replace("\\", "/"))
+
+        def _prod_files(t: dict) -> list[str]:
+            return [f for f in (t.get("files") or [])
+                    if not gitops.matches_any(_norm_file(f), test_globs)]
+
+        for t in tasks:
+            if not t.get("test_intents"):
+                continue
+            if not t.get("files"):
+                raise state_mod.StateError(
+                    f"plan-register: task {t['id']} declares test_intents "
+                    "but no `files` manifest — carry the plan's file-touch "
+                    "manifest (repo-relative paths) so registration can "
+                    "prove a production change exists alongside the tests")
+            if not _prod_files(t) and not (
+                    t.get("test_only_reason") or "").strip():
+                raise state_mod.StateError(
+                    f"plan-register: task {t['id']}: every files entry "
+                    "matches language.test_paths/test_closure — a "
+                    "coverage-backfill task can never satisfy the "
+                    "red-proof (a test proving already-correct behavior "
+                    "never goes red). Fold the tests into the task that "
+                    "changes production code, defer the backfill, or — if "
+                    "this task's PRODUCT is test infrastructure — record "
+                    "test_only_reason; the reason is flagged for "
+                    "plan-review and the human, never assumed. (A "
+                    "PRODUCTION file merely NAMED like a test — e.g. "
+                    "src/load_test.py under **/*_test.* — means the glob "
+                    "overmatches: narrow the workspace "
+                    "language.test_paths override instead of recording a "
+                    "reason that isn't true)")
         st["tasks"] = [
             {"id": t["id"], "repo": t.get("repo", "."), "status": "pending",
              "depends_on": t.get("depends_on", []), "risk": t.get("risk", "low"),
              "test_intents": t.get("test_intents", []),
+             # the SAME normal form the policy judged — a stored
+             # backslashed/`./` spelling would hand the first future
+             # consumer a classification the policy already solved
+             "files": [_norm_file(f) for f in (t.get("files") or [])],
              # a reason only means something for a zero-test task — one
              # riding alongside declared intents (planner confusion, or a
              # revision that added tests without dropping the stale field)
@@ -594,6 +715,14 @@ def plan_register(workspace: Path, run: Path, manifest: dict,
              # record no surface would ever render
              "no_test_reason": ((t.get("no_test_reason") or "").strip() or None)
                                if not t.get("test_intents") else None,
+             # the same stale-reason rule for the backfill mirror: the
+             # reason only means something for a test-carrying task whose
+             # manifest has NO production entry — any other combination
+             # normalizes away
+             "test_only_reason": ((t.get("test_only_reason") or "").strip()
+                                  or None)
+                                 if (t.get("test_intents")
+                                     and not _prod_files(t)) else None,
              "commit_sha": None, "review_rounds": 0, "stalls": 0,
              "worktree": None}
             for t in tasks]
@@ -617,6 +746,13 @@ def plan_register(workspace: Path, run: Path, manifest: dict,
                 ndjson.append_record(run / "events.ndjson", {
                     "kind": "risk-without-tests", "task": t["id"],
                     "actor": "plan-register", "reason": t["no_test_reason"]})
+            # normalization above guarantees: stored reason ⟺ test-carrying
+            # task whose whole manifest is test paths — flag exactly those
+            if t["test_only_reason"]:
+                ndjson.append_record(run / "events.ndjson", {
+                    "kind": "tests-without-production", "task": t["id"],
+                    "actor": "plan-register",
+                    "reason": t["test_only_reason"]})
     return {"tasks": ids, "contracts": [c["id"] for c in contracts or []]}
 
 

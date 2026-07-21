@@ -84,16 +84,21 @@ Check, in order of importance:
    - A task at any risk other than `low` with NO test-intents must state
      a SOUND `no_test_reason` (a cited repo convention qualifies; "low
      value" or silence does not) — judge it, don't just check presence.
-   - A task WITH test-intents whose file-touch manifest has no
-     create/modify entry outside the repo's test paths
-     (`language.test_paths` — the same convention verify-red reads) is
-     coverage backfill: it dead-ends at develop, past every plan gate,
-     at maximum cost (a test proving already-correct behavior never goes
-     red; one documenting an unfixed bug never goes green — either way
-     verify-red/-green refuse, stall-escalating to the human). Add the
-     production change, fold the tests into the task that makes it, or
-     defer the backfill. Judged exception: a task whose product IS test
-     infrastructure (shared fixtures, harness code).
+   - A task WITH test-intents needs a create/modify manifest entry
+     outside the repo's test set (`language.test_paths` +
+     `test_closure` — the same set verify-red SHA-locks); anything else
+     is coverage backfill that dead-ends at develop. Registration enforces the STRUCTURE
+     (missing or all-test `files` refuse; a recorded `test_only_reason`
+     — the test-infrastructure exception — registers flagged as
+     `tests-without-production`). Your judged share is what the machine
+     can't: a recorded reason must be SOUND (the task's product really
+     is shared fixtures / harness code, not backfill wearing the label)
+     and VIABLE — an exception that only *modifies* a
+     `test_closure`-locked fixture can't pass red→green; steer it to
+     create entries or intents scoped so red is achievable — and the
+     manifest HONEST: a production entry the task doesn't actually need
+     sails through the mechanical gate (item 6's spot-check, aimed at
+     this).
 
 Report shape: numbered findings, each `[blocking]` or `[note]`, with file/
 line/AC references — the planner revises against these verbatim, so vague

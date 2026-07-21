@@ -615,10 +615,14 @@ class TwoRepoContracts(BreadthHarness):
         self.scope(run)
         self.cli("plan-register", "--tasks-json",
                  json.dumps([{"id": "T1", "repo": str(self.repo),
-                              "test_intents": ["test_a", "test_b"]}]),
+                              "test_intents": ["test_a", "test_b"],
+                              "files": ["src/thing.py",
+                                        "tests/test_thing.py"]}]),
                  run=run)
         state = self.cli("show", run=run)["state"]
         self.assertEqual(state["tasks"][0]["test_intents"], ["test_a", "test_b"])
+        self.assertEqual(state["tasks"][0]["files"],
+                         ["src/thing.py", "tests/test_thing.py"])
 
     def test_plan_register_accepts_json_files(self):
         # File input avoids shell-quoting large payloads / space-containing
@@ -1094,7 +1098,8 @@ class PlanRegisterValidation(BreadthHarness):
 
     def test_above_low_risk_with_tests_needs_no_reason(self):
         self._register([{"id": "T1", "repo": str(self.repo),
-                         "risk": "high", "test_intents": ["test_x"]}])
+                         "risk": "high", "test_intents": ["test_x"],
+                         "files": ["src/x.py", "tests/test_x.py"]}])
         events = ndjson.read_records(self.run_dir / "events.ndjson")
         self.assertFalse([e for e in events
                           if e.get("kind") == "risk-without-tests"])
@@ -1116,7 +1121,8 @@ class PlanRegisterValidation(BreadthHarness):
         self.assertEqual(len(live), 1)   # latest batch only, not 2
         # revision round adds the tests — the opt-out is withdrawn
         self._register([{"id": "T1", "repo": str(self.repo),
-                         "risk": "medium", "test_intents": ["test_x"]}])
+                         "risk": "medium", "test_intents": ["test_x"],
+                         "files": ["src/x.py", "tests/test_x.py"]}])
         events = ndjson.read_records(self.run_dir / "events.ndjson")
         self.assertFalse([e for e in outstanding_flagged(events)
                           if e.get("kind") == "risk-without-tests"])
@@ -1146,6 +1152,7 @@ class PlanRegisterValidation(BreadthHarness):
         # record — normalized to None, never stored
         self._register([{"id": "T1", "repo": str(self.repo),
                          "risk": "medium", "test_intents": ["test_x"],
+                         "files": ["src/x.py", "tests/test_x.py"],
                          "no_test_reason": "stale from an earlier draft"}])
         st = state_mod.load(self.run_dir, self.workspace)
         self.assertIsNone(st["tasks"][0]["no_test_reason"])
@@ -1165,6 +1172,248 @@ class PlanRegisterValidation(BreadthHarness):
                                "no_test_reason": {"why": "nope"}}],
                              expect=1)
         self.assertIn("no_test_reason must be a string", out["error"])
+
+    # ---- coverage-backfill policy (field 459226 postmortem F-2, the
+    # ---- mechanical half): a test-carrying task must register a files
+    # ---- manifest naming at least one non-test path
+
+    def test_test_carrying_task_without_files_refused(self):
+        # fail-closed: an absent manifest must not duck the policy — the
+        # same stance as the custom risk tier for no_test_reason
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "test_intents": ["test_x"]}], expect=1)
+        self.assertIn("no `files` manifest", out["error"])
+
+    def test_all_test_manifest_without_reason_refused(self):
+        # the field shape verbatim: a pure test-add on unmodified
+        # production code sailed through both review rounds and aborted
+        # the run at develop — now it can't register
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "test_intents": ["test_x"],
+                               "files": ["tests/test_x.py"]}], expect=1)
+        self.assertIn("coverage-backfill", out["error"])
+
+    def test_all_test_manifest_with_reason_registers_stores_and_flags(self):
+        self._register([{"id": "T1", "repo": str(self.repo),
+                         "test_intents": ["test_shared_fixture_shape"],
+                         "files": ["tests/conftest_helpers.py",
+                                   "tests/test_fixture_shape.py"],
+                         "test_only_reason": "task's product IS the shared "
+                                             "fixture layer"}])
+        st = state_mod.load(self.run_dir, self.workspace)
+        self.assertIn("shared", st["tasks"][0]["test_only_reason"])
+        events = ndjson.read_records(self.run_dir / "events.ndjson")
+        flagged = [e for e in events
+                   if e.get("kind") == "tests-without-production"]
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0]["task"], "T1")
+        # human-visible in the shared filter, but never health-degrading:
+        # a recorded, reviewed decision — the risk-without-tests class
+        from harness.workflow import (FLAGGED_EVENT_KINDS,
+                                      HEALTH_DEGRADING_KINDS,
+                                      outstanding_flagged, run_health)
+        self.assertIn("tests-without-production", FLAGGED_EVENT_KINDS)
+        self.assertNotIn("tests-without-production", HEALTH_DEGRADING_KINDS)
+        self.assertEqual(len(outstanding_flagged(events)), 1)
+        self.assertEqual(run_health(events)[0], "HEALTHY")
+
+    def test_production_entry_registers_silently_and_persists_files(self):
+        self._register([{"id": "T1", "repo": str(self.repo),
+                         "test_intents": ["test_x"],
+                         "files": [" src/x.py", "tests/test_x.py"]}])
+        st = state_mod.load(self.run_dir, self.workspace)
+        # entries are stripped on persist; order preserved
+        self.assertEqual(st["tasks"][0]["files"],
+                         ["src/x.py", "tests/test_x.py"])
+        events = ndjson.read_records(self.run_dir / "events.ndjson")
+        self.assertFalse([e for e in events
+                          if e.get("kind") == "tests-without-production"])
+
+    def test_zero_test_task_needs_no_files(self):
+        # the policy reads files only for test-carrying tasks — a docs
+        # task without a manifest registers exactly as before
+        self._register([{"id": "T1", "repo": str(self.repo)}])
+        st = state_mod.load(self.run_dir, self.workspace)
+        self.assertEqual(st["tasks"][0]["files"], [])
+
+    def test_java_and_js_test_layouts_classify_as_tests(self):
+        # the vocabulary is language.test_paths (the same one verify-red
+        # reads) — not a Python-only heuristic
+        out = self._register(
+            [{"id": "T1", "repo": str(self.repo),
+              "test_intents": ["shouldAuthorize"],
+              "files": ["src/test/java/AuthTest.java",
+                        "web/__tests__/auth.spec.ts"]}], expect=1)
+        self.assertIn("coverage-backfill", out["error"])
+
+    def test_non_list_files_refused(self):
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "test_intents": ["test_x"],
+                               "files": "src/x.py"}], expect=1)
+        self.assertIn("files must be a LIST", out["error"])
+
+    def test_non_string_files_entry_refused(self):
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "test_intents": ["test_x"],
+                               "files": ["src/x.py", 7]}], expect=1)
+        self.assertIn("files must be a LIST", out["error"])
+
+    def test_absolute_files_entry_refused(self):
+        # an absolute path can't be honestly classified against the
+        # repo's test globs — and would trivially defeat the policy
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "test_intents": ["test_x"],
+                               "files": ["/etc/passwd",
+                                         "tests/test_x.py"]}], expect=1)
+        self.assertIn("repo-relative", out["error"])
+
+    def test_parent_traversal_files_entry_refused(self):
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "test_intents": ["test_x"],
+                               "files": ["../elsewhere/x.py",
+                                         "tests/test_x.py"]}], expect=1)
+        self.assertIn("repo-relative", out["error"])
+
+    def test_windows_style_paths_are_normalized_for_the_policy(self):
+        # backslash separators and drive letters: the former classify,
+        # the latter refuse — the harness runs on Windows too
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "test_intents": ["test_x"],
+                               "files": ["tests\\test_x.py"]}], expect=1)
+        self.assertIn("coverage-backfill", out["error"])
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "test_intents": ["test_x"],
+                               "files": ["C:/work/x.py"]}], expect=1)
+        self.assertIn("repo-relative", out["error"])
+
+    def test_stale_test_only_reason_normalized_away(self):
+        # a reason riding with a production entry is self-contradictory —
+        # normalized to None, never stored, never flagged (the
+        # no_test_reason mirror)
+        self._register([{"id": "T1", "repo": str(self.repo),
+                         "test_intents": ["test_x"],
+                         "files": ["src/x.py", "tests/test_x.py"],
+                         "test_only_reason": "stale from an earlier draft"}])
+        st = state_mod.load(self.run_dir, self.workspace)
+        self.assertIsNone(st["tasks"][0]["test_only_reason"])
+        events = ndjson.read_records(self.run_dir / "events.ndjson")
+        self.assertFalse([e for e in events
+                          if e.get("kind") == "tests-without-production"])
+
+    def test_non_string_test_only_reason_refused(self):
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "test_intents": ["test_x"],
+                               "files": ["tests/test_x.py"],
+                               "test_only_reason": ["not", "a",
+                                                    "string"]}], expect=1)
+        self.assertIn("test_only_reason must be a string", out["error"])
+
+    def test_reregistration_supersedes_prior_backfill_flags(self):
+        """The same live-gauge rule as risk-without-tests: registration
+        replaces the task list wholesale, so a revision that adds the
+        production change must clear the stale backfill flag."""
+        from harness.workflow import outstanding_flagged
+        self._register([{"id": "T1", "repo": str(self.repo),
+                         "test_intents": ["test_x"],
+                         "files": ["tests/test_x.py"],
+                         "test_only_reason": "fixture-layer task"}])
+        self._register([{"id": "T1", "repo": str(self.repo),
+                         "test_intents": ["test_x"],
+                         "files": ["src/x.py", "tests/test_x.py"]}])
+        events = ndjson.read_records(self.run_dir / "events.ndjson")
+        self.assertFalse([e for e in outstanding_flagged(events)
+                          if e.get("kind") == "tests-without-production"])
+
+    def test_forged_marker_does_not_clear_the_gauge(self):
+        # adversarial-review on this change: the supersession marker is
+        # actor-checked — a stray `log-event` record with the marker's
+        # kind (log-event is unvalidated by design) must not silently
+        # clear outstanding plan flags. Fail-closed, like the deferral
+        # resolver.
+        from harness.workflow import outstanding_flagged
+        self._register([{"id": "T1", "repo": str(self.repo),
+                         "test_intents": ["test_x"],
+                         "files": ["tests/test_x.py"],
+                         "test_only_reason": "fixture-layer task"}])
+        self.cli("log-event", "--json",
+                 json.dumps({"kind": "plan-registered",
+                             "actor": "drifting-orchestrator"}),
+                 run=self.run_dir)
+        events = ndjson.read_records(self.run_dir / "events.ndjson")
+        self.assertEqual(len([e for e in outstanding_flagged(events)
+                              if e.get("kind")
+                              == "tests-without-production"]), 1)
+
+    def test_dot_slash_prefix_still_classifies_as_test(self):
+        # adversarial-review on this change: `./tests/…` classified as
+        # production — two characters re-opened the F-2 dead-end. Entries
+        # are normalized (`./` collapsed) before classification.
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "test_intents": ["test_x"],
+                               "files": ["./tests/test_x.py"]}], expect=1)
+        self.assertIn("coverage-backfill", out["error"])
+
+    def test_directory_shaped_entries_refused(self):
+        # "." or a trailing-slash entry would satisfy the production
+        # requirement vacuously — structure failures, inside the gate's
+        # own jurisdiction
+        for entry in [".", "src/", "./"]:
+            out = self._register([{"id": "T1", "repo": str(self.repo),
+                                   "test_intents": ["test_x"],
+                                   "files": ["tests/test_x.py", entry]}],
+                                 expect=1)
+            self.assertIn("directory, not a file", out["error"])
+
+    def test_root_conftest_classifies_as_test(self):
+        # classification is test_paths ∪ test_closure — the set verify-red
+        # SHA-locks. Root conftest.py is closure: a fixture-layer task
+        # needs its recorded reason regardless of directory layout.
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "test_intents": ["test_x"],
+                               "files": ["conftest.py",
+                                         "tests/test_x.py"]}], expect=1)
+        self.assertIn("coverage-backfill", out["error"])
+
+    def test_root_level_test_file_matches_the_anchored_glob(self):
+        # `**/test_*.py` must also match a ROOT-level test_x.py (the
+        # `**/`-anchor special case in gitops._match) at plan time
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "test_intents": ["test_x"],
+                               "files": ["test_x.py"]}], expect=1)
+        self.assertIn("coverage-backfill", out["error"])
+
+    def test_empty_files_list_refused_like_missing(self):
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "test_intents": ["test_x"],
+                               "files": []}], expect=1)
+        self.assertIn("no `files` manifest", out["error"])
+
+    def test_whitespace_only_files_entry_refused(self):
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "test_intents": ["test_x"],
+                               "files": ["   "]}], expect=1)
+        self.assertIn("non-empty path strings", out["error"])
+
+    def test_persisted_files_are_normalized(self):
+        # ONE normal form judged and stored: forward slashes, ./ collapsed
+        self._register([{"id": "T1", "repo": str(self.repo),
+                         "test_intents": ["test_x"],
+                         "files": ["src\\x.py", "./tests/test_x.py"]}])
+        st = state_mod.load(self.run_dir, self.workspace)
+        self.assertEqual(st["tasks"][0]["files"],
+                         ["src/x.py", "tests/test_x.py"])
+
+    def test_test_only_reason_without_intents_normalized_away(self):
+        # the reason means nothing on a zero-test task — the exact mirror
+        # of the stale-no_test_reason rule
+        self._register([{"id": "T1", "repo": str(self.repo),
+                         "files": ["docs/notes.md"],
+                         "test_only_reason": "stale label"}])
+        st = state_mod.load(self.run_dir, self.workspace)
+        self.assertIsNone(st["tasks"][0]["test_only_reason"])
+        events = ndjson.read_records(self.run_dir / "events.ndjson")
+        self.assertFalse([e for e in events
+                          if e.get("kind") == "tests-without-production"])
 
 
 class LeanModeEntry(BreadthHarness):

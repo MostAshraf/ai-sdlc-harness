@@ -44,6 +44,23 @@ All notable changes to `ai-sdlc-harness` are documented here.
   also now catches coverage-backfill tasks at plan time — a task whose
   test intents come with no production file change dead-ends at develop
   (in the field this forced a full run abort, past every plan gate).
+- Coverage backfill is now refused mechanically at registration, not just
+  by plan-review prose: a task WITH test intents must carry its file-touch
+  manifest (`plan-register`'s new per-task `files` field, repo-relative
+  paths — normalized to one form and persisted on the task record) naming
+  at least one path outside `language.test_paths` ∪ `test_closure` — the
+  full set verify-red SHA-locks with the red proof, so a file develop
+  would refuse to accept as the change can't pose as the production entry
+  at plan time. A missing or all-test manifest
+  refuses registration — the judged exception, a task whose *product* is
+  test infrastructure, registers via a recorded `test_only_reason` and is
+  flagged (`tests-without-production`, superseded per re-registration like
+  its `risk-without-tests` mirror, and never health-degrading). Directory-
+  shaped manifest entries (`.`, trailing slash) are refused, and the
+  supersession marker is actor-checked so a stray `log-event` record can't
+  silently clear outstanding plan flags. Orchestrator
+  prose that registers test-carrying tasks must now carry the manifest —
+  a deliberate contract widening; the shipped step prose does.
 - Every run now carries a process-health verdict: `status` reports
   `health: HEALTHY | DEGRADED` per run, and the metrics report opens with
   a `## Run health` section (degrading-event counts and stall counts —
@@ -99,7 +116,7 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 - `python -m harness.schema` — declared data valid
 - `python tools/budget_check.py` — line budget green
-- `python -m unittest discover -s tests` — 702 tests green
+- `python -m unittest discover -s tests` — 725 tests green
 
 ## [3.0.4] — 2026-07-12
 

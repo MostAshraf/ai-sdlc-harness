@@ -1029,7 +1029,8 @@ def _flag_serialized_panel(run: Path) -> None:
     model violated it in the same breath, so prose can't self-enforce —
     ordering can detect). Round boundary = everything after the LAST
     `plan-registered` marker (a revision round re-registers, re-arming
-    the window — same boundary the risk-flag supersession uses). Loud
+    the window — same actor-checked boundary the plan-flag supersession
+    uses, so a stray `log-event` record can't reset the window). Loud
     and NEVER blocking: the first lens's work is real, and blocking the
     second spawn would waste it. Known benign false positive, named in
     the reason: a stall-recovery re-spawn of ONE lens legitimately
@@ -1044,7 +1045,8 @@ def _flag_serialized_panel(run: Path) -> None:
         return
     completed_this_round = False
     for e in events:
-        if e.get("kind") == "plan-registered":
+        if (e.get("kind") == "plan-registered"
+                and e.get("actor") == "plan-register"):
             completed_this_round = False
         elif e.get("kind") == "lens-complete":
             completed_this_round = True
@@ -1631,8 +1633,8 @@ def capture_post_spawn(p: dict) -> None:
         # record is NOT a reliable completion signal (a lens can finish
         # with a well-formed block and no verdict line and leave no trace
         # at all), so completion gets its own event. Round-scoped by the
-        # plan-registered marker, same boundary the risk-flag supersession
-        # uses.
+        # actor-checked plan-registered marker, the same boundary the
+        # plan-flag supersession uses.
         ndjson.append_record(run / "events.ndjson", {
             "kind": "lens-complete", "actor": shape, "mode": mode})
 

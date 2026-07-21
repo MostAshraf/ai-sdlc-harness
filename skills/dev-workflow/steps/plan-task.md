@@ -82,13 +82,22 @@ fork identified: <why>` under the task table, visible either way.
   `plan-register`'s `no_test_reason` field, registration refuses the
   opt-out without it, and the recorded reason is flagged for review.
   (2) Every task WITH test-intents must create or modify at least one
-  file outside the repo's test paths: with no production change the task
-  dead-ends at develop — a test proving already-correct behavior can
-  never go red, one documenting an unfixed bug never goes green — past
-  every plan gate, at maximum cost. Fold coverage backfill into the task
+  file outside the repo's test set (`language.test_paths` +
+  `test_closure`) — enforced: the orchestrator carries the file-touch
+  manifest's paths into `plan-register`'s `files` field, and registration
+  refuses a test-carrying task whose manifest is missing or all-test.
+  With no production change the task dead-ends at develop — a test
+  proving already-correct behavior can never go red, one documenting an
+  unfixed bug never goes green. Fold coverage backfill into the task
   that changes the code, or record it as a deferral — never plan it as
-  its own task. (A task whose PRODUCT is test infrastructure — shared
-  fixtures, harness code — is the judged exception.)
+  its own task. The judged exception — a task whose PRODUCT is test
+  infrastructure (shared fixtures, harness code) — is a literal
+  `Test-only reason: <why>` line under the Files block, carried into
+  `test_only_reason` and flagged for review. Shape the exception around
+  *create* entries: a task that only MODIFIES a fixture inside
+  `test_closure` can't survive develop (the file is SHA-locked at red,
+  so green refuses the edit) — scope its intents so red is achievable,
+  or plan the new fixture as a create.
 - **`[API: <lib> v<X>]`** annotations where a task prescribes a library API
   — the developer verifies the real signature before writing call sites.
 - **≤2 pattern hints** per task: existing test files via bounded globbing
@@ -110,7 +119,9 @@ fork identified: <why>` under the task table, visible either way.
   with a one-line why — from actually reading the code, not guessing
   (plan-review spot-checks that *modify* entries exist and *create*
   entries don't). This is the single biggest developer accelerant in the
-  plan: the developer starts editing instead of re-discovering.
+  plan: the developer starts editing instead of re-discovering. The
+  orchestrator carries the paths (not the whys) into `plan-register`'s
+  `files` field — the same carry-over the test-intent names get.
   ```
   Files:
   - modify src/auth/service.py — add the token-refresh branch

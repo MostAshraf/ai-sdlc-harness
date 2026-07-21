@@ -657,7 +657,7 @@ def main(argv: list[str] | None = None) -> int:
             contracts = _json_source("--contracts-json", args.contracts_json,
                                      args.contracts_json_file, [])
             result = workflow.plan_register(args.workspace, args.run, manifest,
-                                            tasks, contracts)
+                                            tasks, contracts, config)
             _emit({"ok": True, **result})
             return 0
 
