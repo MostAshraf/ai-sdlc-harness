@@ -1384,13 +1384,27 @@ def _parse_transcript(path: Path) -> dict:
             continue
         msg = entry.get("message") or {}
         content = msg.get("content")
+        # Qwen Code: the SubagentStop transcript is Gemini-format JSONL — the
+        # top-level `type` stays assistant/user, but the message carries
+        # `parts: [{"text": <block>}]` and NO `content` (and no usage/model
+        # anywhere). Read `parts` only when `content` is absent, so Claude
+        # transcript parsing stays byte-identical.
+        parts = msg.get("parts")
         # NEWLINE join, not "" (adversarial-review finding, same class as
         # _response_text): a content block ending without a newline would
         # glue its tail onto the next block's first line, hiding a
         # `verdict:`/`harness-status:` line from the line-anchored regexes.
-        text = "\n".join(c.get("text", "") for c in content
-                         if isinstance(c, dict)) if isinstance(content, list) \
-            else (content if isinstance(content, str) else "")
+        # The Qwen parts branch joins the same way for the same reason.
+        if isinstance(content, list):
+            text = "\n".join(c.get("text", "") for c in content
+                             if isinstance(c, dict))
+        elif isinstance(content, str):
+            text = content
+        elif isinstance(parts, list):
+            text = "\n".join(pt.get("text", "") for pt in parts
+                             if isinstance(pt, dict))
+        else:
+            text = ""
         key = (role, msg.get("id") or id(entry))
         if key not in by_key:
             by_key[key] = {"role": role, "text": "", "model": msg.get("model"),
@@ -1488,13 +1502,41 @@ def capture_subagent_stop(p: dict) -> None:
     task = (TASK_HEADER_RE.search(header_src) or [None, None])[1]
     mode = (MODE_HEADER_RE.search(header_src) or [None, None])[1]
     usage = data.get("usage") or {}
+    input_t = usage.get("input_tokens", 0)
+    output_t = usage.get("output_tokens", 0)
+    cache_r = usage.get("cache_read_input_tokens", 0)
+    cache_w = usage.get("cache_creation_input_tokens", 0)
+    # Qwen Code double-write guard: under Qwen this SubagentStop transcript is
+    # usage-less Gemini JSONL (no usage, no model anywhere), and
+    # capture_post_spawn has ALREADY written this spawn's real token row from
+    # the Task tool's executionSummary. Appending a second, all-zero row here
+    # would duplicate that ledger entry with a useless placeholder. Skip iff the
+    # row would carry NOTHING (all four counts zero) AND the transcript named no
+    # model — the exact Qwen/Gemini signature. Invariant: a real Claude
+    # transcript WITH an assistant turn always carries a model on those turns
+    # (even the degenerate empty-usage shape does), so a well-formed Claude
+    # token row is never suppressed; and under Claude Code usage is present, so
+    # the all-zero test fails and this branch is never taken.
+    #
+    # This signature test is a PROXY for "capture_post_spawn already wrote this
+    # spawn's row," not a coordinated check (the two hooks are separate
+    # processes with no shared state). It over-matches in two accepted corner
+    # cases where the sibling ALSO wrote nothing, so the spawn gets ZERO token
+    # rows (adversarial-review on this change, both lenses): (a) a Qwen spawn
+    # that fails before producing an executionSummary (hard exception /
+    # worktree-provisioning failure / subagent-not-found — see
+    # capture_post_spawn) and (b) a degenerate Claude transcript with NO
+    # assistant turn at all. Both drops are immaterial: a failed or
+    # assistant-less spawn has no billed counts to record, and the failure is
+    # still visible as a missing-status-block stall event — nothing is lost but
+    # an all-zero placeholder row.
+    if not any((input_t, output_t, cache_r, cache_w)) and data.get("model") is None:
+        return
     ndjson.append_record(run / "tokens.ndjson", {
         "task": task, "mode": mode, "role": shape_of(p.get("agent_type")),
         "model": data.get("model"),
-        "input": usage.get("input_tokens", 0),
-        "output": usage.get("output_tokens", 0),
-        "cache_read": usage.get("cache_read_input_tokens", 0),
-        "cache_write": usage.get("cache_creation_input_tokens", 0)})
+        "input": input_t, "output": output_t,
+        "cache_read": cache_r, "cache_write": cache_w})
     # Reviewer-verdict and missing-status-block capture live in
     # capture_post_spawn (PostToolUse on Agent/Task), NOT here (dogfood
     # finding: this event's payload proved unreliable in practice —
@@ -1520,6 +1562,13 @@ def _response_text(resp) -> str:
     if isinstance(resp, dict):
         if "content" in resp:
             return _response_text(resp["content"])
+        # Qwen Code: the Agent/Task tool_response is
+        # {"llmContent": <content>, "returnDisplay": <display>} — llmContent is
+        # normally [{"text": <reply>}], a plain string on the ERROR terminate
+        # path. `content` stays FIRST (Claude precedence, byte-identical); the
+        # list/str branches above then flatten either llmContent encoding.
+        if "llmContent" in resp:
+            return _response_text(resp["llmContent"])
         return str(resp.get("text") or "")
     return ""
 
@@ -1571,6 +1620,35 @@ def capture_post_spawn(p: dict) -> None:
                       "(batch multiple foreground spawns in one message for "
                       "parallelism)"})
         return
+    # Qwen Code: a Task/Agent spawn's token counts live ONLY in the PostToolUse
+    # payload, never the (usage-less Gemini) SubagentStop transcript —
+    # tool_response.returnDisplay.executionSummary =
+    # {inputTokens, outputTokens, thoughtTokens, cachedTokens, totalTokens, …},
+    # with no model field. Same tokens.ndjson schema capture_subagent_stop
+    # writes: task/mode from the spawn-prompt headers above, role = the spawn
+    # shape, model None (Qwen carries none). cachedTokens → cache_read; there is
+    # no cache-creation analogue, so cache_write is 0. thoughtTokens is
+    # deliberately left OUT of input/output — the ledger records actual billed
+    # input/output, and folding reasoning tokens into either would fabricate a
+    # count that was never spent as such. Claude Code payloads carry no
+    # executionSummary, so this branch never fires there. When a Qwen spawn
+    # FAILS before an executionSummary exists (hard exception / worktree-
+    # provisioning failure / subagent-not-found: returnDisplay carries a
+    # `status: failed` but no executionSummary), no token row is written here
+    # and SubagentStop's usage-less transcript is skipped too — an accepted
+    # drop (a failed spawn has no billed counts), and the failure is still
+    # recorded as the missing-status-block stall event captured below.
+    tool_response = p.get("tool_response")
+    if isinstance(tool_response, dict):
+        display = tool_response.get("returnDisplay")
+        summary = display.get("executionSummary") if isinstance(display, dict) else None
+        if isinstance(summary, dict):
+            ndjson.append_record(run / "tokens.ndjson", {
+                "task": task, "mode": mode, "role": shape, "model": None,
+                "input": summary.get("inputTokens", 0),
+                "output": summary.get("outputTokens", 0),
+                "cache_read": summary.get("cachedTokens", 0),
+                "cache_write": 0})
     text = _response_text(p.get("tool_response"))
     captured = None
     if shape == "reviewer":

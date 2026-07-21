@@ -6,6 +6,27 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
+## [3.2.1] — 2026-07-22
+
+> **The harness's hooks now understand Qwen Code's payload encodings, not just Claude Code's.** Running the harness under Qwen Code previously misread every subagent reply as empty — false stalls, lost verdicts, and a blank token ledger — followed by an adversarial-review pass that pinned down two zero-row corners the fix's own dedup logic could otherwise reopen.
+
+### Release highlights
+
+| Theme | What changed |
+|---|---|
+| **Hooks now parse Qwen Code's payload shapes, not just Claude Code's** | Running the harness under Qwen Code previously misread every subagent reply as empty: each foreground spawn logged a false `missing-status-block` stall, reviewer verdicts were never captured (so plan-review panels were re-spawned to re-derive a verdict the run already held), and the token ledger recorded null task/mode attribution with zero counts. Three additive parsing branches in `hooks/guards.py` — Qwen's `llmContent`-wrapped tool responses, its Gemini-format transcript JSONL, and its `executionSummary` token block — restore status-block and verdict capture and recover both task/mode attribution and the real input/output/cache counts. Claude Code behavior is byte-identical: every new branch is ordered after the existing one. |
+| **Adversarial-review follow-up pinned two zero-row corners instead of redesigning the dedup** | The SubagentStop double-write skip is a *proxy* for "the sibling hook already wrote this spawn's row," not a coordinated check — the two hooks are separate processes with no shared state. Two review lenses independently converged on the same root cause and found it over-matches when the sibling ALSO wrote nothing: a Qwen spawn that fails before an `executionSummary` exists, and a degenerate Claude transcript with no assistant turn. Adjudicated as the only correct behavior — a failed or assistant-less spawn has no billed counts to record, and the drop is not silent (the failure path still records a `missing-status-block` stall event) — so this closes the finding by making the behavior precise and enforced: the two overstated guards.py comments now state the proxy nature and both accepted zero-row corners, with a new regression test pinning the failure-path corner. No logic change; Claude and normal-Qwen behavior stay byte-identical. |
+
+### Upgrade notes
+
+- **Patch release — no config, schema, or manifest changes.** Known limitations carried forward from this Qwen-compat work: Qwen never reports a `model` name for a spawn (token counts and task/mode attribution are still recorded); and a Qwen spawn that fails before reporting an execution summary records no token row for that spawn (the failure is still surfaced as a `missing-status-block` stall event).
+
+### Verification on tag tip
+
+- `python -m harness.schema` — declared data valid
+- `python tools/budget_check.py` — 0 errors (7 pre-existing soft-cap warnings)
+- `python -m unittest discover -s tests` — 745 tests green (skipped=13)
+
 ## [3.2.0] — 2026-07-21
 
 > **`harness show` becomes an honest compass.** Field motive: an orchestrator polling `show` after a plan-review verdict had landed in `reviews.ndjson` saw a stale `pending` outcome and no hint that the forward exit was already the sole legal move — a gap confusing enough that one session escalated it into a plausible-sounding false bug report. This release surfaces the engine-legal next moves and ledger-fresh verdict outcomes directly in `show`, strictly read-only, with the new surface adversarially reviewed and hardened before landing.
