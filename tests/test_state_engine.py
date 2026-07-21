@@ -691,6 +691,13 @@ class ShowNextSteps(Harness):
         self.assertEqual(out["next_steps"], {})
         self.assertIsNotNone(out["probe_error"])
         self.assertIn("corrupt", out["probe_error"])
+        # The LedgerCorruption message names the ledger FILE; `show` output is
+        # copy-pasted into shared channels, so the absolute run path must be
+        # scrubbed to a placeholder (the loud local `cursor --to` refusal
+        # keeps the real path for the operator).
+        self.assertIn("<run>", out["probe_error"])
+        self.assertNotIn(str(run), out["probe_error"])
+        self.assertNotIn(str(run.resolve()), out["probe_error"])
         self.assertEqual(   # full state still emitted, unmodified
             out["state"]["cursor"]["current_step"], "plan-review")
 

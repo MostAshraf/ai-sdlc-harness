@@ -1055,6 +1055,23 @@ def main(argv: list[str] | None = None) -> int:
                     # conflated with a genuinely move-less run.
                     next_steps = {}
                     probe_error = f"{type(exc).__name__}: {exc}"
+                    # Scrub any absolute run/workspace path the walk's own
+                    # diagnosis embedded — a LedgerCorruption message names the
+                    # ledger FILE (transitions.py wraps ndjson.py's `{path}`),
+                    # and `show` output is copy-pasted into shared channels
+                    # where a local filesystem layout has no business. The
+                    # loud `cursor --to` refusal keeps the full path (it fires
+                    # locally, for the operator). Replace the RUN prefix before
+                    # the workspace prefix: the run dir lives under the
+                    # workspace, so scrubbing the shorter workspace path first
+                    # would strand the run-dir tail. Both the resolved and the
+                    # as-passed spellings are scrubbed so neither leaks.
+                    for raw, tag in ((args.run, "<run>"),
+                                     (args.workspace, "<workspace>")):
+                        if raw is None:
+                            continue
+                        for form in (str(Path(raw).resolve()), str(raw)):
+                            probe_error = probe_error.replace(form, tag)
                 # `derived` is computed UNCONDITIONALLY — even when the walk
                 # raised. The verdict_bound outcome refresh is the ONLY
                 # set_artifact the walk performs and it runs BEFORE the
