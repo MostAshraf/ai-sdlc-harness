@@ -2114,6 +2114,43 @@ class CaptureHooks(GuardHarness):
         self.assertEqual((rec["model"], rec["input"], rec["output"]),
                          ("claude-opus-4-8", 0, 0))
 
+    def test_qwen_failed_spawn_without_execution_summary_drops_row_visibly(self):
+        """Qwen failure paths (hard exception / worktree-provisioning failure /
+        subagent-not-found) return a returnDisplay with `status: failed` but NO
+        executionSummary, and SubagentStop's usage-less Gemini transcript is
+        skipped — so BOTH hooks decline and the spawn gets zero token rows. That
+        drop is documented and accepted (a failed spawn has no billed counts),
+        but it is NOT silent: post-spawn still records a missing-status-block
+        stall event. Pins the double-write corner where the SubagentStop skip's
+        transcript-shape proxy over-matches (adversarial-review on this change).
+        """
+        run = self.make_run()
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "developer",
+            response={"llmContent": "Failed to run subagent: boom",
+                      "returnDisplay": {"status": "failed",
+                                        "terminateReason": "boom"}}))
+        # no executionSummary → no token row, but the failure is visible
+        self.assertEqual(ndjson.read_records(run / "tokens.ndjson"), [])
+        kinds = [e.get("kind")
+                 for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertIn("missing-status-block", kinds)
+        # the usage-less Gemini SubagentStop for the same spawn must not
+        # resurrect an all-zero placeholder row either
+        transcript = self.workspace / "gemini_fail.jsonl"
+        lines = [
+            {"type": "user", "message": {"role": "user", "parts": [
+                {"text": f"harness-mode: develop\nharness-task: T1\n"
+                         f"harness-run: {run}\ngo"}]}},
+            {"type": "assistant", "message": {"role": "model", "parts": [
+                {"text": "Failed to run subagent: boom"}]}},
+        ]
+        transcript.write_text("\n".join(json.dumps(l) for l in lines))
+        self.assert_allows("subagent-stop",
+                           {"agent_type": "x:developer",
+                            "agent_transcript_path": str(transcript)})
+        self.assertEqual(ndjson.read_records(run / "tokens.ndjson"), [])
+
 
 def _yamlless_python() -> str | None:
     """An interpreter WITHOUT PyYAML (e.g. macOS system python3) — the exact

@@ -1513,10 +1513,23 @@ def capture_subagent_stop(p: dict) -> None:
     # would duplicate that ledger entry with a useless placeholder. Skip iff the
     # row would carry NOTHING (all four counts zero) AND the transcript named no
     # model — the exact Qwen/Gemini signature. Invariant: a real Claude
-    # transcript always carries a model on its assistant turns (even the
-    # degenerate empty-usage shape does), so a legitimate Claude token row is
-    # never suppressed; and under Claude Code usage is present, so the all-zero
-    # test fails and this branch is never taken.
+    # transcript WITH an assistant turn always carries a model on those turns
+    # (even the degenerate empty-usage shape does), so a well-formed Claude
+    # token row is never suppressed; and under Claude Code usage is present, so
+    # the all-zero test fails and this branch is never taken.
+    #
+    # This signature test is a PROXY for "capture_post_spawn already wrote this
+    # spawn's row," not a coordinated check (the two hooks are separate
+    # processes with no shared state). It over-matches in two accepted corner
+    # cases where the sibling ALSO wrote nothing, so the spawn gets ZERO token
+    # rows (adversarial-review on this change, both lenses): (a) a Qwen spawn
+    # that fails before producing an executionSummary (hard exception /
+    # worktree-provisioning failure / subagent-not-found — see
+    # capture_post_spawn) and (b) a degenerate Claude transcript with NO
+    # assistant turn at all. Both drops are immaterial: a failed or
+    # assistant-less spawn has no billed counts to record, and the failure is
+    # still visible as a missing-status-block stall event — nothing is lost but
+    # an all-zero placeholder row.
     if not any((input_t, output_t, cache_r, cache_w)) and data.get("model") is None:
         return
     ndjson.append_record(run / "tokens.ndjson", {
@@ -1618,7 +1631,13 @@ def capture_post_spawn(p: dict) -> None:
     # deliberately left OUT of input/output — the ledger records actual billed
     # input/output, and folding reasoning tokens into either would fabricate a
     # count that was never spent as such. Claude Code payloads carry no
-    # executionSummary, so this branch never fires there.
+    # executionSummary, so this branch never fires there. When a Qwen spawn
+    # FAILS before an executionSummary exists (hard exception / worktree-
+    # provisioning failure / subagent-not-found: returnDisplay carries a
+    # `status: failed` but no executionSummary), no token row is written here
+    # and SubagentStop's usage-less transcript is skipped too — an accepted
+    # drop (a failed spawn has no billed counts), and the failure is still
+    # recorded as the missing-status-block stall event captured below.
     tool_response = p.get("tool_response")
     if isinstance(tool_response, dict):
         display = tool_response.get("returnDisplay")
