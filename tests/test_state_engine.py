@@ -561,8 +561,11 @@ class ShowNextSteps(Harness):
     re-derived from the reviewer-verdict ledger by the next `cursor --to`, so
     an orchestrator polling `show` between the reviewer's captured verdict and
     the move it legalizes saw a stale `pending` and no hint that the forward
-    exit was already the sole engine-legal one. These tests drive the REAL
-    CLI over a subprocess so the emitted JSON contract itself is pinned."""
+    exit was already the sole engine-legal one. The output also carries
+    `probe_error` — null when the candidates walk completed, else the engine's
+    own reason there is no legal move yet — so an empty `next_steps` is never
+    silently conflated with a wedged run. These tests drive the REAL CLI over a
+    subprocess so the emitted JSON contract itself is pinned."""
 
     def _plan_review_run(self):
         """A full-mode run PERSISTED on disk with the cursor parked at
@@ -599,6 +602,7 @@ class ShowNextSteps(Harness):
         # rewrite of the ledger-fresh value back into artifacts)
         self.assertEqual(
             out["state"]["artifacts"]["plan-review.outcome"], "pending")
+        self.assertIsNone(out["probe_error"])   # the walk completed cleanly
 
     def test_show_is_read_only_state_file_byte_identical(self):
         # cursor_candidates MUTATES the dict it's handed (it re-stamps the
@@ -624,6 +628,10 @@ class ShowNextSteps(Harness):
         out = self._show(run)
         self.assertEqual(out["next_steps"], {})
         self.assertEqual(out["derived"], {})
+        # probe_error stays NULL here: the walk COMPLETED and legitimately
+        # found no legal exit (fail-closed), which is a different thing from
+        # the walk raising — the honest distinction probe_error exists for.
+        self.assertIsNone(out["probe_error"])
         # state is still emitted in full — show never regresses to a refusal
         self.assertEqual(
             out["state"]["cursor"]["current_step"], "plan-review")
@@ -639,7 +647,98 @@ class ShowNextSteps(Harness):
         out = self._show(run)
         self.assertEqual(out["next_steps"], {})
         self.assertEqual(out["derived"], {})
+        self.assertIsNone(out["probe_error"])   # walk skipped, not raised
         self.assertTrue(out["state"]["aborted"])
+
+    def test_changes_requested_surfaces_the_loop_edge(self):
+        # An in-bound CHANGES_REQUESTED forces the revision loop: the only
+        # legal move is back to `plan`, and the outcome stays `pending` (the
+        # loop edge decides nothing), so nothing is derived.
+        run, _ = self._plan_review_run()
+        support.seed_review_verdict(run, verdict="CHANGES_REQUESTED")
+        out = self._show(run)
+        self.assertEqual(out["next_steps"], {"plan": "returns_to"})
+        self.assertEqual(out["derived"], {})
+        self.assertIsNone(out["probe_error"])
+
+    def test_bound_exhaustion_surfaces_forward_and_exhausted_outcome(self):
+        # `review_rounds.max` CHANGES_REQUESTED verdicts exhaust the bound:
+        # the forward exit opens (the human sees the failing report) and the
+        # engine-derived outcome is `exhausted` — ledger-fresh, while the
+        # persisted cache is still `pending`.
+        run, _ = self._plan_review_run()
+        for _ in range(self.config["review_rounds"]["max"]):
+            support.seed_review_verdict(run, verdict="CHANGES_REQUESTED")
+        out = self._show(run)
+        self.assertEqual(out["next_steps"].get("approve-plan"), "sequence")
+        self.assertEqual(out["derived"], {"plan-review.outcome": "exhausted"})
+        self.assertIsNone(out["probe_error"])
+        self.assertEqual(
+            out["state"]["artifacts"]["plan-review.outcome"], "pending")
+
+    def test_corrupt_ledger_degrades_with_probe_error_not_a_crash(self):
+        # New failure surface `show` gains by consulting the ledger: a torn
+        # reviews.ndjson at a verdict_bound step fails the derivation closed.
+        # `show` is the diagnostic reached for WHEN a run is wedged, so it must
+        # still exit 0 and emit the full state — the corruption is reported in
+        # probe_error, not raised. (The loud enforcement refusal stays on
+        # `cursor --to`, covered by test_corrupt_ledger_fails_closed above.)
+        run, _ = self._plan_review_run()
+        support.seed_review_verdict(run, verdict="APPROVED")
+        with (run / "reviews.ndjson").open("a", encoding="utf-8") as fh:
+            fh.write("{torn record\n")
+        out = self._show(run)
+        self.assertEqual(out["next_steps"], {})
+        self.assertIsNotNone(out["probe_error"])
+        self.assertIn("corrupt", out["probe_error"])
+        self.assertEqual(   # full state still emitted, unmodified
+            out["state"]["cursor"]["current_step"], "plan-review")
+
+    def test_malformed_sealed_state_degrades_not_crashes(self):
+        # Regression for the too-narrow guard: a seal-valid state whose `mode`
+        # is absent from the manifest (hand-repair + reseal, or a mode renamed
+        # out from under a parked run) makes cursor_candidates raise a BARE
+        # KeyError deep in the walk — not a TransitionError. The broadened
+        # guard must catch it: pre-change `show` emitted such a state fine
+        # (rc 0), and degrading here preserves that instead of dumping a raw
+        # traceback on the exact wedged run `show` exists to diagnose.
+        run, st = _bootstrap(self.workspace, "full")
+        st["mode"] = "ghost-mode"               # undeclared -> KeyError in walk
+        state_mod.save(run, self.workspace, st)  # reseals via the state module
+        out = self._show(run)
+        self.assertEqual(out["next_steps"], {})
+        self.assertIsNotNone(out["probe_error"])
+        self.assertIn("ghost-mode", out["probe_error"])
+        self.assertEqual(out["state"]["mode"], "ghost-mode")   # emitted as-is
+
+    def test_security_pre_scan_empty_is_honest_via_probe_error(self):
+        # A LIVE, healthy step can also produce an empty next_steps: at
+        # `security`, approve-security's `when` predicate reads
+        # `security.max_severity` — an artifact `security` itself produces —
+        # before the scan records it, so eval_predicate raises. Without
+        # probe_error this is byte-identical to a wedged run; with it the
+        # orchestrator sees "run this step", not "stuck".
+        run, st = _bootstrap(self.workspace, "full")
+        self.advance_to(st, run, "security")   # scan artifact not yet recorded
+        state_mod.save(run, self.workspace, st)
+        out = self._show(run)
+        self.assertEqual(out["next_steps"], {})
+        self.assertEqual(out["derived"], {})
+        self.assertIsNotNone(out["probe_error"])
+        self.assertIn("security.max_severity", out["probe_error"])
+
+    def test_lean_approved_panel_surfaces_the_self_skip(self):
+        # Lean's exception gate self-skips on an approved panel: `show` must
+        # surface the forward edge that skips PAST approve-plan-lean, so an
+        # orchestrator sees the gate won't fire before it moves the cursor.
+        run, st = _bootstrap(self.workspace, "lean")
+        self.advance_to(st, run, "plan-review")
+        state_mod.save(run, self.workspace, st)
+        support.seed_review_verdict(run, verdict="APPROVED")
+        out = self._show(run)
+        self.assertEqual(out["next_steps"], {"preflight": "sequence"})
+        self.assertEqual(out["derived"], {"plan-review.outcome": "approved"})
+        self.assertIsNone(out["probe_error"])
 
 
 class LeanModeGating(Harness):

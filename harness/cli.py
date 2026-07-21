@@ -984,7 +984,7 @@ def main(argv: list[str] | None = None) -> int:
             # orchestrator polling `show` between the reviewer's captured
             # verdict landing in reviews.ndjson and the move that consumes it
             # saw a stale `pending` — and no hint that (say) `approve-plan`
-            # was already the sole engine-legal exit. Two added top-level
+            # was already the sole engine-legal exit. Three added top-level
             # fields close that blind spot:
             #   next_steps  the {step_id: reason} the engine would allow
             #               RIGHT NOW — literally transitions.cursor_candidates,
@@ -994,51 +994,82 @@ def main(argv: list[str] | None = None) -> int:
             #               persisted cache (concretely the refreshed
             #               verdict_bound outcome, e.g.
             #               {"plan-review.outcome": "approved"}); always
-            #               present as {} when nothing differs, so the
-            #               contract shape is stable for consumers.
-            # Strictly read-only is load-bearing here: cursor_candidates
-            # MUTATES the state dict it is handed (it re-stamps the outcome
-            # artifact via set_artifact), so it runs on a DEEP COPY. The
-            # emitted `state` therefore stays byte-for-byte the persisted
-            # snapshot — auditability demands that an inspector diffing show's
-            # `state` against disk sees zero drift — while `derived` reports
-            # what the fresh walk changed WITHOUT rewriting it back into
-            # `state`.
+            #               present as {} when nothing differs.
+            #   probe_error null when the candidates walk completed; otherwise
+            #               the engine's OWN reason there is no legal move yet.
+            #               This is what makes an empty `next_steps` HONEST:
+            #               several distinct situations all produce {}, and
+            #               only the walk can tell them apart, so `show`
+            #               reports the reason rather than flattening them into
+            #               one indistinguishable "stuck". Known cases:
+            #                 · a LIVE step whose next-in-sequence carries a
+            #                   `when` predicate on an artifact THIS step still
+            #                   has to produce — at `security`, approve-security's
+            #                   predicate reads `security.max_severity` before
+            #                   the scan records it, so eval_predicate raises
+            #                   "predicate needs artifact … never recorded".
+            #                   Empty here means "run this step", NOT "wedged" —
+            #                   and the message says so.
+            #                 · a corrupt reviews.ndjson at a verdict_bound step
+            #                   (the ledger fail-closes; the loud enforcement
+            #                   refusal stays on `cursor --to`).
+            #                 · a seal-valid but MALFORMED state — e.g. a `mode`
+            #                   absent from the manifest after a hand-repair +
+            #                   `reseal`, or a mode renamed out from under a
+            #                   parked run — which raises a bare KeyError deep in
+            #                   the walk. Pre-change `show` emitted such a state
+            #                   fine (rc 0); degrading here preserves that.
+            # Strictly read-only is load-bearing: cursor_candidates MUTATES the
+            # state dict it is handed (it re-stamps the outcome via
+            # set_artifact), so the walk runs on a DEEP COPY. The emitted
+            # `state` therefore stays byte-for-byte the persisted snapshot —
+            # auditability demands an inspector diffing show's `state` against
+            # disk sees zero drift — while `derived`/`next_steps` report what
+            # the fresh walk found WITHOUT rewriting anything into `state`.
             next_steps: dict = {}
             derived: dict = {}
+            probe_error: str | None = None
             if not (st.get("aborted") or st.get("completed")):
                 # A terminal run (abort/complete — the exact markers
                 # ensure_live refuses every mutation on) has no legal cursor
                 # move, so skip the walk entirely: `next_steps` stays an
                 # honest {} rather than a phantom exit off a run that can
                 # never advance, and show keeps working on terminal runs
-                # exactly as it did before this field existed.
+                # exactly as it did before these fields existed.
                 probe = copy.deepcopy(st)
                 try:
                     next_steps = transitions.cursor_candidates(
                         probe, manifest, config, run=args.run)
-                except transitions.TransitionError:
-                    # The one new failure surface show gains by consulting
-                    # the ledger: a corrupt reviews.ndjson at a verdict_bound
-                    # step fails the derivation closed (the engine's own
-                    # stance). show is the diagnostic reached for WHEN a run
-                    # is wedged, so it must never itself crash on the corrupt
-                    # state it exists to surface — degrade to no derived
-                    # moves, still emit the raw persisted state. The loud
-                    # refusal stays where it belongs, on `cursor --to`, which
-                    # is already ledger-corruption-tested.
+                except Exception as exc:
+                    # The probe is PURE enrichment on a read-only diagnostic,
+                    # so ANY probe failure degrades to an empty next_steps
+                    # while the persisted `state` is still emitted (rc 0) —
+                    # `show` is the tool reached for WHEN a run is wedged and
+                    # must never be the thing that crashes on it. The catch is
+                    # broad ON PURPOSE: a TransitionError (missing predicate
+                    # artifact at a live step, corrupt ledger) AND a bare
+                    # KeyError from a malformed sealed state both belong here,
+                    # and the pre-change `show` emitted the state fine on the
+                    # latter — this preserves that. probe_error carries the
+                    # walk's own diagnosis so the empty set is never silently
+                    # conflated with a genuinely move-less run.
                     next_steps = {}
-                else:
-                    before = st.get("artifacts") or {}
-                    after = probe.get("artifacts") or {}
-                    # The deep-copy walk only ever refreshes the current
-                    # verdict_bound step's outcome artifact, but diff the
-                    # whole artifact map so the `derived` contract stays
-                    # honest if a future engine change refreshes more.
-                    derived = {k: v for k, v in after.items()
-                               if before.get(k) != v}
-            _emit({"ok": True, "state": st,
-                   "next_steps": next_steps, "derived": derived})
+                    probe_error = f"{type(exc).__name__}: {exc}"
+                # `derived` is computed UNCONDITIONALLY — even when the walk
+                # raised. The verdict_bound outcome refresh is the ONLY
+                # set_artifact the walk performs and it runs BEFORE the
+                # sequence walk, so a later raise must not drop a legitimately
+                # refreshed outcome; the deep copy is valid up to the raise
+                # point, so its artifact diff is trustworthy either way. The
+                # walk only ever refreshes the current verdict_bound step's
+                # outcome, but diff the whole map so the contract stays honest
+                # if a future engine change refreshes more.
+                before = st.get("artifacts") or {}
+                after = probe.get("artifacts") or {}
+                derived = {k: v for k, v in after.items()
+                           if before.get(k) != v}
+            _emit({"ok": True, "state": st, "next_steps": next_steps,
+                   "derived": derived, "probe_error": probe_error})
             return 0
 
         # Expensive verify-green test run happens OUTSIDE the lock (RC4);
