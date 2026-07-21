@@ -43,6 +43,19 @@ Loop until the mode's sequence is exhausted, then close the run:
 successful sibling of abort — the final step's file says exactly when).
 
 1. `${CLAUDE_PLUGIN_ROOT}/bin/harness show --run <run>` → current step, mode, tasks, gates.
+   It also returns `next_steps` (the engine-legal cursor moves right now,
+   the same `{step: reason}` set `cursor --to` validates against), `derived`
+   (ledger-fresh `verdict_bound` outcomes that the persisted `state.artifacts`
+   cache hasn't caught up to yet — e.g. a plan-review already APPROVED in the
+   ledger shows `{"plan-review.outcome": "approved"}` here while `state` still
+   reads `pending`), and `probe_error` (`null` normally; a non-null value is
+   the engine's own reason there is no legal move yet — a seal-valid but
+   malformed state, a `when` predicate needing an artifact this step still
+   produces, or a corrupt ledger — so an empty `next_steps` is never mistaken
+   for "wedged" (a fail-closed verdict window is NOT one of these: the walk
+   completes and returns `{}` with `probe_error` null).
+   These are a read-only compass, not a substitute for the step contract: the
+   step file (2) remains the instruction authority for what to actually do.
 2. Read the step's file: `${CLAUDE_PLUGIN_ROOT}/skills/dev-workflow/steps/<step>.md`
    — load ONE step file at a time (context economy). Gate steps all use
    `steps/gate.md`.

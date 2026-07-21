@@ -6,6 +6,28 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
+## [3.2.0] — 2026-07-21
+
+> **`harness show` becomes an honest compass.** Field motive: an orchestrator polling `show` after a plan-review verdict had landed in `reviews.ndjson` saw a stale `pending` outcome and no hint that the forward exit was already the sole legal move — a gap confusing enough that one session escalated it into a plausible-sounding false bug report. This release surfaces the engine-legal next moves and ledger-fresh verdict outcomes directly in `show`, strictly read-only, with the new surface adversarially reviewed and hardened before landing.
+
+### Release highlights
+
+| Theme | What changed |
+|---|---|
+| **`show` surfaces the engine-legal next moves and ledger-fresh outcomes** | `show` output gains `next_steps` — the `{step_id: reason}` set the cursor engine would allow right now, the *same* `cursor_candidates` computation `cursor --to` validates against, never a re-derivation of legality — and `derived`, the ledger-fresh artifact values that differ from the persisted cache (concretely a refreshed `verdict_bound` outcome such as `{"plan-review.outcome": "approved"}`). Motive: at a `verdict_bound` step the persisted `<step>.outcome` artifact is stamped `pending` on entry and only re-derived on the next `cursor --to`, so between the reviewer's captured verdict and the move that consumes it, `show` reported a stale `pending`. The step files remain the instruction authority — the new fields are a read-only compass, not a substitute for the step contract. |
+| **`probe_error` keeps an empty `next_steps` honest** | A third field distinguishes the two ways `next_steps` can be `{}`: `null` means the walk completed and there is legitimately no legal move yet (e.g. a fail-closed verdict window awaiting its reviewer); a non-null value is the engine's own reason the walk could not run — a live step whose follower's `when` predicate reads an artifact the step still has to produce (`security.max_severity` before the scan records it), a corrupt `reviews.ndjson`, or a seal-valid but malformed state (a `mode` absent from the manifest). The diagnosis is type-prefixed (`TypeName: message`) and path-sanitized — any run/workspace path is replaced by a `<run>`/`<workspace>` placeholder, so pasting `show` output into a PR or report leaks no local filesystem layout. |
+| **`show` cannot crash on the wedged run it exists to diagnose** | Any probe failure degrades to empty `next_steps` with the reason in `probe_error`, while the raw persisted `state` is still emitted — the adversarial pass on this release reproduced the alternative (a raw `KeyError` traceback on a seal-valid state whose `mode` the manifest no longer declares, exactly the hand-repaired/mid-upgrade state `show` gets pointed at). The derivation runs on a deep copy: zero disk writes, and the emitted `state` stays byte-for-byte the persisted snapshot (an inspector diffing it against disk sees zero drift). Terminal (aborted/completed) runs report empty fields without walking at all. `verify`'s output is unchanged. |
+
+### Upgrade notes
+
+- **Purely additive.** `show`'s three new top-level fields (`next_steps`, `derived`, `probe_error`) sit beside the unchanged `state`; nothing that parses today's output needs a change, and `verify`'s output is untouched. No config, manifest, or provider changes in this release.
+
+### Verification on tag tip
+
+- `python -m harness.schema` — declared data valid
+- `python tools/budget_check.py` — 0 errors (7 pre-existing soft-cap warnings)
+- `python -m unittest discover -s tests` — 735 tests green (skipped=13)
+
 ## [3.1.1] — 2026-07-21
 
 > **v3.1.0 shipped the plan-review panel; this release closes the gaps it exposed running in the field.** A captured verdict was thrown away over a formatting slip, coverage backfill and low-risk test opt-outs could still slip past registration, a stalled agent or a serialized panel could hide behind a green completion, and a cross-repo contract check false-flagged legitimate HTTP route drift. Each is closed at the mechanism, not just in prose.
