@@ -11,6 +11,7 @@ as tampering).
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import subprocess
 import sys
@@ -971,8 +972,73 @@ def main(argv: list[str] | None = None) -> int:
             # `load()` instead of a stray directory.
             with state_mod.locked_read(args.run):
                 st = state_mod.load(args.run, args.workspace)
-            _emit({"ok": True, "state": st} if args.cmd == "show"
-                  else {"ok": True, "seq_verified": True})
+            if args.cmd == "verify":
+                _emit({"ok": True, "seq_verified": True})
+                return 0
+            # `show` enriches the persisted snapshot with ledger-fresh,
+            # ENGINE-derived context an orchestrator otherwise can't see from
+            # state.yaml alone. Field motive: at a `verdict_bound` step the
+            # persisted `<step>.outcome` artifact is stamped `pending` on
+            # step ENTRY (advance_cursor) and only re-derived from the
+            # reviewer-verdict ledger by the NEXT `cursor --to`. So an
+            # orchestrator polling `show` between the reviewer's captured
+            # verdict landing in reviews.ndjson and the move that consumes it
+            # saw a stale `pending` — and no hint that (say) `approve-plan`
+            # was already the sole engine-legal exit. Two added top-level
+            # fields close that blind spot:
+            #   next_steps  the {step_id: reason} the engine would allow
+            #               RIGHT NOW — literally transitions.cursor_candidates,
+            #               the SAME computation `cursor --to` validates
+            #               against, never a re-implementation of legality.
+            #   derived     ledger-fresh artifact values that DIFFER from the
+            #               persisted cache (concretely the refreshed
+            #               verdict_bound outcome, e.g.
+            #               {"plan-review.outcome": "approved"}); always
+            #               present as {} when nothing differs, so the
+            #               contract shape is stable for consumers.
+            # Strictly read-only is load-bearing here: cursor_candidates
+            # MUTATES the state dict it is handed (it re-stamps the outcome
+            # artifact via set_artifact), so it runs on a DEEP COPY. The
+            # emitted `state` therefore stays byte-for-byte the persisted
+            # snapshot — auditability demands that an inspector diffing show's
+            # `state` against disk sees zero drift — while `derived` reports
+            # what the fresh walk changed WITHOUT rewriting it back into
+            # `state`.
+            next_steps: dict = {}
+            derived: dict = {}
+            if not (st.get("aborted") or st.get("completed")):
+                # A terminal run (abort/complete — the exact markers
+                # ensure_live refuses every mutation on) has no legal cursor
+                # move, so skip the walk entirely: `next_steps` stays an
+                # honest {} rather than a phantom exit off a run that can
+                # never advance, and show keeps working on terminal runs
+                # exactly as it did before this field existed.
+                probe = copy.deepcopy(st)
+                try:
+                    next_steps = transitions.cursor_candidates(
+                        probe, manifest, config, run=args.run)
+                except transitions.TransitionError:
+                    # The one new failure surface show gains by consulting
+                    # the ledger: a corrupt reviews.ndjson at a verdict_bound
+                    # step fails the derivation closed (the engine's own
+                    # stance). show is the diagnostic reached for WHEN a run
+                    # is wedged, so it must never itself crash on the corrupt
+                    # state it exists to surface — degrade to no derived
+                    # moves, still emit the raw persisted state. The loud
+                    # refusal stays where it belongs, on `cursor --to`, which
+                    # is already ledger-corruption-tested.
+                    next_steps = {}
+                else:
+                    before = st.get("artifacts") or {}
+                    after = probe.get("artifacts") or {}
+                    # The deep-copy walk only ever refreshes the current
+                    # verdict_bound step's outcome artifact, but diff the
+                    # whole artifact map so the `derived` contract stays
+                    # honest if a future engine change refreshes more.
+                    derived = {k: v for k, v in after.items()
+                               if before.get(k) != v}
+            _emit({"ok": True, "state": st,
+                   "next_steps": next_steps, "derived": derived})
             return 0
 
         # Expensive verify-green test run happens OUTSIDE the lock (RC4);

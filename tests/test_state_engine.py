@@ -3,7 +3,9 @@ round-bound escalation, red-proof guard, stall procedure, escalation edge."""
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -549,6 +551,95 @@ class VerdictBoundExits(Harness):
                                    "approve-plan", T0, run=self.run)
         self.assertEqual(transitions.cursor_candidates(
             self.st, self.manifest, self.config, run=self.run), {})
+
+
+class ShowNextSteps(Harness):
+    """`harness show` surfaces the ENGINE-legal next cursor moves and any
+    ledger-fresh verdict_bound outcome WITHOUT ever writing state. Field
+    motive: at a verdict_bound step (plan-review) the persisted
+    `<step>.outcome` artifact is stamped `pending` on step ENTRY and only
+    re-derived from the reviewer-verdict ledger by the next `cursor --to`, so
+    an orchestrator polling `show` between the reviewer's captured verdict and
+    the move it legalizes saw a stale `pending` and no hint that the forward
+    exit was already the sole engine-legal one. These tests drive the REAL
+    CLI over a subprocess so the emitted JSON contract itself is pinned."""
+
+    def _plan_review_run(self):
+        """A full-mode run PERSISTED on disk with the cursor parked at
+        plan-review and a clean verdict window (advance_to stops the moment
+        current == target, before plan-review's own verdict is seeded)."""
+        run, st = _bootstrap(self.workspace, "full")
+        self.advance_to(st, run, "plan-review")
+        state_mod.save(run, self.workspace, st)   # persist cursor at plan-review
+        return run, st
+
+    def _show(self, run) -> dict:
+        proc = subprocess.run(
+            [str(support.HARNESS_BIN), "--workspace", str(self.workspace),
+             "--run", str(run), "show"],
+            capture_output=True, text=True, encoding="utf-8", timeout=30,
+            env={**os.environ, "NO_COLOR": "1"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_approved_verdict_surfaces_forward_exit_and_fresh_outcome(self):
+        # The whole point: an APPROVED verdict is captured but no advance has
+        # consumed it yet, so state.yaml still caches `pending`.
+        run, _ = self._plan_review_run()
+        support.seed_review_verdict(run, verdict="APPROVED")
+        out = self._show(run)
+        # next_steps is the same {step_id: reason} dict `cursor --to`
+        # validates against — the forward exit is already legal
+        self.assertEqual(out["next_steps"].get("approve-plan"), "sequence")
+        # derived carries the ledger-FRESH outcome the persisted cache hasn't
+        # caught up to...
+        self.assertEqual(out["derived"], {"plan-review.outcome": "approved"})
+        # ...while the emitted `state` stays the UNMODIFIED persisted snapshot
+        # (auditability: show's `state` must match disk, never a silent
+        # rewrite of the ledger-fresh value back into artifacts)
+        self.assertEqual(
+            out["state"]["artifacts"]["plan-review.outcome"], "pending")
+
+    def test_show_is_read_only_state_file_byte_identical(self):
+        # cursor_candidates MUTATES the dict it's handed (it re-stamps the
+        # outcome via set_artifact); the deep-copy guard must keep that off
+        # disk. A stray re-seal would flip both files below.
+        run, _ = self._plan_review_run()
+        support.seed_review_verdict(run, verdict="APPROVED")
+        state_file = state_mod.state_path(run)
+        hmac_file = state_file.with_name(state_file.name + ".hmac")
+        before, hmac_before = state_file.read_bytes(), hmac_file.read_bytes()
+        self._show(run)
+        self.assertEqual(state_file.read_bytes(), before, "show rewrote state.yaml")
+        self.assertEqual(hmac_file.read_bytes(), hmac_before, "show re-sealed state")
+        # and the integrity chain still verifies (load raises on a broken
+        # seal) — the persisted outcome is still the pre-show `pending`
+        reloaded = state_mod.load(run, self.workspace)
+        self.assertEqual(reloaded["artifacts"]["plan-review.outcome"], "pending")
+
+    def test_no_verdict_yields_empty_next_steps(self):
+        # fail-closed exactly like the engine: no in-window verdict -> no
+        # legal exit, and nothing to refresh off the `pending` cache
+        run, _ = self._plan_review_run()   # clean window, no verdict seeded
+        out = self._show(run)
+        self.assertEqual(out["next_steps"], {})
+        self.assertEqual(out["derived"], {})
+        # state is still emitted in full — show never regresses to a refusal
+        self.assertEqual(
+            out["state"]["cursor"]["current_step"], "plan-review")
+
+    def test_terminal_run_shows_no_next_steps(self):
+        # A terminal run (here aborted — the same marker ensure_live refuses
+        # every mutation on) has no legal cursor move: show reports empty
+        # next_steps/derived and still emits state, working exactly as it did
+        # before these fields existed.
+        run, st = _bootstrap(self.workspace, "full")
+        st["aborted"] = {"at": T0, "reason": "drill"}
+        state_mod.save(run, self.workspace, st)
+        out = self._show(run)
+        self.assertEqual(out["next_steps"], {})
+        self.assertEqual(out["derived"], {})
+        self.assertTrue(out["state"]["aborted"])
 
 
 class LeanModeGating(Harness):
