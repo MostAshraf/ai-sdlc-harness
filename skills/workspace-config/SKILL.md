@@ -36,8 +36,15 @@ time `/dev-workflow` runs.
   `severity_order`, …). Most single-setting changes land here.
 - `provider` — work-item/git provider + specifics (`stories_dir`,
   `github_repo`, `ado_org`, `ado_project`, …).
-- `language` — per-repo `test_cmd`, under `language.repos.<name>` (not the
-  whole-workspace `test_paths`/`test_closure`).
+- `language` — per-repo `test_cmd` / `coverage_cmd` / `quarantine`, under
+  `language.repos.<name>` (not the whole-workspace `test_paths`/
+  `test_closure`). Quarantine drops a **known-failing spec unrelated to any
+  run** from every test + coverage command (`reason` + `since` required,
+  `init-verify` gates the shape, each run flags the exclusions): `{"language":
+  {"repos": {"fe": {"test_cmd": "npx vitest run", "quarantine":
+  {"exclude_template": "--exclude {test}", "tests": [{"test": "t/a.spec.ts",
+  "reason": "fails on main", "since": "2026-07-22"}]}}}}}` — `language` is a
+  full REPLACE (§2): re-send every repo's existing keys.
 - `repos` — repointing or renaming an *existing* entry's path.
 
 ## 2 · Read the current section before writing it

@@ -118,7 +118,14 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
     pf = sub.add_parser("preflight", parents=[common], help="create the feature branch (owned)")
     pf.add_argument("--repo", type=Path, required=True)
     pf.add_argument("--branch", default=None,
-                    help="override the auto-resolved default branch")
+                    help="override the auto-resolved default branch — this is "
+                         "the BASE the feature branch is cut FROM, not the "
+                         "feature branch's own name")
+    pf.add_argument("--feature-branch-suffix", default=None,
+                    help="suffix the FEATURE branch's rendered name (branch "
+                         "aside) — the declared remedy when a prior run of "
+                         "this work item already claimed the deterministic "
+                         "name on the remote (field: dual-run comparison)")
 
     pv = sub.add_parser("provider", parents=[common], help="dispatch a provider operation")
     pv.add_argument("--op", required=True)
@@ -153,6 +160,15 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
                    help="resolve the plan-review lens panel for a run's "
                         "change_type (plan_review.lenses overlaid by "
                         "lenses_by_change_type)")
+
+    rtc = sub.add_parser("resolve-test-cmd", parents=[common],
+                         help="resolve the per-repo test command "
+                              "(language.repos.<name>.test_cmd) with any "
+                              "declared quarantine exclusions applied — the "
+                              "owned way to build a `harness-test-cmd` "
+                              "header, so an agent-run suite excludes the "
+                              "same specs the harness-run one does")
+    rtc.add_argument("--repo", type=Path, required=True)
 
     rcc = sub.add_parser("resolve-coverage-cmd", parents=[common],
                          help="resolve the per-repo coverage command "
@@ -348,6 +364,11 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
                    help="task id for a per-task spawn; omit for a task-less "
                         "spawn (plan-review, pre-pr, …) — the stall is then "
                         "counted per current step, same declared bounds")
+    s.add_argument("--confirm-no-verdict", action="store_true",
+                   help="record the stall even though this step's verdict "
+                        "ledger holds a verdict for the current round — the "
+                        "escape hatch for a spawn that genuinely stalled "
+                        "AFTER the capture (field: dual-run comparison)")
 
     e = sub.add_parser("log-event", parents=[common], help="append to the audit ledger")
     e.add_argument("--json", required=True)
@@ -396,7 +417,7 @@ def main(argv: list[str] | None = None) -> int:
               "ensure-default-branch", "init-verify", "init-section",
               "init-finalize", "add-repo", "migrate-detect", "migrate-extract",
               "status", "repo-map-check", "repo-map-stamp", "validate-mermaid",
-              "resolve-model", "resolve-coverage-cmd")
+              "resolve-model", "resolve-coverage-cmd", "resolve-test-cmd")
     if args.cmd not in NO_RUN and args.run is None:
         p.error(f"--run is required for '{args.cmd}'")
 
@@ -475,9 +496,33 @@ def main(argv: list[str] | None = None) -> int:
                    "lenses": lenses})
             return 0
 
+        if args.cmd == "resolve-test-cmd":
+            # The owned resolution the `harness-test-cmd` header is built
+            # from. Its absence was the hole in the quarantine mechanism
+            # (adversarial-review): the harness applied exclusions to the
+            # suites IT ran (verify-red/green), while develop/review/pre-pr/
+            # harden handed agents a raw config value to run themselves — so
+            # the reviewer re-running the suite still hit the pre-existing
+            # failure and issued CHANGES_REQUESTED, which is the field loop
+            # the quarantine exists to end.
+            from . import initws
+            cmd = initws.resolve_test_cmd(config, args.repo)
+            if cmd:
+                cmd = initws.quarantine_cmd(config, args.repo, cmd, args.run)
+            _emit({"ok": True, "test_cmd": cmd})
+            return 0
+
         if args.cmd == "resolve-coverage-cmd":
             from . import initws
             cmd = initws.resolve_coverage_cmd(config, args.repo)
+            if cmd:
+                # Coverage is the OTHER path the quarantined spec kept
+                # aborting (field: dual-run comparison — three times
+                # in one run), so it gets the same exclusions the test
+                # command does. `--run` is optional on this verb, so the
+                # flagged event is only appended when a run is in scope.
+                cmd = initws.quarantine_cmd(config, args.repo, cmd, args.run,
+                                            coverage=True)
             _emit({"ok": True, "coverage_cmd": cmd})
             return 0
 
@@ -634,7 +679,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.cmd == "preflight":
             result = workflow.preflight(args.workspace, args.run, config,
-                                        manifest, args.repo, args.branch)
+                                        manifest, args.repo, args.branch,
+                                        args.feature_branch_suffix)
             _emit({"ok": True, **result})
             return 0
 
@@ -1121,7 +1167,9 @@ def main(argv: list[str] | None = None) -> int:
                         proof = json.loads(chain.verify(
                             proof_path, key,
                             label=transitions.redproof_label(args.id)))
-                    gitops.verify_green(proof, Path(repo), test_cmd, run_tests=True)
+                    gitops.verify_green(proof, Path(repo), test_cmd,
+                                        run_tests=True, config=config,
+                                        task_repo=task["repo"], run=args.run)
                 verify_ctx = {"repo": Path(repo), "run_tests": False}
 
         with state_mod.locked(args.run):
@@ -1277,6 +1325,13 @@ def main(argv: list[str] | None = None) -> int:
                 transitions.set_artifact(st, manifest, args.name, args.value)
             elif args.cmd == "stall":
                 stall_key = args.task or f"step:{st['cursor']['current_step']}"
+                if not args.confirm_no_verdict:
+                    # Checked BEFORE record_stall so a refusal leaves the
+                    # counters untouched (field: dual-run comparison —
+                    # a stall recorded for an already-captured verdict cost a
+                    # full lens panel + one of five review rounds).
+                    transitions.guard_stall_verdict(st, manifest, args.run,
+                                                    stall_key)
                 action = transitions.record_stall(st, config, stall_key)
                 ndjson.append_record(args.run / "events.ndjson",
                                      {"kind": "stall", "task": stall_key,

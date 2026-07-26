@@ -369,6 +369,48 @@ def _branch_exists(repo: Path, branch: str) -> bool:
     return proc.returncode == 0
 
 
+def remote_branch_exists(repo: Path, branch: str) -> bool | None:
+    """Does `branch` already exist on the repo's remote? Tri-state:
+    True/False when the probe answered, **None when it could not be made** —
+    no remote configured, an ambiguous remote set, an offline/auth/timeout
+    failure. Callers must degrade on None (warn + flag), never read it as
+    "absent": a connectivity blip must not be able to green-light the exact
+    collision this exists to catch.
+
+    field: dual-run comparison — `_branch_exists` checks
+    `refs/heads/` LOCALLY only, so a fresh clone re-running a story sailed
+    through preflight and discovered the prior run's branch hours later, at
+    push, as a non-fast-forward — by then with five tasks of work committed
+    on it and an open MR already occupying the name in two repos. The branch
+    template is deterministic per work item, so a same-item rerun collides
+    by construction; the probe has to reach the remote to see it.
+
+    The pattern is the FULL `refs/heads/<branch>`, matching `_branch_exists`'s
+    exactness: `ls-remote` matches patterns against the ref TAIL, so a bare
+    `main` would also report a hit on `refs/heads/topic/main`. The returned
+    ref is re-compared exactly for the same reason."""
+    try:
+        remote = _push_remote(repo)
+    except (GitError, OSError):
+        # OSError covers a missing `git` binary (FileNotFoundError), so the
+        # tri-state contract holds for every unanswerable case the docstring
+        # enumerates rather than leaking a raw exception (adversarial-review)
+        return None  # no remote, or ambiguous — nothing to probe against
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "ls-remote", "--heads", remote,
+             f"refs/heads/{branch}"],
+            capture_output=True, text=True, timeout=30,
+            encoding="utf-8", errors="replace")
+    except (subprocess.SubprocessError, OSError):
+        # includes TimeoutExpired: an unreachable host can block on auth
+        return None
+    if proc.returncode != 0:
+        return None
+    return any(line.split("\t")[-1].strip() == f"refs/heads/{branch}"
+               for line in proc.stdout.splitlines() if line.strip())
+
+
 def _in_progress_operation(repo: Path) -> str | None:
     """A mid-rebase/merge/cherry-pick repo can look clean to changed_files()
     (conflicts already resolved-and-staged, operation just not concluded)
@@ -519,6 +561,47 @@ def _test_set(repo: Path, config: dict, declared: list[str] | None) -> tuple[dic
     return shas, closure_shas
 
 
+def _quarantined(config: dict, task_repo, cmd: str,
+                 run: Path | None) -> str:
+    """Apply the repo's declared test quarantine to a command about to run.
+
+    Resolved against the task's REGISTERED repo path, never the worktree
+    `repo` argument: during develop each task runs in a linked worktree
+    whose path can never match a `repos.yaml` name (the same reason
+    resolve_test_cmd takes `task["repo"]`). A caller that passes neither
+    config nor a registered path simply gets no exclusions — which surfaces
+    as the quarantined test failing again, loudly, never as a silently
+    wrong pass."""
+    from . import initws
+    if not config or task_repo is None:
+        return cmd
+    return initws.quarantine_cmd(config, task_repo, cmd, run)
+
+
+def _refuse_quarantine_overlap(config: dict, task_repo, locked: dict) -> None:
+    """Refuse when a quarantine entry covers one of the red-proof's OWN
+    locked test files.
+
+    adversarial-review: without this, an overlap degrades in two wrong ways
+    — verify-red reports "test suite PASSES — not red" (true, but it points
+    the developer at a vacuous test rather than at the exclusion), and
+    verify-green passes while the task's own test is never EXECUTED at all:
+    the blob-SHA check confirms the file is unchanged, and the assertion
+    simply never runs. That is the one silently-wrong-pass this mechanism
+    must not be able to produce."""
+    from . import initws
+    if not config or task_repo is None:
+        return
+    overlap = sorted(initws.quarantined_paths(config, task_repo)
+                     & {initws.normalize_test_path(p) for p in locked})
+    if overlap:
+        raise RedProofError(
+            f"quarantined test file(s) {', '.join(overlap)} are also part of "
+            "this task's locked test set — the task's own test would be "
+            "excluded from the run and never execute. Narrow the quarantine "
+            "entry, or move this task's test to another file; never both.")
+
+
 def _declared_test_intents(workspace: Path, run: Path, task_id: str) -> list[str]:
     """The plan's declared test-intent names for this task (empty in quick
     mode, or any mode with no plan step — consistent with its relaxations).
@@ -532,6 +615,16 @@ def _declared_test_intents(workspace: Path, run: Path, task_id: str) -> list[str
     if task is None:
         raise RedProofError(f"task {task_id}: not found in state.yaml — check --task")
     return task.get("test_intents", [])
+
+
+def _task_repo(workspace: Path, run: Path, task_id: str):
+    """The task's REGISTERED repo path (what `repos.yaml` names), for config
+    lookups that must not see a worktree path. Absent task -> None; the
+    caller's own lookup raises the loud error."""
+    with state_mod.locked_read(run):   # torn-read guard, same as its sibling
+        st = state_mod.load(run, workspace)
+    task = next((t for t in st.get("tasks", []) if t["id"] == task_id), None)
+    return task.get("repo") if task else None
 
 
 def _missing_intents(repo: Path, tests: dict, closure: dict,
@@ -585,12 +678,19 @@ def verify_red(run: Path, workspace: Path, repo: Path, config: dict, task_id: st
             "requires --revise --reason (flagged, reviewer-visible; never silent)")
     if revise and not reason:
         raise RedProofError("--revise requires --reason")
-    code, tail = _run_tests(repo, test_cmd)
+    # Quarantine applies to the RED run too, and strengthens it: a suite that
+    # is red only because an unrelated pre-existing failure is still in it is
+    # not proof that THIS task's test fails. Excluding those first makes the
+    # red-proof about the task's own declared intents (field: dual-run
+    # comparison — that exact spec aborted three runs of the frontend suite).
+    task_repo = _task_repo(workspace, run, task_id)
+    code, tail = _run_tests(repo, _quarantined(config, task_repo, test_cmd, run))
     if code == 0:
         raise RedProofError(
             f"task {task_id}: test suite PASSES — not red. Test-first means the "
             "failing test exists before the implementation.")
     tests, closure = _test_set(repo, config, declared)
+    _refuse_quarantine_overlap(config, task_repo, tests)
     declared_intents = intents if intents is not None else _declared_test_intents(
         workspace, run, task_id)
     missing_intents = _missing_intents(repo, tests, closure, declared_intents)
@@ -616,11 +716,16 @@ def verify_red(run: Path, workspace: Path, repo: Path, config: dict, task_id: st
 
 
 def verify_green(proof: dict, repo: Path, test_cmd: str | None,
-                 run_tests: bool = True) -> None:
+                 run_tests: bool = True, config: dict | None = None,
+                 task_repo=None, run: Path | None = None) -> None:
     """The completion checkpoint: test passes AND the locked set is unchanged
     (blob-SHA comparison catches ANY mutation path — Write/Edit/sed/checkout).
     `run_tests=False` re-checks only the SHAs — used inside the state lock
-    after the expensive test run already happened outside it (RC4)."""
+    after the expensive test run already happened outside it (RC4).
+
+    `config`/`task_repo`/`run` carry the declared test quarantine down to the
+    actual run (see `_quarantined`); the SHA-only path never runs a command,
+    so it needs none of them."""
     for path, sha in {**proof["tests"], **proof["closure"]}.items():
         current = blob_sha(repo, path) if (repo / path).exists() else "<deleted>"
         if current != sha:
@@ -629,6 +734,8 @@ def verify_green(proof: dict, repo: Path, test_cmd: str | None,
                 f"(sha {sha[:8]} -> {current[:8]}) — use the flagged revision "
                 "path (verify-red --revise --reason), never a silent edit")
     if run_tests:
-        code, tail = _run_tests(repo, test_cmd)
+        _refuse_quarantine_overlap(config, task_repo, proof["tests"])
+        code, tail = _run_tests(repo, _quarantined(config, task_repo,
+                                                   test_cmd, run))
         if code != 0:
             raise RedProofError(f"tests still failing (exit {code}) — not green:\n{tail}")

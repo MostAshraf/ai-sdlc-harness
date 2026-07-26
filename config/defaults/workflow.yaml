@@ -89,3 +89,31 @@ language:
                   "**/package.json", "**/*.csproj", "pyproject.toml",
                   "setup.py", "setup.cfg", "requirements*.txt", "go.mod",
                   "go.sum", "Cargo.toml", "Gemfile", "composer.json"]
+# Per-repo entries live under `language.repos.<name>` (test_cmd, coverage_cmd,
+# quarantine) and are written at /init-workspace or /workspace-config, never
+# shipped as defaults — there is no sensible default test command. The
+# `quarantine` shape, for a KNOWN-FAILING spec unrelated to any run (field:
+# dual-run comparison — one pre-existing failure was rediscovered and
+# hand-routed-around four times across two runs of the same story, because
+# the per-call `--test-cmd` override could express the workaround but nothing
+# carried it between runs). init-verify refuses a malformed block:
+#
+#   language:
+#     repos:
+#       frontend:
+#         test_cmd: "npx vitest run"
+#         quarantine:
+#           # rendered once per entry and APPENDED, so the command must be a
+#           # single one (no &&/|) and the flag must reach the RUNNER — an
+#           # `npm test` wrapper needs "-- --exclude {test}" to pass it on
+#           exclude_template: "--exclude {test}"
+#           # optional, and only when coverage is a DIFFERENT tool from the
+#           # test runner (mvn test vs mvn jacoco:report, vitest vs nyc);
+#           # defaults to exclude_template
+#           coverage_exclude_template: "--exclude {test}"
+#           tests:
+#             # reason + since are REQUIRED: quarantine is never casual or
+#             # undated, and every run flags the exclusions it applied
+#             - test: "tests/harden-fe010.spec.ts"
+#               reason: "pre-existing appVersion mismatch, fails on main"
+#               since: "2026-07-22"

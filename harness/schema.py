@@ -155,10 +155,11 @@ def validate_manifest(manifest: dict, surfaces: dict, config: dict, issues: Issu
                            "reviewer verdicts)")
             if (not isinstance(vb, dict)
                     or not {"mode", "bound"} <= set(vb)
-                    or set(vb) - {"mode", "bound", "outcome_artifact"}):
+                    or set(vb) - {"mode", "bound", "outcome_artifact",
+                                  "round_marker"}):
                 issues.err(f"{where}: `verdict_bound` must be "
                            "{mode, bound: {config: key}} plus optional "
-                           "outcome_artifact")
+                           "outcome_artifact / round_marker")
             else:
                 spawn_modes = {s.get("mode")
                                for s in step.get("spawns", []) or []}
@@ -182,6 +183,13 @@ def validate_manifest(manifest: dict, surfaces: dict, config: dict, issues: Issu
                     # mismatch at validation, not on the first forward edge
                     issues.err(f"{where}: verdict_bound.outcome_artifact "
                                f"'{oa}' must be one of the step's produces")
+                rm = vb.get("round_marker")
+                if rm is not None and not (isinstance(rm, str) and rm.strip()):
+                    # half-enforced-vocabulary bar: a non-string/blank marker
+                    # would silently degrade guard_stall_verdict's anchor to
+                    # "no round marker" instead of failing at validation
+                    issues.err(f"{where}: verdict_bound.round_marker must be "
+                               "a non-empty events.ndjson kind string")
                 # Two data features each claiming exclusive exit ownership
                 # would silently resolve by interpreter ordering — refuse
                 # the combination instead (half-enforced-vocabulary bar).

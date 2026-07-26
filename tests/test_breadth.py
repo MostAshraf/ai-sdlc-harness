@@ -414,6 +414,155 @@ class PreflightDefaultBranch(BreadthHarness):
             gitops.run_git(self.repo, "rev-parse", "--abbrev-ref", "HEAD"), first)
 
 
+class PreflightPriorWork(PreflightDefaultBranch):
+    """field: dual-run comparison — the deterministic branch template
+    makes a same-item RERUN collide by construction, but `_branch_exists`
+    only ever looked at local refs. A fresh clone therefore sailed through
+    preflight and hit the collision hours later, at push, as a
+    non-fast-forward — five tasks of work already committed and a prior
+    run's MR already open on the name in two repos."""
+
+    def _add_bare_origin(self) -> Path:
+        bare = self.workspace / "origin.git"
+        gitops.run_git(self.workspace, "init", "--bare", str(bare))
+        gitops.run_git(self.repo, "remote", "add", "origin", str(bare))
+        gitops.run_git(self.repo, "push", "origin", "main")
+        return bare
+
+    def _expected_branch(self, run, suffix=None) -> str:
+        from harness import workflow
+        from harness.cli import load_declared
+        _m, _f, config = load_declared(self.workspace)
+        return workflow._render_feature_branch(
+            config, state_mod.load(run, self.workspace), suffix)
+
+    def _kinds(self, run) -> list[str]:
+        return [e.get("kind")
+                for e in ndjson.read_records(run / "events.ndjson")]
+
+    def test_remote_branch_collision_refuses_without_side_effects(self):
+        run = self._to_preflight("W-45")
+        bare = self._add_bare_origin()
+        branch = self._expected_branch(run)
+        gitops.run_git(bare, "branch", branch, "main")   # the prior run's branch
+        out = self.cli("preflight", "--repo", str(self.repo), run=run, expect=1)
+        self.assertIn("already exists on the remote", out["error"])
+        self.assertIn("--feature-branch-suffix", out["error"])
+        # nothing was cut locally and the checkout never moved
+        self.assertFalse(gitops._branch_exists(self.repo, branch))
+        self.assertEqual(
+            gitops.run_git(self.repo, "rev-parse", "--abbrev-ref", "HEAD"), "main")
+        st = state_mod.load(run, self.workspace)
+        self.assertNotIn("branches", st.get("artifacts") or {})
+        self.assertIn("remote-branch-exists", self._kinds(run))
+
+    def test_suffix_is_the_declared_branch_aside_remedy(self):
+        run = self._to_preflight("W-46")
+        bare = self._add_bare_origin()
+        gitops.run_git(bare, "branch", self._expected_branch(run), "main")
+        out = self.cli("preflight", "--repo", str(self.repo),
+                       "--feature-branch-suffix", "rerun", run=run)
+        self.assertEqual(out["branch"], self._expected_branch(run, "rerun"))
+        self.assertEqual(
+            gitops.run_git(self.repo, "rev-parse", "--abbrev-ref", "HEAD"),
+            out["branch"])
+
+    def test_clean_remote_proceeds_unchanged(self):
+        run = self._to_preflight("W-47")
+        self._add_bare_origin()
+        branch = self.cli("preflight", "--repo", str(self.repo), run=run)["branch"]
+        self.assertEqual(
+            gitops.run_git(self.repo, "rev-parse", "--abbrev-ref", "HEAD"), branch)
+        # probe answered "absent" — no flag of either kind
+        kinds = self._kinds(run)
+        self.assertNotIn("remote-branch-exists", kinds)
+        self.assertNotIn("remote-branch-unverified", kinds)
+
+    def test_no_remote_configured_skips_the_probe_silently(self):
+        # make_repo has no remote. That is STRUCTURAL — there is no collision
+        # to have — so it must not put a permanent unresolvable flag on every
+        # preflight in every local-only workspace (adversarial-review).
+        run = self._to_preflight("W-48")
+        branch = self.cli("preflight", "--repo", str(self.repo), run=run)["branch"]
+        self.assertEqual(
+            gitops.run_git(self.repo, "rev-parse", "--abbrev-ref", "HEAD"), branch)
+        self.assertNotIn("remote-branch-unverified", self._kinds(run))
+
+    def test_unreachable_remote_flags_the_unanswered_probe(self):
+        # …but a remote that RESOLVED and would not answer is transient and
+        # genuinely worth a human's eye: continue, but record it.
+        run = self._to_preflight("W-52")
+        gitops.run_git(self.repo, "remote", "add", "origin",
+                       str(self.workspace / "no-such-repo.git"))
+        self.cli("preflight", "--repo", str(self.repo), run=run)
+        unverified = next(e for e in ndjson.read_records(run / "events.ndjson")
+                          if e["kind"] == "remote-branch-unverified")
+        self.assertEqual(unverified["reason"], "probe-failed")
+
+    def test_suffix_on_an_already_cut_repo_refuses_instead_of_lying(self):
+        # adversarial-review: the idempotent fast path used to return the
+        # ORIGINAL name with ok:true, leaving the run on the colliding branch
+        # believing the branch-aside remedy had been applied.
+        run = self._to_preflight("W-53")
+        first = self.cli("preflight", "--repo", str(self.repo), run=run)["branch"]
+        out = self.cli("preflight", "--repo", str(self.repo),
+                       "--feature-branch-suffix", "rerun", run=run, expect=1)
+        self.assertIn("already cut branch", out["error"])
+        self.assertIn("--feature-branch-suffix", out["error"])
+        # the recorded branch is untouched, and a suffix-free retry still no-ops
+        self.assertEqual(
+            self.cli("preflight", "--repo", str(self.repo), run=run)["branch"],
+            first)
+
+    def test_idempotent_retry_does_not_reprobe(self):
+        # The recorded-`branches` fast path returns BEFORE the probe: a
+        # crash-and-retry must not start refusing just because the first
+        # attempt's own push landed the branch on the remote.
+        run = self._to_preflight("W-49")
+        bare = self._add_bare_origin()
+        first = self.cli("preflight", "--repo", str(self.repo), run=run)["branch"]
+        gitops.run_git(bare, "branch", first, "main")
+        second = self.cli("preflight", "--repo", str(self.repo), run=run)
+        self.assertEqual(second["branch"], first)
+        self.assertNotIn("remote-branch-exists", self._kinds(run))
+
+
+class FetchAlreadyDone(BreadthHarness):
+    """field: dual-run comparison — a story still marked `Done` by a
+    run three days earlier was re-fetched and rebuilt end-to-end. The intake
+    noticed and flagged it as an ambiguity; nothing mechanical acted on it."""
+
+    def test_done_item_warns_and_flags_but_still_bootstraps(self):
+        self.story("W-50", "already shipped")
+        (self.stories / "W-50.md").write_text(
+            (self.stories / "W-50.md").read_text().replace(
+                "Status: Open", "Status: ✅ Done — 2026-07-22"))
+        self.init()
+        out = self.cli("fetch", "--id", "W-50", "--date", "2026-02-11")
+        run = Path(out["run"])
+        # warn, never block: replays and re-plans are legitimate
+        self.assertTrue(out["ok"])
+        self.assertIn("Done", out["already_done"])
+        self.assertIn("already in state", out["warning"])
+        self.assertTrue(state_mod.state_path(run).exists())
+        # and it reaches the shared flagged-events surface
+        status = next(r for r in self.cli("status")["runs"]
+                      if r["run"] == run.name)
+        self.assertGreaterEqual(status["flagged_events"], 1)
+        self.assertIn("work-item-already-done",
+                      [e.get("kind")
+                       for e in ndjson.read_records(run / "events.ndjson")])
+
+    def test_open_item_is_not_flagged(self):
+        self.story("W-51", "still open")     # Status: Open
+        self.init()
+        out = self.cli("fetch", "--id", "W-51", "--date", "2026-02-11")
+        self.assertNotIn("already_done", out)
+        self.assertNotIn("work-item-already-done",
+                         [e.get("kind") for e in ndjson.read_records(
+                             Path(out["run"]) / "events.ndjson")])
+
+
 class QuickWalk(BreadthHarness):
     def _to_quick_recheck(self, sid, touch_auth: bool):
         self.story(sid, "fix typo in docs page", body="Mode: quick\njust a typo",

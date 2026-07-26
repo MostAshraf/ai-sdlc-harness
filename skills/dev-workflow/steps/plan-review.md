@@ -89,10 +89,15 @@ counter would hit `human_after` on unrelated hiccups):
 - **Synthesizer** stalled (no status block, or an uncaptured verdict —
   its verdict is the one the engine needs): `${CLAUDE_PLUGIN_ROOT}/bin/harness
   stall --run <run>` (no `--task` → counted as `step:plan-review`).
-  EXCEPT: a `status-block-malformed` event in `<run>/events.ndjson` means
-  the verdict WAS captured despite the loose block — proceed on the
-  ledger, never stall (a stall here re-runs the whole panel to re-derive
-  a verdict the engine already holds).
+  Look for the verdict in `<run>/reviews.ndjson` — that is the ONLY ledger
+  verdicts are written to; `<run>/events.ndjson` holds stall/hook/
+  status-block events. EXCEPT: a `status-block-malformed` event in
+  `<run>/events.ndjson` means the verdict WAS captured despite the loose
+  block — proceed on the ledger, never stall (a stall here re-runs the whole
+  panel to re-derive a verdict the engine already holds, and the duplicate
+  capture burns a review round). The verb refuses this itself when a verdict
+  for the current round exists; if the synthesizer genuinely stalled AFTER
+  that capture, re-run with `--confirm-no-verdict`.
 - **A lens** stalled (no status block / no report — an oddly-formatted
   advisory verdict alone is NOT a stall; the engine never reads lens
   verdicts): `${CLAUDE_PLUGIN_ROOT}/bin/harness stall --run <run>

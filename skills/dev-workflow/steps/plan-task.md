@@ -128,10 +128,12 @@ fork identified: <why>` under the task table, visible either way.
   - create tests/test_refresh.py — the task's declared test-intents
   ```
 - **Verify command**: the exact invocation that proves THIS task green —
-  the repo's discovered `test_cmd` scoped down to the task's tests where
-  the framework allows (`sh mvnw -q test -Dtest=RefreshTest`,
-  `npm test -- --testPathPattern refresh`); the bare repo `test_cmd` when
-  it doesn't. Never invent a runner the repo doesn't use.
+  `${CLAUDE_PLUGIN_ROOT}/bin/harness resolve-test-cmd --repo <repo>` scoped
+  down to the task's tests where the framework allows (`sh mvnw -q test
+  -Dtest=RefreshTest`, `npm test -- --testPathPattern refresh`); its bare
+  output when it doesn't. Resolve it through the verb rather than reading
+  `test_cmd` from config, so the repo's quarantined specs stay excluded.
+  Never invent a runner the repo doesn't use.
 - **Size budget**: estimated changed-LOC and the split rule — if the real
   diff runs past ~2× the estimate, the developer stops and flags rather
   than pushing through ("one task = one reviewable unit" is only honest

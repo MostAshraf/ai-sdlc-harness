@@ -101,11 +101,18 @@ successful sibling of abort — the final step's file says exactly when).
   omit `--task` — the stall counts per step, same bounds — except when the
   step file declares finer keys (plan-review counts each panel lens as
   `--task step:plan-review:<lens>`; the step file is the authority). NEVER
-  commit or write on a stalled agent's behalf. Blockless reply? Check the
-  TAIL of `<run>/events.ndjson` before calling `stall`:
+  commit or write on a stalled agent's behalf. **Verdicts live in
+  `<run>/reviews.ndjson`; `<run>/events.ndjson` carries stall/hook/
+  status-block events, never verdicts** — looking for a verdict in the wrong
+  ledger is what makes a captured round read as a stall. Blockless reply?
+  Check the TAIL of `<run>/events.ndjson` before calling `stall`:
   `status-block-malformed` → the verdict was captured despite the loose
   block — proceed on the ledger, never stall; `missing-status-block` →
-  genuine stall, procedure above.
+  genuine stall, procedure above. For a task-less **step** key, `stall`
+  refuses outright when that step's ledger already holds a verdict for the
+  current round (`--confirm-no-verdict` overrides, for a spawn that stalled
+  *after* the capture); per-task and per-lens keys are never refused — the
+  engine reads no verdict for those.
 - **Ad-hoc human requests mid-run:** spawn `reviewer` with
   `harness-mode: request-triage` (always legal), surface the triage verdict
   to the user; out-of-scope items are never silently merged.

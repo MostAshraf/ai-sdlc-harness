@@ -14,7 +14,8 @@ from pathlib import Path
 
 from unittest import mock
 
-from harness import chain, gitops, ndjson, state as state_mod, transitions, workflow
+from harness import (chain, gitops, initws, ndjson, state as state_mod,
+                     transitions, workflow)
 from harness.cli import load_declared
 from harness.providers import ProviderError
 from tests import support
@@ -740,6 +741,337 @@ class ReconcileMcpCarveOut(GitopsHarness):
         self.assertEqual(result, {"reconciled": True})
         st = state_mod.load(self.run, self.workspace)
         self.assertEqual(st["tasks"][0]["status"], "archived")
+
+
+class TestQuarantine(GitopsHarness):
+    """field: dual-run comparison — one pre-existing, unrelated
+    failing spec was rediscovered and routed around FOUR times across two
+    runs of the same story (it blocked a task's completion in one and
+    aborted the frontend coverage run three times in the other). The
+    per-call `--test-cmd` override could express the workaround; nothing
+    carried the knowledge between runs. Loud by construction: required
+    reason+since, a refusal when the runner flag is missing, and a flagged
+    event on every exclusion."""
+
+    def _config(self, quarantine=None, coverage_cmd=None):
+        cfg = dict(self.config)
+        cfg["repos"] = {"repo": str(self.repo)}
+        entry = {"test_cmd": support.NOP_CMD}
+        if coverage_cmd:
+            entry["coverage_cmd"] = coverage_cmd
+        if quarantine is not None:
+            entry["quarantine"] = quarantine
+        cfg["language"] = {**(cfg.get("language") or {}),
+                           "repos": {"repo": entry}}
+        return cfg
+
+    ONE = {"exclude_template": "--exclude {test}",
+           "tests": [{"test": "tests/harden-fe010.spec.ts",
+                      "reason": "pre-existing appVersion mismatch on main",
+                      "since": "2026-07-22"}]}
+
+    def test_renders_exclusions_and_flags_them(self):
+        cfg = self._config(self.ONE)
+        out = initws.quarantine_cmd(cfg, self.repo, "npm test", self.run)
+        self.assertEqual(out, "npm test --exclude tests/harden-fe010.spec.ts")
+        flagged = [e for e in ndjson.read_records(self.run / "events.ndjson")
+                   if e["kind"] == "tests-quarantined"]
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0]["tests"], ["tests/harden-fe010.spec.ts"])
+        self.assertIn("appVersion", flagged[0]["reasons"]
+                      ["tests/harden-fe010.spec.ts"])
+        # and it is on the shared flagged-events surface, not a private list
+        self.assertIn("tests-quarantined", workflow.FLAGGED_EVENT_KINDS)
+
+    def test_multiple_entries_each_render(self):
+        cfg = self._config({
+            "exclude_template": "--deselect {test}",
+            "tests": [{"test": "a_test.py", "reason": "flaky", "since": "2026-07-01"},
+                      {"test": "b_test.py", "reason": "flaky", "since": "2026-07-02"}]})
+        self.assertEqual(initws.quarantine_cmd(cfg, self.repo, "pytest"),
+                         "pytest --deselect a_test.py --deselect b_test.py")
+
+    def test_missing_exclude_template_refuses(self):
+        cfg = self._config({"tests": [{"test": "a", "reason": "r",
+                                       "since": "2026-07-01"}]})
+        with self.assertRaises(initws.QuarantineError) as ctx:
+            initws.quarantine_cmd(cfg, self.repo, "npm test")
+        msg = str(ctx.exception)
+        self.assertIn("exclude_template", msg)
+        self.assertIn("--exclude {test}", msg)     # names the runner flags
+        self.assertIn("Refusing", msg)             # never a silent full suite
+
+    def test_entry_without_reason_or_since_refuses(self):
+        for bad in ({"test": "a", "since": "2026-07-01"},
+                    {"test": "a", "reason": "r"},
+                    {"test": "a", "reason": "  ", "since": "2026-07-01"},
+                    {"reason": "r", "since": "2026-07-01"}):
+            cfg = self._config({"exclude_template": "-x {test}", "tests": [bad]})
+            with self.assertRaises(initws.QuarantineError):
+                initws.quarantine_cmd(cfg, self.repo, "npm test")
+
+    def test_no_quarantine_leaves_the_command_byte_identical(self):
+        for cfg in (self._config(), self._config({}),
+                    self._config({"exclude_template": "-x {test}", "tests": []})):
+            self.assertEqual(
+                initws.quarantine_cmd(cfg, self.repo, "npm test"), "npm test")
+        # an unregistered repo path resolves to no name and is left alone too
+        self.assertEqual(
+            initws.quarantine_cmd(self._config(self.ONE), self.workspace / "nope",
+                                  "npm test"), "npm test")
+        self.assertEqual(ndjson.read_records(self.run / "events.ndjson"), [])
+
+    def test_coverage_command_gets_the_same_exclusions(self):
+        # the coverage run is the OTHER path the quarantined spec kept killing
+        cfg = self._config(self.ONE, coverage_cmd="npm run coverage")
+        self.assertEqual(
+            initws.quarantine_cmd(cfg, self.repo,
+                                  initws.resolve_coverage_cmd(cfg, self.repo)),
+            "npm run coverage --exclude tests/harden-fe010.spec.ts")
+
+    def test_malformed_block_refuses_instead_of_reading_as_empty(self):
+        # adversarial-review, both lenses: these are the shapes a user
+        # actually writes. Collapsing them to "nothing quarantined" left the
+        # user believing a config file fixed a failure it never touched.
+        for bad in ("tests/foo.spec.ts",
+                    [{"test": "a", "reason": "r", "since": "2026-07-01"}],
+                    {"exclude_template": "-x {test}",     # typo'd `tests`
+                     "test": [{"test": "a", "reason": "r", "since": "d"}]}):
+            cfg = self._config(bad)
+            with self.assertRaises(initws.QuarantineError):
+                initws.quarantine_cmd(cfg, self.repo, "npm test")
+
+    def test_shell_composed_command_refuses(self):
+        # flags are APPENDED, so they would land on `tee`, not the runner
+        cfg = self._config(self.ONE)
+        for cmd in ("cd fe && npm test", "npm test | tee log", "a; b"):
+            with self.assertRaises(initws.QuarantineError) as ctx:
+                initws.quarantine_cmd(cfg, self.repo, cmd)
+            self.assertIn("shell-composed", str(ctx.exception))
+
+    def test_coverage_uses_its_own_template_when_declared(self):
+        # a coverage_cmd that is a DIFFERENT tool must not get the test
+        # runner's flag appended (adversarial-review)
+        cfg = self._config({**self.ONE,
+                            "coverage_exclude_template": "--ignore={test}"})
+        self.assertEqual(
+            initws.quarantine_cmd(cfg, self.repo, "nyc report", coverage=True),
+            "nyc report --ignore=tests/harden-fe010.spec.ts")
+        # …and falls back to exclude_template when it has none of its own
+        self.assertEqual(
+            initws.quarantine_cmd(self._config(self.ONE), self.repo,
+                                  "nyc report", coverage=True),
+            "nyc report --exclude tests/harden-fe010.spec.ts")
+
+    def test_event_is_emitted_once_per_run_not_once_per_call(self):
+        # adversarial-review, both lenses: per-application emission put ~12
+        # identical records in the gauge a human reads to triage a run
+        cfg = self._config(self.ONE)
+        for _ in range(4):
+            initws.quarantine_cmd(cfg, self.repo, "npm test", self.run)
+        flagged = [e for e in ndjson.read_records(self.run / "events.ndjson")
+                   if e["kind"] == "tests-quarantined"]
+        self.assertEqual(len(flagged), 1)
+
+    def test_overlap_with_the_locked_test_set_refuses(self):
+        # the one silently-wrong pass this mechanism must not produce: the
+        # task's own test excluded, so verify-green never executes it while
+        # the SHA check still confirms the file is unchanged
+        self._write_test()
+        cfg = self._config({"exclude_template": "--ignore={test}",
+                            "tests": [{"test": "tests/test_x.py",
+                                       "reason": "pre-existing",
+                                       "since": "2026-07-22"}]})
+        with self.assertRaises(gitops.RedProofError) as ctx:
+            gitops.verify_red(self.run, self.workspace, self.repo, cfg, "T1",
+                              TEST_CMD, declared=["tests/test_x.py"],
+                              intents=["test_val"])
+        self.assertIn("locked test set", str(ctx.exception))
+
+    def test_init_verify_gates_a_malformed_block(self):
+        # caught where fixing config is cheap, not mid-develop at verify-red
+        cfg = self._config({"tests": [{"test": "a", "reason": "r",
+                                       "since": "2026-07-01"}]})  # no template
+        checks = initws.verify(cfg)
+        bad = next(c for c in checks if c["check"] == "quarantine:repo")
+        self.assertEqual(bad["status"], "fail")
+        self.assertIn("exclude_template", bad["detail"])
+        # a well-formed block passes
+        ok = next(c for c in initws.verify(self._config(self.ONE))
+                  if c["check"] == "quarantine:repo")
+        self.assertEqual(ok["status"], "pass")
+
+    def test_resolve_test_cmd_verb_carries_the_exclusions(self):
+        # the owned entry point agent-run suites build their header from —
+        # without it, develop/review/pre-pr/harden ran the raw command and
+        # re-hit the quarantined failure (adversarial-review, blocking)
+        cfg = self._config(self.ONE)
+        self.assertEqual(
+            initws.quarantine_cmd(cfg, self.repo,
+                                  initws.resolve_test_cmd(cfg, self.repo)),
+            f"{support.NOP_CMD} --exclude tests/harden-fe010.spec.ts")
+
+    def test_verify_green_applies_it_and_refuses_an_overlap(self):
+        # re-verify finding: BOTH halves of verify-green's quarantine wiring
+        # (the exclusion and the overlap guard) could be deleted with the
+        # whole suite still green — the silent-false-green guard was unpinned.
+        self._write_test()
+        cfg = self._config({"exclude_template": "--ignore={test}",
+                            "tests": [{"test": "tests/quarantined_test.py",
+                                       "reason": "pre-existing",
+                                       "since": "2026-07-22"}]})
+        proof = {"tests": {"tests/test_x.py": "sha"}, "closure": {}}
+        seen = []
+        with mock.patch("harness.gitops.blob_sha", return_value="sha"), \
+                mock.patch("harness.gitops._run_tests",
+                           side_effect=lambda r, c: (seen.append(c), (0, ""))[1]):
+            gitops.verify_green(proof, self.repo, "pytest", config=cfg,
+                                task_repo=self.repo, run=self.run)
+        self.assertEqual(seen, ["pytest --ignore=tests/quarantined_test.py"])
+
+        overlapping = self._config({"exclude_template": "--ignore={test}",
+                                    "tests": [{"test": "tests/test_x.py",
+                                               "reason": "r",
+                                               "since": "2026-07-22"}]})
+        with mock.patch("harness.gitops.blob_sha", return_value="sha"):
+            with self.assertRaises(gitops.RedProofError) as ctx:
+                gitops.verify_green(proof, self.repo, "pytest",
+                                    config=overlapping, task_repo=self.repo,
+                                    run=self.run)
+        self.assertIn("locked test set", str(ctx.exception))
+
+    def test_overlap_check_is_spelling_insensitive(self):
+        # re-verify finding: './x' and absolute spellings slipped the exact
+        # string intersection while the runner still honoured the exclusion —
+        # the silent false green. Refused at declaration now.
+        for spelling in ("./tests/test_x.py", str(self.repo / "tests/test_x.py"),
+                         "tests\\test_x.py"):
+            cfg = self._config({"exclude_template": "--ignore={test}",
+                                "tests": [{"test": spelling, "reason": "r",
+                                           "since": "2026-07-22"}]})
+            with self.assertRaises(initws.QuarantineError) as ctx:
+                initws.quarantine_cmd(cfg, self.repo, "pytest")
+            self.assertIn("repo-relative", str(ctx.exception))
+
+    def test_reapplying_is_idempotent(self):
+        # the documented develop path applies twice: resolve-test-cmd builds
+        # the header, develop-task.md passes it back as --test-cmd to
+        # verify-red (re-verify finding: rendered `--exclude x --exclude x`)
+        cfg = self._config(self.ONE)
+        once = initws.quarantine_cmd(cfg, self.repo, "npm test")
+        self.assertEqual(initws.quarantine_cmd(cfg, self.repo, once), once)
+
+    def test_template_without_the_placeholder_refuses(self):
+        cfg = self._config({"exclude_template": "--exclude",
+                            "tests": [{"test": "a", "reason": "r",
+                                       "since": "2026-07-01"}]})
+        with self.assertRaises(initws.QuarantineError) as ctx:
+            initws.quarantine_cmd(cfg, self.repo, "npm test")
+        self.assertIn("{test}", str(ctx.exception))
+
+    def test_quoted_shell_metacharacters_are_not_composition(self):
+        # re-verify finding: a bare substring scan refused every quoted regex
+        # alternation — normal single commands — with irrelevant advice
+        cfg = self._config(self.ONE)
+        for ok in ('go test ./... -run "TestA|TestB"',
+                   'npm test -- --testPathPattern "src/(a|b)"',
+                   "pytest -k 'a or b;c'"):
+            self.assertTrue(initws.quarantine_cmd(cfg, self.repo, ok)
+                            .startswith(ok))
+        for bad in ("cd fe && npm test", "npm test | tee log", "a; b"):
+            with self.assertRaises(initws.QuarantineError):
+                initws.quarantine_cmd(cfg, self.repo, bad)
+
+    def test_init_verify_gates_the_coverage_template_too(self):
+        # re-verify finding: verify() only exercised the test path, so a bad
+        # coverage template passed init-verify and died at harden
+        cfg = self._config({**self.ONE,
+                            "coverage_exclude_template": "--ignore"},
+                           coverage_cmd="npm run coverage")
+        bad = next(c for c in initws.verify(cfg)
+                   if c["check"] == "quarantine:repo")
+        self.assertEqual(bad["status"], "fail")
+
+    def test_verify_red_applies_it_through_the_real_run(self):
+        # end-to-end through the choke point: the exclusion reaches the
+        # executed command, and the event lands on the run's ledger
+        self._write_test()
+        cfg = self._config({"exclude_template": "--ignore={test}",
+                            "tests": [{"test": "tests/quarantined_test.py",
+                                       "reason": "pre-existing failure",
+                                       "since": "2026-07-22"}]})
+        seen = []
+
+        def spy(repo, cmd):
+            seen.append(cmd)
+            return 1, "boom"
+
+        with mock.patch("harness.gitops._run_tests", side_effect=spy):
+            gitops.verify_red(self.run, self.workspace, self.repo, cfg,
+                              "T1", "pytest", declared=["tests/test_x.py"],
+                              intents=["test_val"])
+        self.assertEqual(seen, ["pytest --ignore=tests/quarantined_test.py"])
+        self.assertIn("tests-quarantined",
+                      [e["kind"] for e in
+                       ndjson.read_records(self.run / "events.ndjson")])
+
+
+class RemoteBranchProbe(GitopsHarness):
+    """gitops.remote_branch_exists — the remote half of the branch check
+    `_branch_exists` only ever did locally (field: dual-run
+    comparison). Tri-state on purpose: None means UNANSWERED, never absent."""
+
+    def _bare_origin(self) -> Path:
+        bare = self.workspace / "origin.git"
+        gitops.run_git(self.workspace, "init", "--bare", str(bare))
+        gitops.run_git(self.repo, "remote", "add", "origin", str(bare))
+        gitops.run_git(self.repo, "push", "origin", "main")
+        return bare
+
+    def test_detects_and_denies_correctly(self):
+        bare = self._bare_origin()
+        self.assertFalse(gitops.remote_branch_exists(self.repo, "fix/absent"))
+        gitops.run_git(bare, "branch", "fix/GIT-1-t", "main")
+        self.assertTrue(gitops.remote_branch_exists(self.repo, "fix/GIT-1-t"))
+
+    def test_matches_the_exact_ref_not_the_tail(self):
+        # ls-remote matches patterns against the ref TAIL, so a bare `main`
+        # would also hit `refs/heads/topic/main` — the full refs/heads/ form
+        # plus the exact re-compare is what keeps this precise.
+        bare = self._bare_origin()
+        gitops.run_git(bare, "branch", "topic/release", "main")
+        self.assertFalse(gitops.remote_branch_exists(self.repo, "release"))
+        self.assertTrue(gitops.remote_branch_exists(self.repo, "topic/release"))
+
+    def test_no_remote_is_unanswered_not_absent(self):
+        self.assertIsNone(gitops.remote_branch_exists(self.repo, "anything"))
+
+    def test_ambiguous_remotes_are_unanswered(self):
+        gitops.run_git(self.repo, "remote", "add", "upstream", "u://x")
+        gitops.run_git(self.repo, "remote", "add", "fork", "u://y")
+        self.assertIsNone(gitops.remote_branch_exists(self.repo, "anything"))
+
+    def test_unreachable_remote_is_unanswered_not_absent(self):
+        # Offline/auth failure must NOT green-light the collision it exists
+        # to catch: callers degrade to a warning on None.
+        gitops.run_git(self.repo, "remote", "add", "origin",
+                       str(self.workspace / "no-such-repo.git"))
+        self.assertIsNone(gitops.remote_branch_exists(self.repo, "anything"))
+
+    def test_probe_timeout_is_unanswered_not_a_crash(self):
+        # An unreachable host can block on auth until the timeout fires; that
+        # must surface as "unanswered", not as a traceback out of preflight.
+        self._bare_origin()
+        real = subprocess.run
+
+        def only_ls_remote_times_out(args, **kwargs):
+            if "ls-remote" in args:
+                raise subprocess.TimeoutExpired("ls-remote", 30)
+            return real(args, **kwargs)
+
+        with mock.patch("harness.gitops.subprocess.run",
+                        side_effect=only_ls_remote_times_out):
+            self.assertIsNone(gitops.remote_branch_exists(self.repo, "main"))
 
 
 class DefaultBranch(GitopsHarness):

@@ -38,7 +38,25 @@ FLAGGED_EVENT_KINDS = (
     "contracts-check", "verdict-uncaptured", "background-spawn-uncaptured",
     "coverage-skipped", "risk-without-tests", "tests-without-production",
     "pr-recorded-manually", "secret-sweep-blocked", "gate-skipped",
-    "deferral-pending", "panel-serialized")
+    "deferral-pending", "panel-serialized",
+    # field: dual-run comparison — prior-work and quarantine signals.
+    # All FOUR record OCCURRENCES (like hook-blocked/gate-skipped), not live
+    # plan state, so outstanding_flagged needs no resolver for them: a remote
+    # branch that collided, a probe that resolved a remote but could not
+    # answer, a re-run of an already-done item, and a run's quarantined
+    # exclusions each stay permanently on the dashboard. `tests-quarantined`
+    # is the one that had to EARN that classification — it is emitted once
+    # per run per (repo, set) rather than once per test invocation, which is
+    # what makes it an occurrence rather than an O(tasks) repeated assertion
+    # (adversarial-review, both lenses independently).
+    #
+    # None are HEALTH_DEGRADING (below): each means "a human should look",
+    # not "this run's machinery degraded / evidence was lost". The closest
+    # call is `remote-branch-unverified` — evidence genuinely not obtained —
+    # but preflight continuing without it is the declared, safe behaviour
+    # (a connectivity blip must not brick a run), not a degraded one.
+    "remote-branch-exists", "remote-branch-unverified",
+    "work-item-already-done", "tests-quarantined")
 
 
 def outstanding_flagged(events: list[dict]) -> list[dict]:
@@ -271,6 +289,62 @@ def bootstrap_gate(config: dict) -> None:
             "bootstrap incomplete — run /init-workspace before /dev-workflow")
 
 
+#: Provider-independent "this item is already finished" vocabulary. Each
+#: adapter ships its own STATUS_DEFAULTS (github `closed`, ado `Closed`,
+#: jira `Done`, …) and users remap via `status_mapping`, so both are
+#: consulted first — this set only catches the rest.
+_DONE_VOCABULARY = frozenset(
+    {"done", "closed", "resolved", "completed", "complete", "shipped"})
+
+
+def done_state_match(config: dict, item: dict) -> str | None:
+    """The item's provider state, if it reads as ALREADY DONE — else None.
+
+    field: dual-run comparison — a story still marked `Done` from a
+    run three days earlier was re-fetched and rebuilt end-to-end; the intake
+    noticed the stale state and flagged it as an ambiguity, but nothing
+    mechanical acted on it, and the run only collided at push.
+
+    Matching is deliberately TOLERANT and deliberately WARN-ONLY. Provider
+    status vocabularies differ and adapters pass decorated values through
+    verbatim (`local-markdown` yields whole header lines like
+    `✅ Done — 2026-07-22`), so the state is casefolded, split into word
+    tokens, and tested for any done token. That can over-match in principle
+    (`Not Done`); over-matching costs one warning line, whereas refusing
+    would block the legitimate replay/re-plan cases — which is exactly why
+    this warns instead of blocking."""
+    raw = str(item.get("state") or "").strip()
+    if not raw:
+        return None
+    known = set()
+    try:
+        from .providers import get_module
+        provider_done = getattr(get_module(config), "STATUS_DEFAULTS", {}
+                                ).get("done")
+        if provider_done:
+            known.add(str(provider_done).casefold())
+    except Exception:      # unknown/unset provider: fall back to the vocabulary
+        pass
+    mapping = config.get("status_mapping") or {}
+    # Type-specific SHADOWS default — the same precedence
+    # resolve_write_back_status uses, so the two readers of this declared
+    # data cannot hold different beliefs about it (adversarial-review).
+    # Note this only decides the CONFIGURED name: the universal vocabulary
+    # below still matches, by design, so a `default: {done: Shipped}` that a
+    # type overrides can still be recognized on its own English merits
+    # (re-verify: worth stating, since the shadow alone doesn't suppress it).
+    item_type = item.get("type")
+    section = (mapping.get(item_type) if item_type else None) or \
+        mapping.get("default", {})
+    configured = section.get("done") if isinstance(section, dict) else None
+    if configured:
+        known.add(str(configured).casefold())
+    tokens = {t for t in re.split(r"[^0-9a-z]+", raw.casefold()) if t}
+    if known & ({raw.casefold()} | tokens) or tokens & _DONE_VOCABULARY:
+        return raw
+    return None
+
+
 def _bootstrap_from_item(workspace: Path, config: dict, manifest: dict,
                          item: dict, date: str | None) -> dict:
     """The shared step-one *tail* (RC2), transport-independent: classify ->
@@ -335,8 +409,26 @@ def _bootstrap_from_item(workspace: Path, config: dict, manifest: dict,
                               "basis": "positional-default (repos[0]); "
                                        "provisional until plan-register"},
                           "actor": "fetch"})
-    return {"run": str(run), "mode": mode, "change_type": change_type,
-            "classify_reason": reason}
+    result = {"run": str(run), "mode": mode, "change_type": change_type,
+              "classify_reason": reason}
+    already_done = done_state_match(config, item)
+    if already_done:
+        # Warn at minute zero rather than blocking: replays and re-plans of a
+        # closed item are legitimate. The flagged event is what makes the
+        # decision auditable — and what preflight's remote-branch probe then
+        # corroborates if a prior run really did ship this
+        # (field: dual-run comparison).
+        ndjson.append_record(run / "events.ndjson",
+                             {"kind": "work-item-already-done",
+                              "item": item["id"], "state": already_done,
+                              "actor": "fetch"})
+        result["already_done"] = already_done
+        result["warning"] = (
+            f"work item {item['id']} is already in state '{already_done}' — "
+            "it may have been built by an earlier run. Confirm this is an "
+            "intentional replay before planning; preflight will refuse if a "
+            "prior run's branch still occupies the remote.")
+    return result
 
 
 def fetch_flow(workspace: Path, config: dict, manifest: dict, item_id: str,
@@ -1403,8 +1495,71 @@ def metrics_report(workspace: Path, run: Path,
     return path
 
 
+def _render_feature_branch(config: dict, st: dict,
+                           suffix: str | None = None) -> str:
+    """The run's feature-branch name from the declared `naming.branch`
+    template, plus preflight's optional branch-aside suffix. One renderer,
+    so the name the remote probe checks is byte-identical to the one
+    actually cut (field: dual-run comparison)."""
+    branch = gitops.render(config["naming"]["branch"],
+                           type=st["change_type"],
+                           id=st["work_item"]["id"],
+                           slug=slug(st["work_item"]["title"]))
+    if suffix:
+        # slug()'d, not pasted raw: this value comes from a CLI flag and
+        # ends up in a ref name, where spaces/`~^:?*[` are illegal
+        return f"{branch}-{slug(suffix)}"
+    return branch
+
+
+def _probe_prior_remote_branch(run: Path, repo: Path, name: str,
+                               branch: str) -> None:
+    """Refuse a preflight whose deterministic branch name is already taken on
+    the remote — the collision Run B discovered hours later at push, with an
+    open MR and five tasks of committed work already on the name.
+
+    Surface, never auto-fix (ensure_default_branch's stance): three remedies,
+    no silent continuation and no automatic adoption of a foreign branch. An
+    UNANSWERABLE probe (offline, no remote, auth) degrades to a flagged
+    warning — a connectivity blip must not brick preflight, but it must not
+    pass unrecorded either."""
+    hit = gitops.remote_branch_exists(repo, branch)
+    if hit is None:
+        # An unanswered probe has two very different causes, and conflating
+        # them put one permanent unresolvable flag on every preflight in
+        # every local-only workspace (adversarial-review). A repo with no
+        # remote — or an ambiguous remote set — is a STRUCTURAL state, not a
+        # run-health signal: there is no collision to have, so skip silently.
+        # A remote that resolved but would not answer (offline, auth,
+        # timeout) is transient and genuinely worth a human's eye.
+        try:
+            gitops._push_remote(repo)
+        except (gitops.GitError, OSError):
+            return
+        ndjson.append_record(run / "events.ndjson",
+                             {"kind": "remote-branch-unverified",
+                              "repo": name, "branch": branch,
+                              "reason": "probe-failed", "actor": "preflight"})
+        return
+    if not hit:
+        return
+    ndjson.append_record(run / "events.ndjson",
+                         {"kind": "remote-branch-exists", "repo": name,
+                          "branch": branch, "actor": "preflight"})
+    raise state_mod.StateError(
+        f"{name}: branch '{branch}' already exists on the remote — a prior "
+        "run of this work item already claimed the deterministic branch "
+        "name, and continuing would collide at push (possibly on top of an "
+        "already-open PR/MR). Refusing to guess. Either: (1) resume that "
+        "work — fetch and reconcile the remote branch by hand, then re-run "
+        "preflight; (2) branch aside — re-run preflight with "
+        "--feature-branch-suffix <s> to cut a distinct name; or (3) delete "
+        "the remote branch if it is abandoned. Never auto-adopted.")
+
+
 def preflight(workspace: Path, run: Path, config: dict, manifest: dict,
-              repo: Path, base_branch: str | None = None) -> dict:
+              repo: Path, base_branch: str | None = None,
+              feature_branch_suffix: str | None = None) -> dict:
     """Create the feature branch from the declared naming template and record
     the `branches` artifact — an owned, mechanical step. Ensures the repo is
     clean and on its default branch first (gitops.ensure_default_branch) so
@@ -1442,6 +1597,22 @@ def preflight(workspace: Path, run: Path, config: dict, manifest: dict,
     # this, or a post-advance resume would hard-error instead of no-op'ing).
     existing = ((pre.get("artifacts") or {}).get("branches") or {}).get(name)
     if existing:
+        # …but a suffix the caller asked for and did NOT get back is a silent
+        # lie (adversarial-review): applying the branch-aside remedy to a repo
+        # whose branch was already recorded used to return `ok: true` with the
+        # ORIGINAL name, leaving the run on the colliding branch believing it
+        # had moved aside. Idempotency means "same request, same answer" — a
+        # different request must not be answered by the cached one.
+        wanted = _render_feature_branch(config, pre, feature_branch_suffix)
+        if feature_branch_suffix and existing.get("branch") != wanted:
+            raise state_mod.StateError(
+                f"{name}: this run already cut branch "
+                f"'{existing.get('branch')}'; --feature-branch-suffix "
+                f"'{feature_branch_suffix}' would name it '{wanted}'. "
+                "Preflight is idempotent per repo and will not rename a "
+                "branch that may already carry commits — rename or delete it "
+                "by hand, or leave the suffix off to keep the recorded name. "
+                "(Branch-aside is for a repo preflight has NOT yet cut.)")
         return existing
     # F4 (validation-walk): for a FRESH preflight, validate the step
     # precondition BEFORE any git side effect. Running preflight with the cursor
@@ -1454,6 +1625,14 @@ def preflight(workspace: Path, run: Path, config: dict, manifest: dict,
         raise TransitionError(
             f"step '{_step}' does not declare producing 'branches' — advance "
             "the cursor to the preflight step before running preflight")
+    # Prior-work probe BEFORE any git side effect, and before the run lock:
+    # `ls-remote` reaches the network (up to its timeout) and holding the
+    # lock across that would stall every concurrent reader. Rendering off
+    # `pre` is safe — change_type and work_item are bootstrap-fixed and the
+    # in-lock render below produces the same name from the reloaded state.
+    _probe_prior_remote_branch(run, repo, name,
+                               _render_feature_branch(config, pre,
+                                                      feature_branch_suffix))
     resolved = gitops.ensure_default_branch(repo, base_branch)
     # pin `.harness-key` out of `git add -A`'s reach in this repo and every
     # task worktree it will spawn (shared via the common git dir)
@@ -1464,10 +1643,7 @@ def preflight(workspace: Path, run: Path, config: dict, manifest: dict,
         existing = branches.get(name)
         if existing:
             return existing
-        branch = gitops.render(config["naming"]["branch"],
-                               type=st["change_type"],
-                               id=st["work_item"]["id"],
-                               slug=slug(st["work_item"]["title"]))
+        branch = _render_feature_branch(config, st, feature_branch_suffix)
         # F4 (validation-walk): a crash after `checkout -b` but before recording
         # leaves the feature branch AT the base tip — ADOPT only that, a branch
         # pointing exactly where a fresh cut would. The branch name is

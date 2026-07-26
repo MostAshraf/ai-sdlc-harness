@@ -16,11 +16,16 @@ that already exists), so NO red-proof machinery applies.
    re-resolve) or an explicit skip — record that with
    `${CLAUDE_PLUGIN_ROOT}/bin/harness log-event --json '{"kind":
    "coverage-skipped", "repo": "<name>", "reason": "<their words>"}'` and
-   harden that repo from the tasks' own test gaps instead. Run the resolved command to find diff-coverage gaps against
+   harden that repo from the tasks' own test gaps instead. The resolved
+   command already carries any `language.repos.<name>.quarantine` exclusions
+   — if a pre-existing unrelated failure keeps aborting the run, quarantine
+   it in config (with a reason + date) rather than hand-narrowing the
+   command, so the next run inherits the knowledge. Run the resolved command to find diff-coverage gaps against
    the tasks' touched files.
 2. Spawn `developer` with `harness-mode: harden` (+ run/repo/test-cmd
-   headers — test-cmd is per repo, same `language.repos.<repo-name>.test_cmd`
-   convention as `develop`) and the gap list. It follows `steps/harden-task.md`.
+   headers — test-cmd is per repo, resolved with
+   `${CLAUDE_PLUGIN_ROOT}/bin/harness resolve-test-cmd --repo <repo> --run
+   <run>`, same as `develop`) and the gap list. It follows `steps/harden-task.md`.
 3. Spawn `reviewer` (`harness-mode: review`) on the new tests.
 4. The DEVELOPER already committed its tests (harden-task.md's own
    commit step — do not commit again from here; a second commit in

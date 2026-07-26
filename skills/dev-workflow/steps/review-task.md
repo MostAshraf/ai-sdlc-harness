@@ -4,7 +4,10 @@ Review ONE task's diff (its worktree branch vs the feature branch), inside
 the develop loop:
 
 - Re-run the task's tests yourself (`harness-test-cmd`) — independent
-  verification, never trust the developer's claim. Long output? Capture it
+  verification, never trust the developer's claim. Run that header VERBATIM,
+  don't rebuild it from config: it already carries the repo's declared
+  quarantine, so a pre-existing failure unrelated to this task can't turn
+  into a CHANGES_REQUESTED against it. Long output? Capture it
   under /tmp (`… 2>&1 | tee /tmp/review.log`) — /tmp and /dev/null are
   your only legal write targets; any other shell write is blocked. Spell
   the path LITERALLY: a variable-held target (`$SCRATCH/x`, `$(mktemp -d)`)

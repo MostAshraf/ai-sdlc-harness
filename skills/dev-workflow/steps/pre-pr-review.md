@@ -3,6 +3,10 @@
 Review the ENTIRE feature branch (all squashed task commits) as one change:
 
 - Re-run build + full test suite yourself — never trust reported results.
+  Use the command from `${CLAUDE_PLUGIN_ROOT}/bin/harness resolve-test-cmd
+  --repo <repo> --run <run>`, not a hand-built one: it carries the repo's declared
+  quarantine, so a known-failing spec unrelated to this branch does not
+  become a finding against it.
 - Check each review-policy rule from config (assertion-depth,
   patch-dto-wrapper, team rules) and cite violations by file:line.
 - Check plan-vs-implementation drift: does what shipped match what was
