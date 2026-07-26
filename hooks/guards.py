@@ -426,7 +426,7 @@ SUBAGENT_REGISTER_RE = re.compile(
 MODE_HEADER_RE = re.compile(r"^harness-mode:\s*(?!<)(\S+)", re.MULTILINE)
 TASK_HEADER_RE = re.compile(r"^harness-task:\s*(?!<)(\S+)", re.MULTILINE)
 # `harness-run`'s value is a filesystem PATH, which CAN contain spaces
-# (field report: a workspace under `.../HEX AI Engine/...` truncated at the
+# (field report: a workspace under `.../AI Engine/...` truncated at the
 # first space with a `\S+` capture, so the resolved run never matched any
 # live run and every harness-shape spawn was blocked as "does not match any
 # active run"). Capture the REST OF THE LINE (`.` excludes newline) with
@@ -767,7 +767,7 @@ def _developer_write_ok(path: Path, workspace: Path) -> bool:
     """A developer may write inside a registered repo, inside one of its
     per-task worktree siblings (`worktree_add`: `repo.parent/<repo.name>-wt-
     <task>-<uid>`), or in /tmp — nothing else. Derived from `repos.yaml`
-    under the workspace; a spaced repo path (`.../HEX AI Engine/...`) is
+    under the workspace; a spaced repo path (`.../AI Engine/...`) is
     handled by Path semantics, not a regex.
 
     Fail-OPEN when the repo set can't be determined (no `repos.yaml`, no

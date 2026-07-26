@@ -702,18 +702,18 @@ class WriteGuard(GuardHarness):
         # (repo.parent/<repo.name>-wt-<task>-<uid>), OUTSIDE the workspace,
         # so the old cwd-based confinement blocked every legitimate worktree
         # write. Spaced repo path included (the reported workspace was under
-        # `HEX AI Engine`) to prove it's Path semantics, not a regex.
+        # `AI Engine`) to prove it's Path semantics, not a regex.
         dev = "x:developer"
-        repo = self.workspace / "HEX AI Engine" / "Code" / "hex-ai-engine-backend"
+        repo = self.workspace / "AI Engine" / "Code" / "ai-engine-backend"
         repo.mkdir(parents=True)
         self._register_repo(repo)
-        wt_file = (self.workspace / "HEX AI Engine" / "Code"
-                   / "hex-ai-engine-backend-wt-T1-3a1f7827" / "src"
+        wt_file = (self.workspace / "AI Engine" / "Code"
+                   / "ai-engine-backend-wt-T1-3a1f7827" / "src"
                    / "N8nDiscoveryPort.java")
         self.assert_allows("write", self._w(str(wt_file), dev))
         # but a sibling that ISN'T a worktree of this repo is still blocked
         self.assert_blocks("write", self._w(str(
-            self.workspace / "HEX AI Engine" / "Code" / "unrelated" / "x.java"),
+            self.workspace / "AI Engine" / "Code" / "unrelated" / "x.java"),
             dev), "worktree")
 
     def test_second_registered_repo_and_its_worktree_allowed_regardless_of_yaml_order(self):
@@ -1012,15 +1012,15 @@ class SpawnGuard(GuardHarness):
                            "fail-closed pre-run")
 
     def test_run_header_with_spaces_in_the_path_resolves(self):
-        # field report: a workspace under `.../HEX AI Engine/...` truncated
+        # field report: a workspace under `.../AI Engine/...` truncated
         # the harness-run header at the first space (\S+ capture), so the
         # resolved run never matched any live run and every harness-shape
         # spawn was blocked as "does not match any active run".
-        ws = self.workspace / "HEX AI Engine"   # a space in the workspace path
+        ws = self.workspace / "AI Engine"   # a space in the workspace path
         (ws / "ai").mkdir(parents=True)
-        run = ws / "ai" / "2026-07-06-US-039"
+        run = ws / "ai" / "2026-07-06-WI-206"
         state_mod.bootstrap(run, ws,
-                            work_item={"id": "US-039", "title": "t", "provider_ref": ""},
+                            work_item={"id": "WI-206", "title": "t", "provider_ref": ""},
                             mode="full", change_type="fix",
                             tasks=[{"id": "T1"}], entry_step="fetch")
         manifest, _, config = load_declared(ws)
