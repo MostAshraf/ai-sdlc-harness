@@ -580,6 +580,25 @@ class BashGuard(GuardHarness):
             "bash", bash("${CLAUDE_PLUGIN_ROOT}/bin/harness scope-register "
                          "--repos-json '[\"/p\"]' --run ai/r"))
 
+    def test_subagents_cannot_save_reports(self):
+        """save-report joined the orchestrator-only set (pre-release review,
+        both lenses): a run's reports/ are GATE-PRESENTED evidence — an
+        exhausted plan-review decision rests on reports/plan-review.md — and
+        before the verb existed no subagent had any path into that directory.
+        A reviewer persisting its own reply would author the evidence the
+        human reads AND, via the snapshot immutability check, could wedge
+        the orchestrator's own documented save."""
+        for shape in ("ai-sdlc-reviewer", "ai-sdlc-developer",
+                      "ai-sdlc-planner"):
+            self.assert_blocks(
+                "bash",
+                bash("${CLAUDE_PLUGIN_ROOT}/bin/harness save-report "
+                     "--mode pre-pr --body-file /tmp/x.md --run ai/r", shape),
+                "orchestrator-only")
+        self.assert_allows(
+            "bash", bash("${CLAUDE_PLUGIN_ROOT}/bin/harness save-report "
+                         "--mode pre-pr --body-file /tmp/x.md --run ai/r"))
+
     def test_unparseable_payload_fails_open(self):
         proc = subprocess.run([sys.executable, str(GUARDS), "bash"],
                               input="not json{", capture_output=True, text=True, encoding="utf-8")
@@ -1586,6 +1605,41 @@ class CaptureHooks(GuardHarness):
         rec = ndjson.read_records(run / "reviews.ndjson")[-1]
         self.assertEqual(rec["blocking_findings"], 7)
         self.assertEqual(rec["plan_generation"], 1)
+
+    def test_blocking_findings_scoped_to_the_final_status_block(self):
+        # pre-release review, both lenses: a prose recap of a previous round
+        # must not become THIS round's count when the final block omits the
+        # optional line — same scoping extract_verdict already has
+        run = self.make_run()
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "reviewer",
+            reply="Recap: round 1 had blocking-findings: 9, all fixed.\n\n"
+                  "harness-status: SUCCESS\nharness-task: T1\n"
+                  "verdict: APPROVED\noutcome: clean"))
+        rec = ndjson.read_records(run / "reviews.ndjson")[-1]
+        self.assertIsNone(rec["blocking_findings"])
+        # …while a count IN the final block still records
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "reviewer",
+            reply="Earlier prose says blocking-findings: 9.\n\n"
+                  "harness-status: SUCCESS\nharness-task: T1\n"
+                  "verdict: CHANGES_REQUESTED\nblocking-findings: 2\n"
+                  "outcome: two blockers"))
+        rec = ndjson.read_records(run / "reviews.ndjson")[-1]
+        self.assertEqual(rec["blocking_findings"], 2)
+
+    def test_forged_plan_registered_does_not_move_the_generation(self):
+        # actor-checked like outstanding_flagged: a stray `log-event` record
+        # of the right kind must not inflate the round stamped on verdicts
+        run = self.make_run()
+        ndjson.append_record(run / "events.ndjson",
+                             {"kind": "plan-registered"})   # no actor: forged
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "reviewer",
+            reply="harness-status: SUCCESS\nharness-task: T1\n"
+                  "verdict: APPROVED\noutcome: fine"))
+        rec = ndjson.read_records(run / "reviews.ndjson")[-1]
+        self.assertEqual(rec["plan_generation"], 0)
 
     def test_blocking_findings_is_optional_and_never_gates_the_verdict(self):
         # the engine's exits read `verdict` only — a missing or echoed-

@@ -1356,6 +1356,17 @@ class StallVerdictGuard(Harness):
             transitions.record_stall(self.st, self.config, self.KEY),
             "reinvoke")
 
+    def test_unreadable_ledger_fails_open_like_a_corrupt_one(self):
+        # pre-release review: only the CORRUPTION spelling (LedgerCorruption
+        # -> TransitionError) was caught, so an exists-but-unreadable ledger
+        # (EACCES/EIO) failed CLOSED on exactly the wedged-run path — the
+        # I/O failures most likely to accompany a wedge
+        support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        from unittest import mock
+        with mock.patch("harness.transitions.ndjson.read_records",
+                        side_effect=OSError("EACCES")):
+            self._guard()   # no refusal: cannot-read is not proof-of-verdict
+
     def test_corrupt_events_ledger_does_not_brick_the_procedure(self):
         # The anchor reads events leniently: a torn line may only LOWER the
         # anchor (-> over-refusal, escapable), never raise and wedge the one

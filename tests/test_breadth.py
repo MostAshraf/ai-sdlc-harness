@@ -471,6 +471,68 @@ class SaveReport(BreadthHarness):
                          body="rewritten\n", expect=1)
         self.assertIn("immutable", out["error"])
 
+    def test_typoed_run_refuses_instead_of_manufacturing_a_phantom(self):
+        # pre-release review: save-report was the one run-scoped verb that
+        # never checked the run exists — mkdir(parents=True) built the whole
+        # phantom path and reported success while the real run's gate later
+        # presented a missing report
+        ghost = self.workspace / "ai" / "2026-02-13-TYPO-1"
+        proc = subprocess.run(
+            [sys.executable, "-m", "harness", "--workspace",
+             str(self.workspace), "--run", str(ghost), "save-report",
+             "--mode", "pre-pr"],
+            cwd=ROOT, input="body\n", capture_output=True, text=True,
+            encoding="utf-8", timeout=120)
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("not a run", json.loads(proc.stdout)["error"])
+        self.assertFalse(ghost.exists())
+
+    def test_recorded_stall_reopens_the_round_snapshot(self):
+        """pre-release review (reproduced): synthesis saved, verdict never
+        captured, stall recorded, spawn re-invoked — the re-invoked reply
+        must be saveable in the SAME round, or the live path keeps the
+        pre-stall synthesis while reviews.ndjson holds the re-invoked
+        verdict: a report/verdict mismatch at the human gate. A recorded
+        stall for the mode's step reopens the snapshot; without one the
+        immutability refusal stands (previous test)."""
+        self._save("--mode", "plan-review", body="pre-stall synthesis\n")
+        ndjson.append_record(self.run_dir / "events.ndjson",
+                             {"kind": "stall", "task": "step:plan-review",
+                              "action": "reinvoke"})
+        out = self._save("--mode", "plan-review", body="re-invoked synthesis\n")
+        self.assertEqual(out["round"], 1)   # same round, superseded
+        self.assertEqual(
+            (self.run_dir / "reports/plan-review.md").read_text(),
+            "re-invoked synthesis\n")
+        # a lens stall (finer key, same step prefix) reopens its lens too
+        self._save("--mode", "plan-attack", "--lens", "gaps", body="a\n")
+        ndjson.append_record(self.run_dir / "events.ndjson",
+                             {"kind": "stall", "task": "step:plan-review:gaps",
+                              "action": "reinvoke"})
+        self._save("--mode", "plan-attack", "--lens", "gaps", body="b\n")
+
+    def test_pre_pr_round_advances_on_gate_rejection_not_plan_generation(self):
+        # pre-release review (reproduced): pre-pr rounds are gate-rejection-
+        # driven; anchoring them to the plan generation made every second
+        # pre-pr save refuse with a plan-review-flavored message
+        first = self._save("--mode", "pre-pr", body="round one\n")
+        self.assertEqual(first["round"], 1)
+        ndjson.append_record(self.run_dir / "events.ndjson",
+                             {"kind": "gate-decision", "gate": "approve-pre-pr",
+                              "decision": "rejected"})
+        second = self._save("--mode", "pre-pr", body="round two\n")
+        self.assertEqual(second["round"], 2)
+        self.assertEqual(
+            (self.run_dir / "reports/pre-pr-r1.md").read_text(), "round one\n")
+
+    def test_forged_plan_registered_does_not_move_the_round(self):
+        # actor-checked, the same anti-forgery stance outstanding_flagged
+        # takes for exactly this kind
+        ndjson.append_record(self.run_dir / "events.ndjson",
+                             {"kind": "plan-registered"})   # no actor: forged
+        out = self._save("--mode", "plan-review")
+        self.assertEqual(out["round"], 1)
+
     def test_writes_live_path_and_round_snapshot_in_one_call(self):
         out = self._save("--mode", "plan-attack", "--lens", "contradictions",
                          "--round", "2")
@@ -577,6 +639,50 @@ class EnvPrerequisites(BreadthHarness):
         out = self.cli("env-check", run=self.run_dir, expect=1)
         self.assertEqual(out["missing"][0]["detail"], "unprobeable")
         self.assertIn("no `probe` declared", out["missing"][0]["hint"])
+
+    def test_task_scoped_clean_probe_does_not_clear_other_flags(self):
+        """pre-release review, both lenses independently (reproduced): T1
+        needs docker (up), T2 needs emulator (down, flagged). The natural
+        human move after fixing docker — `env-check --task T1` — used to
+        append `env-prereq-satisfied`, and outstanding_flagged clears every
+        open miss on one satisfied event, so the emulator's flag left the
+        dashboard while the wall was still there. Only the run-wide check
+        the develop step documents may clear."""
+        self._declare(support.NOP_CMD, name="docker")
+        self._declare("exit 1", name="emulator")
+        self.cli("plan-register", "--tasks-json",
+                 json.dumps([{"id": "T1", "repo": str(self.repo),
+                              "env_requires": ["docker"]},
+                             {"id": "T2", "repo": str(self.repo),
+                              "env_requires": ["emulator"]}]),
+                 run=self.run_dir)
+        self.cli("env-check", run=self.run_dir, expect=1)     # emulator down
+        flagged = next(r for r in self.cli("status")["runs"]
+                       if r["run"] == self.run_dir.name)["flagged_events"]
+        self.cli("env-check", "--task", "T1", run=self.run_dir)  # docker fine
+        still = next(r for r in self.cli("status")["runs"]
+                     if r["run"] == self.run_dir.name)["flagged_events"]
+        self.assertEqual(still, flagged)     # emulator's flag survives
+        self._declare(support.NOP_CMD, name="emulator")
+        self.cli("env-check", run=self.run_dir)              # run-wide clean
+        cleared = next(r for r in self.cli("status")["runs"]
+                       if r["run"] == self.run_dir.name)["flagged_events"]
+        self.assertEqual(cleared, flagged - 1)
+
+    def test_revision_that_drops_the_requirement_clears_the_flag(self):
+        # a plan revision may remove env_requires entirely: nothing left to
+        # probe still RESOLVES the outstanding miss (pre-release review)
+        self._declare("exit 1")
+        self._register()
+        self.cli("env-check", run=self.run_dir, expect=1)
+        st = state_mod.load(self.run_dir, self.workspace)
+        st["tasks"][0]["env_requires"] = []
+        state_mod.save(self.run_dir, self.workspace, st)
+        out = self.cli("env-check", run=self.run_dir)
+        self.assertTrue(out["ok"])
+        kinds = [e.get("kind")
+                 for e in ndjson.read_records(self.run_dir / "events.ndjson")]
+        self.assertIn("env-prereq-satisfied", kinds)
 
     def test_satisfying_the_requirement_clears_the_flag(self):
         # re-verify finding: unlike its sibling kinds this one is genuinely
@@ -713,6 +819,20 @@ class PreflightPriorWork(PreflightDefaultBranch):
             self.cli("preflight", "--repo", str(self.repo), run=run)["branch"],
             first)
 
+    def test_unverified_probe_is_flagged_once_per_run(self):
+        # pre-release review: the probe runs BEFORE the clean/default-branch
+        # checks, so a probe-failed repo that was also dirty appended one
+        # permanent flag per refusal-and-retry loop iteration
+        run = self._to_preflight("W-54")
+        gitops.run_git(self.repo, "remote", "add", "origin",
+                       str(self.workspace / "no-such-repo.git"))
+        (self.repo / "dirty.txt").write_text("uncommitted\n")
+        self.cli("preflight", "--repo", str(self.repo), run=run, expect=1)
+        self.cli("preflight", "--repo", str(self.repo), run=run, expect=1)
+        unverified = [e for e in ndjson.read_records(run / "events.ndjson")
+                      if e["kind"] == "remote-branch-unverified"]
+        self.assertEqual(len(unverified), 1)
+
     def test_idempotent_retry_does_not_reprobe(self):
         # The recorded-`branches` fast path returns BEFORE the probe: a
         # crash-and-retry must not start refusing just because the first
@@ -751,6 +871,20 @@ class FetchAlreadyDone(BreadthHarness):
         self.assertIn("work-item-already-done",
                       [e.get("kind")
                        for e in ndjson.read_records(run / "events.ndjson")])
+
+    def test_list_shaped_status_mapping_stays_in_the_error_contract(self):
+        # pre-release review: an unvalidated status_mapping reached
+        # done_state_match — the FIRST verb a run touches — as .get() on a
+        # list, escaping as a raw AttributeError traceback (the identical
+        # class this branch fixed for env_requirements)
+        self.story("W-55", "config typo")
+        self.init()
+        self.cli("init-section", "--section", "overrides", "--json",
+                 json.dumps({"status_mapping": ["done", "open"]}))
+        out = self.cli("fetch", "--id", "W-55", "--date", "2026-02-14",
+                       expect=1)
+        self.assertIn("status_mapping", out["error"])
+        self.assertIn("must be a mapping", out["error"])
 
     def test_open_item_is_not_flagged(self):
         self.story("W-51", "still open")     # Status: Open

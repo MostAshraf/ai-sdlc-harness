@@ -346,6 +346,14 @@ def done_state_match(config: dict, item: dict) -> str | None:
     except Exception:      # unknown/unset provider: fall back to the vocabulary
         pass
     mapping = config.get("status_mapping") or {}
+    if not isinstance(mapping, dict):
+        # Unvalidated config key, and this is the FIRST verb a run touches —
+        # a list-shaped status_mapping used to escape as a raw AttributeError
+        # traceback instead of the JSON error contract (pre-release review;
+        # the identical class this branch fixed for env_requirements).
+        raise state_mod.StateError(
+            "config `status_mapping` must be a mapping of work-item type -> "
+            f"{{milestone: status}} (got {type(mapping).__name__})")
     # Type-specific SHADOWS default — the same precedence
     # resolve_write_back_status uses, so the two readers of this declared
     # data cannot hold different beliefs about it (adversarial-review).
@@ -1665,10 +1673,20 @@ def _probe_prior_remote_branch(run: Path, repo: Path, name: str,
             gitops._push_remote(repo)
         except (gitops.GitError, OSError):
             return
-        ndjson.append_record(run / "events.ndjson",
-                             {"kind": "remote-branch-unverified",
-                              "repo": name, "branch": branch,
-                              "reason": "probe-failed", "actor": "preflight"})
+        # Once per run per (repo, branch), like tests-quarantined
+        # (pre-release review: the probe runs BEFORE the clean/default-branch
+        # checks, so a probe-failed repo that is also dirty appended one
+        # permanent flag per refusal-and-retry — drowning the gauge with
+        # copies of one fact).
+        prior = ndjson.read_records(run / "events.ndjson")
+        if not any(e.get("kind") == "remote-branch-unverified"
+                   and e.get("repo") == name and e.get("branch") == branch
+                   for e in prior):
+            ndjson.append_record(run / "events.ndjson",
+                                 {"kind": "remote-branch-unverified",
+                                  "repo": name, "branch": branch,
+                                  "reason": "probe-failed",
+                                  "actor": "preflight"})
         return
     if not hit:
         return
@@ -1693,6 +1711,14 @@ REPORT_BASENAMES = {
     "plan-review": "plan-review",
     "pre-pr": "pre-pr",
 }
+#: report mode -> the pipeline step whose stalls reopen its round snapshot
+#: (a lens stall is keyed `step:plan-review:<lens>`, so prefix-matching on
+#: the step covers both the synthesizer and its panel members).
+REPORT_STEPS = {
+    "plan-attack": "plan-review",
+    "plan-review": "plan-review",
+    "pre-pr": "pre-pr",
+}
 
 
 def save_report(run: Path, mode: str, body: str, lens: str | None = None,
@@ -1711,10 +1737,27 @@ def save_report(run: Path, mode: str, body: str, lens: str | None = None,
     Writes the live path (what the gate reads) AND that round's immutable
     snapshot in one call — so the "snapshot the old one aside first" step the
     step files used to spell out can no longer be skipped or done
-    inconsistently. The round is derived from the run's plan generation
-    unless overridden, and re-writing an existing snapshot with different
-    content refuses. Emits `report-saved`, so the event implies the file
-    exists rather than merely asserting that a spawn finished."""
+    inconsistently. The round is derived from the run's own ledger unless
+    overridden — PER MODE, because different review loops advance on
+    different events (pre-release adversarial review: plan-review rounds
+    open on a plan re-registration, while pre-pr rounds open on an
+    approve-pre-pr rejection, and anchoring both to the plan generation made
+    every second pre-pr save refuse with a plan-review-flavored message).
+    Re-writing an existing snapshot with different content refuses UNLESS a
+    recorded stall for the mode's step postdates the last save — a stall
+    means the spawn was re-invoked and this round's report is legitimately
+    superseded (the same "a stall opens a new attempt" semantics
+    _stall_round_anchor holds). Emits `report-saved`, so the event implies
+    the file exists rather than merely asserting that a spawn finished."""
+    if not state_mod.state_path(run).exists():
+        # The one run-scoped verb that used to skip this check: a typo'd or
+        # stale-pasted --run manufactured the whole phantom directory via
+        # mkdir(parents=True) and reported success, while the real run's
+        # gate later presented a missing report — the exact failure this
+        # verb exists to close (pre-release adversarial review).
+        raise state_mod.StateError(
+            f"{run} is not a run (no state.yaml) — check --run; refusing to "
+            "manufacture a phantom run directory")
     if mode not in REPORT_BASENAMES:
         raise state_mod.StateError(
             f"unknown report mode '{mode}' — one of: "
@@ -1727,37 +1770,83 @@ def save_report(run: Path, mode: str, body: str, lens: str | None = None,
                 "names the report file, and two lenses sharing one path "
                 "would silently overwrite each other")
         # the value lands in a FILENAME: refuse anything that could escape
-        # the reports directory or collide with the round-suffix convention
-        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", lens.strip().lower()):
+        # the reports directory or collide with the round-suffix convention.
+        # Normalized ONCE, here, and the normalized form is what the event
+        # records and the reopen comparison matches (re-verify: recording
+        # the raw spelling let case-inconsistent --lens values miss their
+        # own predecessor in the last-save lookup).
+        lens = lens.strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", lens):
             raise state_mod.StateError(
                 f"--lens {lens!r} must be a lowercase slug ([a-z0-9-]) — it "
                 "is used as a path component")
-        template = template.format(lens=lens.strip().lower())
+        template = template.format(lens=lens)
     if not body.strip():
         raise state_mod.StateError(
             "refusing to save an empty report — a zero-byte file at the "
             "canonical path is indistinguishable from a persisted one")
     if round_n is not None and round_n < 1:
         raise state_mod.StateError("--round must be >= 1")
+    events = ndjson.read_records(run / "events.ndjson")
     if round_n is None:
         # DERIVED, not hand-tracked (re-verify finding: an optional,
         # orchestrator-supplied round number is skippable and mis-typeable,
         # so "prior rounds stay recoverable" was still a promise resting on
-        # prose). The plan generation is the same anchor capture_post_spawn
-        # stamps on every verdict, so a report and the verdict it explains
-        # carry the same round number by construction.
-        round_n = max(1, sum(1 for e in ndjson.read_records(run / "events.ndjson")
-                             if e.get("kind") == "plan-registered"))
+        # prose) — and derived PER MODE, from the event that actually opens
+        # that mode's next round. Actor-checked for plan-registered, the
+        # same anti-forgery stance outstanding_flagged takes: a stray
+        # `log-event` record must not move the round.
+        if mode == "pre-pr":
+            round_n = 1 + sum(
+                1 for e in events
+                if e.get("kind") == "gate-decision"
+                and e.get("gate") == "approve-pre-pr"
+                and e.get("decision") != "approved")
+        else:
+            round_n = max(1, sum(
+                1 for e in events
+                if e.get("kind") == "plan-registered"
+                and e.get("actor") == "plan-register"))
     reports = run / "reports"
     reports.mkdir(parents=True, exist_ok=True)
     snapshot = reports / f"{template}-r{round_n}.md"
     if snapshot.exists() and snapshot.read_text(encoding="utf-8") != body:
-        raise state_mod.StateError(
-            f"reports/{snapshot.name} already exists with different content "
-            f"— round {round_n}'s snapshot is immutable. If this really is a "
-            "new round, the plan was not re-registered (the round is derived "
-            "from the `plan-registered` count); pass --round explicitly to "
-            "override.")
+        # A recorded stall for this mode's step REOPENS the snapshot: the
+        # spawn was re-invoked inside the same round, so the re-invoked
+        # reply legitimately supersedes the pre-stall one (pre-release
+        # adversarial review, reproduced: without this, the documented
+        # stall -> reinvoke -> save flow refused, the live path kept the
+        # pre-stall synthesis while reviews.ndjson held the re-invoked
+        # verdict — a report/verdict mismatch at the human gate — and the
+        # refusal's own advertised remedy could not work).
+        # EXACT stall key per report (re-verify on this fix: a prefix match
+        # let one early lens stall reopen every sibling lens + the synthesis
+        # snapshot for the rest of the round). The synthesizer's stall key is
+        # the bare step; a lens's is the declared finer key.
+        step = REPORT_STEPS[mode]
+        stall_task = f"step:{step}:{lens}" if lens else f"step:{step}"
+        last_save = max((e.get("at", "") for e in events
+                         if e.get("kind") == "report-saved"
+                         and e.get("mode") == mode
+                         and e.get("lens") == lens
+                         and e.get("round") == round_n), default="")
+        # A forged far-future `report-saved` via log-event could pin
+        # stalled_since false forever — accepted: the failure direction is
+        # OVER-refusal (recoverable at the next round), the same direction
+        # every other unvalidated-log-event hazard here resolves to.
+        stalled_since = any(
+            e.get("kind") == "stall" and e.get("task") == stall_task
+            and e.get("at", "") > last_save
+            for e in events)
+        if not stalled_since:
+            raise state_mod.StateError(
+                f"reports/{snapshot.name} already exists with different "
+                f"content — round {round_n}'s snapshot is immutable. If the "
+                "spawn was re-invoked after a stall, record the stall first "
+                "(`harness stall`) and re-save; if this is genuinely the "
+                "next round, the event that opens it was never recorded "
+                "(plan-review rounds open on plan re-registration, pre-pr "
+                "rounds on an approve-pre-pr rejection).")
     written = []
     for name in (f"{template}.md", snapshot.name):
         (reports / name).write_text(body, encoding="utf-8")
@@ -1768,6 +1857,22 @@ def save_report(run: Path, mode: str, body: str, lens: str | None = None,
                           "actor": "save-report"})
     return {"mode": mode, "lens": lens, "round": round_n, "paths": written,
             "path": written[0]}
+
+
+def _has_open_env_miss(run: Path) -> bool:
+    """Is the NEWEST env-prereq event a miss? — i.e. is there anything left
+    to pair off. Checking `any(miss in history)` instead meant every clean
+    run-wide check after the first ever miss appended another satisfied
+    event forever (re-verify: ledger noise, not a gauge error — the pairing
+    itself was already order-correct)."""
+    latest = ""
+    open_miss = False
+    for e in ndjson.read_records(run / "events.ndjson"):
+        if e.get("kind") in ("env-prereq-missing", "env-prereq-satisfied") \
+                and e.get("at", "") >= latest:
+            latest = e.get("at", "")
+            open_miss = e.get("kind") == "env-prereq-missing"
+    return open_miss
 
 
 def env_check(workspace: Path, run: Path, config: dict,
@@ -1849,12 +1954,20 @@ def env_check(workspace: Path, run: Path, config: dict,
                               "tasks": [t["id"] for t in scoped],
                               "missing": [m["name"] for m in missing],
                               "actor": "env-check"})
-    elif checked and any(e.get("kind") == "env-prereq-missing"
-                         for e in ndjson.read_records(run / "events.ndjson")):
+    elif task_id is None and _has_open_env_miss(run):
         # Unlike its sibling kinds this one is genuinely RESOLVABLE — the
         # human starts the service and re-runs — so a permanent flag would
         # leave every such run reading DEGRADED forever (re-verify finding).
         # Paired off in outstanding_flagged like deferral-pending/-recorded.
+        # RUN-WIDE invocations only (pre-release review, both lenses,
+        # reproduced): outstanding_flagged clears every open miss on one
+        # satisfied event, on the strength of "the whole set is re-probed" —
+        # which a `--task`-scoped probe makes false. Fixing docker and
+        # re-checking only T1 must not clear T2's emulator flag; the
+        # run-wide check the develop step documents is the one that clears.
+        # No `checked` requirement: a plan revision that REMOVED the failing
+        # requirement leaves nothing to probe, and that too resolves the
+        # outstanding miss rather than flagging it forever.
         ndjson.append_record(run / "events.ndjson",
                              {"kind": "env-prereq-satisfied",
                               "checked": [c["name"] for c in checked],

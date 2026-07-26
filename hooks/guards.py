@@ -416,7 +416,16 @@ PLANNER_STAMP_RE = re.compile(
 # plan-accuracy round: the intake planner has Bash and is live at exactly
 # the cursors where these verbs are legal).
 SUBAGENT_REGISTER_RE = re.compile(
-    r"\bharness\b" + _CMD_GAP + r"\b(?:scope-register|plan-register)\b")
+    r"\bharness\b" + _CMD_GAP + r"\b(?:scope-register|plan-register|"
+    # save-report joins the orchestrator-only set (pre-release adversarial
+    # review, both lenses independently): reports/ under a run is
+    # GATE-PRESENTED evidence — an exhausted plan-review decision rests on
+    # reports/plan-review.md — and before this verb existed no subagent had
+    # any path into it (Write/Edit and bash-write confinement both block the
+    # directory). A reviewer that "helpfully" persisted its own reply would
+    # both author the evidence the human reads AND, via the snapshot
+    # immutability check, wedge the orchestrator's own documented save.
+    r"save-report)\b")
 # `(?!<)` after the colon: spawn prompts routinely quote
 # shared/status-block.md's reply template verbatim as instructions to the
 # subagent — including its literal `harness-task: <task-id or ->` example —
@@ -733,11 +742,13 @@ def guard_bash(p: dict) -> None:
                   "`repo-map-stamp` is the orchestrator's job, run once after "
                   "the planner's spawn returns (agents/planner.md).", cwd, p)
         if shape_of(p.get("agent_type")) and SUBAGENT_REGISTER_RE.search(target):
-            block("scope-register and plan-register are orchestrator-only: "
-                  "the scope records the HUMAN's confirmation and the task "
-                  "list is what the plan gate ratifies — report your "
-                  "proposal in your status block; the orchestrator confirms "
-                  "with the user and registers it.", cwd, p)
+            block("scope-register, plan-register and save-report are "
+                  "orchestrator-only: the scope records the HUMAN's "
+                  "confirmation, the task list is what the plan gate "
+                  "ratifies, and a run's reports/ are the evidence a human "
+                  "gate presents — report your proposal/review in your "
+                  "status block; the orchestrator confirms, registers, and "
+                  "persists.", cwd, p)
 
 
 # ------------------------------------------------- Write/Edit path guards
@@ -1779,13 +1790,26 @@ def capture_post_spawn(p: dict) -> None:
             # only, so a missing or malformed count can never change a
             # transition — it just leaves that round's convergence
             # unrecorded (field: dual-run comparison).
-            # LAST match, not first: `extract_verdict` is scoped to the final
-            # status block, and a recap line earlier in the reply would
-            # otherwise win over the block the verdict came from (re-verify
-            # finding — advisory-only, but the asymmetry was wrong).
-            bf = (BLOCKING_RE.findall(text) or [None])[-1]
-            plans = sum(1 for e in ndjson.read_records(run / "events.ndjson")
-                        if e.get("kind") == "plan-registered")
+            # Scoped to the FINAL status block exactly like extract_verdict
+            # (pre-release review, both lenses: a prose recap of a previous
+            # round — "round 1 had blocking-findings: 9" — must not become
+            # THIS round's count when the final block omits the optional
+            # line); same whole-text fallback for a malformed block.
+            _m = list(STATUS_RE.finditer(text))
+            _scope = text[_m[-1].start():] if _m else text
+            bf = (BLOCKING_RE.findall(_scope) or [None])[-1]
+            # Best-effort, and actor-checked like outstanding_flagged (a
+            # stray `log-event` record must not move the generation). The
+            # try/except is load-bearing: this read sits in front of the
+            # FSM-critical verdict append, and an OSError here used to
+            # abort the whole capture — verdict lost over an advisory count
+            # (pre-release review).
+            try:
+                plans = sum(1 for e in ndjson.read_records(run / "events.ndjson")
+                            if e.get("kind") == "plan-registered"
+                            and e.get("actor") == "plan-register")
+            except OSError:
+                plans = None
             ndjson.append_record(run / "reviews.ndjson", {
                 "task": task, "mode": mode, "verdict": captured,
                 "blocking_findings": int(bf) if bf is not None else None,

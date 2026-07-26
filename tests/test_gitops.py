@@ -88,10 +88,21 @@ class TddProofPair(GitopsHarness):
     def test_test_command_timeout_raises_redprooferror_not_a_raw_traceback(self):
         # adversarial-review finding: subprocess.TimeoutExpired was uncaught
         # here, crashing with a raw Python traceback instead of the CLI's
-        # JSON error contract.
+        # JSON error contract. The mock times out only the TEST command —
+        # patching every subprocess.run also killed the git calls _test_set
+        # makes, which the old blanket mock got away with purely because the
+        # test run happened to come first (pre-release review reordered
+        # verify_red so the overlap check precedes the run).
         self._write_test()
+        real = subprocess.run
+
+        def only_test_cmd_times_out(args, **kwargs):
+            if isinstance(args, str):   # shell=True: the test command itself
+                raise subprocess.TimeoutExpired(TEST_CMD, 600)
+            return real(args, **kwargs)
+
         with mock.patch("harness.gitops.subprocess.run",
-                        side_effect=subprocess.TimeoutExpired(TEST_CMD, 600)):
+                        side_effect=only_test_cmd_times_out):
             with self.assertRaises(gitops.RedProofError) as ctx:
                 self._red()
         self.assertIn("timed out", str(ctx.exception))
@@ -971,6 +982,38 @@ class TestQuarantine(GitopsHarness):
             gitops.verify_red(self.run, self.workspace, self.repo, cfg, "T1",
                               TEST_CMD, declared=["tests/test_x.py"],
                               intents=["test_val"])
+
+    def test_overlap_refusal_fires_before_the_misleading_passes_message(self):
+        """pre-release review: with the overlap check AFTER the code==0
+        raise, quarantining the task's own test made the excluded suite pass
+        and 'PASSES — not red' fired first — sending the developer to fix a
+        'vacuous' test while the real cause was the exclusion (the exact
+        field pain the guard's docstring cites)."""
+        self._write_test()
+        self._write_impl()      # suite would genuinely pass when excluded
+        cfg = self._config({"exclude_template": "--ignore={test}",
+                            "tests": [{"test": "tests/test_x.py",
+                                       "reason": "misattributed",
+                                       "since": "2026-07-22"}]})
+        with self.assertRaises(gitops.RedProofError) as ctx:
+            gitops.verify_red(self.run, self.workspace, self.repo, cfg, "T1",
+                              TEST_CMD, declared=["tests/test_x.py"],
+                              intents=["test_val"])
+        self.assertIn("locked test set", str(ctx.exception))
+        self.assertNotIn("not red", str(ctx.exception))
+
+    def test_windows_wrapper_spellings_refuse_too(self):
+        # pre-release review: `sh.exe -c`, `cmd /c` and `powershell
+        # -Command` slipped the POSIX-only wrapper pattern — reviving the
+        # silent-full-suite false negative on the platform whose toolchains
+        # wrap commands most
+        cfg = self._config(self.ONE)
+        for bad in ('sh.exe -c "npm test"', 'bash.exe -lc "npm test"',
+                    'cmd /c "npm test"', 'cmd.exe /d /c "npm test"',
+                    'powershell -Command "npm test"',
+                    'pwsh.exe -NoProfile -c "npm test"'):
+            with self.assertRaises(initws.QuarantineError):
+                initws.quarantine_cmd(cfg, self.repo, bad)
 
     def test_wrapped_and_multiline_commands_refuse(self):
         """re-verify finding: the quote-aware scan let `sh -c "cd fe && …"`

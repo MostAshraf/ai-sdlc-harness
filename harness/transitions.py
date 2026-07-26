@@ -607,6 +607,12 @@ def _stall_round_anchor(state: dict, run: Path, stall_key: str,
     marks += [e.get("at", "") for e in events
               if e.get("kind") == "stall" and e.get("task") == stall_key]
     if round_marker:
+        # Deliberately NOT actor-checked, unlike outstanding_flagged's
+        # plan-registered consumers: the marker kind is generic declared
+        # data, and a forged marker here only WIDENS the anchor — which
+        # ALLOWS a stall, burning budget toward the human. That is the
+        # design's safe direction, the same reason timestamp ties resolve
+        # the same way (pre-release review adjudication).
         marks += [e.get("at", "") for e in events
                   if e.get("kind") == round_marker]
     return max(marks, default="")
@@ -638,7 +644,7 @@ def guard_stall_verdict(state: dict, manifest: dict, run: Path,
         return
     try:
         latest_verdict, _rounds, at = _verdict_window(state, run, vb["mode"])
-    except TransitionError:
+    except (TransitionError, OSError):
         # A guard whose job is to SUPPRESS an action must fail OPEN, the
         # opposite of the exit filter this shares a reader with (adversarial-
         # review, both lenses independently). _verdict_window reads
@@ -648,11 +654,20 @@ def guard_stall_verdict(state: dict, manifest: dict, run: Path,
         # recorded. Refusing then would brick the stalled-agent procedure,
         # the one path a wedged run depends on, with a message about
         # `verdict_bound` that says nothing about stalls. A ledger that
-        # cannot be read cannot prove a verdict exists: let the stall through.
+        # cannot be read cannot prove a verdict exists: let the stall
+        # through. OSError joins TransitionError (pre-release review): an
+        # exists-but-unreadable ledger (EACCES/EIO) is the same "cannot
+        # read" — only the corruption spelling was caught, so the wedged-run
+        # path failed CLOSED on exactly the I/O failures most likely to
+        # accompany a wedge.
         return
     if latest_verdict is None:
         return
-    anchor = _stall_round_anchor(state, run, stall_key, vb.get("round_marker"))
+    try:
+        anchor = _stall_round_anchor(state, run, stall_key,
+                                     vb.get("round_marker"))
+    except OSError:
+        return  # unreadable events ledger: same fail-open reasoning
     if at <= anchor:
         return  # an EARLIER round's verdict — this stall is genuine
     raise TransitionError(

@@ -267,7 +267,16 @@ QUARANTINE_KEYS = {"exclude_template", "coverage_exclude_template", "tests"}
 #: unwraps for the bash guard (re-verify finding: `sh -c "cd fe && vitest"`
 #: passed the quote-aware scan AND init-verify, then silently ran the full
 #: suite — a false negative strictly worse than the false positive it fixed).
-_SHELL_WRAPPER_RE = re.compile(r"(?:^|\s)(?:[a-z]*sh|env)\s+(?:-\w+\s+)*-\w*c\b")
+#: Windows spellings included (pre-release review: `sh.exe -c`, `cmd /c` and
+#: `powershell -Command` all slipped the POSIX-only pattern, reviving that
+#: exact false negative on the one platform whose toolchains wrap commands
+#: most — a Git-Bash `test_cmd: sh.exe -c "…"` is routine there).
+_SHELL_WRAPPER_RE = re.compile(
+    r"(?:^|\s)(?:"
+    r"(?:[a-z]*sh|env)(?:\.\w+)?\s+(?:-\w+\s+)*-\w*c\b"     # sh/bash/zsh/env, .exe ok
+    r"|cmd(?:\.\w+)?\s+(?:/\w+\s+)*/c\b"                    # cmd /c
+    r"|(?:powershell|pwsh)(?:\.\w+)?\s+(?:-\w+\s+)*-c(?:ommand)?\b"
+    r")", re.IGNORECASE)
 
 
 def _shell_composition(cmd: str) -> str | None:

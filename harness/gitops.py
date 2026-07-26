@@ -689,14 +689,21 @@ def verify_red(run: Path, workspace: Path, repo: Path, config: dict, task_id: st
     # not proof that THIS task's test fails. Excluding those first makes the
     # red-proof about the task's own declared intents (field: dual-run
     # comparison — that exact spec aborted three runs of the frontend suite).
+    #
+    # Overlap refusal BEFORE the run (pre-release review: with the check
+    # after the code==0 raise, a quarantine entry covering the task's own
+    # test made the excluded suite pass and the misleading "PASSES — not
+    # red" fired first — sending the developer to fix a "vacuous" test while
+    # the real cause was the exclusion. The check needs nothing from the
+    # run, so it goes first and names the actual problem).
     task_repo = _task_repo(workspace, run, task_id)
+    tests, closure = _test_set(repo, config, declared)
+    _refuse_quarantine_overlap(config, task_repo, tests)
     code, tail = _run_tests(repo, _quarantined(config, task_repo, test_cmd, run))
     if code == 0:
         raise RedProofError(
             f"task {task_id}: test suite PASSES — not red. Test-first means the "
             "failing test exists before the implementation.")
-    tests, closure = _test_set(repo, config, declared)
-    _refuse_quarantine_overlap(config, task_repo, tests)
     declared_intents = intents if intents is not None else _declared_test_intents(
         workspace, run, task_id)
     missing_intents = _missing_intents(repo, tests, closure, declared_intents)

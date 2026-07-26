@@ -6,7 +6,9 @@ deliberately absent) — tests here are green-from-birth (they cover code
 that already exists), so NO red-proof machinery applies.
 
 1. Resolve the coverage command: `${CLAUDE_PLUGIN_ROOT}/bin/harness
-   resolve-coverage-cmd --repo <repo>` (per repo, `language.repos.<repo-
+   resolve-coverage-cmd --repo <repo> --run <run>` (`--run` is what puts any
+   quarantine exclusion on the run's flagged-events dashboard — without it
+   the exclusions apply invisibly) (per repo, `language.repos.<repo-
    name>.coverage_cmd` — `discover` proposes one at `/init-workspace` time
    where repo evidence supports it: python/go conventions, a node
    `coverage` script or jest/vitest+provider, jacoco in a java pom). Null

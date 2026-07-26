@@ -166,14 +166,16 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
                              "to its canonical <run>/reports/ path, plus "
                              "this round's snapshot")
     sr.add_argument("--mode", required=True,
-                    help="plan-attack | plan-review | pre-pr | review")
+                    help="plan-attack | plan-review | pre-pr (per-task "
+                         "review verdicts are hook-captured, not persisted)")
     sr.add_argument("--lens", default=None,
                     help="panel member name (required for lens modes) — "
                          "becomes part of the filename")
     sr.add_argument("--round", type=int, default=None, dest="round_n",
                     help="this round's immutable snapshot (<name>-r<N>.md); "
-                         "omitted, it is derived from the run's plan "
-                         "generation")
+                         "omitted, it is derived from the run's own ledger — "
+                         "plan modes count plan re-registrations, pre-pr "
+                         "counts approve-pre-pr rejections")
     sr.add_argument("--body-file", type=Path, default=None,
                     help="read the report from this file instead of stdin — "
                          "the preferred form: a report on the command line "
