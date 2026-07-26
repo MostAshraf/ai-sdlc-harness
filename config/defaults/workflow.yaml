@@ -57,6 +57,25 @@ plan_review:
     chore: []
     docs: []
 
+# Environment prerequisites a task can declare (`env_requires: [docker]` at
+# plan-register) and `harness env-check` probes BEFORE the developer spawn.
+# field: dual-run comparison — Docker was down in both runs. One never
+# executed its Testcontainers integration test at all and shipped that path
+# verified by code review only; the other lost ~1h38m mid-develop stopping to
+# ask, starting Docker, and re-running. The cost is the same either way: the
+# wall is hit after the developer is already working.
+#
+# Declared, not hardcoded: the probe command is data, so a workspace adds its
+# own (`kubectl`, a local postgres, an emulator) without touching Python.
+# `probe` is run through the shell; exit 0 means present. `hint` is shown to
+# the human verbatim when it isn't. plan-register REFUSES an `env_requires`
+# name absent from this map — an unprobeable requirement is worse than none,
+# since it reads as checked.
+env_requirements:
+  docker:
+    probe: "docker info"
+    hint: "start Docker Desktop (or the docker daemon) and re-run env-check"
+
 # Severity model for the security step + conditional gate predicate.
 security:
   severity_order: [info, low, medium, high, critical]

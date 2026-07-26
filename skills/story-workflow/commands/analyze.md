@@ -21,6 +21,13 @@ non-destructive — it never rewrites the story.
      'handles errors gracefully' — untestable; suggest 'Given an invalid token,
      When login is attempted, Then a 401 with code `AUTH_INVALID_TOKEN` is
      returned'."
+   - **UI ACs must name observable DOM semantics.** "the Next button is
+     disabled" reads two defensible ways — rendered carrying `disabled`, or
+     not rendered at all — and each yields incompatible code AND incompatible
+     tests. Flag it and draft the specific one (field: two independent runs
+     of one story read exactly that AC in opposite directions and shipped
+     mutually incompatible work, each internally consistent). Same for
+     "shows an error", "the row is highlighted", "the field is cleared".
    - **Suggest, don't only critique.** Every 🔴/🟡 carries a concrete fix —
      draft the replacement text where you can.
    - **Constructive tone.** The PO and team will read this.

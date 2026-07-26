@@ -10,6 +10,7 @@ the human, but not a stall. Don't lean on that: it is a degraded path.
 harness-status: SUCCESS | PARTIAL | FAILED
 harness-task: <task-id or ->
 verdict: <APPROVED | CHANGES_REQUESTED>
+blocking-findings: <N>
 outcome: <one line — what actually happened, evidence-grounded>
 details: <optional: findings list / clarifying questions / blocker>
 ```
@@ -27,6 +28,13 @@ Rules:
   uncapturable — the hook reads only a line-anchored verdict, fail-closed
   (three field re-reviews were paid for exactly that run-together shape;
   the verdict used to be defined as part of `details`, which taught it).
+- `blocking-findings` is the REVIEWER's count of findings that must be
+  fixed before approval (CRITICAL, and any WARNING you are actually
+  blocking on) — `0` on an APPROVED verdict. Optional, but give it: it is
+  the only machine-readable record of whether a review panel is converging,
+  and the metrics report turns it into a per-round table the human reads at
+  the gate. Non-reviewer shapes omit the line. It never changes the verdict
+  — `verdict` alone decides that.
 - `outcome` claims only what a tool result in THIS session proves — report
   failures faithfully ("tests fail with X"), never aspirationally.
 - `PARTIAL` means you checkpointed (wip commit) and the work is resumable —

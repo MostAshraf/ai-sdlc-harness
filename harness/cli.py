@@ -161,6 +161,34 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
                         "change_type (plan_review.lenses overlaid by "
                         "lenses_by_change_type)")
 
+    sr = sub.add_parser("save-report", parents=[common],
+                        help="persist a read-only reviewer's report (stdin) "
+                             "to its canonical <run>/reports/ path, plus "
+                             "this round's snapshot")
+    sr.add_argument("--mode", required=True,
+                    help="plan-attack | plan-review | pre-pr | review")
+    sr.add_argument("--lens", default=None,
+                    help="panel member name (required for lens modes) — "
+                         "becomes part of the filename")
+    sr.add_argument("--round", type=int, default=None, dest="round_n",
+                    help="this round's immutable snapshot (<name>-r<N>.md); "
+                         "omitted, it is derived from the run's plan "
+                         "generation")
+    sr.add_argument("--body-file", type=Path, default=None,
+                    help="read the report from this file instead of stdin — "
+                         "the preferred form: a report on the command line "
+                         "breaks on its own apostrophes AND trips the bash "
+                         "guard whenever it quotes a run-authority path or a "
+                         "markdown blockquote")
+
+    ec = sub.add_parser("env-check", parents=[common],
+                        help="probe the environment prerequisites the plan "
+                             "declared (`env_requires`) BEFORE the developer "
+                             "spawn; refuses on a missing one")
+    ec.add_argument("--task", default=None,
+                    help="scope to one task; omit for every non-terminal "
+                         "task in the run")
+
     rtc = sub.add_parser("resolve-test-cmd", parents=[common],
                          help="resolve the per-repo test command "
                               "(language.repos.<name>.test_cmd) with any "
@@ -495,6 +523,29 @@ def main(argv: list[str] | None = None) -> int:
             _emit({"ok": True, "change_type": st.get("change_type"),
                    "lenses": lenses})
             return 0
+
+        if args.cmd == "save-report":
+            # A file or stdin, never an argument: a report is multi-line
+            # prose, and putting it on the command line both breaks on its
+            # own apostrophes and trips the bash guard the moment it quotes
+            # a run-authority path or a markdown blockquote (the guard reads
+            # `>` as a redirect). Same file-form precedent as
+            # `--tasks-json-file`.
+            body = (args.body_file.read_text(encoding="utf-8")
+                    if args.body_file else sys.stdin.read())
+            result = workflow.save_report(args.run, args.mode, body,
+                                          args.lens, args.round_n)
+            _emit({"ok": True, **result})
+            return 0
+
+        if args.cmd == "env-check":
+            result = workflow.env_check(args.workspace, args.run, config,
+                                        args.task)
+            # Refuse (exit 1) rather than reporting ok:false at exit 0 — the
+            # develop step branches on the exit code, and a prerequisite the
+            # human has to fix is exactly the "refused" contract.
+            _emit({"ok": not result["missing"], **result})
+            return 1 if result["missing"] else 0
 
         if args.cmd == "resolve-test-cmd":
             # The owned resolution the `harness-test-cmd` header is built

@@ -11,6 +11,7 @@ import datetime as _dt
 import json
 import posixpath
 import re
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -39,24 +40,33 @@ FLAGGED_EVENT_KINDS = (
     "coverage-skipped", "risk-without-tests", "tests-without-production",
     "pr-recorded-manually", "secret-sweep-blocked", "gate-skipped",
     "deferral-pending", "panel-serialized",
-    # field: dual-run comparison — prior-work and quarantine signals.
-    # All FOUR record OCCURRENCES (like hook-blocked/gate-skipped), not live
-    # plan state, so outstanding_flagged needs no resolver for them: a remote
-    # branch that collided, a probe that resolved a remote but could not
-    # answer, a re-run of an already-done item, and a run's quarantined
-    # exclusions each stay permanently on the dashboard. `tests-quarantined`
-    # is the one that had to EARN that classification — it is emitted once
-    # per run per (repo, set) rather than once per test invocation, which is
-    # what makes it an occurrence rather than an O(tasks) repeated assertion
-    # (adversarial-review, both lenses independently).
+    # field: dual-run comparison. Six kinds, in three resolution classes —
+    # each stated explicitly, because getting this wrong is what makes the
+    # flagged-events gauge either over- or under-report (see
+    # outstanding_flagged below).
     #
-    # None are HEALTH_DEGRADING (below): each means "a human should look",
-    # not "this run's machinery degraded / evidence was lost". The closest
-    # call is `remote-branch-unverified` — evidence genuinely not obtained —
-    # but preflight continuing without it is the declared, safe behaviour
-    # (a connectivity blip must not brick a run), not a degraded one.
+    # (a) PERMANENT OCCURRENCES, no resolver (like hook-blocked/gate-skipped):
+    #     a remote branch that collided, a probe that resolved a remote but
+    #     could not answer, a re-run of an already-done item, and a run's
+    #     quarantined exclusions. `tests-quarantined` had to EARN this — it
+    #     is emitted once per run per (repo, set) rather than once per test
+    #     invocation, which is what makes it an occurrence rather than an
+    #     O(tasks) repeated assertion (adversarial-review, both lenses).
     "remote-branch-exists", "remote-branch-unverified",
-    "work-item-already-done", "tests-quarantined")
+    "work-item-already-done", "tests-quarantined",
+    # (b) LIVE PLAN STATE, superseded by the next `plan-registered`: a weak
+    #     contract fragment describes the currently-registered plan, exactly
+    #     like risk-without-tests.
+    "contract-fragment-weak",
+    # (c) RESOLVABLE, paired off by `env-prereq-satisfied`: the human starts
+    #     the service and re-runs. Permanent here would leave every such run
+    #     reading DEGRADED forever (re-verify finding).
+    "env-prereq-missing")
+# None of the six are HEALTH_DEGRADING (below): each means "a human should
+# look", not "this run's machinery degraded / evidence was lost". The closest
+# call is `remote-branch-unverified` — evidence genuinely not obtained — but
+# preflight continuing without it is the declared, safe behaviour (a
+# connectivity blip must not brick a run), not a degraded one.
 
 
 def outstanding_flagged(events: list[dict]) -> list[dict]:
@@ -88,6 +98,7 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
     flagged = [e for e in events if e.get("kind") in FLAGGED_EVENT_KINDS]
     open_pending: list[dict] = []
     open_plan: list[dict] = []
+    open_env: list[dict] = []
     resolved: set[int] = set()
     for e in events:
         kind = e.get("kind")
@@ -95,7 +106,16 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
             open_pending.append(e)
         elif kind == "deferral-recorded" and open_pending:
             resolved.add(id(open_pending.pop(0)))   # resolve earliest open pending
-        elif kind in ("risk-without-tests", "tests-without-production"):
+        elif kind == "env-prereq-missing":
+            open_env.append(e)
+        elif kind == "env-prereq-satisfied":
+            # A prerequisite the human then made available is RESOLVED, not a
+            # permanent occurrence — every earlier miss is superseded by one
+            # clean probe (the whole set is re-probed each time).
+            resolved.update(id(x) for x in open_env)
+            open_env.clear()
+        elif kind in ("risk-without-tests", "tests-without-production",
+                      "contract-fragment-weak"):
             open_plan.append(e)
         elif (kind == "plan-registered"
                 and e.get("actor") == "plan-register"):
@@ -456,6 +476,47 @@ def fetch_from_raw(workspace: Path, config: dict, manifest: dict, raw: dict,
 
 
 CONTRACT_TYPES = {"http", "service-bus", "dto"}
+#: Leading tokens that mark an http fragment as a method+path DESCRIPTION
+#: rather than a grep-able route substring (see _contract_advisories).
+_HTTP_VERBS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS",
+               "TRACE", "CONNECT"}
+
+
+def _contract_advisories(c: dict) -> list[str]:
+    """Weak-but-legal contract shapes, surfaced as flags rather than
+    refusals.
+
+    field: dual-run comparison — one run registered
+    `GET /api/v1/admin/workflows/discovery` as its http fragment. The
+    method+path form appears verbatim in neither client nor controller
+    source (a client calls `get("/api/v1/…")`; a controller carries the verb
+    as a decorator), so reconcile-contracts reported `drift` on a correctly
+    implemented contract and pre-PR had to adjudicate it away. The other run
+    registered the bare route and got `clean`. The verb adds nothing to
+    matching and reliably breaks it.
+
+    FLAGGED, not refused: the method+path form is a documented, supported
+    shape and it matches fine where source really does carry it verbatim
+    (route tables, generated clients). Refusing would break working setups
+    to prevent a false POSITIVE — the wrong trade. The flag reaches
+    plan-review and the human, the same treatment `risk-without-tests`
+    gets."""
+    if c.get("type") != "http":
+        return []
+    sig = c.get("signature")
+    fragments = sig if isinstance(sig, list) else [sig]
+    out = []
+    for f in fragments:
+        head = str(f or "").strip().split(None, 1)
+        if head and head[0].upper() in _HTTP_VERBS:
+            route = head[1] if len(head) > 1 else "the route alone"
+            out.append(
+                f"contract {c.get('id')}: http fragment {f!r} leads with an "
+                "HTTP verb. reconcile-contracts matches fragments as literal "
+                "source substrings, and method+path rarely appears verbatim "
+                f"in either side's code — prefer {route!r} (or a distinctive "
+                "tail of it) unless your source really does carry the verb.")
+    return out
 
 
 def _validate_contract(c: dict) -> None:
@@ -703,6 +764,39 @@ def plan_register(workspace: Path, run: Path, manifest: dict,
                     f"plan-register: task {t['id']}: test_only_reason must "
                     "be a string (got "
                     f"{type(t['test_only_reason']).__name__})")
+            # env_requires: declared at plan time, probed before the spawn.
+            # The vocabulary is `env_requirements` in config — an unknown
+            # name REFUSES here rather than reading as a checked requirement
+            # `env-check` would silently skip (half-enforced-vocabulary bar).
+            # Vocabulary is only checkable when a config was threaded; the
+            # CLI always threads it, unit harnesses may not (same stance the
+            # language/test_paths default below takes).
+            reqs = t.get("env_requires", [])
+            if not isinstance(reqs, list):
+                raise state_mod.StateError(
+                    f"plan-register: task {t['id']}: env_requires must be a "
+                    f"LIST of requirement names (got {type(reqs).__name__})")
+            _envcfg = (config or {}).get("env_requirements") or {}
+            if not isinstance(_envcfg, dict):
+                raise state_mod.StateError(
+                    "config `env_requirements` must be a mapping of name -> "
+                    f"{{probe, hint}} (got {type(_envcfg).__name__})")
+            declared = set(_envcfg)
+            for r in reqs:
+                if not isinstance(r, str) or not r.strip():
+                    raise state_mod.StateError(
+                        f"plan-register: task {t['id']}: env_requires must "
+                        f"be a LIST of non-empty names ({r!r} isn't)")
+                # normalized BEFORE the vocabulary check, so validation and
+                # the persisted form below agree on what the name is
+                if config is not None and r.strip() not in declared:
+                    raise state_mod.StateError(
+                        f"plan-register: task {t['id']}: env_requires names "
+                        f"'{r.strip()}', which has no probe declared. Known: "
+                        f"{', '.join(sorted(declared)) or '(none)'}. Add it "
+                        "to `env_requirements` in workspace config (name -> "
+                        "{probe, hint}) so env-check can actually verify it "
+                        "— an unprobeable requirement reads as checked.")
         # Zero-test policy (field 459226): `test_intents: []` stays the
         # plan-approved opt-out, but at any risk OTHER THAN "low" the
         # opt-out must carry a RECORDED reason — one medium-risk task
@@ -815,6 +909,10 @@ def plan_register(workspace: Path, run: Path, manifest: dict,
                                   or None)
                                  if (t.get("test_intents")
                                      and not _prod_files(t)) else None,
+             # normalized + de-duplicated, order preserved: env-check probes
+             # each distinct requirement once per invocation
+             "env_requires": list(dict.fromkeys(
+                 r.strip() for r in (t.get("env_requires") or []))),
              "commit_sha": None, "review_rounds": 0, "stalls": 0,
              "worktree": None}
             for t in tasks]
@@ -845,6 +943,15 @@ def plan_register(workspace: Path, run: Path, manifest: dict,
                     "kind": "tests-without-production", "task": t["id"],
                     "actor": "plan-register",
                     "reason": t["test_only_reason"]})
+        # Weak-but-legal contract shapes: flagged for plan-review and the
+        # human, never refused (see _contract_advisories). Superseded by the
+        # next `plan-registered` exactly like the two batches above — a
+        # revision that fixes a fragment must clear its flag.
+        for c in contracts or []:
+            for advisory in _contract_advisories(c):
+                ndjson.append_record(run / "events.ndjson", {
+                    "kind": "contract-fragment-weak", "contract": c.get("id"),
+                    "actor": "plan-register", "reason": advisory})
     return {"tasks": ids, "contracts": [c["id"] for c in contracts or []]}
 
 
@@ -1453,6 +1560,28 @@ def metrics_report(workspace: Path, run: Path,
                         [[r.get("task"), r.get("mode"), r.get("verdict"),
                           _fmt_when(r.get("at"))] for r in reviews])
               if reviews else ["No review verdicts recorded."])
+    # Convergence: is the panel actually closing findings, or spinning?
+    # field: dual-run comparison — a run's verdict rows carried only
+    # mode/verdict/at, so nothing machine-readable answered that. Its own
+    # retro then misstated the final round, and the human gate at
+    # `exhausted` had no one-glance framing that the trajectory had been
+    # 9 → 7 → 2 → 2 (converging) rather than flat (stuck). Rendered only
+    # when at least one reviewer supplied the optional count — an empty
+    # table would imply the data was collected and was zero.
+    conv = [r for r in reviews if r.get("blocking_findings") is not None]
+    if conv:
+        lines += ["", "## Review convergence", ""]
+        by_mode: dict[str, list[dict]] = {}
+        for r in conv:
+            by_mode.setdefault(str(r.get("mode")), []).append(r)
+        rows = []
+        for mode_name, rs in by_mode.items():
+            for i, r in enumerate(rs, 1):
+                rows.append([mode_name, i, r.get("plan_generation"),
+                             r.get("verdict"), r.get("blocking_findings"),
+                             _fmt_when(r.get("at"))])
+        lines += _md_table(["Mode", "Round", "Plan gen", "Verdict",
+                            "Blocking", "At (UTC)"], rows)
     lines += ["", "## Tokens", ""]
     if tokens:
         agg: dict[tuple, dict] = {}
@@ -1555,6 +1684,183 @@ def _probe_prior_remote_branch(run: Path, repo: Path, name: str,
         "preflight; (2) branch aside — re-run preflight with "
         "--feature-branch-suffix <s> to cut a distinct name; or (3) delete "
         "the remote branch if it is abandoned. Never auto-adopted.")
+
+
+#: report mode -> canonical basename under `<run>/reports/`. `{lens}` is
+#: filled from --lens; every other mode ignores it.
+REPORT_BASENAMES = {
+    "plan-attack": "plan-attack-{lens}",
+    "plan-review": "plan-review",
+    "pre-pr": "pre-pr",
+}
+
+
+def save_report(run: Path, mode: str, body: str, lens: str | None = None,
+                round_n: int | None = None) -> dict:
+    """`harness save-report` — the owned way a read-only reviewer's report
+    reaches disk.
+
+    field: dual-run comparison — lens reports for two whole rounds do not
+    exist on disk in one of the runs. Read-only lens agents returned their
+    reports in-reply and the orchestrator hand-copied them roughly three
+    times before the practice lapsed; persistence was PROSE ("the
+    orchestrator persists it"), which is exactly the trust-the-prose shape
+    the harness refuses everywhere else. The other run invented the
+    `-r1/-r2/-r3` round-suffix convention ad hoc, mid-run.
+
+    Writes the live path (what the gate reads) AND that round's immutable
+    snapshot in one call — so the "snapshot the old one aside first" step the
+    step files used to spell out can no longer be skipped or done
+    inconsistently. The round is derived from the run's plan generation
+    unless overridden, and re-writing an existing snapshot with different
+    content refuses. Emits `report-saved`, so the event implies the file
+    exists rather than merely asserting that a spawn finished."""
+    if mode not in REPORT_BASENAMES:
+        raise state_mod.StateError(
+            f"unknown report mode '{mode}' — one of: "
+            f"{', '.join(sorted(REPORT_BASENAMES))}")
+    template = REPORT_BASENAMES[mode]
+    if "{lens}" in template:
+        if not (lens or "").strip():
+            raise state_mod.StateError(
+                f"--mode {mode} needs --lens (the panel member's name) — it "
+                "names the report file, and two lenses sharing one path "
+                "would silently overwrite each other")
+        # the value lands in a FILENAME: refuse anything that could escape
+        # the reports directory or collide with the round-suffix convention
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", lens.strip().lower()):
+            raise state_mod.StateError(
+                f"--lens {lens!r} must be a lowercase slug ([a-z0-9-]) — it "
+                "is used as a path component")
+        template = template.format(lens=lens.strip().lower())
+    if not body.strip():
+        raise state_mod.StateError(
+            "refusing to save an empty report — a zero-byte file at the "
+            "canonical path is indistinguishable from a persisted one")
+    if round_n is not None and round_n < 1:
+        raise state_mod.StateError("--round must be >= 1")
+    if round_n is None:
+        # DERIVED, not hand-tracked (re-verify finding: an optional,
+        # orchestrator-supplied round number is skippable and mis-typeable,
+        # so "prior rounds stay recoverable" was still a promise resting on
+        # prose). The plan generation is the same anchor capture_post_spawn
+        # stamps on every verdict, so a report and the verdict it explains
+        # carry the same round number by construction.
+        round_n = max(1, sum(1 for e in ndjson.read_records(run / "events.ndjson")
+                             if e.get("kind") == "plan-registered"))
+    reports = run / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    snapshot = reports / f"{template}-r{round_n}.md"
+    if snapshot.exists() and snapshot.read_text(encoding="utf-8") != body:
+        raise state_mod.StateError(
+            f"reports/{snapshot.name} already exists with different content "
+            f"— round {round_n}'s snapshot is immutable. If this really is a "
+            "new round, the plan was not re-registered (the round is derived "
+            "from the `plan-registered` count); pass --round explicitly to "
+            "override.")
+    written = []
+    for name in (f"{template}.md", snapshot.name):
+        (reports / name).write_text(body, encoding="utf-8")
+        written.append(f"reports/{name}")
+    ndjson.append_record(run / "events.ndjson",
+                         {"kind": "report-saved", "mode": mode, "lens": lens,
+                          "round": round_n, "paths": written,
+                          "actor": "save-report"})
+    return {"mode": mode, "lens": lens, "round": round_n, "paths": written,
+            "path": written[0]}
+
+
+def env_check(workspace: Path, run: Path, config: dict,
+              task_id: str | None = None) -> dict:
+    """Probe the environment prerequisites the plan declared, BEFORE the
+    developer spawn that would hit the wall.
+
+    field: dual-run comparison — Docker was down in both runs. One never ran
+    its Testcontainers integration test at all and shipped that path with
+    code-review verification only; the other lost ~1h38m mid-develop
+    discovering it, asking, starting Docker, and re-running. The requirement
+    was knowable at plan time in both cases; nothing asked.
+
+    Scoped to `--task` when given, else every non-terminal task in the run —
+    a done task's requirement is no longer this run's problem. Each distinct
+    requirement is probed once. Returns the full picture (probed, present,
+    missing) rather than short-circuiting, so one round-trip tells the human
+    everything to fix. A missing requirement logs a flagged event and the CLI
+    refuses; it never auto-starts anything (surface, never auto-fix)."""
+    from .transitions import ensure_live
+    with state_mod.locked_read(run):   # torn-read guard, same as show/verify
+        st = state_mod.load(run, workspace)
+    ensure_live(st, "env-check")
+    tasks = st.get("tasks", [])
+    if task_id is not None:
+        scoped = [t for t in tasks if t["id"] == task_id]
+        if not scoped:
+            raise state_mod.StateError(
+                f"unknown task '{task_id}' — check --task")
+    else:
+        scoped = [t for t in tasks
+                  if t.get("status") not in ("done", "archived")]
+    declared = (config or {}).get("env_requirements") or {}
+    if not isinstance(declared, dict):
+        # `env_requirements` is not schema-validated (nor is `language.*`), so
+        # a list-shaped typo used to escape the CLI's JSON error contract as a
+        # raw AttributeError traceback (re-verify finding).
+        raise state_mod.StateError(
+            "config `env_requirements` must be a mapping of name -> "
+            f"{{probe, hint}} (got {type(declared).__name__})")
+    names: list[str] = []
+    for t in scoped:
+        for r in t.get("env_requires") or []:
+            if r not in names:
+                names.append(r)
+    checked, missing = [], []
+    for name in names:
+        spec = declared.get(name)
+        if not isinstance(spec, dict) or not str(spec.get("probe") or "").strip():
+            # A requirement whose probe vanished from config AFTER
+            # plan-register validated it (a workspace-config edit mid-run).
+            # Treated as MISSING, never as satisfied: "cannot check" must
+            # never render as "checked".
+            missing.append({"name": name, "probe": None,
+                            "hint": "no `probe` declared in config "
+                                    "`env_requirements` — add one, or drop "
+                                    "the requirement from the plan",
+                            "detail": "unprobeable"})
+            continue
+        probe = str(spec["probe"])
+        try:
+            proc = subprocess.run(probe, shell=True, capture_output=True,
+                                  text=True, timeout=60,
+                                  encoding="utf-8", errors="replace")
+            ok, detail = proc.returncode == 0, (
+                proc.stdout + proc.stderr).strip().splitlines()[-1:] or [""]
+            detail = detail[0][:200]
+        except (subprocess.SubprocessError, OSError) as exc:
+            ok, detail = False, f"{type(exc).__name__}: {exc}"[:200]
+        entry = {"name": name, "probe": probe, "detail": detail}
+        checked.append({**entry, "present": ok})
+        if not ok:
+            missing.append({**entry,
+                            "hint": str(spec.get("hint") or "").strip()
+                            or "make this available, then re-run env-check"})
+    if missing:
+        ndjson.append_record(run / "events.ndjson",
+                             {"kind": "env-prereq-missing",
+                              "tasks": [t["id"] for t in scoped],
+                              "missing": [m["name"] for m in missing],
+                              "actor": "env-check"})
+    elif checked and any(e.get("kind") == "env-prereq-missing"
+                         for e in ndjson.read_records(run / "events.ndjson")):
+        # Unlike its sibling kinds this one is genuinely RESOLVABLE — the
+        # human starts the service and re-runs — so a permanent flag would
+        # leave every such run reading DEGRADED forever (re-verify finding).
+        # Paired off in outstanding_flagged like deferral-pending/-recorded.
+        ndjson.append_record(run / "events.ndjson",
+                             {"kind": "env-prereq-satisfied",
+                              "checked": [c["name"] for c in checked],
+                              "actor": "env-check"})
+    return {"tasks": [t["id"] for t in scoped], "checked": checked,
+            "missing": missing}
 
 
 def preflight(workspace: Path, run: Path, config: dict, manifest: dict,

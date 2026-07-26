@@ -464,6 +464,17 @@ VERDICT_RE = re.compile(
 # recover via SendMessage-resume, a channel NO capture hook sees.
 # This powers a signpost event naming the one sanctioned recovery.
 VERDICT_ANYWHERE_RE = re.compile(r"verdict:\**\s*(APPROVED|CHANGES_REQUESTED)\b")
+# Optional convergence signal (shared/status-block.md): how many findings the
+# reviewer is BLOCKING on. field: dual-run comparison — verdict rows carried
+# only mode/verdict/at, so nothing machine-readable recorded whether a review
+# panel was converging. That run's own retro then misstated its final round
+# ("0 blocking" where the artifacts show 2), and the human gate at
+# `exhausted` had no one-glance framing that the real trajectory had been
+# 9 → 7 → 2 → 2. Same lenient shape as VERDICT_RE (bold/indent tolerated),
+# same placeholder-invisibility guard so the quoted template's own
+# `blocking-findings: <N>` line never reads as a real count.
+BLOCKING_RE = re.compile(r"^[ \t]*\**blocking-findings:\**[ \t]*(?!<)(\d+)\b",
+                         re.MULTILINE)
 # The reviewer modes whose captured verdict the ENGINE actually reads:
 # `review` → the task FSM's reviewer-approved completion guard;
 # `plan-review` → the manifest's verdict_bound exits. Every other reviewer
@@ -499,7 +510,59 @@ def extract_verdict(text: str) -> str | None:
     return "APPROVED"
 
 
-def block(msg: str, cwd: Path | None = None) -> None:
+#: Credential shapes scrubbed from a logged `attempt` (see _blocked_context).
+#: Deliberately broad — over-redacting an audit string costs nothing, while
+#: one leaked token in a ledger that ships with the run costs a rotation.
+_SECRET_PATTERNS = (
+    re.compile(r"://[^@/\s]*:[^@/\s]*@"),                 # user:pass@host
+    re.compile(r"\b(?:glpat|ghp|gho|ghu|ghs|ghr|github_pat|sk|xox[baprs])"
+               r"[-_][A-Za-z0-9_\-]{8,}"),                # common token prefixes
+    re.compile(r"(?i)\b(?:bearer|token|api[-_]?key|password|passwd|secret)"
+               r"\b[=:\s]+\S+"),
+)
+
+
+def _blocked_context(p: dict, workspace: Path, runs: list[Path]) -> dict:
+    """What was actually ATTEMPTED, for a `hook-blocked` event.
+
+    field: dual-run comparison — one run logged four reviewer read-only
+    violations of the same class, but the event carried only the guard's
+    message, so there was nothing to coach against and no way to pattern-
+    match recurrence across runs. The guard message says which RULE fired;
+    this says what the agent tried to do.
+
+    Path-sanitized like `show`'s probe_error (3.2.0 precedent): these events
+    are read in shared reports, and a local filesystem layout has no
+    business there. Run prefixes are replaced BEFORE the workspace prefix —
+    runs live under the workspace, so scrubbing the shorter path first would
+    strand the run-dir tail. Truncated: a blocked heredoc can be enormous
+    and the ledger is an audit trail, not a transcript."""
+    tool_input = p.get("tool_input") or {}
+    attempt = (tool_input.get("command")
+               or tool_input.get("file_path") or tool_input.get("path") or "")
+    if not attempt and p.get("tool_name") == "Task":
+        attempt = str(tool_input.get("subagent_type") or "")
+    attempt = str(attempt)
+    for raw, tag in ([(r, "<run>") for r in runs] + [(workspace, "<workspace>")]):
+        for form in (str(Path(raw).resolve()), str(raw)):
+            attempt = attempt.replace(form, tag)
+    # Credentials BEFORE truncation (re-verify finding): the raw-git guard is
+    # the one most likely to fire on a token-bearing command line
+    # (`git push https://oauth2:glpat-…@host/…`), and events.ndjson is an
+    # unsealed file that travels with the run and gets pasted into reports.
+    for pattern in _SECRET_PATTERNS:
+        attempt = pattern.sub("<redacted>", attempt)
+    if len(attempt) > 300:
+        attempt = attempt[:300] + "…"
+    prompt = str(tool_input.get("prompt") or "")
+    m = MODE_HEADER_RE.search(prompt)
+    return {"tool": p.get("tool_name"),
+            "attempt": attempt or None,
+            "role": shape_of(p.get("agent_type")) or None,
+            "mode": m.group(1) if m else None}
+
+
+def block(msg: str, cwd: Path | None = None, payload: dict | None = None) -> None:
     """Adversarial-review finding: hook blocks were never logged anywhere,
     despite design.md documenting them and metrics_report/status already
     filtering for a `hook-blocked` event kind that could never occur. Logs
@@ -508,13 +571,24 @@ def block(msg: str, cwd: Path | None = None) -> None:
     to the wrong sibling run (the same misattribution class Group 3 fixed
     for subagent-stop), so it's skipped rather than guessed. The block
     itself always happens regardless — logging is best-effort, never a
-    precondition for it."""
+    precondition for it.
+
+    `payload` adds the attempted command/path + role/mode (see
+    `_blocked_context`); omitting it degrades to the message-only record
+    this always wrote."""
     if cwd is not None:
         try:
-            runs = live_runs(_session_workspace(cwd))
+            workspace = _session_workspace(cwd)
+            runs = live_runs(workspace)
             if len(runs) == 1:
-                ndjson.append_record(runs[0] / "events.ndjson",
-                                     {"kind": "hook-blocked", "reason": msg})
+                record = {"kind": "hook-blocked", "reason": msg}
+                if payload is not None:
+                    # never let context-building sink the block's own logging
+                    try:
+                        record.update(_blocked_context(payload, workspace, runs))
+                    except Exception:
+                        pass
+                ndjson.append_record(runs[0] / "events.ndjson", record)
         except OSError:
             pass
     print(msg, file=sys.stderr)
@@ -576,7 +650,7 @@ def guard_bash(p: dict) -> None:
                 block(f"raw `git {m.group(1)}` is blocked (RC1): commits, history "
                       "rewrites, and remote updates go through the owned entry points — "
                       "`harness commit`, `harness merge-task`, `harness sync-branch`, "
-                      "`harness push`, `harness publish-mirror`.", cwd)
+                      "`harness push`, `harness publish-mirror`.", cwd, p)
         if AUTHORITY_RE.search(target) and WRITE_HINT_RE.search(target):
             block("run-authority files mutate only via the owned entry points — "
                   "`harness cursor` / `harness task` / `harness gate` / "
@@ -584,7 +658,7 @@ def guard_bash(p: dict) -> None:
                   "are blocked. state.yaml and red-proofs are also chain-sealed "
                   "(RC4 detects out-of-band edits); the append-only evidence "
                   "ledgers (human-input.ndjson, reviews.ndjson) are NOT sealed, "
-                  "so this guard is their sole protection.", cwd)
+                  "so this guard is their sole protection.", cwd, p)
         if HOOK_FORGE_RE.search(target):
             block("the capture hook entry points (user-prompt / post-spawn / "
                   "subagent-stop) are fired by the platform ONLY — invoking "
@@ -592,7 +666,7 @@ def guard_bash(p: dict) -> None:
                   "payload would mint a gate approval or reviewer verdict "
                   "indistinguishable from the real one). If a capture seems "
                   "broken, diagnose read-only and report; never execute the "
-                  "hook yourself.", cwd)
+                  "hook yourself.", cwd, p)
         if (shape_of(p.get("agent_type")) in ("planner", "developer", "reviewer")
                 and ".redproof" in target):
             # READ side of the red-proof (the write side is AUTHORITY_RE
@@ -608,7 +682,7 @@ def guard_bash(p: dict) -> None:
                   "integrity verification and is blocked for every shape. "
                   "Invoke it as `${CLAUDE_PLUGIN_ROOT}/bin/harness "
                   "show-redproof` — the bare `harness` spelling is neither "
-                  "on PATH nor allow-listed.", cwd)
+                  "on PATH nor allow-listed.", cwd, p)
         if shape_of(p.get("agent_type")) == "reviewer":
             why = _reviewer_bash_write_violation(target, cwd)
             if why:
@@ -620,7 +694,7 @@ def guard_bash(p: dict) -> None:
                       "'>' or '<>', QUOTE the pattern — unquoted, the shell "
                       "reads it as a redirect (field: a C# compiler "
                       "closure name '<>c__DisplayClass' tripped exactly "
-                      "this).", cwd)
+                      "this).", cwd, p)
         if shape_of(p.get("agent_type")) == "developer":
             # bash-side analogue of the Write/Edit confinement: a write
             # targeting an ABSOLUTE path outside the developer's allowed
@@ -647,23 +721,23 @@ def guard_bash(p: dict) -> None:
                           f"repo or its worktree — '{tgt}' is outside it "
                           "(design.md piece 3 path-guard). Author via Write/"
                           "Edit or write inside your `harness-repo` worktree.",
-                          cwd)
+                          cwd, p)
                 # same test-first ordering as the Write/Edit surface —
                 # otherwise `sed -i src/main/...` bypasses it on day one
                 reason = _tdd_block_reason(
                     resolved, _session_workspace(cwd).resolve())
                 if reason:
-                    block(reason, cwd)
+                    block(reason, cwd, p)
         if shape_of(p.get("agent_type")) == "planner" and PLANNER_STAMP_RE.search(target):
             block("the planner never stamps its own repo-map output — "
                   "`repo-map-stamp` is the orchestrator's job, run once after "
-                  "the planner's spawn returns (agents/planner.md).", cwd)
+                  "the planner's spawn returns (agents/planner.md).", cwd, p)
         if shape_of(p.get("agent_type")) and SUBAGENT_REGISTER_RE.search(target):
             block("scope-register and plan-register are orchestrator-only: "
                   "the scope records the HUMAN's confirmation and the task "
                   "list is what the plan gate ratifies — report your "
                   "proposal in your status block; the orchestrator confirms "
-                  "with the user and registers it.", cwd)
+                  "with the user and registers it.", cwd, p)
 
 
 # ------------------------------------------------- Write/Edit path guards
@@ -954,7 +1028,7 @@ def guard_read(p: dict) -> None:
               "(chain-verified) — a raw `.redproof/` read skips integrity "
               "verification. Invoke it as `${CLAUDE_PLUGIN_ROOT}/bin/"
               "harness show-redproof --task <T> --run <run>`.",
-              Path(p.get("cwd") or "."))
+              Path(p.get("cwd") or "."), p)
 
 
 def guard_write(p: dict) -> None:
@@ -969,10 +1043,10 @@ def guard_write(p: dict) -> None:
         block("run-authority files mutate only via the owned entry points — "
               "`harness cursor` / `harness task` / `harness gate` / "
               "`harness artifact` / `harness log-event` (RC1); this write is "
-              "blocked for every role.", cwd)
+              "blocked for every role.", cwd, p)
     shape = shape_of(p.get("agent_type"))
     if shape == "reviewer":
-        block("the reviewer is read-only (design.md piece 3) — no Write/Edit.", cwd)
+        block("the reviewer is read-only (design.md piece 3) — no Write/Edit.", cwd, p)
     if shape == "developer":
         # `cwd` is the workspace the developer was spawned from (NOT its
         # worktree — that lives outside the workspace); use it to find the
@@ -985,10 +1059,10 @@ def guard_write(p: dict) -> None:
             block(f"developer writes are confined to a registered repo or its "
                   f"per-task worktree (design.md piece 3 path-guard) — '{fp}' "
                   "is under neither. Write inside your `harness-repo` worktree, "
-                  "not the workspace or another repo.", cwd)
+                  "not the workspace or another repo.", cwd, p)
         reason = _tdd_block_reason(path, ws.resolve())
         if reason:
-            block(reason, cwd)
+            block(reason, cwd, p)
     if shape == "planner":
         path = _resolve_write_path(fp, cwd)
         artifact_roots = (ws.resolve() / "ai", (ws / ".claude" / "context").resolve())
@@ -1002,7 +1076,7 @@ def guard_write(p: dict) -> None:
                 or _is_scratch_write(path, ws.resolve())):
             block("planner writes are confined to run artifacts (ai/<run>/) and "
                   ".claude/context/ — it never touches repo source "
-                  "(design.md piece 3 path-guard).", cwd)
+                  "(design.md piece 3 path-guard).", cwd, p)
         if path.name == ".meta.json":
             # Otherwise legal by the path check above — repo-map/<name>/ is
             # squarely inside .claude/context/ — so this needs its own,
@@ -1014,7 +1088,7 @@ def guard_write(p: dict) -> None:
             block("the planner never stamps its own repo-map output — "
                   "`.meta.json` is written only by `harness repo-map-stamp`, "
                   "run by the orchestrator after the planner's spawn "
-                  "returns (agents/planner.md).", cwd)
+                  "returns (agents/planner.md).", cwd, p)
 
 
 # --------------------------------------------------------- spawn / skill
@@ -1095,12 +1169,12 @@ def guard_spawn(p: dict) -> None:
               "reviewer verdict would be unrecoverable and a spurious stall "
               "event fabricated. For parallelism, batch multiple foreground "
               "spawns in ONE message — they run concurrently and each reply "
-              "is captured.", cwd)
+              "is captured.", cwd, p)
     prompt = tool_input.get("prompt") or ""
     m = MODE_HEADER_RE.search(prompt)
     if not m:
         block(f"harness-shape spawn ('{shape}') requires the structured "
-              "`harness-mode: <mode>` header in the spawn prompt (RC4).", cwd)
+              "`harness-mode: <mode>` header in the spawn prompt (RC4).", cwd, p)
     mode = m.group(1)
     pair = {"shape": shape, "mode": mode}
     if pair in (manifest.get("always_legal_spawns") or []):
@@ -1158,14 +1232,14 @@ def guard_spawn(p: dict) -> None:
         block(f"spawn ({shape}, {mode}) matches a live run's current step, "
               "but the prompt carries no `harness-run: <run-dir>` header — "
               "every in-run spawn must name its run so its tokens/stalls "
-              "attribute to it (RC4; SKILL.md's mandated headers).", cwd)
+              "attribute to it (RC4; SKILL.md's mandated headers).", cwd, p)
     if not runs:
         block(f"no active run — harness-shape spawns are fail-closed pre-run; "
               f"({shape}, {mode}) is not a declared out-of-run exception "
-              "(invocation control, design.md piece 3).", cwd)
+              "(invocation control, design.md piece 3).", cwd, p)
     block(f"spawn ({shape}, {mode}) does not match any active run's current "
           "step spawn-set or the always-legal list — the manifest is the "
-          "source of truth (design.md piece 1).", cwd)
+          "source of truth (design.md piece 1).", cwd, p)
 
 
 def guard_skill(p: dict) -> None:
@@ -1176,7 +1250,7 @@ def guard_skill(p: dict) -> None:
         block(f"'/{skill}' is a user-entry skill — invocable only from the "
               "main session by a human, never from a subagent "
               "(invocation control, design.md piece 3).",
-              Path(p.get("cwd") or "."))
+              Path(p.get("cwd") or "."), p)
 
 
 # --------------------------------------------------------------- capture
@@ -1537,6 +1611,10 @@ def capture_subagent_stop(p: dict) -> None:
         "model": data.get("model"),
         "input": input_t, "output": output_t,
         "cache_read": cache_r, "cache_write": cache_w})
+    # This transcript shape (usage on the assistant turn) is Claude Code's;
+    # the Qwen sibling records itself from capture_post_spawn's
+    # executionSummary branch.
+    _record_agent_identity(run, "claude-code", data.get("model"))
     # Reviewer-verdict and missing-status-block capture live in
     # capture_post_spawn (PostToolUse on Agent/Task), NOT here (dogfood
     # finding: this event's payload proved unreliable in practice —
@@ -1544,6 +1622,40 @@ def capture_subagent_stop(p: dict) -> None:
     # FSM-guard-critical, so it anchors to the one payload that carries
     # the spawn prompt and the final reply deterministically). This event
     # keeps only the best-effort token accounting above.
+
+
+def _record_agent_identity(run: Path, cli: str, model: str | None) -> None:
+    """Once per run per (cli, model): WHICH agent CLI drove this run.
+
+    field: dual-run comparison — one run's token rows all carried
+    `model: null` (a documented limitation of that CLI) and nothing anywhere
+    recorded which CLI produced them. The user asked mid-run "what model are
+    the reviewers using?" and the artifacts could not answer; attribution for
+    the whole comparison ended up resting on a retro happening to mention a
+    `.qwen` path. The discrimination is free — the token-capture branches
+    already tell the two payload shapes apart — it just was never written
+    down. Model may legitimately be null (that CLI reports none); the CLI
+    name alone still answers the question the artifacts could not.
+
+    ACCEPTED RACE: the dedupe is read-then-append with no lock, and
+    plan-review.md mandates batching every lens spawn in ONE message — so N
+    concurrent SubagentStop hooks can all read "no record" and all append,
+    giving up to N identical rows (re-verify finding). Left as-is
+    deliberately: the kind is informational, not flagged, so a duplicate
+    inflates no gauge and changes no decision, and taking the run lock in a
+    hook on a purely descriptive record would buy consistency nobody reads
+    at the cost of serializing the panel's captures.
+    """
+    try:
+        prior = ndjson.read_records(run / "events.ndjson")
+    except OSError:
+        return
+    if any(e.get("kind") == "agent-identity" and e.get("cli") == cli
+           and e.get("model") == model for e in prior):
+        return
+    ndjson.append_record(run / "events.ndjson",
+                         {"kind": "agent-identity", "cli": cli,
+                          "model": model, "actor": "capture"})
 
 
 def _response_text(resp) -> str:
@@ -1649,6 +1761,10 @@ def capture_post_spawn(p: dict) -> None:
                 "output": summary.get("outputTokens", 0),
                 "cache_read": summary.get("cachedTokens", 0),
                 "cache_write": 0})
+            # executionSummary is Qwen Code's signature (Claude payloads
+            # carry none) — the same discrimination this branch already
+            # makes, now written down
+            _record_agent_identity(run, "qwen-code", None)
     text = _response_text(p.get("tool_response"))
     captured = None
     if shape == "reviewer":
@@ -1658,8 +1774,22 @@ def capture_post_spawn(p: dict) -> None:
             # guard requires: which task (spawn-prompt header), which
             # reviewer mode, what verdict. Written only here; scoped to the
             # final status block and conflict-fail-closed (extract_verdict).
+            # `blocking-findings` and the plan generation ride ALONGSIDE the
+            # verdict, never gating it: the engine's exits read `verdict`
+            # only, so a missing or malformed count can never change a
+            # transition — it just leaves that round's convergence
+            # unrecorded (field: dual-run comparison).
+            # LAST match, not first: `extract_verdict` is scoped to the final
+            # status block, and a recap line earlier in the reply would
+            # otherwise win over the block the verdict came from (re-verify
+            # finding — advisory-only, but the asymmetry was wrong).
+            bf = (BLOCKING_RE.findall(text) or [None])[-1]
+            plans = sum(1 for e in ndjson.read_records(run / "events.ndjson")
+                        if e.get("kind") == "plan-registered")
             ndjson.append_record(run / "reviews.ndjson", {
-                "task": task, "mode": mode, "verdict": captured})
+                "task": task, "mode": mode, "verdict": captured,
+                "blocking_findings": int(bf) if bf is not None else None,
+                "plan_generation": plans})
         elif VERDICT_ANYWHERE_RE.search(text):
             # A verdict exists but isn't line-anchored in the final status
             # block — correctly NOT captured (fail-closed), but say so and

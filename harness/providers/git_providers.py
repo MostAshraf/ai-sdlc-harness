@@ -6,6 +6,7 @@ the records-only provider so the pipeline completes without a forge.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from . import ProviderError, ProviderUnsupported
@@ -30,12 +31,112 @@ def create_github(config, repo: Path, branch, base, title, work_item_id, summary
     return {"provider": "github", "branch": branch, "title": title, "url": url}
 
 
+#: `glab mr create` failure text that means "the project could not be
+#: resolved", as opposed to a real API/permission/validation error. Matched
+#: case-insensitively against the CLI's combined output.
+#: Matched case-insensitively, and each tell is PROJECT-adjacent on purpose
+#: (re-verify finding: a bare "404"/"not found" also matches glab's echo of
+#: the source branch, so a story about a 404 page — branch `fix/US-1-404-page`
+#: — routed every failure through the fallback and surfaced the API's error
+#: instead of glab's own).
+_GITLAB_PROJECT_RESOLUTION = (
+    "project not found", "404 project", "could not find project",
+    "failed to get project", "project does not exist",
+)
+
+
+def _remote_project_path(repo: Path) -> str:
+    """`group/subgroup/project` from origin's URL, for any of the spellings
+    git accepts: `git@host:group/proj.git`, `https://host/group/proj.git`,
+    `https://user@host/group/proj.git`, `ssh://git@host:22/group/proj.git`.
+    Empty string when origin is absent or unparseable."""
+    try:
+        url = run_cli(["git", "-C", str(repo), "remote", "get-url",
+                       "origin"]).strip()
+    except ProviderError:
+        return ""
+    had_scheme = False
+    for scheme in ("ssh://", "https://", "http://", "git://"):
+        if url.startswith(scheme):
+            url, had_scheme = url.removeprefix(scheme), True
+    url = url.split("@", 1)[-1]          # drop any user@ prefix
+    if had_scheme:
+        # Ports are legal only in URL form. In scp form (`host:group/proj`)
+        # the segment after the colon is a PATH, and stripping a numeric one
+        # silently drops a group literally named `2024` (re-verify finding).
+        url = re.sub(r":\d+(?=/)", "", url)
+    # scp-style `host:group/proj` and url-style `host/group/proj` both leave
+    # the host as the first segment once the separator is normalized
+    if "/" not in url.split(":", 1)[0]:
+        url = url.replace(":", "/", 1)
+    parts = [p for p in url.split("/") if p]
+    return "/".join(parts[1:]).removesuffix(".git") if len(parts) > 1 else ""
+
+
+def _gitlab_project_id(repo: Path) -> str | None:
+    """The numeric project id for this checkout, via search.
+
+    field: dual-run comparison — both runs ended with `pr-recorded-manually`
+    twice. The instance 404s PATH-ENCODED project lookups (`group/sub/proj`)
+    while numeric-id access works, so `glab mr create` — which resolves by
+    path — could never create the MR, and the human/manual hatch was the only
+    route. Resolved by matching the remote's path suffix against the search
+    results, never by taking the first hit: a substring search for `backend`
+    will happily return someone else's `backend`."""
+    import json as _json
+    path = _remote_project_path(repo)
+    slug = path.rsplit("/", 1)[-1] if path else ""
+    if not slug:
+        return None
+    try:
+        raw = run_cli(["glab", "api",
+                       f"projects?search={slug}&per_page=100"], cwd=repo)
+        for proj in _json.loads(raw):
+            if str(proj.get("path_with_namespace", "")).casefold() == path.casefold():
+                return str(proj.get("id"))
+    except Exception:      # any search failure -> no fallback, manual hatch
+        return None
+    return None
+
+
 def create_gitlab(config, repo: Path, branch, base, title, work_item_id, summary):
-    url = run_cli(["glab", "mr", "create", "--title", title,
-                   "--description", _pr_body(work_item_id, summary, "closes"),
-                   "--source-branch", branch, "--target-branch", base, "--yes"],
-                  cwd=repo)
-    return {"provider": "gitlab", "branch": branch, "title": title, "url": url}
+    body = _pr_body(work_item_id, summary, "closes")
+    try:
+        url = run_cli(["glab", "mr", "create", "--title", title,
+                       "--description", body,
+                       "--source-branch", branch, "--target-branch", base,
+                       "--yes"], cwd=repo)
+        return {"provider": "gitlab", "branch": branch, "title": title,
+                "url": url}
+    except ProviderError as exc:
+        # Only the project-resolution class falls back. A validation error
+        # (branch missing, MR already open, no permission) must surface as
+        # itself — retrying it through a second transport would just produce
+        # a second, more confusing failure.
+        if not any(tell in str(exc).casefold()
+                   for tell in _GITLAB_PROJECT_RESOLUTION):
+            raise
+        pid = _gitlab_project_id(repo)
+        if pid is None:
+            raise
+        raw = run_cli(["glab", "api", "--method", "POST",
+                       f"projects/{pid}/merge_requests",
+                       "-f", f"source_branch={branch}",
+                       "-f", f"target_branch={base}",
+                       "-f", f"title={title}",
+                       "-f", f"description={body}"], cwd=repo)
+        import json as _json
+        try:
+            url = str(_json.loads(raw).get("web_url") or "").strip()
+        except ValueError:
+            url = ""
+        if not url:
+            raise ProviderError(
+                "gitlab: path-encoded project lookup 404'd and the numeric-id "
+                f"fallback (project {pid}) returned no web_url — record the "
+                "MR manually (`harness create-pr --manual-url <url>`)") from exc
+        return {"provider": "gitlab", "branch": branch, "title": title,
+                "url": url, "resolved_by": "numeric-project-id"}
 
 
 def create_ado(config, repo: Path, branch, base, title, work_item_id, summary):

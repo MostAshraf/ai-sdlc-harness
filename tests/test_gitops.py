@@ -941,17 +941,55 @@ class TestQuarantine(GitopsHarness):
         self.assertIn("locked test set", str(ctx.exception))
 
     def test_overlap_check_is_spelling_insensitive(self):
-        # re-verify finding: './x' and absolute spellings slipped the exact
-        # string intersection while the runner still honoured the exclusion —
-        # the silent false green. Refused at declaration now.
-        for spelling in ("./tests/test_x.py", str(self.repo / "tests/test_x.py"),
+        """Every spelling a RUNNER treats as the same file must either be
+        refused at declaration or be caught by the overlap guard — never
+        excluded-but-unmatched, which is the silent false green.
+
+        re-verify finding: the first version validated the STRIPPED value but
+        rendered the RAW one, so `"tests/x.py "` (a quoted YAML scalar keeps
+        the space) sailed through both, excluded the task's own test, and
+        left verify-green passing with the assertion never executed."""
+        for spelling in ("./tests/test_x.py", "tests//test_x.py",
+                         "tests/./test_x.py", "tests/sub/../test_x.py",
+                         " tests/test_x.py", "tests/test_x.py ",
+                         str(self.repo / "tests/test_x.py"),
                          "tests\\test_x.py"):
             cfg = self._config({"exclude_template": "--ignore={test}",
                                 "tests": [{"test": spelling, "reason": "r",
                                            "since": "2026-07-22"}]})
-            with self.assertRaises(initws.QuarantineError) as ctx:
+            with self.assertRaises(initws.QuarantineError):
                 initws.quarantine_cmd(cfg, self.repo, "pytest")
-            self.assertIn("repo-relative", str(ctx.exception))
+
+    def test_case_only_difference_still_trips_the_overlap_guard(self):
+        # on a case-insensitive filesystem these are one file, so a
+        # case-only difference must not slip the guard (fail toward refusing)
+        self._write_test()
+        cfg = self._config({"exclude_template": "--ignore={test}",
+                            "tests": [{"test": "Tests/Test_X.py",
+                                       "reason": "r", "since": "2026-07-22"}]})
+        with self.assertRaises(gitops.RedProofError):
+            gitops.verify_red(self.run, self.workspace, self.repo, cfg, "T1",
+                              TEST_CMD, declared=["tests/test_x.py"],
+                              intents=["test_val"])
+
+    def test_wrapped_and_multiline_commands_refuse(self):
+        """re-verify finding: the quote-aware scan let `sh -c "cd fe && …"`
+        through — the flags became the wrapper's arguments and never reached
+        the runner, so the full suite ran while init-verify said `pass`. A
+        false negative strictly worse than the false positive it replaced."""
+        cfg = self._config(self.ONE)
+        for bad in ('sh -c "cd frontend && npx vitest run"',
+                    'bash -lc "npm test | tee log"',
+                    "docker compose run --rm test sh -c 'pytest && flake8'",
+                    "npm test\nnpm run coverage",
+                    "npm test & npm run lint"):
+            with self.assertRaises(initws.QuarantineError):
+                initws.quarantine_cmd(cfg, self.repo, bad)
+        # …while a quoted regex alternation is still a normal single command
+        for ok in ('go test ./... -run "TestA|TestB"',
+                   'npx vitest run -t "auth\\"quoted|token"'):
+            self.assertTrue(
+                initws.quarantine_cmd(cfg, self.repo, ok).startswith(ok))
 
     def test_reapplying_is_idempotent(self):
         # the documented develop path applies twice: resolve-test-cmd builds

@@ -8,6 +8,29 @@
 #   reviewer:
 #     default: inherit
 #     pre-pr: claude-opus-4-8      # strongest model where rigor matters most
+#
+# RECOMMENDED TIERING (measured, field: dual-run comparison — two runs of the
+# same story, same harness, different agents). Put the strongest model on the
+# PLANNING-side reviewer modes and inherit everywhere else:
+#
+#   reviewer:
+#     default: inherit
+#     plan-attack: <strongest available>
+#     plan-review: <strongest available>
+#
+# What the comparison measured. The run with a stronger plan-attack panel
+# caught a compile-break, an unreachable race test, and an off-by-one in
+# Prev-navigation that the weaker panel missed — all at plan time, before any
+# code existed. Downstream that showed up as 5/5 first-pass task approvals and
+# a zero-gap coverage report. The cost is real but lands where it is cheapest:
+# ~80% of that run's output tokens were planning-side, while EXECUTION-side
+# output was within 3% of the other run's (186K vs 181K). Planning tokens are
+# spent once; a defect that reaches develop is paid for in rework, review
+# rounds, and human gate time.
+#
+# The default stays `inherit` deliberately — model names are provider- and
+# account-specific, and a shipped default naming a model you may not have
+# access to fails worse than no opinion at all. Set it per workspace.
 
 subagent_models:
   planner: inherit

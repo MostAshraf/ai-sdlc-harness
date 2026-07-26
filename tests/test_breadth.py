@@ -414,6 +414,205 @@ class PreflightDefaultBranch(BreadthHarness):
             gitops.run_git(self.repo, "rev-parse", "--abbrev-ref", "HEAD"), first)
 
 
+class SaveReport(BreadthHarness):
+    """field: dual-run comparison — lens reports for two whole rounds do not
+    exist on disk in one run: read-only lens agents returned them in-reply
+    and the orchestrator hand-copied them ~3 times before the practice
+    lapsed. Persistence was PROSE ("the orchestrator persists it"), the
+    trust-the-prose shape the harness refuses everywhere else."""
+
+    def setUp(self):
+        super().setUp()
+        self.story("W-97", "reports")
+        self.init()
+        self.run_dir = Path(
+            self.cli("fetch", "--id", "W-97", "--date", "2026-02-13")["run"])
+
+    def _save(self, *args, body="# Findings\n\n[R1] CRITICAL thing\n", expect=0):
+        cmd = [sys.executable, "-m", "harness", "--workspace",
+               str(self.workspace), "--run", str(self.run_dir),
+               "save-report", *args]
+        proc = subprocess.run(cmd, cwd=ROOT, input=body, capture_output=True,
+                              text=True, encoding="utf-8", timeout=120)
+        self.assertEqual(proc.returncode, expect, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout) if proc.stdout.strip() else {}
+
+    def test_body_file_carries_prose_the_command_line_cannot(self):
+        """re-verify finding (blocking): the documented `printf … | save-report`
+        spelling is unusable on the reports it was built for — a report with
+        an apostrophe breaks the shell quoting, and one quoting a run-authority
+        path or a `>` blockquote is BLOCKED by the harness's own bash guard.
+        The fallback would have been the hand-copying this verb replaced."""
+        body = ("> the plan's own note: see ai/<run>/events.ndjson\n"
+                "[R1] CRITICAL doesn't hold\n")
+        scratch = self.workspace / "body.md"
+        scratch.write_text(body, encoding="utf-8")
+        out = self._save("--mode", "pre-pr", "--body-file", str(scratch),
+                         body="")   # stdin unused
+        self.assertEqual(
+            (self.run_dir / out["path"]).read_text(encoding="utf-8"), body)
+
+    def test_round_is_derived_from_the_plan_generation(self):
+        # re-verify finding: an optional, hand-tracked round number is
+        # skippable and mis-typeable, so "prior rounds stay recoverable" was
+        # still a promise resting on prose
+        ndjson.append_record(self.run_dir / "events.ndjson",
+                             {"kind": "plan-registered", "actor": "plan-register"})
+        ndjson.append_record(self.run_dir / "events.ndjson",
+                             {"kind": "plan-registered", "actor": "plan-register"})
+        out = self._save("--mode", "plan-review")
+        self.assertEqual(out["round"], 2)
+        self.assertIn("reports/plan-review-r2.md", out["paths"])
+
+    def test_rewriting_a_round_snapshot_with_different_content_refuses(self):
+        self._save("--mode", "plan-review", "--round", "1", body="one\n")
+        self._save("--mode", "plan-review", "--round", "1", body="one\n")  # idempotent
+        out = self._save("--mode", "plan-review", "--round", "1",
+                         body="rewritten\n", expect=1)
+        self.assertIn("immutable", out["error"])
+
+    def test_writes_live_path_and_round_snapshot_in_one_call(self):
+        out = self._save("--mode", "plan-attack", "--lens", "contradictions",
+                         "--round", "2")
+        self.assertEqual(out["paths"],
+                         ["reports/plan-attack-contradictions.md",
+                          "reports/plan-attack-contradictions-r2.md"])
+        for p in out["paths"]:
+            self.assertIn("[R1] CRITICAL", (self.run_dir / p).read_text())
+        kinds = [e.get("kind")
+                 for e in ndjson.read_records(self.run_dir / "events.ndjson")]
+        self.assertIn("report-saved", kinds)
+
+    def test_live_path_always_holds_the_latest_round(self):
+        self._save("--mode", "plan-review", "--round", "1", body="round one\n")
+        self._save("--mode", "plan-review", "--round", "2", body="round two\n")
+        self.assertEqual(
+            (self.run_dir / "reports/plan-review.md").read_text(), "round two\n")
+        # …and the earlier round stays recoverable, which is what the
+        # hand-rolled `-r<n>` convention was reaching for
+        self.assertEqual(
+            (self.run_dir / "reports/plan-review-r1.md").read_text(), "round one\n")
+
+    def test_lens_modes_require_a_safe_lens_slug(self):
+        self.assertIn("needs --lens",
+                      self._save("--mode", "plan-attack", expect=1)["error"])
+        for bad in ("../../etc/passwd", "a/b", "Up Case"):
+            out = self._save("--mode", "plan-attack", "--lens", bad, expect=1)
+            self.assertIn("lowercase slug", out["error"])
+
+    def test_empty_report_and_bad_mode_refuse(self):
+        self.assertIn("empty report",
+                      self._save("--mode", "pre-pr", body="   \n",
+                                 expect=1)["error"])
+        self.assertIn("unknown report mode",
+                      self._save("--mode", "nonsense", expect=1)["error"])
+
+
+class EnvPrerequisites(BreadthHarness):
+    """field: dual-run comparison — Docker was down in both runs. One never
+    executed its Testcontainers integration test at all and shipped that path
+    verified by code review only; the other lost ~1h38m mid-develop stopping
+    to ask, starting Docker, and re-running. The requirement was knowable at
+    plan time in both cases and nothing asked, so `env-check` probes what the
+    plan declared BEFORE the developer spawn."""
+
+    def setUp(self):
+        super().setUp()
+        self.story("W-96", "needs docker")
+        self.init()
+        self.run_dir = Path(
+            self.cli("fetch", "--id", "W-96", "--date", "2026-02-12")["run"])
+        self.cli("cursor", "--to", "intake", run=self.run_dir)
+        self.cli("cursor", "--to", "plan", run=self.run_dir)
+        self.scope(self.run_dir)
+
+    def _declare(self, probe, name="docker", hint="start it"):
+        """Point the shipped `docker` requirement at a probe we control —
+        the config layer is the declared data, so no real daemon is needed."""
+        self.cli("init-section", "--section", "overrides", "--json",
+                 json.dumps({"env_requirements":
+                             {name: {"probe": probe, "hint": hint}}}))
+
+    def _register(self, requires=("docker",)):
+        self.cli("plan-register", "--tasks-json",
+                 json.dumps([{"id": "T1", "repo": str(self.repo),
+                              "env_requires": list(requires)}]),
+                 run=self.run_dir)
+
+    def test_present_requirement_passes(self):
+        self._declare(support.NOP_CMD)
+        self._register()
+        out = self.cli("env-check", run=self.run_dir)
+        self.assertTrue(out["ok"])
+        self.assertEqual([c["name"] for c in out["checked"]], ["docker"])
+        self.assertTrue(out["checked"][0]["present"])
+        self.assertEqual(out["missing"], [])
+
+    def test_missing_requirement_refuses_with_the_declared_hint(self):
+        self._declare("exit 7", hint="start Docker Desktop and re-run")
+        self._register()
+        out = self.cli("env-check", run=self.run_dir, expect=1)
+        self.assertFalse(out["ok"])
+        self.assertEqual([m["name"] for m in out["missing"]], ["docker"])
+        self.assertIn("Docker Desktop", out["missing"][0]["hint"])
+        kinds = [e.get("kind")
+                 for e in ndjson.read_records(self.run_dir / "events.ndjson")]
+        self.assertIn("env-prereq-missing", kinds)
+
+    def test_nothing_declared_is_a_clean_pass(self):
+        self.cli("plan-register", "--tasks-json",
+                 json.dumps([{"id": "T1", "repo": str(self.repo)}]),
+                 run=self.run_dir)
+        out = self.cli("env-check", run=self.run_dir)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["checked"], [])
+
+    def test_requirement_declared_without_a_probe_counts_as_missing(self):
+        # plan-register validates the NAME against the config map; a name
+        # whose entry carries no `probe` still registers. "cannot check"
+        # must never render as "checked".
+        self.cli("init-section", "--section", "overrides", "--json",
+                 json.dumps({"env_requirements": {"emulator": {"hint": "x"}}}))
+        self._register(("emulator",))
+        out = self.cli("env-check", run=self.run_dir, expect=1)
+        self.assertEqual(out["missing"][0]["detail"], "unprobeable")
+        self.assertIn("no `probe` declared", out["missing"][0]["hint"])
+
+    def test_satisfying_the_requirement_clears_the_flag(self):
+        # re-verify finding: unlike its sibling kinds this one is genuinely
+        # RESOLVABLE (the human starts the service and re-runs), so a
+        # permanent flag would leave every such run reading DEGRADED forever
+        self._declare("exit 1")
+        self._register()
+        self.cli("env-check", run=self.run_dir, expect=1)
+        flagged = next(r for r in self.cli("status")["runs"]
+                       if r["run"] == self.run_dir.name)["flagged_events"]
+        self.assertGreaterEqual(flagged, 1)
+
+        self._declare(support.NOP_CMD)          # the human fixed it
+        self.assertTrue(self.cli("env-check", run=self.run_dir)["ok"])
+        cleared = next(r for r in self.cli("status")["runs"]
+                       if r["run"] == self.run_dir.name)["flagged_events"]
+        self.assertEqual(cleared, flagged - 1)
+
+    def test_reports_every_missing_requirement_not_just_the_first(self):
+        # one round-trip must tell the human everything to fix
+        self._declare("exit 1", name="docker")
+        self._declare("exit 1", name="emulator")
+        self._register(("docker", "emulator"))
+        out = self.cli("env-check", run=self.run_dir, expect=1)
+        self.assertEqual(sorted(m["name"] for m in out["missing"]),
+                         ["docker", "emulator"])
+
+    def test_done_tasks_are_out_of_scope_but_task_flag_still_reaches_them(self):
+        self._declare("exit 1")
+        self._register()
+        self._force_tasks_done(self.run_dir)
+        self.assertTrue(self.cli("env-check", run=self.run_dir)["ok"])
+        out = self.cli("env-check", "--task", "T1", run=self.run_dir, expect=1)
+        self.assertEqual([m["name"] for m in out["missing"]], ["docker"])
+
+
 class PreflightPriorWork(PreflightDefaultBranch):
     """field: dual-run comparison — the deterministic branch template
     makes a same-item RERUN collide by construction, but `_branch_exists`
@@ -1194,6 +1393,61 @@ class PlanRegisterValidation(BreadthHarness):
         # must carry its registered repo path explicitly
         out = self._register([{"id": "T1"}], expect=1)
         self.assertIn("outside the confirmed scope", out["error"])
+
+    def test_http_verb_prefixed_fragment_is_flagged_not_refused(self):
+        """field: dual-run comparison — one run registered
+        `GET /api/v1/admin/workflows/discovery`; the method+path form appears
+        verbatim in neither client nor controller source, so
+        reconcile-contracts reported drift on a correct implementation and
+        pre-PR had to adjudicate it away. The other run registered the bare
+        route and got clean. FLAGGED, not refused: the shape is documented
+        and legal, and it matches fine where source really carries it."""
+        self.cli("plan-register", "--tasks-json",
+                 json.dumps([{"id": "T1", "repo": str(self.repo)}]),
+                 "--contracts-json",
+                 json.dumps([{"id": "C1", "type": "http",
+                              "producer": str(self.repo),
+                              "consumers": [str(self.repo)],
+                              "signature": ["GET /api/v1/admin/discovery"]}]),
+                 run=self.run_dir)
+        flagged = [e for e in ndjson.read_records(self.run_dir / "events.ndjson")
+                   if e.get("kind") == "contract-fragment-weak"]
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0]["contract"], "C1")
+        self.assertIn("/api/v1/admin/discovery", flagged[0]["reason"])
+
+    def test_route_only_fragment_is_not_flagged(self):
+        self.cli("plan-register", "--tasks-json",
+                 json.dumps([{"id": "T1", "repo": str(self.repo)}]),
+                 "--contracts-json",
+                 json.dumps([{"id": "C1", "type": "http",
+                              "producer": str(self.repo),
+                              "consumers": [str(self.repo)],
+                              "signature": ["admin/workflows/discovery"]}]),
+                 run=self.run_dir)
+        self.assertNotIn("contract-fragment-weak",
+                         [e.get("kind") for e in ndjson.read_records(
+                             self.run_dir / "events.ndjson")])
+
+    def test_env_requires_must_name_a_declared_probe(self):
+        # half-enforced-vocabulary bar: an unprobeable requirement is worse
+        # than none — env-check would skip it while it READS as checked
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "env_requires": ["kubernetes"]}], expect=1)
+        self.assertIn("no probe declared", out["error"])
+        self.assertIn("docker", out["error"])          # names the known set
+
+    def test_env_requires_shape_is_validated(self):
+        for bad in ("docker", [""], [7], {"docker": True}):
+            out = self._register([{"id": "T1", "repo": str(self.repo),
+                                   "env_requires": bad}], expect=1)
+            self.assertIn("env_requires", out["error"])
+
+    def test_env_requires_registers_normalized_and_deduped(self):
+        self._register([{"id": "T1", "repo": str(self.repo),
+                         "env_requires": ["docker", " docker ", "docker"]}])
+        st = state_mod.load(self.run_dir, self.workspace)
+        self.assertEqual(st["tasks"][0]["env_requires"], ["docker"])
 
     def test_above_low_risk_without_tests_or_reason_refused(self):
         """Zero-test policy (field 459226): one medium-risk task shipped

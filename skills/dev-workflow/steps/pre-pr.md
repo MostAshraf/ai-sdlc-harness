@@ -7,8 +7,11 @@
    review-policy rules, plan-vs-implementation drift, the residuals the TDD
    lock can't catch (semantically-empty tests, impl-overfit).
 3. The reviewer is read-only: it reports the review in its status block; YOU
-   persist it to `<run>/reports/pre-pr.md` verbatim and record the declared
-   artifact: `${CLAUDE_PLUGIN_ROOT}/bin/harness artifact --name pre-pr-report
-   --value reports/pre-pr.md --run <run>`.
+   persist it through the owned verb — write the body to a scratch file, then
+   `${CLAUDE_PLUGIN_ROOT}/bin/harness save-report --mode pre-pr --body-file
+   /tmp/pre-pr.md --run <run>` (`--body-file`, not a pipe: a report on the
+   command line breaks on apostrophes and trips the bash guard) — and record
+   the declared artifact: `${CLAUDE_PLUGIN_ROOT}/bin/harness artifact
+   --name pre-pr-report --value reports/pre-pr.md --run <run>`.
 4. Advance to ⟨approve-pre-pr⟩ (`gate.md`); present the report AND the
    contracts verdict. Rejection routes to `pre-pr-fixes` (declared edge).

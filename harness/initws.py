@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
+import re
 import subprocess
 from pathlib import Path
 
@@ -259,6 +261,15 @@ class QuarantineError(ValueError):
 #: `exclude_template:` — would otherwise read as "nothing quarantined" and
 #: leave the user believing a config file fixed a failure it never touched.
 QUARANTINE_KEYS = {"exclude_template", "coverage_exclude_template", "tests"}
+#: `sh -c '<payload>'` and friends: the payload is a whole shell command in
+#: its own right, so appended flags become the wrapper's arguments and never
+#: reach the runner at all. Same nesting hazard hooks/guards.py `_scan_targets`
+#: unwraps for the bash guard (re-verify finding: `sh -c "cd fe && vitest"`
+#: passed the quote-aware scan AND init-verify, then silently ran the full
+#: suite — a false negative strictly worse than the false positive it fixed).
+_SHELL_WRAPPER_RE = re.compile(r"(?:^|\s)(?:[a-z]*sh|env)\s+(?:-\w+\s+)*-\w*c\b")
+
+
 def _shell_composition(cmd: str) -> str | None:
     """The first shell operator OUTSIDE quotes, or None.
 
@@ -267,12 +278,21 @@ def _shell_composition(cmd: str) -> str | None:
     exclusion to `tee`, silently running the full suite (adversarial-review).
     Quote-aware, NOT a substring scan (re-verify finding: a bare scan refused
     `go test ./... -run "TestA|TestB"` and every other quoted regex
-    alternation — normal single commands — with remediation advice that made
-    no sense for them)."""
+    alternation — normal single commands — with advice that made no sense).
+
+    Detected: `&&`, `||`, `|`, `;`, a lone backgrounding `&`, a newline
+    (a YAML block scalar is an ordinary way to write two commands), and a
+    `-c` shell wrapper. Backslash escapes are honoured so `\\"` inside a
+    quoted string doesn't end it."""
+    if _SHELL_WRAPPER_RE.search(cmd):
+        return "-c"
     quote = None
     i = 0
     while i < len(cmd):
         ch = cmd[i]
+        if ch == "\\" and quote != "'":
+            i += 2                      # escaped char: never a delimiter
+            continue
         if quote is not None:
             if ch == quote:
                 quote = None
@@ -280,19 +300,28 @@ def _shell_composition(cmd: str) -> str | None:
             quote = ch
         elif cmd[i:i + 2] in ("&&", "||"):
             return cmd[i:i + 2]
-        elif ch in "|;":
+        elif ch in "|;&":
             return ch
+        elif ch in "\n\r":
+            return "newline"
         i += 1
     return None
 
 
 def normalize_test_path(path: str) -> str:
-    """Repo-relative, forward-slashed spelling of a test path — the single
-    form quarantine entries and red-proof locked sets are compared in."""
-    s = str(path).replace("\\", "/")
-    while s.startswith("./"):
-        s = s[2:]
-    return s
+    """The ONE spelling a test path is compared in — used for the overlap
+    guard, the rendered exclusion flag, and the flagged event alike.
+
+    Collapses everything a runner would treat as the same file but a string
+    compare would not: surrounding whitespace, `./`, `//`, `/./`, `/../`
+    (re-verify finding: each of these declared-vs-locked mismatches let an
+    exclusion take effect while `_refuse_quarantine_overlap` saw no overlap
+    — the silent false green at verify-green this guard exists to stop).
+    Backslashes are NOT rewritten here; `quarantine_cmd` refuses them
+    outright, because a `\\` is as likely to be a regex escape as a Windows
+    separator and guessing mangles both."""
+    s = posixpath.normpath(str(path).strip())
+    return "" if s == "." else s
 
 
 def resolve_quarantine(config: dict, repo_path) -> tuple[str | None, dict]:
@@ -407,31 +436,32 @@ def quarantine_cmd(config: dict, repo_path, cmd: str,
                 f"{' and '.join(missing)} — quarantine is never casual or "
                 "undated; record WHY it is excluded and WHEN it was added so "
                 "the next run can tell a stale entry from a live one")
-        spec = str(entry["test"]).strip()
-        if spec != normalize_test_path(spec) or Path(spec).is_absolute():
-            # ONE canonical spelling, enforced at declaration (re-verify
-            # finding): the overlap guard in gitops compares these against a
-            # red-proof's locked test paths by exact string, while a runner
-            # normalizes `./x`, `x` and an absolute path to the same file —
-            # so a non-canonical spelling excluded the task's own test while
-            # slipping the guard, which is the one silent false green this
-            # mechanism must not produce. Normalizing here instead would
-            # leave the config and the ledger disagreeing about the name.
+        raw = str(entry["test"])
+        # ONE canonical spelling, enforced at declaration: the overlap guard
+        # in gitops compares these against a red-proof's LOCKED test paths,
+        # while a runner treats `./x`, `x//y`, `x/./y` and a trailing space
+        # as the same file — so a non-canonical spelling excluded the task's
+        # own test while slipping the guard, the one silent false green this
+        # mechanism must not produce (re-verify finding: the first version
+        # checked the stripped value but RENDERED the raw one, so a trailing
+        # space reopened exactly that hole).
+        if "\\" in raw:
             raise QuarantineError(
-                f"{where}.tests[{i}] test {spec!r} must be repo-relative with "
-                "forward slashes and no './' prefix (the spelling git and "
-                f"the red-proof use) — write it as "
-                f"{normalize_test_path(spec).lstrip('/')!r}")
-        excluded.append(entry)
+                f"{where}.tests[{i}] test {raw!r} contains a backslash — "
+                "entries are repo-relative PATHS with forward slashes, not "
+                "Windows paths and not regexes (a runner-specific pattern "
+                "belongs in the template, not here)")
+        spec = normalize_test_path(raw)
+        if raw != spec or posixpath.isabs(spec) or spec.startswith("../"):
+            raise QuarantineError(
+                f"{where}.tests[{i}] test {raw!r} must be the repo-relative "
+                "path git and the red-proof use — no leading './', no "
+                "doubled or '.'/'..' segments, no surrounding whitespace, "
+                f"not absolute. Write it as {spec.lstrip('./')!r}")
+        excluded.append({**entry, "test": spec})
     from .gitops import render
     flags = " ".join(render(template, test=e["test"]) for e in excluded)
     names = [e["test"] for e in excluded]
-    if cmd.rstrip().endswith(flags):
-        # Already applied — re-applying is the documented develop path
-        # (`resolve-test-cmd` builds the `harness-test-cmd` header, which
-        # develop-task.md then passes back as `--test-cmd` to verify-red) and
-        # used to render `--exclude x --exclude x` (re-verify finding). Idempotent.
-        return cmd
     if run is not None:
         from . import ndjson
         # ONCE per run per (repo, set) — not once per application
@@ -449,6 +479,15 @@ def quarantine_cmd(config: dict, repo_path, cmd: str,
                                   "tests": names,
                                   "reasons": {e["test"]: e["reason"]
                                               for e in excluded}})
+    if cmd.rstrip().endswith(flags):
+        # Already applied — re-applying is the documented develop path
+        # (`resolve-test-cmd` builds the `harness-test-cmd` header, which
+        # develop-task.md then passes back as `--test-cmd` to verify-red) and
+        # used to render `--exclude x --exclude x`. Checked AFTER the event
+        # (re-verify finding: with the early return first, a run whose first
+        # application came from a `--run`-less resolve-test-cmd never got its
+        # flagged event at all — the exclusions applied invisibly).
+        return cmd
     return f"{cmd} {flags}"
 
 

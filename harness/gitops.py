@@ -592,8 +592,14 @@ def _refuse_quarantine_overlap(config: dict, task_repo, locked: dict) -> None:
     from . import initws
     if not config or task_repo is None:
         return
-    overlap = sorted(initws.quarantined_paths(config, task_repo)
-                     & {initws.normalize_test_path(p) for p in locked})
+    # Case-folded: on a case-insensitive filesystem `Tests/Foo.spec.ts` and
+    # `tests/foo.spec.ts` are one file, so a case-only difference must not
+    # slip the guard. Over-refusing here is loud and fixable; under-refusing
+    # is the silent false green (re-verify finding).
+    quarantined = {p.casefold(): p
+                   for p in initws.quarantined_paths(config, task_repo)}
+    locked_norm = {initws.normalize_test_path(p).casefold() for p in locked}
+    overlap = sorted(quarantined[k] for k in quarantined.keys() & locked_norm)
     if overlap:
         raise RedProofError(
             f"quarantined test file(s) {', '.join(overlap)} are also part of "

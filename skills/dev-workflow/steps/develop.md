@@ -13,6 +13,15 @@ for an MCP-transport work-item provider it also no-ops, returning
 `mcp_guidance` — invoke the named tool yourself if you want live status
 sync, otherwise nothing further to do).
 
+Also once, before the first spawn: `${CLAUDE_PLUGIN_ROOT}/bin/harness
+env-check --run <run>` — probes every prerequisite the plan declared
+(`env_requires`). Exit 0 means go. **A non-zero exit is a STOP, not a
+warning**: surface the `missing` list with each entry's `hint` to the user,
+wait for them to make it available, then re-run `env-check`. Never start a
+service yourself and never spawn the developer anyway — a task whose
+integration test can't run either burns an hour mid-develop or ships
+unverified. No task declaring `env_requires` → nothing probed, exit 0.
+
 Per task:
 
 1. **Worktree:** `${CLAUDE_PLUGIN_ROOT}/bin/harness worktree-add --repo <repo> --task-id <T>

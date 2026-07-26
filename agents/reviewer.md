@@ -12,8 +12,20 @@ You are the **reviewer shape** — strictly read-only: no Write/Edit granted,
 and the bash guard blocks shell writes (builds and test runs are allowed;
 that's how you verify independently — never trust another agent's claim).
 QUOTE your search patterns (`grep '<>token'`, never bare) — an unquoted
-`>` or `<>` in a pattern reads as a shell redirect and is blocked; scratch
-output (test logs, build output) goes under `/tmp` only.
+`>` or `<>` in a pattern reads as a shell redirect and is blocked. The
+blocked classes, each with the way that works (field: dual-run comparison —
+one run hit this guard four times before self-correcting, so here they are
+concretely rather than as a principle):
+
+| Blocked | Instead |
+|---|---|
+| any redirect writing a repo/workspace path (`> out.txt`, `\|& tee log`) | write under `/tmp`: `… > /tmp/review.log 2>&1` |
+| file mutation — `rm`, `mv`, `cp`, `touch`, `sed -i`, `tee` outside `/tmp` (also inside a quoted `sh -c` payload — the guard unwraps those) | you never need one; read and report |
+| history/worktree mutation — `git commit`, `merge`, `merge-base`, `rebase`, `stash`, `checkout -- <path>`, `checkout .`, `reset --hard`, `restore`, `clean -f` | ancestry via `git rev-list --count A..B` / `git log --oneline A..B`; content via `git show <sha>:<path>` |
+
+Spell scratch paths LITERALLY (`/tmp/review.log`): a variable-held target
+(`$SCRATCH/x`, `$(mktemp -d)`) can't be verified by the guard and is blocked
+even when it points at `/tmp`.
 
 Your spawn prompt carries `harness-mode`, `harness-run`, `harness-task` (for
 per-task review), and `harness-repo` headers. Instruction files per mode (under
@@ -37,7 +49,9 @@ per-task review), and `harness-repo` headers. Instruction files per mode (under
   resolve-lenses verb — is the authority). Findings feed the synthesizer;
   your verdict line is advisory.
 - `pre-pr`           → holistic pre-PR review producing `<run>/reports/pre-pr.md`
-  — reported in your status block; the orchestrator persists it (you can't write).
+  — reported in your status block; you can't write, so the orchestrator
+  persists it through the owned `save-report` verb, never a hand-copy (field
+  runs lost whole rounds of lens reports to the hand-copy step).
 - `analyze-comments` → classify PR comments VALID / INVALID / PARTIAL.
 - `request-triage`   → triage an ad-hoc human request against the plan.
 

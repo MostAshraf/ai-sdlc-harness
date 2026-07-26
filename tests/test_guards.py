@@ -168,6 +168,50 @@ class BashGuard(GuardHarness):
         self.assertEqual(len(blocked), 1)
         self.assertIn("harness commit", blocked[0]["reason"])
 
+    def test_blocked_event_records_what_was_attempted(self):
+        """field: dual-run comparison — one run logged four reviewer
+        read-only violations of the same class, but the event carried only
+        the guard's message. The attempted command was lost, so there was
+        nothing to coach against and no way to pattern-match recurrence."""
+        run = self.make_run()
+        self.assert_blocks("bash", bash('git commit -m "secret-ish"',
+                                        agent="ai-sdlc-reviewer"),
+                           "harness commit")
+        blocked = [e for e in ndjson.read_records(run / "events.ndjson")
+                   if e.get("kind") == "hook-blocked"][0]
+        self.assertEqual(blocked["tool"], "Bash")
+        self.assertIn("git commit", blocked["attempt"])
+        self.assertEqual(blocked["role"], "reviewer")
+
+    def test_blocked_event_sanitizes_paths_and_bounds_length(self):
+        # these events are read in shared reports; a local filesystem layout
+        # has no business there (the `show` probe_error precedent)
+        run = self.make_run()
+        self.assert_blocks("bash",
+                           bash(f'git commit -m "x" # {run} ' + "y" * 500),
+                           "harness commit")
+        blocked = [e for e in ndjson.read_records(run / "events.ndjson")
+                   if e.get("kind") == "hook-blocked"][0]
+        self.assertNotIn(str(run), blocked["attempt"])
+        self.assertIn("<run>", blocked["attempt"])
+        self.assertLessEqual(len(blocked["attempt"]), 301)
+
+    def test_blocked_event_redacts_credentials(self):
+        # re-verify finding: the raw-git guard is the one MOST likely to fire
+        # on a token-bearing command line, and events.ndjson is unsealed and
+        # travels with the run into shared reports
+        run = self.make_run()
+        self.assert_blocks(
+            "bash",
+            bash("git push https://oauth2:glpat-SECRETTOKEN123@gitlab.com/g/p.git"),
+            "harness push")
+        attempt = [e for e in ndjson.read_records(run / "events.ndjson")
+                   if e.get("kind") == "hook-blocked"][0]["attempt"]
+        self.assertNotIn("glpat-SECRETTOKEN123", attempt)
+        self.assertNotIn("oauth2:", attempt)
+        self.assertIn("<redacted>", attempt)
+        self.assertIn("git push", attempt)      # still coachable
+
     def test_blocked_bash_call_not_logged_with_zero_live_runs(self):
         # No run to attribute to — logging is skipped, the block still happens.
         self.assert_blocks("bash", bash('git commit -m "x"'), "harness commit")
@@ -1524,6 +1568,37 @@ class CaptureHooks(GuardHarness):
         rec = ndjson.read_records(run / "reviews.ndjson")[-1]
         self.assertEqual((rec["task"], rec["mode"], rec["verdict"]),
                          ("T1", "review", "APPROVED"))
+
+    def test_post_spawn_captures_blocking_findings_and_plan_generation(self):
+        """field: dual-run comparison — verdict rows carried only
+        mode/verdict/at, so nothing machine-readable recorded whether a panel
+        was converging. That run's retro then misstated its own final round,
+        and the human gate at `exhausted` had no one-glance framing that the
+        real trajectory had been 9 → 7 → 2 → 2."""
+        run = self.make_run()
+        ndjson.append_record(run / "events.ndjson",
+                             {"kind": "plan-registered", "actor": "plan-register"})
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "reviewer",
+            reply="harness-status: SUCCESS\nharness-task: T1\n"
+                  "verdict: CHANGES_REQUESTED\nblocking-findings: 7\n"
+                  "outcome: seven blockers\ndetails: …"))
+        rec = ndjson.read_records(run / "reviews.ndjson")[-1]
+        self.assertEqual(rec["blocking_findings"], 7)
+        self.assertEqual(rec["plan_generation"], 1)
+
+    def test_blocking_findings_is_optional_and_never_gates_the_verdict(self):
+        # the engine's exits read `verdict` only — a missing or echoed-
+        # template count leaves convergence unrecorded, never a transition
+        run = self.make_run()
+        for reply_extra in ("", "blocking-findings: <N>\n"):
+            self.assert_allows("post-spawn", self._post_spawn(
+                run, "reviewer",
+                reply="harness-status: SUCCESS\nharness-task: T1\n"
+                      f"verdict: APPROVED\n{reply_extra}outcome: fine"))
+            rec = ndjson.read_records(run / "reviews.ndjson")[-1]
+            self.assertEqual(rec["verdict"], "APPROVED")
+            self.assertIsNone(rec["blocking_findings"])
 
     def test_post_spawn_verdict_in_new_template_position_captured(self):
         # 0.16.8: the template moved `verdict:` to its own line BEFORE the
