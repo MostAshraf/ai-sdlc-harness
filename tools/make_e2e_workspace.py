@@ -1,7 +1,7 @@
 """Scaffold the v0.16 end-to-end workspace (docs/validation-plan.md, C + D).
 
 Two repos — the multi-repo path is where every 0.16.x field bug lived — plus
-four stories built to walk the machinery the HEX runs exercised the hard way:
+four stories built to walk the machinery the field runs exercised the hard way:
 
   svc/  python (pyproject marker, stdlib-unittest suite) — discover's static
         coverage proposal will fail its confirm-by-run wherever pytest-cov

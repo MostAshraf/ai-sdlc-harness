@@ -95,9 +95,13 @@ When the planner's status block reports the plan ready:
    never satisfy the red-proof) and is refused unless the plan records
    `test_only_reason`
    (the judged test-infrastructure exception, flagged as
-   `tests-without-production`) — declare cross-repo contracts too if
+   `tests-without-production`). Add `"env_requires":["docker"]` to any task
+   whose tests need something the machine may not have running — the name
+   must exist in config `env_requirements` (registration refuses an
+   unprobeable one), and `env-check` probes it before the developer spawn
+   rather than letting develop hit the wall — declare cross-repo contracts too if
    the plan named any: `--contracts-json '[{"id":"C1","type":"http",
-   "producer":"a","consumers":["b"],"signature":["POST /v2/items",
+   "producer":"a","consumers":["b"],"signature":["/v2/items",
    "field: item_id"]}]'` (`type` is `http | service-bus | dto` — and `http`
    also changes matching: each `{param}` token in a fragment matches any ONE
    path segment per repo, so declare the route template — whichever shape,
@@ -106,10 +110,13 @@ When the planner's status block reports the plan ready:
    (an all-param fragment like `"{id}"` is rejected at registration);
    `signature` is one string or a list of fragments, and **each must be
    a grep-able code token/signature that appears verbatim in source** —
-   `archived`, `filter_notes(notes, tag)`, `POST /v2/items` — NOT an English
+   `archived`, `filter_notes(notes, tag)`, `/v2/items` — NOT an English
    description: reconcile-contracts matches by literal source search
    (route-structural only for http `{param}`s), so a prose fragment is
-   rejected at plan-register and would false-report drift.
+   rejected at plan-register and would false-report drift. For `http`,
+   register the ROUTE alone, not `GET /v2/items`: the method+path form
+   rarely appears verbatim on either side, and a verb-led fragment is
+   flagged (`contract-fragment-weak`) for plan-review.
    All fragments must be present; the flat legacy `"repos":["a","b"]` form
    still works in place of `producer`/`consumers`. Legal only at cursor `plan`.
 2. Check the diagrams: `${CLAUDE_PLUGIN_ROOT}/bin/harness validate-mermaid

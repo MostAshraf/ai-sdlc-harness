@@ -71,3 +71,12 @@ story's `provider_ref` path (returned by the fetch) to overwrite it with the
 refined markdown. If the user declines both a comment and an overwrite, leave
 the output in the conversation for them to copy — never overwrite silently, and
 never overwrite for `analyze` / `groom` (that would destroy the story).
+
+**Preserve the `# <id>: <title>` H1** when you overwrite. That heading is how
+the file claims its id: a story named with a descriptive slug
+(`US-42-add-multiply.md`) resolves from the short id `US-42` *only* because it
+says so. `templates/story-template.md` opens at `## Context` and carries no
+H1, so rewriting straight from the template drops the claim — a
+`/dev-workflow` run already bootstrapped on the short id then fails every
+later `write-back` and `reconcile` with "work item not found"
+(adversarial-review, re-verify pass).

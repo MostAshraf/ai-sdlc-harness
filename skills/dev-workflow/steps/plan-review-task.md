@@ -41,6 +41,15 @@ Check, in order of importance:
    decorative: the named test would actually exercise that criterion. An
    AC with no task, no test-intent, or a table row the task detail
    contradicts is a numbered finding.
+   Also check each AC is **testable as written**: a UI criterion must state
+   the observable semantics, not just the intent. "the Next button is
+   disabled" has two defensible readings — rendered with a `disabled`
+   attribute, or not rendered at all — and they produce behaviorally
+   incompatible implementations *and* incompatible tests. Where the plan
+   silently picked one, say which, and raise it as a finding so the choice
+   is made at plan time rather than discovered in review (field: dual-run
+   comparison — two runs read exactly that AC in opposite directions and
+   shipped mutually incompatible MRs, each internally consistent).
 2. **Scope containment.** Every task's `repo` is inside the confirmed
    scope (`${CLAUDE_PLUGIN_ROOT}/bin/harness show --run <run>` →
    `scope.repos`). An out-of-scope

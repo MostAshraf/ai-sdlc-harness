@@ -118,7 +118,14 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
     pf = sub.add_parser("preflight", parents=[common], help="create the feature branch (owned)")
     pf.add_argument("--repo", type=Path, required=True)
     pf.add_argument("--branch", default=None,
-                    help="override the auto-resolved default branch")
+                    help="override the auto-resolved default branch — this is "
+                         "the BASE the feature branch is cut FROM, not the "
+                         "feature branch's own name")
+    pf.add_argument("--feature-branch-suffix", default=None,
+                    help="suffix the FEATURE branch's rendered name (branch "
+                         "aside) — the declared remedy when a prior run of "
+                         "this work item already claimed the deterministic "
+                         "name on the remote (field: dual-run comparison)")
 
     pv = sub.add_parser("provider", parents=[common], help="dispatch a provider operation")
     pv.add_argument("--op", required=True)
@@ -153,6 +160,45 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
                    help="resolve the plan-review lens panel for a run's "
                         "change_type (plan_review.lenses overlaid by "
                         "lenses_by_change_type)")
+
+    sr = sub.add_parser("save-report", parents=[common],
+                        help="persist a read-only reviewer's report (stdin) "
+                             "to its canonical <run>/reports/ path, plus "
+                             "this round's snapshot")
+    sr.add_argument("--mode", required=True,
+                    help="plan-attack | plan-review | pre-pr (per-task "
+                         "review verdicts are hook-captured, not persisted)")
+    sr.add_argument("--lens", default=None,
+                    help="panel member name (required for lens modes) — "
+                         "becomes part of the filename")
+    sr.add_argument("--round", type=int, default=None, dest="round_n",
+                    help="this round's immutable snapshot (<name>-r<N>.md); "
+                         "omitted, it is derived from the run's own ledger — "
+                         "plan modes count plan re-registrations, pre-pr "
+                         "counts approve-pre-pr rejections")
+    sr.add_argument("--body-file", type=Path, default=None,
+                    help="read the report from this file instead of stdin — "
+                         "the preferred form: a report on the command line "
+                         "breaks on its own apostrophes AND trips the bash "
+                         "guard whenever it quotes a run-authority path or a "
+                         "markdown blockquote")
+
+    ec = sub.add_parser("env-check", parents=[common],
+                        help="probe the environment prerequisites the plan "
+                             "declared (`env_requires`) BEFORE the developer "
+                             "spawn; refuses on a missing one")
+    ec.add_argument("--task", default=None,
+                    help="scope to one task; omit for every non-terminal "
+                         "task in the run")
+
+    rtc = sub.add_parser("resolve-test-cmd", parents=[common],
+                         help="resolve the per-repo test command "
+                              "(language.repos.<name>.test_cmd) with any "
+                              "declared quarantine exclusions applied — the "
+                              "owned way to build a `harness-test-cmd` "
+                              "header, so an agent-run suite excludes the "
+                              "same specs the harness-run one does")
+    rtc.add_argument("--repo", type=Path, required=True)
 
     rcc = sub.add_parser("resolve-coverage-cmd", parents=[common],
                          help="resolve the per-repo coverage command "
@@ -348,6 +394,11 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
                    help="task id for a per-task spawn; omit for a task-less "
                         "spawn (plan-review, pre-pr, …) — the stall is then "
                         "counted per current step, same declared bounds")
+    s.add_argument("--confirm-no-verdict", action="store_true",
+                   help="record the stall even though this step's verdict "
+                        "ledger holds a verdict for the current round — the "
+                        "escape hatch for a spawn that genuinely stalled "
+                        "AFTER the capture (field: dual-run comparison)")
 
     e = sub.add_parser("log-event", parents=[common], help="append to the audit ledger")
     e.add_argument("--json", required=True)
@@ -396,11 +447,32 @@ def main(argv: list[str] | None = None) -> int:
               "ensure-default-branch", "init-verify", "init-section",
               "init-finalize", "add-repo", "migrate-detect", "migrate-extract",
               "status", "repo-map-check", "repo-map-stamp", "validate-mermaid",
-              "resolve-model", "resolve-coverage-cmd")
+              "resolve-model", "resolve-coverage-cmd", "resolve-test-cmd")
     if args.cmd not in NO_RUN and args.run is None:
         p.error(f"--run is required for '{args.cmd}'")
 
     try:
+        if (args.cmd in ("resolve-test-cmd", "resolve-coverage-cmd")
+                and args.run is not None
+                and not state_mod.state_path(args.run).exists()):
+            # `--run` is OPTIONAL on these two (they resolve a command with
+            # or without a run in scope), which is why they sit in NO_RUN and
+            # skip the required-run check above — but when one IS given it
+            # must name a real run. `quarantine_cmd` appends the
+            # `tests-quarantined` flagged event through `ndjson.append_record`,
+            # whose `mkdir(parents=True)` will happily build an entire phantom
+            # run directory out of a typo'd path and return `ok: true`, while
+            # the REAL run never receives the event and the exclusions apply
+            # invisibly — the one thing this mechanism must not do.
+            #
+            # save_report closed exactly this hazard and called itself "the
+            # one run-scoped verb that used to skip this check"; the
+            # whole-branch adversarial pass reproduced it on both of these
+            # (which the step files now mandate `--run` for), leaving that
+            # comment false by two verbs.
+            raise state_mod.StateError(
+                f"{args.run} is not a run (no state.yaml) — check --run; "
+                "refusing to manufacture a phantom run directory")
         if args.cmd == "init":
             def kv(flag, specs):
                 # `--repo myrepo` (no '=') used to die inside dict() with
@@ -475,9 +547,56 @@ def main(argv: list[str] | None = None) -> int:
                    "lenses": lenses})
             return 0
 
+        if args.cmd == "save-report":
+            # A file or stdin, never an argument: a report is multi-line
+            # prose, and putting it on the command line both breaks on its
+            # own apostrophes and trips the bash guard the moment it quotes
+            # a run-authority path or a markdown blockquote (the guard reads
+            # `>` as a redirect). Same file-form precedent as
+            # `--tasks-json-file`.
+            body = (args.body_file.read_text(encoding="utf-8")
+                    if args.body_file else sys.stdin.read())
+            result = workflow.save_report(args.run, args.mode, body,
+                                          args.lens, args.round_n)
+            _emit({"ok": True, **result})
+            return 0
+
+        if args.cmd == "env-check":
+            result = workflow.env_check(args.workspace, args.run, config,
+                                        args.task)
+            # Refuse (exit 1) rather than reporting ok:false at exit 0 — the
+            # develop step branches on the exit code, and a prerequisite the
+            # human has to fix is exactly the "refused" contract.
+            _emit({"ok": not result["missing"], **result})
+            return 1 if result["missing"] else 0
+
+        if args.cmd == "resolve-test-cmd":
+            # The owned resolution the `harness-test-cmd` header is built
+            # from. Its absence was the hole in the quarantine mechanism
+            # (adversarial-review): the harness applied exclusions to the
+            # suites IT ran (verify-red/green), while develop/review/pre-pr/
+            # harden handed agents a raw config value to run themselves — so
+            # the reviewer re-running the suite still hit the pre-existing
+            # failure and issued CHANGES_REQUESTED, which is the field loop
+            # the quarantine exists to end.
+            from . import initws
+            cmd = initws.resolve_test_cmd(config, args.repo)
+            if cmd:
+                cmd = initws.quarantine_cmd(config, args.repo, cmd, args.run)
+            _emit({"ok": True, "test_cmd": cmd})
+            return 0
+
         if args.cmd == "resolve-coverage-cmd":
             from . import initws
             cmd = initws.resolve_coverage_cmd(config, args.repo)
+            if cmd:
+                # Coverage is the OTHER path the quarantined spec kept
+                # aborting (field: dual-run comparison — three times
+                # in one run), so it gets the same exclusions the test
+                # command does. `--run` is optional on this verb, so the
+                # flagged event is only appended when a run is in scope.
+                cmd = initws.quarantine_cmd(config, args.repo, cmd, args.run,
+                                            coverage=True)
             _emit({"ok": True, "coverage_cmd": cmd})
             return 0
 
@@ -634,7 +753,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.cmd == "preflight":
             result = workflow.preflight(args.workspace, args.run, config,
-                                        manifest, args.repo, args.branch)
+                                        manifest, args.repo, args.branch,
+                                        args.feature_branch_suffix)
             _emit({"ok": True, **result})
             return 0
 
@@ -1121,7 +1241,9 @@ def main(argv: list[str] | None = None) -> int:
                         proof = json.loads(chain.verify(
                             proof_path, key,
                             label=transitions.redproof_label(args.id)))
-                    gitops.verify_green(proof, Path(repo), test_cmd, run_tests=True)
+                    gitops.verify_green(proof, Path(repo), test_cmd,
+                                        run_tests=True, config=config,
+                                        task_repo=task["repo"], run=args.run)
                 verify_ctx = {"repo": Path(repo), "run_tests": False}
 
         with state_mod.locked(args.run):
@@ -1277,10 +1399,57 @@ def main(argv: list[str] | None = None) -> int:
                 transitions.set_artifact(st, manifest, args.name, args.value)
             elif args.cmd == "stall":
                 stall_key = args.task or f"step:{st['cursor']['current_step']}"
+                # Checked BEFORE record_stall so a refusal leaves the
+                # counters untouched (field: dual-run comparison —
+                # a stall recorded for an already-captured verdict cost a
+                # full lens panel + one of five review rounds).
+                #
+                # The escape hatch runs the guard too, and keeps what it
+                # would have said: every OTHER escape hatch in this codebase
+                # is visible afterwards (`verify-red --revise` -> a
+                # `test-revision` flag, `coverage-skipped`,
+                # `pr-recorded-manually`), while this one wrote a stall
+                # record byte-identical to a guarded one — so the reviewer of
+                # a DEGRADED run could not tell an overridden stall from a
+                # genuine one (whole-branch adversarial review). The guard
+                # fails open on an unreadable ledger, so the only thing this
+                # catch can see is a real, suppressed refusal — passing the
+                # flag on a genuine stall records nothing extra.
+                overridden = None
+                if not args.confirm_no_verdict:
+                    transitions.guard_stall_verdict(st, manifest, args.run,
+                                                    stall_key)
+                else:
+                    try:
+                        transitions.guard_stall_verdict(st, manifest, args.run,
+                                                        stall_key)
+                    except Exception as exc:      # noqa: BLE001 — see below
+                        # Deliberately every exception, not just
+                        # TransitionError. Before this, the flag SKIPPED the
+                        # guard entirely, so nothing the guard could do was
+                        # able to break the escape hatch; running it for the
+                        # marker handed it that power back. A malformed
+                        # ledger record (a non-string `at` makes
+                        # _verdict_window's comparison raise TypeError) then
+                        # took `stall --confirm-no-verdict` out of the JSON
+                        # error contract entirely — on the one path a wedged
+                        # run depends on, whose fail-open property the guard's
+                        # own comment calls load-bearing (re-verification
+                        # finding, reproduced). The flag's contract is
+                        # "record it anyway"; anything the guard says on the
+                        # way is a note, never a veto.
+                        overridden = f"{type(exc).__name__}: {exc}"[:200]
                 action = transitions.record_stall(st, config, stall_key)
-                ndjson.append_record(args.run / "events.ndjson",
-                                     {"kind": "stall", "task": stall_key,
-                                      "action": action})
+                ndjson.append_record(
+                    args.run / "events.ndjson",
+                    {"kind": "stall", "task": stall_key, "action": action,
+                     **({"override": "confirm-no-verdict"} if overridden
+                        else {})})
+                if overridden:
+                    ndjson.append_record(
+                        args.run / "events.ndjson",
+                        {"kind": "stall-verdict-override", "task": stall_key,
+                         "reason": overridden, "actor": "stall"})
                 state_mod.save(args.run, args.workspace, st)
                 _emit({"ok": True, "action": action})
                 return 0

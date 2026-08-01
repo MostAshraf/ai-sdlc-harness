@@ -13,6 +13,15 @@ for an MCP-transport work-item provider it also no-ops, returning
 `mcp_guidance` — invoke the named tool yourself if you want live status
 sync, otherwise nothing further to do).
 
+Also once, before the first spawn: `${CLAUDE_PLUGIN_ROOT}/bin/harness
+env-check --run <run>` — probes every prerequisite the plan declared
+(`env_requires`). Exit 0 means go. **A non-zero exit is a STOP, not a
+warning**: surface the `missing` list with each entry's `hint` to the user,
+wait for them to make it available, then re-run `env-check`. Never start a
+service yourself and never spawn the developer anyway — a task whose
+integration test can't run either burns an hour mid-develop or ships
+unverified. No task declaring `env_requires` → nothing probed, exit 0.
+
 Per task:
 
 1. **Worktree:** `${CLAUDE_PLUGIN_ROOT}/bin/harness worktree-add --repo <repo> --task-id <T>
@@ -22,10 +31,15 @@ Per task:
 2. `${CLAUDE_PLUGIN_ROOT}/bin/harness task --id <T> --to in-progress --run <run>`
 3. **Spawn `developer`** with headers (`harness-mode: develop`,
    `harness-task: <T>`, `harness-run`, `harness-repo: <worktree-path>`,
-   `harness-test-cmd`: the task's registered repo's own `language.repos.<repo-name>.test_cmd`
-   — language-config is per repo, not one global command; look up the name
-   this task's repo was registered under in `repos.yaml`) + the task's plan
-   section. It follows `steps/develop-task.md` (TDD: verify-red, then
+   `harness-test-cmd`: resolve it with `${CLAUDE_PLUGIN_ROOT}/bin/harness
+   resolve-test-cmd --repo <the task's REGISTERED repo path> --run <run>` —
+   never by reading `language.repos.<name>.test_cmd` by hand; the verb
+   applies that repo's declared quarantine exclusions, so an agent-run suite
+   skips the same known-failing specs the harness-run one does, and `--run`
+   is what puts the exclusion on the run's flagged-events dashboard. Null
+   `test_cmd` means unconfigured — ask the user, never improvise, exactly as
+   with `resolve-coverage-cmd`. Language-config is per repo, not one global
+   command) + the task's plan section. It follows `steps/develop-task.md` (TDD: verify-red, then
    impl, then a harness commit).
 4. **Completion:** `${CLAUDE_PLUGIN_ROOT}/bin/harness task --id <T> --to in-review --repo <worktree>
    --run <run>` (`--test-cmd <cmd>` optional — omitted, it auto-resolves from

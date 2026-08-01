@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
+import re
 import subprocess
 from pathlib import Path
 
@@ -248,6 +250,278 @@ def resolve_coverage_cmd(config: dict, repo_path) -> str | None:
     return entry.get("coverage_cmd") if isinstance(entry, dict) else None
 
 
+class QuarantineError(ValueError):
+    """A `language.repos.<name>.quarantine` block the harness refuses to act
+    on. `ValueError` so the CLI's error contract already carries it."""
+
+
+#: The only keys a `quarantine` block may carry. Unknown keys REFUSE rather
+#: than being ignored (adversarial-review, both lenses): `language.*` is not
+#: schema-validated, so a typo'd key — `test:` for `tests:`, `template:` for
+#: `exclude_template:` — would otherwise read as "nothing quarantined" and
+#: leave the user believing a config file fixed a failure it never touched.
+QUARANTINE_KEYS = {"exclude_template", "coverage_exclude_template", "tests"}
+#: `sh -c '<payload>'` and friends: the payload is a whole shell command in
+#: its own right, so appended flags become the wrapper's arguments and never
+#: reach the runner at all. Same nesting hazard hooks/guards.py `_scan_targets`
+#: unwraps for the bash guard (re-verify finding: `sh -c "cd fe && vitest"`
+#: passed the quote-aware scan AND init-verify, then silently ran the full
+#: suite — a false negative strictly worse than the false positive it fixed).
+#: Windows spellings included (pre-release review: `sh.exe -c`, `cmd /c` and
+#: `powershell -Command` all slipped the POSIX-only pattern, reviving that
+#: exact false negative on the one platform whose toolchains wrap commands
+#: most — a Git-Bash `test_cmd: sh.exe -c "…"` is routine there).
+_SHELL_WRAPPER_RE = re.compile(
+    r"(?:^|\s)(?:"
+    r"(?:[a-z]*sh|env)(?:\.\w+)?\s+(?:-\w+\s+)*-\w*c\b"     # sh/bash/zsh/env, .exe ok
+    r"|cmd(?:\.\w+)?\s+(?:/\w+\s+)*/c\b"                    # cmd /c
+    r"|(?:powershell|pwsh)(?:\.\w+)?\s+(?:-\w+\s+)*-c(?:ommand)?\b"
+    r")", re.IGNORECASE)
+
+
+def _shell_composition(cmd: str) -> str | None:
+    """The first shell operator OUTSIDE quotes, or None.
+
+    A quarantined command has its flags APPENDED, so it must be a single
+    command: appending to `cd fe && npm test | tee log` attaches the
+    exclusion to `tee`, silently running the full suite (adversarial-review).
+    Quote-aware, NOT a substring scan (re-verify finding: a bare scan refused
+    `go test ./... -run "TestA|TestB"` and every other quoted regex
+    alternation — normal single commands — with advice that made no sense).
+
+    Detected: `&&`, `||`, `|`, `;`, a lone backgrounding `&`, a newline
+    (a YAML block scalar is an ordinary way to write two commands), and a
+    `-c` shell wrapper. Backslash escapes are honoured so `\\"` inside a
+    quoted string doesn't end it."""
+    if _SHELL_WRAPPER_RE.search(cmd):
+        return "-c"
+    quote = None
+    i = 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if ch == "\\" and quote != "'":
+            i += 2                      # escaped char: never a delimiter
+            continue
+        if quote is not None:
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif cmd[i:i + 2] in ("&&", "||"):
+            return cmd[i:i + 2]
+        elif ch in "|;&":
+            return ch
+        elif ch in "\n\r":
+            return "newline"
+        i += 1
+    return None
+
+
+def normalize_test_path(path: str) -> str:
+    """The ONE spelling a test path is compared in — used for the overlap
+    guard, the rendered exclusion flag, and the flagged event alike.
+
+    Collapses everything a runner would treat as the same file but a string
+    compare would not: surrounding whitespace, `./`, `//`, `/./`, `/../`
+    (re-verify finding: each of these declared-vs-locked mismatches let an
+    exclusion take effect while `_refuse_quarantine_overlap` saw no overlap
+    — the silent false green at verify-green this guard exists to stop).
+    Backslashes are NOT rewritten here; `quarantine_cmd` refuses them
+    outright, because a `\\` is as likely to be a regex escape as a Windows
+    separator and guessing mangles both."""
+    s = posixpath.normpath(str(path).strip())
+    return "" if s == "." else s
+
+
+def resolve_quarantine(config: dict, repo_path) -> tuple[str | None, dict]:
+    """(repo name, quarantine block) for a repo path — `{}` when none is
+    declared. Same `language.repos.<name>` convention as its `test_cmd` /
+    `coverage_cmd` siblings. `language.*` is not schema-validated, so the
+    shape is checked here and in `quarantine_cmd` below; `initws.verify()`
+    runs the same checks at `init-verify` time, where fixing config is cheap
+    rather than mid-develop."""
+    name = repo_name(config, repo_path)
+    if name is None:
+        return None, {}
+    repos_cfg = (config.get("language") or {}).get("repos")
+    entry = repos_cfg.get(name) if isinstance(repos_cfg, dict) else None
+    if not isinstance(entry, dict) or "quarantine" not in entry:
+        return name, {}
+    block = entry["quarantine"]
+    where = f"language.repos.{name}.quarantine"
+    if not isinstance(block, dict):
+        raise QuarantineError(
+            f"{where} must be a mapping of "
+            "{exclude_template, coverage_exclude_template?, tests: [...]} — "
+            f"got {type(block).__name__}. A bare string or list is silently "
+            "not a quarantine; refusing rather than running the full suite "
+            "as if the config had taken effect.")
+    unknown = sorted(set(block) - QUARANTINE_KEYS)
+    if unknown:
+        raise QuarantineError(
+            f"{where} has unknown key(s) {', '.join(unknown)} — allowed: "
+            f"{', '.join(sorted(QUARANTINE_KEYS))}. Refusing rather than "
+            "ignoring a typo that would leave nothing actually quarantined.")
+    return name, block
+
+
+def quarantine_cmd(config: dict, repo_path, cmd: str,
+                   run: Path | None = None, coverage: bool = False) -> str:
+    """`cmd` with this repo's quarantined specs excluded, or `cmd` untouched
+    when nothing is quarantined.
+
+    field: dual-run comparison — one pre-existing, unrelated failing
+    spec was rediscovered and routed around FOUR times across two runs of the
+    same story: it blocked a task's completion in one and aborted the
+    frontend coverage run three times in the other. The per-call `--test-cmd`
+    override could express the workaround, but the knowledge evaporated
+    between runs; this makes it declared workspace config instead.
+
+    Deliberately LOUD, never silent — a quarantine that hides itself is worse
+    than the status quo:
+      * `reason` and `since` are REQUIRED per entry (no casual, undated
+        exclusions);
+      * a non-empty `tests` with no template REFUSES rather than running the
+        full suite as though nothing were quarantined — the flag is
+        runner-specific and must not be guessed;
+      * a malformed block refuses (see `resolve_quarantine`) instead of
+        reading as "nothing quarantined";
+      * a shell-composed command refuses, because appended flags would land
+        on the wrong command;
+      * the run gets a flagged `tests-quarantined` event naming the excluded
+        specs, so the exclusion is on its dashboard.
+
+    `coverage=True` prefers `coverage_exclude_template`: a repo's
+    `coverage_cmd` is often a DIFFERENT tool from its `test_cmd`
+    (`sh mvnw test` vs `sh mvnw test jacoco:report`, `vitest` vs `nyc
+    report`), and appending the test runner's flag to it would kill the
+    coverage step with an unknown-flag error — the very symptom this exists
+    to remove (adversarial-review).
+    """
+    name, block = resolve_quarantine(config, repo_path)
+    tests = block.get("tests") or []
+    if not tests:
+        return cmd
+    where = f"language.repos.{name}.quarantine"
+    if not isinstance(tests, list):
+        raise QuarantineError(f"{where}.tests must be a list of "
+                              "{test, reason, since} entries")
+    key = "coverage_exclude_template" if coverage else "exclude_template"
+    template = block.get(key) or block.get("exclude_template")
+    if not isinstance(template, str) or not template.strip():
+        raise QuarantineError(
+            f"{where} lists {len(tests)} quarantined test(s) but no "
+            f"`{key}` — the exclusion flag is runner-specific and the "
+            "harness will not guess it (vitest '--exclude {test}', pytest "
+            "'--deselect {test}', maven '-Dtest=!{test}'; an npm wrapper "
+            "needs its own passthrough, e.g. '-- --exclude {test}'). Set "
+            f"{where}.{key}, or empty `tests`. Refusing to run the full "
+            "suite as if nothing were quarantined.")
+    if "{test}" not in template:
+        # re-verify finding: str.format leaves a placeholder-free template
+        # unchanged, so `exclude_template: "--exclude"` with 3 entries
+        # rendered `--exclude --exclude --exclude` and excluded nothing
+        raise QuarantineError(
+            f"{where}.{key} must contain the '{{test}}' placeholder — it is "
+            f"rendered once per entry; {template!r} names no test and would "
+            "exclude nothing while looking like it had.")
+    hit = _shell_composition(cmd)
+    if hit:
+        raise QuarantineError(
+            f"{where} cannot be applied to {cmd!r}: exclusion flags are "
+            f"APPENDED, and this command is shell-composed ({hit!r}), so "
+            "they would attach to its last stage instead of the test "
+            "runner — silently running the full suite. Move the composition "
+            "into a script and point the command at that.")
+    excluded = []
+    for i, entry in enumerate(tests):
+        if not isinstance(entry, dict) or not str(entry.get("test") or "").strip():
+            raise QuarantineError(f"{where}.tests[{i}] needs a non-empty `test`")
+        missing = [k for k in ("reason", "since")
+                   if not str(entry.get(k) or "").strip()]
+        if missing:
+            raise QuarantineError(
+                f"{where}.tests[{i}] ('{entry['test']}') is missing "
+                f"{' and '.join(missing)} — quarantine is never casual or "
+                "undated; record WHY it is excluded and WHEN it was added so "
+                "the next run can tell a stale entry from a live one")
+        raw = str(entry["test"])
+        # ONE canonical spelling, enforced at declaration: the overlap guard
+        # in gitops compares these against a red-proof's LOCKED test paths,
+        # while a runner treats `./x`, `x//y`, `x/./y` and a trailing space
+        # as the same file — so a non-canonical spelling excluded the task's
+        # own test while slipping the guard, the one silent false green this
+        # mechanism must not produce (re-verify finding: the first version
+        # checked the stripped value but RENDERED the raw one, so a trailing
+        # space reopened exactly that hole).
+        if "\\" in raw:
+            raise QuarantineError(
+                f"{where}.tests[{i}] test {raw!r} contains a backslash — "
+                "entries are repo-relative PATHS with forward slashes, not "
+                "Windows paths and not regexes (a runner-specific pattern "
+                "belongs in the template, not here)")
+        spec = normalize_test_path(raw)
+        if raw != spec or posixpath.isabs(spec) or spec.startswith("../"):
+            raise QuarantineError(
+                f"{where}.tests[{i}] test {raw!r} must be the repo-relative "
+                "path git and the red-proof use — no leading './', no "
+                "doubled or '.'/'..' segments, no surrounding whitespace, "
+                f"not absolute. Write it as {spec.lstrip('./')!r}")
+        excluded.append({**entry, "test": spec})
+    from .gitops import render
+    flags = " ".join(render(template, test=e["test"]) for e in excluded)
+    names = [e["test"] for e in excluded]
+    if run is not None:
+        from . import ndjson
+        # ONCE per run per (repo, set) — not once per application
+        # (adversarial-review, both lenses): verify-red fires per task,
+        # verify-green again per task, resolve-coverage-cmd once per repo, so
+        # a 5-task run emitted ~12 identical records into the very gauge a
+        # human reads to decide whether a run needs attention. The fact must
+        # be on the dashboard; twelve copies of it drown the dashboard.
+        prior = ndjson.read_records(run / "events.ndjson")
+        if not any(e.get("kind") == "tests-quarantined"
+                   and e.get("repo") == name and e.get("tests") == names
+                   for e in prior):
+            ndjson.append_record(run / "events.ndjson",
+                                 {"kind": "tests-quarantined", "repo": name,
+                                  "tests": names,
+                                  "reasons": {e["test"]: e["reason"]
+                                              for e in excluded},
+                                  # SINGULAR `reason` too — that is the key
+                                  # the metrics report's flagged table
+                                  # renders, and `reasons` (the per-entry map
+                                  # a machine reads) is not it, so this row
+                                  # came out blank in the one surface a human
+                                  # actually reads: the event named the
+                                  # exclusions and the dashboard did not
+                                  # (whole-branch adversarial review).
+                                  "reason": f"{name}: excluded " + "; ".join(
+                                      f"{e['test']} ({e['reason']})"
+                                      for e in excluded)})
+    if cmd.rstrip().endswith(flags):
+        # Already applied — re-applying is the documented develop path
+        # (`resolve-test-cmd` builds the `harness-test-cmd` header, which
+        # develop-task.md then passes back as `--test-cmd` to verify-red) and
+        # used to render `--exclude x --exclude x`. Checked AFTER the event
+        # (re-verify finding: with the early return first, a run whose first
+        # application came from a `--run`-less resolve-test-cmd never got its
+        # flagged event at all — the exclusions applied invisibly).
+        return cmd
+    return f"{cmd} {flags}"
+
+
+def quarantined_paths(config: dict, repo_path) -> set[str]:
+    """Just the quarantined spec paths for a repo — for callers that must
+    detect an OVERLAP rather than build a command (see gitops)."""
+    _name, block = resolve_quarantine(config, repo_path)
+    # normalized on the way out too, so the overlap comparison holds even for
+    # a block written before the declaration-time spelling check existed
+    return {normalize_test_path(str(e.get("test")))
+            for e in (block.get("tests") or [])
+            if isinstance(e, dict) and e.get("test")}
+
+
 def verify(config: dict, workspace: Path | None = None) -> list[dict]:
     """Verification gates (a real gate, not a rubber-stamp): every check
     returns pass/fail/manual + remediation. Callers block on failures.
@@ -333,6 +607,29 @@ def verify(config: dict, workspace: Path | None = None) -> list[dict]:
             "path must be a git checkout")
 
     for name, path in repos.items():
+        # Quarantine shape checked HERE, where fixing config is cheap
+        # (adversarial-review, both lenses): `language.*` is not
+        # schema-validated, so a malformed block used to surface only at the
+        # first verify-red — deep inside develop, after preflight, plan,
+        # plan-review and the plan gate — and then wedged every TDD task in
+        # the repo. Rendering exercises every refusal the run would hit.
+        try:
+            quarantine_cmd(config, path, _test_cmd_for_name(config, name) or "x")
+            cov = resolve_coverage_cmd(config, path)
+            if cov:
+                # the coverage path has its own template and its own command
+                # shape, so it can refuse where the test path passed
+                # (re-verify finding: a shell-composed coverage_cmd, or a
+                # non-string coverage_exclude_template, sailed through
+                # init-verify and died at harden instead)
+                quarantine_cmd(config, path, cov, coverage=True)
+            add(f"quarantine:{name}", "pass",
+                f"{len(quarantined_paths(config, path))} quarantined test(s)",
+                "")
+        except QuarantineError as exc:
+            add(f"quarantine:{name}", "fail", str(exc),
+                f"fix language.repos.{name}.quarantine")
+
         cmd = _test_cmd_for_name(config, name)
         if not cmd:
             add(f"test_cmd:{name}", "fail", "not configured",

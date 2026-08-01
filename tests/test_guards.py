@@ -168,6 +168,50 @@ class BashGuard(GuardHarness):
         self.assertEqual(len(blocked), 1)
         self.assertIn("harness commit", blocked[0]["reason"])
 
+    def test_blocked_event_records_what_was_attempted(self):
+        """field: dual-run comparison — one run logged four reviewer
+        read-only violations of the same class, but the event carried only
+        the guard's message. The attempted command was lost, so there was
+        nothing to coach against and no way to pattern-match recurrence."""
+        run = self.make_run()
+        self.assert_blocks("bash", bash('git commit -m "secret-ish"',
+                                        agent="ai-sdlc-reviewer"),
+                           "harness commit")
+        blocked = [e for e in ndjson.read_records(run / "events.ndjson")
+                   if e.get("kind") == "hook-blocked"][0]
+        self.assertEqual(blocked["tool"], "Bash")
+        self.assertIn("git commit", blocked["attempt"])
+        self.assertEqual(blocked["role"], "reviewer")
+
+    def test_blocked_event_sanitizes_paths_and_bounds_length(self):
+        # these events are read in shared reports; a local filesystem layout
+        # has no business there (the `show` probe_error precedent)
+        run = self.make_run()
+        self.assert_blocks("bash",
+                           bash(f'git commit -m "x" # {run} ' + "y" * 500),
+                           "harness commit")
+        blocked = [e for e in ndjson.read_records(run / "events.ndjson")
+                   if e.get("kind") == "hook-blocked"][0]
+        self.assertNotIn(str(run), blocked["attempt"])
+        self.assertIn("<run>", blocked["attempt"])
+        self.assertLessEqual(len(blocked["attempt"]), 301)
+
+    def test_blocked_event_redacts_credentials(self):
+        # re-verify finding: the raw-git guard is the one MOST likely to fire
+        # on a token-bearing command line, and events.ndjson is unsealed and
+        # travels with the run into shared reports
+        run = self.make_run()
+        self.assert_blocks(
+            "bash",
+            bash("git push https://oauth2:glpat-SECRETTOKEN123@gitlab.com/g/p.git"),
+            "harness push")
+        attempt = [e for e in ndjson.read_records(run / "events.ndjson")
+                   if e.get("kind") == "hook-blocked"][0]["attempt"]
+        self.assertNotIn("glpat-SECRETTOKEN123", attempt)
+        self.assertNotIn("oauth2:", attempt)
+        self.assertIn("<redacted>", attempt)
+        self.assertIn("git push", attempt)      # still coachable
+
     def test_blocked_bash_call_not_logged_with_zero_live_runs(self):
         # No run to attribute to — logging is skipped, the block still happens.
         self.assert_blocks("bash", bash('git commit -m "x"'), "harness commit")
@@ -536,6 +580,86 @@ class BashGuard(GuardHarness):
             "bash", bash("${CLAUDE_PLUGIN_ROOT}/bin/harness scope-register "
                          "--repos-json '[\"/p\"]' --run ai/r"))
 
+    def test_subagents_cannot_save_reports(self):
+        """save-report joined the orchestrator-only set (pre-release review,
+        both lenses): a run's reports/ are GATE-PRESENTED evidence — an
+        exhausted plan-review decision rests on reports/plan-review.md. A
+        reviewer persisting its own reply would author the evidence the
+        human reads AND, via the snapshot immutability check, could wedge
+        the orchestrator's own documented save.
+
+        This covers the BASH surface only; the Write surface has its own
+        test below (whole-branch review: the planner's write confinement
+        admitted all of `ai/`, so blocking the verb here left the directory
+        reachable by the shape live at the two cursors before the gate)."""
+        for shape in ("ai-sdlc-reviewer", "ai-sdlc-developer",
+                      "ai-sdlc-planner"):
+            self.assert_blocks(
+                "bash",
+                bash("${CLAUDE_PLUGIN_ROOT}/bin/harness save-report "
+                     "--mode pre-pr --body-file /tmp/x.md --run ai/r", shape),
+                "orchestrator-only")
+        self.assert_allows(
+            "bash", bash("${CLAUDE_PLUGIN_ROOT}/bin/harness save-report "
+                         "--mode pre-pr --body-file /tmp/x.md --run ai/r"))
+
+    def test_subagents_cannot_register_artifacts(self):
+        """Whole-branch review: blocking the WRITE half of report
+        persistence left the REGISTRATION half open, and registration is
+        what a gate reads. `set_artifact` validates only that the name is
+        in the live step's `produces` — and the reviewer is alive exactly
+        while the cursor sits on `plan-review`, whose produces includes
+        `plan-review-report`."""
+        for shape in ("ai-sdlc-reviewer", "ai-sdlc-developer",
+                      "ai-sdlc-planner"):
+            self.assert_blocks(
+                "bash",
+                bash("${CLAUDE_PLUGIN_ROOT}/bin/harness artifact "
+                     "--name plan-review-report --value reports/plan-review.md "
+                     "--run ai/r", shape),
+                "orchestrator-only")
+        self.assert_allows(
+            "bash", bash("${CLAUDE_PLUGIN_ROOT}/bin/harness artifact "
+                         "--name plan-review-report "
+                         "--value reports/plan-review.md --run ai/r"))
+        # Anchored on the `--name` the verb always carries: the gap spans
+        # the whole command, so a bare `\bartifact\b` would also fire on an
+        # unrelated path that merely contains the word.
+        self.assert_allows(
+            "bash", bash("${CLAUDE_PLUGIN_ROOT}/bin/harness verify "
+                         "--run ai/artifact-run", "ai-sdlc-reviewer"))
+        # Re-verification findings — two evasions of that anchor. A shell
+        # line continuation is still ONE command (and the step files render
+        # long harness invocations exactly this way), and argparse's default
+        # allow_abbrev makes `--n`/`--na`/`--nam` real spellings of the flag.
+        self.assert_blocks(
+            "bash",
+            bash("${CLAUDE_PLUGIN_ROOT}/bin/harness artifact \\\n"
+                 "  --name plan-review-report --value reports/plan-review.md "
+                 "--run ai/r", "ai-sdlc-reviewer"),
+            "orchestrator-only")
+        for abbrev in ("--n", "--na", "--nam"):
+            self.assert_blocks(
+                "bash",
+                bash(f"${{CLAUDE_PLUGIN_ROOT}}/bin/harness artifact {abbrev} "
+                     "plan-review-report --value reports/plan-review.md "
+                     "--run ai/r", "ai-sdlc-reviewer"),
+                "orchestrator-only")
+        # the continuation widening covers the three older verbs too
+        self.assert_blocks(
+            "bash",
+            bash("${CLAUDE_PLUGIN_ROOT}/bin/harness save-report \\\n"
+                 "  --mode pre-pr --body-file /tmp/x.md --run ai/r",
+                 "ai-sdlc-reviewer"),
+            "orchestrator-only")
+        # global flags legally precede the verb, so the gap is still needed
+        self.assert_blocks(
+            "bash",
+            bash("${CLAUDE_PLUGIN_ROOT}/bin/harness --workspace . artifact "
+                 "--name plan-review-report --value reports/x.md --run ai/r",
+                 "ai-sdlc-reviewer"),
+            "orchestrator-only")
+
     def test_unparseable_payload_fails_open(self):
         proc = subprocess.run([sys.executable, str(GUARDS), "bash"],
                               input="not json{", capture_output=True, text=True, encoding="utf-8")
@@ -702,18 +826,18 @@ class WriteGuard(GuardHarness):
         # (repo.parent/<repo.name>-wt-<task>-<uid>), OUTSIDE the workspace,
         # so the old cwd-based confinement blocked every legitimate worktree
         # write. Spaced repo path included (the reported workspace was under
-        # `HEX AI Engine`) to prove it's Path semantics, not a regex.
+        # `AI Engine`) to prove it's Path semantics, not a regex.
         dev = "x:developer"
-        repo = self.workspace / "HEX AI Engine" / "Code" / "hex-ai-engine-backend"
+        repo = self.workspace / "AI Engine" / "Code" / "ai-engine-backend"
         repo.mkdir(parents=True)
         self._register_repo(repo)
-        wt_file = (self.workspace / "HEX AI Engine" / "Code"
-                   / "hex-ai-engine-backend-wt-T1-3a1f7827" / "src"
+        wt_file = (self.workspace / "AI Engine" / "Code"
+                   / "ai-engine-backend-wt-T1-3a1f7827" / "src"
                    / "N8nDiscoveryPort.java")
         self.assert_allows("write", self._w(str(wt_file), dev))
         # but a sibling that ISN'T a worktree of this repo is still blocked
         self.assert_blocks("write", self._w(str(
-            self.workspace / "HEX AI Engine" / "Code" / "unrelated" / "x.java"),
+            self.workspace / "AI Engine" / "Code" / "unrelated" / "x.java"),
             dev), "worktree")
 
     def test_second_registered_repo_and_its_worktree_allowed_regardless_of_yaml_order(self):
@@ -812,6 +936,78 @@ class WriteGuard(GuardHarness):
             str(self.workspace / ".claude" / "context" / "repo-map" / "m.md"), pl))
         self.assert_blocks("write", self._w(str(self.workspace / "src" / "x.py"), pl),
                            "repo source")
+
+    def test_planner_cannot_write_gate_evidence_into_reports(self):
+        """Whole-branch review: SUBAGENT_REGISTER_RE's comment claimed no
+        subagent had a path into `<run>/reports/`. True for the reviewer
+        (blocked outright) and the developer (confined to repos), FALSE for
+        the planner — whose artifact root is all of `ai/`, and which is live
+        at intake/plan, the two cursors immediately before the gate that
+        reads this evidence. Pre-seeding `plan-review-r1.md` also arms the
+        snapshot-immutability wedge against the orchestrator's FIRST
+        legitimate save."""
+        pl = "x:planner"
+        reports = self.workspace / "ai" / "r" / "reports"
+        for name in ("plan-review.md", "plan-review-r1.md", "pre-pr.md",
+                     "plan-attack-contradictions.md"):
+            self.assert_blocks("write", self._w(str(reports / name), pl),
+                               "gate-presented evidence")
+        # An exemption, not a blanket block — the plan's revision archaeology
+        # is the planner's own output (agents/planner.md).
+        self.assert_allows(
+            "write", self._w(str(reports / "plan-revision-log.md"), pl))
+        # A nested path under reports/ is still reports/.
+        self.assert_blocks("write",
+                           self._w(str(reports / "round-2" / "plan-review.md"), pl),
+                           "gate-presented evidence")
+        # Regression guard: the rule is scoped to reports/, not to ai/.
+        self.assert_allows("write",
+                           self._w(str(self.workspace / "ai" / "r" / "plan.md"), pl))
+        # Re-verification finding, reproduced on macOS: on a case-insensitive
+        # filesystem `Reports/` and `reports/` are ONE directory, and a file
+        # written through either spelling is read back through the other —
+        # including by save_report's own snapshot-immutability check.
+        self.assert_blocks(
+            "write",
+            self._w(str(self.workspace / "ai" / "r" / "Reports" / "plan-review.md"),
+                    pl),
+            "gate-presented evidence")
+        # …and the exemption is casefolded with it, so the same file does not
+        # block under a different spelling
+        self.assert_allows("write", self._w(
+            str(reports / "Plan-Revision-Log.md"), pl))
+
+    def test_planner_bash_writes_into_reports_are_blocked_too(self):
+        """Re-verification finding (HIGH): the first cut of the reports/ rule
+        closed Write/Edit only. The reviewer and the developer each have a
+        bash-write confinement; the planner had none — so `echo >`, `tee`,
+        `cp` and an inline `open(...,'w')` all still reached gate-presented
+        evidence for the one shape that was the hole. Closing one surface of
+        two is the exact shape of the finding the rule exists to fix."""
+        pl = "x:planner"
+        # Commands spell paths the way the EXECUTING shell sees them —
+        # forward slashes on every OS, since the Bash tool is Git Bash on
+        # Windows — the same convention (and the same reason) as
+        # test_developer_bash_writes_confined_to_repo_and_worktree above. A
+        # backslash spelling trivially misses the target-detection regex, so
+        # it would leave this rule untested exactly where it is least tested.
+        run_sh = (self.workspace / "ai" / "r").as_posix()
+        tgt = f"{run_sh}/reports/plan-review.md"
+        for cmd in (f"echo hi > {tgt}",
+                    f"echo hi | tee {tgt}",
+                    f"cp /tmp/x.md {tgt}",
+                    f"python3 -c \"open('{tgt}','w').write('x')\""):
+            self.assert_blocks("bash", bash(cmd, pl), "gate-presented evidence")
+        # a planner's cwd IS the workspace, so the relative spelling is the
+        # natural one here — the developer branch skips relative targets, and
+        # this rule must not
+        self.assert_blocks("bash", bash("echo hi > ai/r/reports/pre-pr.md", pl),
+                           "gate-presented evidence")
+        # its own file, and an unrelated artifact write, still pass
+        self.assert_allows(
+            "bash", bash(f"echo hi > {run_sh}/reports/plan-revision-log.md", pl))
+        self.assert_allows("bash", bash(f"echo hi > {run_sh}/plan.md", pl))
+        self.assert_allows("bash", bash("npm test > /dev/null", pl))
 
     def test_planner_lexical_traversal_escape_blocked(self):
         # adversarial-review finding: `is_relative_to` never resolved `..`
@@ -1012,15 +1208,15 @@ class SpawnGuard(GuardHarness):
                            "fail-closed pre-run")
 
     def test_run_header_with_spaces_in_the_path_resolves(self):
-        # field report: a workspace under `.../HEX AI Engine/...` truncated
+        # field report: a workspace under `.../AI Engine/...` truncated
         # the harness-run header at the first space (\S+ capture), so the
         # resolved run never matched any live run and every harness-shape
         # spawn was blocked as "does not match any active run".
-        ws = self.workspace / "HEX AI Engine"   # a space in the workspace path
+        ws = self.workspace / "AI Engine"   # a space in the workspace path
         (ws / "ai").mkdir(parents=True)
-        run = ws / "ai" / "2026-07-06-US-039"
+        run = ws / "ai" / "2026-07-06-WI-206"
         state_mod.bootstrap(run, ws,
-                            work_item={"id": "US-039", "title": "t", "provider_ref": ""},
+                            work_item={"id": "WI-206", "title": "t", "provider_ref": ""},
                             mode="full", change_type="fix",
                             tasks=[{"id": "T1"}], entry_step="fetch")
         manifest, _, config = load_declared(ws)
@@ -1524,6 +1720,72 @@ class CaptureHooks(GuardHarness):
         rec = ndjson.read_records(run / "reviews.ndjson")[-1]
         self.assertEqual((rec["task"], rec["mode"], rec["verdict"]),
                          ("T1", "review", "APPROVED"))
+
+    def test_post_spawn_captures_blocking_findings_and_plan_generation(self):
+        """field: dual-run comparison — verdict rows carried only
+        mode/verdict/at, so nothing machine-readable recorded whether a panel
+        was converging. That run's retro then misstated its own final round,
+        and the human gate at `exhausted` had no one-glance framing that the
+        real trajectory had been 9 → 7 → 2 → 2."""
+        run = self.make_run()
+        ndjson.append_record(run / "events.ndjson",
+                             {"kind": "plan-registered", "actor": "plan-register"})
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "reviewer",
+            reply="harness-status: SUCCESS\nharness-task: T1\n"
+                  "verdict: CHANGES_REQUESTED\nblocking-findings: 7\n"
+                  "outcome: seven blockers\ndetails: …"))
+        rec = ndjson.read_records(run / "reviews.ndjson")[-1]
+        self.assertEqual(rec["blocking_findings"], 7)
+        self.assertEqual(rec["plan_generation"], 1)
+
+    def test_blocking_findings_scoped_to_the_final_status_block(self):
+        # pre-release review, both lenses: a prose recap of a previous round
+        # must not become THIS round's count when the final block omits the
+        # optional line — same scoping extract_verdict already has
+        run = self.make_run()
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "reviewer",
+            reply="Recap: round 1 had blocking-findings: 9, all fixed.\n\n"
+                  "harness-status: SUCCESS\nharness-task: T1\n"
+                  "verdict: APPROVED\noutcome: clean"))
+        rec = ndjson.read_records(run / "reviews.ndjson")[-1]
+        self.assertIsNone(rec["blocking_findings"])
+        # …while a count IN the final block still records
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "reviewer",
+            reply="Earlier prose says blocking-findings: 9.\n\n"
+                  "harness-status: SUCCESS\nharness-task: T1\n"
+                  "verdict: CHANGES_REQUESTED\nblocking-findings: 2\n"
+                  "outcome: two blockers"))
+        rec = ndjson.read_records(run / "reviews.ndjson")[-1]
+        self.assertEqual(rec["blocking_findings"], 2)
+
+    def test_forged_plan_registered_does_not_move_the_generation(self):
+        # actor-checked like outstanding_flagged: a stray `log-event` record
+        # of the right kind must not inflate the round stamped on verdicts
+        run = self.make_run()
+        ndjson.append_record(run / "events.ndjson",
+                             {"kind": "plan-registered"})   # no actor: forged
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "reviewer",
+            reply="harness-status: SUCCESS\nharness-task: T1\n"
+                  "verdict: APPROVED\noutcome: fine"))
+        rec = ndjson.read_records(run / "reviews.ndjson")[-1]
+        self.assertEqual(rec["plan_generation"], 0)
+
+    def test_blocking_findings_is_optional_and_never_gates_the_verdict(self):
+        # the engine's exits read `verdict` only — a missing or echoed-
+        # template count leaves convergence unrecorded, never a transition
+        run = self.make_run()
+        for reply_extra in ("", "blocking-findings: <N>\n"):
+            self.assert_allows("post-spawn", self._post_spawn(
+                run, "reviewer",
+                reply="harness-status: SUCCESS\nharness-task: T1\n"
+                      f"verdict: APPROVED\n{reply_extra}outcome: fine"))
+            rec = ndjson.read_records(run / "reviews.ndjson")[-1]
+            self.assertEqual(rec["verdict"], "APPROVED")
+            self.assertIsNone(rec["blocking_findings"])
 
     def test_post_spawn_verdict_in_new_template_position_captured(self):
         # 0.16.8: the template moved `verdict:` to its own line BEFORE the

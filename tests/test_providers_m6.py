@@ -495,5 +495,84 @@ class McpAdapters(unittest.TestCase):
         self.assertEqual(get_module(self.ADO_MCP).STATUS_DEFAULTS, cli_defaults)
 
 
+GLAB_404_STUB = r'''#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+base = Path(__file__).parent
+args = sys.argv[1:]
+(base / "invocations.log").open("a").write(json.dumps(args) + "\n")
+if args[:2] == ["mr", "create"]:
+    sys.stderr.write("GET https://gitlab/api/v4/projects/g%2Fsub%2Fproj: 404 "
+                     "{message: 404 Project Not Found}\n")
+    sys.exit(1)
+if args[:2] == ["api", "--method"]:
+    print(json.dumps({"web_url": "https://gitlab/g/sub/proj/-/merge_requests/12"}))
+    sys.exit(0)
+if args[0] == "api":
+    print(json.dumps([{"id": 4, "path_with_namespace": "other/proj"},
+                      {"id": 77, "path_with_namespace": "g/sub/proj"}]))
+    sys.exit(0)
+sys.exit(1)
+'''
+
+
+class GitlabNumericIdFallback(FakeCliHarness):
+    """field: dual-run comparison — both runs ended with
+    `pr-recorded-manually` twice. The instance 404s PATH-encoded project
+    lookups while numeric-id access works, so `glab mr create` (which
+    resolves by path) could never create the MR and the manual hatch was the
+    only route."""
+
+    def _repo(self, url="git@gitlab:g/sub/proj.git") -> Path:
+        from harness import gitops
+        repo = self.bin / "checkout"
+        repo.mkdir()
+        gitops.run_git(self.bin, "init", "-b", "main", "checkout")
+        gitops.run_git(repo, "remote", "add", "origin", url)
+        return repo
+
+    KW = dict(branch="fix/7-x", base="main", title="Fix",
+              work_item_id="7", summary="s")
+
+    def test_falls_back_to_the_numeric_project_id(self):
+        support.write_cli_stub(self.bin, "glab", GLAB_404_STUB)
+        pr = create_pr({"provider": {"git": "gitlab"}},
+                       repo=self._repo(), **self.KW)
+        self.assertEqual(pr["url"],
+                         "https://gitlab/g/sub/proj/-/merge_requests/12")
+        self.assertEqual(pr["resolved_by"], "numeric-project-id")
+        post = self.invocations()[-1]
+        # resolved by EXACT path match, never "first search hit"
+        self.assertIn("projects/77/merge_requests", post)
+        self.assertIn("source_branch=fix/7-x", post)
+        self.assertIn("target_branch=main", post)
+
+    def test_non_resolution_failures_still_surface(self):
+        # a validation error (branch missing, MR already open, no permission)
+        # must raise as itself — retrying it through a second transport
+        # would only produce a second, more confusing failure
+        support.write_cli_stub(self.bin, "glab", r'''#!/usr/bin/env python3
+import sys
+sys.stderr.write("branch 'fix/7-x' does not exist\n")
+sys.exit(1)
+''')
+        with self.assertRaises(ProviderError) as ctx:
+            create_pr({"provider": {"git": "gitlab"}},
+                      repo=self._repo(), **self.KW)
+        self.assertIn("does not exist", str(ctx.exception))
+
+    def test_remote_url_spellings_all_yield_the_project_path(self):
+        for url, expected in (
+                ("git@gitlab.com:g/sub/proj.git", "g/sub/proj"),
+                ("https://gitlab.com/g/sub/proj.git", "g/sub/proj"),
+                ("https://user@gitlab.com/g/proj.git", "g/proj"),
+                ("ssh://git@gitlab.com:2222/g/proj.git", "g/proj"),
+                ("https://gitlab.com/g/proj", "g/proj")):
+            repo = self._repo(url)
+            self.assertEqual(git_providers._remote_project_path(repo), expected,
+                             f"for {url}")
+            support.rmtree(repo)
+
+
 if __name__ == "__main__":
     unittest.main()

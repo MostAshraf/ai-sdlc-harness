@@ -127,11 +127,19 @@ fork identified: <why>` under the task table, visible either way.
   - modify src/auth/service.py — add the token-refresh branch
   - create tests/test_refresh.py — the task's declared test-intents
   ```
+- **Environment prerequisites**: anything this task's tests need RUNNING
+  that a dev machine may not have (docker-backed integration tests,
+  emulators, local services). Carried into `plan-register`'s `env_requires`
+  and probed by `env-check` before the spawn — one line (`Env: docker —
+  Testcontainers Postgres in the integration test`) versus a mid-develop
+  stop (field: one run lost ~1h38m to this; the other skipped its
+  integration test and shipped that path unverified).
 - **Verify command**: the exact invocation that proves THIS task green —
-  the repo's discovered `test_cmd` scoped down to the task's tests where
-  the framework allows (`sh mvnw -q test -Dtest=RefreshTest`,
-  `npm test -- --testPathPattern refresh`); the bare repo `test_cmd` when
-  it doesn't. Never invent a runner the repo doesn't use.
+  `${CLAUDE_PLUGIN_ROOT}/bin/harness resolve-test-cmd --repo <repo>` (never
+  `test_cmd` read from config: the verb keeps quarantined specs excluded),
+  scoped to the task's tests where the framework allows (`sh mvnw -q test
+  -Dtest=RefreshTest`); its bare output when it doesn't. Never invent a
+  runner the repo doesn't use.
 - **Size budget**: estimated changed-LOC and the split rule — if the real
   diff runs past ~2× the estimate, the developer stops and flags rather
   than pushing through ("one task = one reviewable unit" is only honest

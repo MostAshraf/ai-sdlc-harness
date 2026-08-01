@@ -11,6 +11,7 @@ import datetime as _dt
 import json
 import posixpath
 import re
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -38,7 +39,62 @@ FLAGGED_EVENT_KINDS = (
     "contracts-check", "verdict-uncaptured", "background-spawn-uncaptured",
     "coverage-skipped", "risk-without-tests", "tests-without-production",
     "pr-recorded-manually", "secret-sweep-blocked", "gate-skipped",
-    "deferral-pending", "panel-serialized")
+    "deferral-pending", "panel-serialized",
+    # field: dual-run comparison. Six kinds, in three resolution classes —
+    # each stated explicitly, because getting this wrong is what makes the
+    # flagged-events gauge either over- or under-report (see
+    # outstanding_flagged below).
+    #
+    # (a) PERMANENT OCCURRENCES, no resolver (like hook-blocked/gate-skipped):
+    #     a remote branch that collided, a probe that resolved a remote but
+    #     could not answer, a re-run of an already-done item, and a run's
+    #     quarantined exclusions. `tests-quarantined` had to EARN this — it
+    #     is emitted once per run per (repo, set) rather than once per test
+    #     invocation, which is what makes it an occurrence rather than an
+    #     O(tasks) repeated assertion (adversarial-review, both lenses).
+    "remote-branch-exists", "remote-branch-unverified",
+    "work-item-already-done", "tests-quarantined",
+    # …and the stall guard's own escape hatch, on the same footing as
+    # `test-revision` / `coverage-skipped` / `pr-recorded-manually`: a
+    # deliberate human-or-orchestrator override of a mechanical refusal is
+    # exactly what a flagged event is for. Emitted ONLY when the guard would
+    # actually have refused, so `--confirm-no-verdict` on a genuine stall
+    # stays silent (whole-branch adversarial review: the override wrote a
+    # stall record byte-identical to a guarded one, leaving the one escape
+    # hatch in this change the only invisible one).
+    "stall-verdict-override",
+    # (b) LIVE PLAN STATE, superseded by the next `plan-registered`: a weak
+    #     contract fragment describes the currently-registered plan, exactly
+    #     like risk-without-tests.
+    "contract-fragment-weak",
+    # (c) RESOLVABLE, paired off by `env-prereq-satisfied`: the human starts
+    #     the service and re-runs. Permanent here would leave every such run
+    #     reading DEGRADED forever (re-verify finding).
+    "env-prereq-missing",
+    # field: US-CHAT-00 run. Class (c), RESOLVABLE — paired off by
+    # `write-back-succeeded`. The milestone write-back is declared best-effort
+    # ("never a blocking requirement", write_back below), so a provider that
+    # refuses the transition must not abort the run; but swallowing it
+    # silently would leave the live tracker stale with nothing anywhere
+    # saying so. Surface it on the same gauge a human already reads, and
+    # never auto-fix — the house stance.
+    #
+    # Class (c) rather than (a) for exactly the reason `env-prereq-missing`
+    # is: the trigger is an external dependency the human restores (tracker
+    # down, credential expired), and the harness then RETRIES by construction
+    # — up to three milestones per run (develop_start, in_review, done). A
+    # run whose `done` write-back succeeded has a correct tracker and nothing
+    # outstanding; leaving the earlier miss permanent made that run report a
+    # stale flag forever, the same false reading the re-verify finding
+    # rejected one class above (adversarial-review, both lenses
+    # independently). Not HEALTH_DEGRADING either: no evidence was lost and
+    # the run's own machinery is intact — only the external tracker is behind.
+    "write-back-failed")
+# None of the seven are HEALTH_DEGRADING (below): each means "a human should
+# look", not "this run's machinery degraded / evidence was lost". The closest
+# call is `remote-branch-unverified` — evidence genuinely not obtained — but
+# preflight continuing without it is the declared, safe behaviour (a
+# connectivity blip must not brick a run), not a degraded one.
 
 
 def outstanding_flagged(events: list[dict]) -> list[dict]:
@@ -70,6 +126,8 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
     flagged = [e for e in events if e.get("kind") in FLAGGED_EVENT_KINDS]
     open_pending: list[dict] = []
     open_plan: list[dict] = []
+    open_env: list[dict] = []
+    open_wb: list[dict] = []
     resolved: set[int] = set()
     for e in events:
         kind = e.get("kind")
@@ -77,7 +135,51 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
             open_pending.append(e)
         elif kind == "deferral-recorded" and open_pending:
             resolved.add(id(open_pending.pop(0)))   # resolve earliest open pending
-        elif kind in ("risk-without-tests", "tests-without-production"):
+        elif kind == "env-prereq-missing":
+            open_env.append(e)
+        elif (kind == "env-prereq-satisfied"
+                and e.get("actor") == "env-check"):
+            # A prerequisite the human then made available is RESOLVED, not a
+            # permanent occurrence — every earlier miss is superseded by one
+            # clean probe (the whole set is re-probed each time).
+            #
+            # actor-checked, exactly like its two siblings below (whole-branch
+            # adversarial review, reproduced 1 -> 0): `log-event` is
+            # unvalidated AND is named as an owned entry point in two guard
+            # messages, so without this a hand-appended record from any
+            # Bash-holding shape — the developer the probe just blocked, most
+            # of all — cleared the gauge, and bypassed the deliberate
+            # run-wide-only emission rule below that stops a `--task`-scoped
+            # probe clearing a flag it never checked.
+            #
+            # This stops a STRAY record, not a determined one: the actor is
+            # caller-supplied, so a caller that writes it still clears
+            # (re-verification finding, reproduced). That is the same bound
+            # the two siblings have, and it is the convention rather than a
+            # gap in this one — worth stating so the check is not read as
+            # more than it is.
+            resolved.update(id(x) for x in open_env)
+            open_env.clear()
+        elif kind == "write-back-failed":
+            open_wb.append(e)
+        elif (kind == "write-back-succeeded"
+                and e.get("actor") in ("write-back", "reconcile")):
+            # Same resolver shape as env-prereq: a later milestone that DID
+            # land proves the tracker is no longer behind, so every earlier
+            # miss on this run is superseded. Each milestone pushes the one
+            # current status, so one success supersedes the whole batch
+            # rather than pairing 1:1.
+            #
+            # actor-checked, exactly like `plan-registered` below: this
+            # CLEARS an audit gauge, and `log-event` is unvalidated, so
+            # without the check a stray record cleared a genuine outstanding
+            # miss — `status.flagged_events` verified going 1 -> 0 on a
+            # hand-appended kind (re-verify finding). The real emitter always
+            # writes the actor.
+            resolved.update(id(x) for x in open_wb)
+            open_wb.clear()
+        elif kind in ("risk-without-tests", "tests-without-production",
+                      "contract-fragment-weak"):
             open_plan.append(e)
         elif (kind == "plan-registered"
                 and e.get("actor") == "plan-register"):
@@ -271,6 +373,70 @@ def bootstrap_gate(config: dict) -> None:
             "bootstrap incomplete — run /init-workspace before /dev-workflow")
 
 
+#: Provider-independent "this item is already finished" vocabulary. Each
+#: adapter ships its own STATUS_DEFAULTS (github `closed`, ado `Closed`,
+#: jira `Done`, …) and users remap via `status_mapping`, so both are
+#: consulted first — this set only catches the rest.
+_DONE_VOCABULARY = frozenset(
+    {"done", "closed", "resolved", "completed", "complete", "shipped"})
+
+
+def done_state_match(config: dict, item: dict) -> str | None:
+    """The item's provider state, if it reads as ALREADY DONE — else None.
+
+    field: dual-run comparison — a story still marked `Done` from a
+    run three days earlier was re-fetched and rebuilt end-to-end; the intake
+    noticed the stale state and flagged it as an ambiguity, but nothing
+    mechanical acted on it, and the run only collided at push.
+
+    Matching is deliberately TOLERANT and deliberately WARN-ONLY. Provider
+    status vocabularies differ and adapters pass decorated values through
+    verbatim (`local-markdown` yields whole header lines like
+    `✅ Done — 2026-07-22`), so the state is casefolded, split into word
+    tokens, and tested for any done token. That can over-match in principle
+    (`Not Done`); over-matching costs one warning line, whereas refusing
+    would block the legitimate replay/re-plan cases — which is exactly why
+    this warns instead of blocking."""
+    raw = str(item.get("state") or "").strip()
+    if not raw:
+        return None
+    known = set()
+    try:
+        from .providers import get_module
+        provider_done = getattr(get_module(config), "STATUS_DEFAULTS", {}
+                                ).get("done")
+        if provider_done:
+            known.add(str(provider_done).casefold())
+    except Exception:      # unknown/unset provider: fall back to the vocabulary
+        pass
+    mapping = config.get("status_mapping") or {}
+    if not isinstance(mapping, dict):
+        # Unvalidated config key, and this is the FIRST verb a run touches —
+        # a list-shaped status_mapping used to escape as a raw AttributeError
+        # traceback instead of the JSON error contract (pre-release review;
+        # the identical class this branch fixed for env_requirements).
+        raise state_mod.StateError(
+            "config `status_mapping` must be a mapping of work-item type -> "
+            f"{{milestone: status}} (got {type(mapping).__name__})")
+    # Type-specific SHADOWS default — the same precedence
+    # resolve_write_back_status uses, so the two readers of this declared
+    # data cannot hold different beliefs about it (adversarial-review).
+    # Note this only decides the CONFIGURED name: the universal vocabulary
+    # below still matches, by design, so a `default: {done: Shipped}` that a
+    # type overrides can still be recognized on its own English merits
+    # (re-verify: worth stating, since the shadow alone doesn't suppress it).
+    item_type = item.get("type")
+    section = (mapping.get(item_type) if item_type else None) or \
+        mapping.get("default", {})
+    configured = section.get("done") if isinstance(section, dict) else None
+    if configured:
+        known.add(str(configured).casefold())
+    tokens = {t for t in re.split(r"[^0-9a-z]+", raw.casefold()) if t}
+    if known & ({raw.casefold()} | tokens) or tokens & _DONE_VOCABULARY:
+        return raw
+    return None
+
+
 def _bootstrap_from_item(workspace: Path, config: dict, manifest: dict,
                          item: dict, date: str | None) -> dict:
     """The shared step-one *tail* (RC2), transport-independent: classify ->
@@ -335,8 +501,29 @@ def _bootstrap_from_item(workspace: Path, config: dict, manifest: dict,
                               "basis": "positional-default (repos[0]); "
                                        "provisional until plan-register"},
                           "actor": "fetch"})
-    return {"run": str(run), "mode": mode, "change_type": change_type,
-            "classify_reason": reason}
+    result = {"run": str(run), "mode": mode, "change_type": change_type,
+              "classify_reason": reason}
+    already_done = done_state_match(config, item)
+    if already_done:
+        # Warn at minute zero rather than blocking: replays and re-plans of a
+        # closed item are legitimate. The flagged event is what makes the
+        # decision auditable — and what preflight's remote-branch probe then
+        # corroborates if a prior run really did ship this
+        # (field: dual-run comparison).
+        ndjson.append_record(run / "events.ndjson",
+                             {"kind": "work-item-already-done",
+                              "item": item["id"], "state": already_done,
+                              # renders in the metrics flagged table
+                              "reason": f"{item['id']} is already "
+                                        f"'{already_done}' in the tracker",
+                              "actor": "fetch"})
+        result["already_done"] = already_done
+        result["warning"] = (
+            f"work item {item['id']} is already in state '{already_done}' — "
+            "it may have been built by an earlier run. Confirm this is an "
+            "intentional replay before planning; preflight will refuse if a "
+            "prior run's branch still occupies the remote.")
+    return result
 
 
 def fetch_flow(workspace: Path, config: dict, manifest: dict, item_id: str,
@@ -364,6 +551,47 @@ def fetch_from_raw(workspace: Path, config: dict, manifest: dict, raw: dict,
 
 
 CONTRACT_TYPES = {"http", "service-bus", "dto"}
+#: Leading tokens that mark an http fragment as a method+path DESCRIPTION
+#: rather than a grep-able route substring (see _contract_advisories).
+_HTTP_VERBS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS",
+               "TRACE", "CONNECT"}
+
+
+def _contract_advisories(c: dict) -> list[str]:
+    """Weak-but-legal contract shapes, surfaced as flags rather than
+    refusals.
+
+    field: dual-run comparison — one run registered
+    `GET /api/v1/admin/workflows/discovery` as its http fragment. The
+    method+path form appears verbatim in neither client nor controller
+    source (a client calls `get("/api/v1/…")`; a controller carries the verb
+    as a decorator), so reconcile-contracts reported `drift` on a correctly
+    implemented contract and pre-PR had to adjudicate it away. The other run
+    registered the bare route and got `clean`. The verb adds nothing to
+    matching and reliably breaks it.
+
+    FLAGGED, not refused: the method+path form is a documented, supported
+    shape and it matches fine where source really does carry it verbatim
+    (route tables, generated clients). Refusing would break working setups
+    to prevent a false POSITIVE — the wrong trade. The flag reaches
+    plan-review and the human, the same treatment `risk-without-tests`
+    gets."""
+    if c.get("type") != "http":
+        return []
+    sig = c.get("signature")
+    fragments = sig if isinstance(sig, list) else [sig]
+    out = []
+    for f in fragments:
+        head = str(f or "").strip().split(None, 1)
+        if head and head[0].upper() in _HTTP_VERBS:
+            route = head[1] if len(head) > 1 else "the route alone"
+            out.append(
+                f"contract {c.get('id')}: http fragment {f!r} leads with an "
+                "HTTP verb. reconcile-contracts matches fragments as literal "
+                "source substrings, and method+path rarely appears verbatim "
+                f"in either side's code — prefer {route!r} (or a distinctive "
+                "tail of it) unless your source really does carry the verb.")
+    return out
 
 
 def _validate_contract(c: dict) -> None:
@@ -611,6 +839,39 @@ def plan_register(workspace: Path, run: Path, manifest: dict,
                     f"plan-register: task {t['id']}: test_only_reason must "
                     "be a string (got "
                     f"{type(t['test_only_reason']).__name__})")
+            # env_requires: declared at plan time, probed before the spawn.
+            # The vocabulary is `env_requirements` in config — an unknown
+            # name REFUSES here rather than reading as a checked requirement
+            # `env-check` would silently skip (half-enforced-vocabulary bar).
+            # Vocabulary is only checkable when a config was threaded; the
+            # CLI always threads it, unit harnesses may not (same stance the
+            # language/test_paths default below takes).
+            reqs = t.get("env_requires", [])
+            if not isinstance(reqs, list):
+                raise state_mod.StateError(
+                    f"plan-register: task {t['id']}: env_requires must be a "
+                    f"LIST of requirement names (got {type(reqs).__name__})")
+            _envcfg = (config or {}).get("env_requirements") or {}
+            if not isinstance(_envcfg, dict):
+                raise state_mod.StateError(
+                    "config `env_requirements` must be a mapping of name -> "
+                    f"{{probe, hint}} (got {type(_envcfg).__name__})")
+            declared = set(_envcfg)
+            for r in reqs:
+                if not isinstance(r, str) or not r.strip():
+                    raise state_mod.StateError(
+                        f"plan-register: task {t['id']}: env_requires must "
+                        f"be a LIST of non-empty names ({r!r} isn't)")
+                # normalized BEFORE the vocabulary check, so validation and
+                # the persisted form below agree on what the name is
+                if config is not None and r.strip() not in declared:
+                    raise state_mod.StateError(
+                        f"plan-register: task {t['id']}: env_requires names "
+                        f"'{r.strip()}', which has no probe declared. Known: "
+                        f"{', '.join(sorted(declared)) or '(none)'}. Add it "
+                        "to `env_requirements` in workspace config (name -> "
+                        "{probe, hint}) so env-check can actually verify it "
+                        "— an unprobeable requirement reads as checked.")
         # Zero-test policy (field 459226): `test_intents: []` stays the
         # plan-approved opt-out, but at any risk OTHER THAN "low" the
         # opt-out must carry a RECORDED reason — one medium-risk task
@@ -723,6 +984,10 @@ def plan_register(workspace: Path, run: Path, manifest: dict,
                                   or None)
                                  if (t.get("test_intents")
                                      and not _prod_files(t)) else None,
+             # normalized + de-duplicated, order preserved: env-check probes
+             # each distinct requirement once per invocation
+             "env_requires": list(dict.fromkeys(
+                 r.strip() for r in (t.get("env_requires") or []))),
              "commit_sha": None, "review_rounds": 0, "stalls": 0,
              "worktree": None}
             for t in tasks]
@@ -753,6 +1018,15 @@ def plan_register(workspace: Path, run: Path, manifest: dict,
                     "kind": "tests-without-production", "task": t["id"],
                     "actor": "plan-register",
                     "reason": t["test_only_reason"]})
+        # Weak-but-legal contract shapes: flagged for plan-review and the
+        # human, never refused (see _contract_advisories). Superseded by the
+        # next `plan-registered` exactly like the two batches above — a
+        # revision that fixes a fragment must clear its flag.
+        for c in contracts or []:
+            for advisory in _contract_advisories(c):
+                ndjson.append_record(run / "events.ndjson", {
+                    "kind": "contract-fragment-weak", "contract": c.get("id"),
+                    "actor": "plan-register", "reason": advisory})
     return {"tasks": ids, "contracts": [c["id"] for c in contracts or []]}
 
 
@@ -1093,7 +1367,16 @@ def create_pr(workspace: Path, run: Path, config: dict, manifest: dict,
     ndjson.append_record(run / "events.ndjson", {
         "kind": "pr-recorded-manually" if manual_url else "pr-created",
         "title": title, "repo": name, "actor": "create-pr",
-        **({"url": manual_url} if manual_url else {})})
+        # `reason` on the flagged variant, for the same rendering rule the
+        # four kinds this change added were just given it for: `_detail`
+        # reads `reason`/`verdict` and nothing else, so this row had been
+        # showing a timestamp and a kind and nothing more. Predates this
+        # change; caught by the same re-verification sweep and one line to
+        # close, which makes the "all eight carry it" claim true of the
+        # whole gauge rather than just the new half.
+        **({"url": manual_url,
+            "reason": f"{name}: PR recorded by hand — {manual_url}"}
+           if manual_url else {})})
     return pr
 
 
@@ -1127,6 +1410,106 @@ def resolve_write_back_status(config: dict, milestone: str,
     return {**provider_defaults, **override}.get(key, _MILESTONE_FALLBACK.get(milestone))
 
 
+def _best_effort_transition(run: Path, config: dict, item_id: str, target: str,
+                            actor: str) -> dict:
+    """Push one provider status, best-effort: a `ProviderError` is recorded as
+    a flagged `write-back-failed` and reported, never raised.
+
+    field: US-CHAT-00 run. Both milestone write-back call sites (write_back
+    and reconcile_flow) dispatched the transition bare, so a provider refusal
+    propagated out of a step whose own contract calls it "never a blocking
+    requirement" — a run whose story file carried a slug-suffixed filename
+    aborted `develop` at its very first verb. The resolution bug behind that
+    specific case is fixed in the local-markdown provider, but the contract
+    gap is separate and outlives it: ANY provider refusal here (a tracker
+    down, a credential expired, a status name the tracker rejects) should
+    leave the run walking and the staleness visible, not halt it.
+
+    ONE definition for both call sites — the same anti-drift rule
+    FLAGGED_EVENT_KINDS and outstanding_flagged state above; a swallow that
+    logged on one path and not the other would make the gauge lie about which
+    milestones actually landed. Only `ProviderError` is caught: it is the
+    declared "the provider said no" channel. A bug in our own dispatch layer
+    still raises, because that is not a best-effort condition.
+
+    MCP transport is deliberately NOT best-effort and propagates: `dispatch`
+    raises there before reaching any provider, and that refusal is the
+    MECHANISM telling the orchestrator to invoke the mapped tool itself (then
+    pass `reconcile --skip-transition`). Demoting it to a flagged event would
+    let a run reconcile with its tracker never synced and nothing forcing the
+    question — the trust-the-prose shape this codebase refuses everywhere.
+    `write_back` short-circuits MCP earlier with its own guidance return, so
+    only `reconcile_flow` reaches this branch."""
+    from .providers import (ProviderError, ProviderUnsupported, dispatch,
+                            get_module)
+    # resolved OUTSIDE the try: an unknown provider name is a config error,
+    # not "the provider said no", and must keep raising like it always has
+    mcp = getattr(get_module(config), "TRANSPORT", "") == "mcp"
+    try:
+        dispatch(config, "work_item.transition", id=item_id, to=target)
+    except ProviderUnsupported:
+        # `ProviderUnsupported` subclasses ProviderError, so the bare catch
+        # below swallowed it too — turning a provider that DECLARES no
+        # transition support into a flagged event on every milestone of every
+        # run. Declared-unsupported is a statement about the PROVIDER, not a
+        # runtime "the tracker said no", and flagging it would report the same
+        # non-news on every run forever (adversarial-review, lens B).
+        #
+        # Honest limit (re-verify finding): no config-time check refuses this
+        # earlier — nothing outside providers/ reads `SUPPORTS`, and
+        # init-verify does not probe it. All seven shipped providers implement
+        # work_item.transition, so this is unreachable on stock config; a FORK
+        # provider that omits it would abort develop's first verb and
+        # reconcile post-merge. Raising is still right — silently flagging a
+        # permanent capability gap is worse — but it is a refusal at first
+        # use, not at configuration time.
+        raise
+    except ProviderError as exc:
+        if mcp:
+            raise
+        try:
+            ndjson.append_record(
+                run / "events.ndjson",
+                {"kind": "write-back-failed", "item": item_id, "to": target,
+                 # `reason` is the key metrics' _detail() renders — named
+                 # `error` in the first cut, the flagged row came out blank,
+                 # so the surfacing this whole path exists for showed a human
+                 # only the kind (adversarial-review, both lenses)
+                 "reason": f"{target!r}: {exc}", "actor": actor})
+        except OSError:
+            # a full or read-only run dir must not convert a suppressed
+            # ProviderError into a DIFFERENT raised exception — the contract
+            # is "never raises", unqualified (adversarial-review, lens B)
+            pass
+        return {"written": False, "to": target, "error": str(exc)}
+    # Emitted only when there is an OUTSTANDING miss to supersede: the
+    # resolver above needs a marker, but a success marker on every clean run
+    # would be three ledger lines per run recording that nothing happened.
+    # Gating on "a miss appears anywhere in the ledger" is not the same test —
+    # it stays true forever once one has been resolved, so three clean
+    # write-backs after one miss appended three markers, only the first
+    # superseding anything. `_has_open_env_miss` exists because this exact
+    # bug was found for env-prereq-satisfied; same lesson, same shape
+    # (re-verify finding).
+    #
+    # Wrapped like the failure branch above, and for the same reason: the
+    # contract is "never raises", unqualified, and this branch is reached
+    # post-merge from reconcile. Leaving the success-path ledger I/O bare
+    # meant a full or read-only run dir raised out of a call that had already
+    # succeeded (re-verify finding).
+    try:
+        if any(e.get("kind") == "write-back-failed"
+               for e in outstanding_flagged(
+                   ndjson.read_records(run / "events.ndjson"))):
+            ndjson.append_record(run / "events.ndjson",
+                                 {"kind": "write-back-succeeded",
+                                  "item": item_id, "to": target,
+                                  "actor": actor})
+    except OSError:
+        pass
+    return {"written": True, "to": target}
+
+
 def write_back(workspace: Path, run: Path, config: dict, milestone: str) -> dict:
     """`harness write-back --milestone <develop_start|in_review|done>` —
     the orchestrator-owned call for the two milestones that used to have NO
@@ -1144,7 +1527,11 @@ def write_back(workspace: Path, run: Path, config: dict, milestone: str) -> dict
     transport directly (same check `dispatch()` makes internally) and
     returns guidance instead of raising, mirroring fetch.md's pattern: the
     orchestrator invokes the mapped tool itself if it cares about live
-    status sync; write-back is best-effort, never a blocking requirement."""
+    status sync; write-back is best-effort, never a blocking requirement.
+
+    That best-effort promise is enforced, not just stated: a provider that
+    refuses the transition is recorded as a flagged `write-back-failed` and
+    reported in the result, never raised (see `_best_effort_transition`)."""
     from .transitions import ensure_live
     with state_mod.locked_read(run):  # torn-read guard, same as show/verify
         st = state_mod.load(run, workspace)
@@ -1152,15 +1539,15 @@ def write_back(workspace: Path, run: Path, config: dict, milestone: str) -> dict
     target = resolve_write_back_status(config, milestone, st["work_item"].get("type"))
     if target is None:
         return {"written": False}
-    from .providers import dispatch, get_module
+    from .providers import get_module
     if getattr(get_module(config), "TRANSPORT", "") == "mcp":
         return {"written": False, "mcp_target": target,
                "mcp_guidance": f"MCP-transport provider — a script can't call "
                                f"an MCP tool; invoke the mapped work_item."
                                f"transition tool yourself if you want live "
                                f"status sync (to={target!r})."}
-    dispatch(config, "work_item.transition", id=st["work_item"]["id"], to=target)
-    return {"written": True, "to": target}
+    return _best_effort_transition(run, config, st["work_item"]["id"], target,
+                                   "write-back")
 
 
 def reconcile_flow(workspace: Path, run: Path, config: dict, fsm: dict,
@@ -1176,7 +1563,6 @@ def reconcile_flow(workspace: Path, run: Path, config: dict, fsm: dict,
     default on. The orchestrator invokes the mapped MCP tool itself first,
     then passes this flag so archiving/worktree-sweep still run normally."""
     from . import chain as chain_mod
-    from .providers import dispatch
     from .transitions import transition_task
     key = chain_mod.load_key(workspace)  # strict: never mint from a drifted cwd
     with state_mod.locked(run):
@@ -1195,14 +1581,28 @@ def reconcile_flow(workspace: Path, run: Path, config: dict, fsm: dict,
             # declared and recorded by nothing)
             set_artifact(st, manifest, "reconciled", True)
         state_mod.save(run, workspace, st)
+    written: dict | None = None
     if not skip_transition:
         target = resolve_write_back_status(config, "done", st["work_item"].get("type"))
         if target is not None:
-            dispatch(config, "work_item.transition",
-                     id=st["work_item"]["id"], to=target)
+            # best-effort, same contract as write_back's — reconcile runs
+            # POST-merge, so raising here would fail a run whose work is
+            # already landed and leave its worktrees swept but its ledger
+            # unreconciled (field: US-CHAT-00 run). The result is REPORTED,
+            # not dropped: `harness reconcile` returning a bare
+            # {"reconciled": true} made a refused transition indistinguishable
+            # from a clean sync at the one decision point where the
+            # orchestrator reads it, leaving the staleness discoverable only
+            # by separately running `status` (adversarial-review, both lenses)
+            written = _best_effort_transition(run, config,
+                                              st["work_item"]["id"], target,
+                                              "reconcile")
     ndjson.append_record(run / "events.ndjson",
                          {"kind": "reconciled", "actor": "reconcile"})
-    return {"reconciled": True}
+    # only present when a transition was actually attempted — an unchanged
+    # shape for the flag-off and --skip-transition paths
+    return ({"reconciled": True} if written is None
+            else {"reconciled": True, "write_back": written})
 
 
 def abort_run(workspace: Path, run: Path, reason: str) -> dict:
@@ -1361,6 +1761,28 @@ def metrics_report(workspace: Path, run: Path,
                         [[r.get("task"), r.get("mode"), r.get("verdict"),
                           _fmt_when(r.get("at"))] for r in reviews])
               if reviews else ["No review verdicts recorded."])
+    # Convergence: is the panel actually closing findings, or spinning?
+    # field: dual-run comparison — a run's verdict rows carried only
+    # mode/verdict/at, so nothing machine-readable answered that. Its own
+    # retro then misstated the final round, and the human gate at
+    # `exhausted` had no one-glance framing that the trajectory had been
+    # 9 → 7 → 2 → 2 (converging) rather than flat (stuck). Rendered only
+    # when at least one reviewer supplied the optional count — an empty
+    # table would imply the data was collected and was zero.
+    conv = [r for r in reviews if r.get("blocking_findings") is not None]
+    if conv:
+        lines += ["", "## Review convergence", ""]
+        by_mode: dict[str, list[dict]] = {}
+        for r in conv:
+            by_mode.setdefault(str(r.get("mode")), []).append(r)
+        rows = []
+        for mode_name, rs in by_mode.items():
+            for i, r in enumerate(rs, 1):
+                rows.append([mode_name, i, r.get("plan_generation"),
+                             r.get("verdict"), r.get("blocking_findings"),
+                             _fmt_when(r.get("at"))])
+        lines += _md_table(["Mode", "Round", "Plan gen", "Verdict",
+                            "Blocking", "At (UTC)"], rows)
     lines += ["", "## Tokens", ""]
     if tokens:
         agg: dict[tuple, dict] = {}
@@ -1403,8 +1825,421 @@ def metrics_report(workspace: Path, run: Path,
     return path
 
 
+def _render_feature_branch(config: dict, st: dict,
+                           suffix: str | None = None) -> str:
+    """The run's feature-branch name from the declared `naming.branch`
+    template, plus preflight's optional branch-aside suffix. One renderer,
+    so the name the remote probe checks is byte-identical to the one
+    actually cut (field: dual-run comparison)."""
+    branch = gitops.render(config["naming"]["branch"],
+                           type=st["change_type"],
+                           id=st["work_item"]["id"],
+                           slug=slug(st["work_item"]["title"]))
+    if suffix:
+        # slug()'d, not pasted raw: this value comes from a CLI flag and
+        # ends up in a ref name, where spaces/`~^:?*[` are illegal
+        return f"{branch}-{slug(suffix)}"
+    return branch
+
+
+def _probe_prior_remote_branch(run: Path, repo: Path, name: str,
+                               branch: str) -> None:
+    """Refuse a preflight whose deterministic branch name is already taken on
+    the remote — the collision Run B discovered hours later at push, with an
+    open MR and five tasks of committed work already on the name.
+
+    Surface, never auto-fix (ensure_default_branch's stance): three remedies,
+    no silent continuation and no automatic adoption of a foreign branch. An
+    UNANSWERABLE probe (offline, no remote, auth) degrades to a flagged
+    warning — a connectivity blip must not brick preflight, but it must not
+    pass unrecorded either."""
+    hit = gitops.remote_branch_exists(repo, branch)
+    if hit is None:
+        # An unanswered probe has two very different causes, and conflating
+        # them put one permanent unresolvable flag on every preflight in
+        # every local-only workspace (adversarial-review). A repo with no
+        # remote — or an ambiguous remote set — is a STRUCTURAL state, not a
+        # run-health signal: there is no collision to have, so skip silently.
+        # A remote that resolved but would not answer (offline, auth,
+        # timeout) is transient and genuinely worth a human's eye.
+        try:
+            gitops._push_remote(repo)
+        except (gitops.GitError, OSError):
+            return
+        # Once per run per (repo, branch), like tests-quarantined
+        # (pre-release review: the probe runs BEFORE the clean/default-branch
+        # checks, so a probe-failed repo that is also dirty appended one
+        # permanent flag per refusal-and-retry — drowning the gauge with
+        # copies of one fact).
+        prior = ndjson.read_records(run / "events.ndjson")
+        if not any(e.get("kind") == "remote-branch-unverified"
+                   and e.get("repo") == name and e.get("branch") == branch
+                   for e in prior):
+            ndjson.append_record(run / "events.ndjson",
+                                 {"kind": "remote-branch-unverified",
+                                  "repo": name, "branch": branch,
+                                  "reason": "probe-failed",
+                                  "actor": "preflight"})
+        return
+    if not hit:
+        return
+    # Once per run per (repo, branch), exactly like the sibling three lines
+    # up — this refusal is retried at least as often as that one (the human
+    # re-runs preflight after each remedy), and it is a class-(a) PERMANENT
+    # kind with no resolver, so every copy stays on the gauge forever
+    # (whole-branch adversarial review: the dedup was written for
+    # `remote-branch-unverified` and not carried to its neighbour).
+    prior = ndjson.read_records(run / "events.ndjson")
+    if not any(e.get("kind") == "remote-branch-exists"
+               and e.get("repo") == name and e.get("branch") == branch
+               for e in prior):
+        ndjson.append_record(run / "events.ndjson",
+                             {"kind": "remote-branch-exists", "repo": name,
+                              "branch": branch,
+                              # renders in the metrics flagged table
+                              "reason": f"{branch} already on the remote",
+                              "actor": "preflight"})
+    # The remedies are the ones that actually TERMINATE. The first cut of
+    # this message opened with "resume that work — fetch and reconcile the
+    # remote branch by hand, then re-run preflight", which loops forever:
+    # nothing done locally removes the remote ref, so the re-run hits this
+    # same refusal (whole-branch adversarial review, reproduced against a
+    # real bare remote). Resuming genuinely means going back to the prior
+    # RUN, whose recorded `branches` artifact short-circuits this probe
+    # before it fires — it is not something this run can do.
+    raise state_mod.StateError(
+        f"{name}: branch '{branch}' already exists on the remote — a prior "
+        "run of this work item already claimed the deterministic branch "
+        "name, and continuing would collide at push (possibly on top of an "
+        "already-open PR/MR). Refusing to guess. Either: (1) branch aside — "
+        "re-run preflight with --feature-branch-suffix <s> to cut a distinct "
+        "name; or (2) free the name — merge or delete the remote branch (and "
+        "close its PR/MR) by hand, then re-run preflight. To RESUME the "
+        "prior work instead, continue in that run's directory rather than "
+        "this one: its recorded `branches` artifact is what lets preflight "
+        "skip this probe. This run never adopts a remote branch.")
+
+
+#: report mode -> canonical basename under `<run>/reports/`. `{lens}` is
+#: filled from --lens; every other mode ignores it.
+REPORT_BASENAMES = {
+    "plan-attack": "plan-attack-{lens}",
+    "plan-review": "plan-review",
+    "pre-pr": "pre-pr",
+}
+#: report mode -> the pipeline step whose stalls reopen its round snapshot
+#: (a lens stall is keyed `step:plan-review:<lens>`, so prefix-matching on
+#: the step covers both the synthesizer and its panel members).
+REPORT_STEPS = {
+    "plan-attack": "plan-review",
+    "plan-review": "plan-review",
+    "pre-pr": "pre-pr",
+}
+
+
+def save_report(run: Path, mode: str, body: str, lens: str | None = None,
+                round_n: int | None = None) -> dict:
+    """`harness save-report` — the owned way a read-only reviewer's report
+    reaches disk.
+
+    field: dual-run comparison — lens reports for two whole rounds do not
+    exist on disk in one of the runs. Read-only lens agents returned their
+    reports in-reply and the orchestrator hand-copied them roughly three
+    times before the practice lapsed; persistence was PROSE ("the
+    orchestrator persists it"), which is exactly the trust-the-prose shape
+    the harness refuses everywhere else. The other run invented the
+    `-r1/-r2/-r3` round-suffix convention ad hoc, mid-run.
+
+    Writes the live path (what the gate reads) AND that round's immutable
+    snapshot in one call — so the "snapshot the old one aside first" step the
+    step files used to spell out can no longer be skipped or done
+    inconsistently. The round is derived from the run's own ledger unless
+    overridden — PER MODE, because different review loops advance on
+    different events (pre-release adversarial review: plan-review rounds
+    open on a plan re-registration, while pre-pr rounds open on an
+    approve-pre-pr rejection, and anchoring both to the plan generation made
+    every second pre-pr save refuse with a plan-review-flavored message).
+    Re-writing an existing snapshot with different content refuses UNLESS a
+    recorded stall for the mode's step postdates the last save — a stall
+    means the spawn was re-invoked and this round's report is legitimately
+    superseded (the same "a stall opens a new attempt" semantics
+    _stall_round_anchor holds). Emits `report-saved`, so the event implies
+    the file exists rather than merely asserting that a spawn finished."""
+    if not state_mod.state_path(run).exists():
+        # The one run-scoped verb that used to skip this check: a typo'd or
+        # stale-pasted --run manufactured the whole phantom directory via
+        # mkdir(parents=True) and reported success, while the real run's
+        # gate later presented a missing report — the exact failure this
+        # verb exists to close (pre-release adversarial review).
+        raise state_mod.StateError(
+            f"{run} is not a run (no state.yaml) — check --run; refusing to "
+            "manufacture a phantom run directory")
+    if mode not in REPORT_BASENAMES:
+        raise state_mod.StateError(
+            f"unknown report mode '{mode}' — one of: "
+            f"{', '.join(sorted(REPORT_BASENAMES))}")
+    template = REPORT_BASENAMES[mode]
+    if "{lens}" in template:
+        if not (lens or "").strip():
+            raise state_mod.StateError(
+                f"--mode {mode} needs --lens (the panel member's name) — it "
+                "names the report file, and two lenses sharing one path "
+                "would silently overwrite each other")
+        # the value lands in a FILENAME: refuse anything that could escape
+        # the reports directory or collide with the round-suffix convention.
+        # Normalized ONCE, here, and the normalized form is what the event
+        # records and the reopen comparison matches (re-verify: recording
+        # the raw spelling let case-inconsistent --lens values miss their
+        # own predecessor in the last-save lookup).
+        lens = lens.strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", lens):
+            raise state_mod.StateError(
+                f"--lens {lens!r} must be a lowercase slug ([a-z0-9-]) — it "
+                "is used as a path component")
+        template = template.format(lens=lens)
+    if not body.strip():
+        raise state_mod.StateError(
+            "refusing to save an empty report — a zero-byte file at the "
+            "canonical path is indistinguishable from a persisted one")
+    if round_n is not None and round_n < 1:
+        raise state_mod.StateError("--round must be >= 1")
+    events = ndjson.read_records(run / "events.ndjson")
+    if round_n is None:
+        # DERIVED, not hand-tracked (re-verify finding: an optional,
+        # orchestrator-supplied round number is skippable and mis-typeable,
+        # so "prior rounds stay recoverable" was still a promise resting on
+        # prose) — and derived PER MODE, from the event that actually opens
+        # that mode's next round. Actor-checked for plan-registered, the
+        # same anti-forgery stance outstanding_flagged takes: a stray
+        # `log-event` record must not move the round.
+        if mode == "pre-pr":
+            round_n = 1 + sum(
+                1 for e in events
+                if e.get("kind") == "gate-decision"
+                and e.get("gate") == "approve-pre-pr"
+                and e.get("decision") != "approved")
+        else:
+            round_n = max(1, sum(
+                1 for e in events
+                if e.get("kind") == "plan-registered"
+                and e.get("actor") == "plan-register"))
+    reports = run / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    snapshot = reports / f"{template}-r{round_n}.md"
+    if snapshot.exists() and snapshot.read_text(encoding="utf-8") != body:
+        # A recorded stall for this mode's step REOPENS the snapshot: the
+        # spawn was re-invoked inside the same round, so the re-invoked
+        # reply legitimately supersedes the pre-stall one (pre-release
+        # adversarial review, reproduced: without this, the documented
+        # stall -> reinvoke -> save flow refused, the live path kept the
+        # pre-stall synthesis while reviews.ndjson held the re-invoked
+        # verdict — a report/verdict mismatch at the human gate — and the
+        # refusal's own advertised remedy could not work).
+        # EXACT stall key per report (re-verify on this fix: a prefix match
+        # let one early lens stall reopen every sibling lens + the synthesis
+        # snapshot for the rest of the round). The synthesizer's stall key is
+        # the bare step; a lens's is the declared finer key.
+        step = REPORT_STEPS[mode]
+        stall_task = f"step:{step}:{lens}" if lens else f"step:{step}"
+        last_save = max((e.get("at", "") for e in events
+                         if e.get("kind") == "report-saved"
+                         and e.get("mode") == mode
+                         and e.get("lens") == lens
+                         and e.get("round") == round_n), default="")
+        # A forged far-future `report-saved` via log-event could pin
+        # stalled_since false forever — accepted: the failure direction is
+        # OVER-refusal (recoverable at the next round), the same direction
+        # every other unvalidated-log-event hazard here resolves to.
+        stalled_since = any(
+            e.get("kind") == "stall" and e.get("task") == stall_task
+            and e.get("at", "") > last_save
+            for e in events)
+        if not stalled_since:
+            # Both remedies this used to name could be UNREACHABLE from the
+            # state the caller is actually in (whole-branch adversarial
+            # review, converged on from two sides):
+            #   * "record the stall first (`harness stall`)" — at plan-review
+            #     the new stall guard REFUSES exactly when a verdict for this
+            #     round was captured, which is the common way to arrive here
+            #     (a double synthesizer spawn: the manifest itself names the
+            #     duplicate-capture case). The escape exists, but it is
+            #     `--confirm-no-verdict`, and it is not free, so say so.
+            #   * "the event that opens it was never recorded" — false, and
+            #     misleading, when the round genuinely IS round 1 and the
+            #     snapshot was pre-seeded by something other than a save.
+            raise state_mod.StateError(
+                f"reports/{snapshot.name} already exists with different "
+                f"content — round {round_n}'s snapshot is immutable. Three "
+                "ways to be here. (1) The spawn was re-invoked after a stall: "
+                "record it (`harness stall`) and re-save. If that refuses "
+                "because this round's verdict is already captured, the spawn "
+                "was a DUPLICATE rather than a re-invocation — "
+                "`harness stall --confirm-no-verdict` records it anyway and "
+                "supersedes this snapshot, at the cost of a flagged override "
+                "and a stall counted toward the human gate. (2) This is "
+                "genuinely the next round but the event that opens it was "
+                "never recorded (plan-review rounds open on plan "
+                "re-registration, pre-pr rounds on an approve-pre-pr "
+                "rejection) — record that first. (3) Nothing wrote this "
+                "round's report and the file is still here: it was not "
+                "written by `save-report`, so inspect it before removing it.")
+    written = []
+    for name in (f"{template}.md", snapshot.name):
+        (reports / name).write_text(body, encoding="utf-8")
+        written.append(f"reports/{name}")
+    ndjson.append_record(run / "events.ndjson",
+                         {"kind": "report-saved", "mode": mode, "lens": lens,
+                          "round": round_n, "paths": written,
+                          "actor": "save-report"})
+    return {"mode": mode, "lens": lens, "round": round_n, "paths": written,
+            "path": written[0]}
+
+
+def _has_open_env_miss(run: Path) -> bool:
+    """Is the NEWEST env-prereq event a miss? — i.e. is there anything left
+    to pair off. Checking `any(miss in history)` instead meant every clean
+    run-wide check after the first ever miss appended another satisfied
+    event forever (re-verify: ledger noise, not a gauge error — the pairing
+    itself was already order-correct)."""
+    latest = ""
+    open_miss = False
+    for e in ndjson.read_records(run / "events.ndjson"):
+        kind = e.get("kind")
+        if kind == "env-prereq-satisfied" and e.get("actor") != "env-check":
+            # Same actor rule `outstanding_flagged` applies to this kind, and
+            # it has to be the SAME rule: with the check added there only, a
+            # forged record stopped clearing the gauge (good) but still read
+            # as "nothing outstanding" HERE, which suppressed the real
+            # emitter — so the next genuine clean probe emitted nothing and
+            # the flag stayed up forever. A stray record must be inert in
+            # both readers, not merely harmless in one (whole-branch
+            # adversarial review, caught by the fix's own test).
+            continue
+        if kind in ("env-prereq-missing", "env-prereq-satisfied") \
+                and e.get("at", "") >= latest:
+            latest = e.get("at", "")
+            open_miss = kind == "env-prereq-missing"
+    return open_miss
+
+
+def env_check(workspace: Path, run: Path, config: dict,
+              task_id: str | None = None) -> dict:
+    """Probe the environment prerequisites the plan declared, BEFORE the
+    developer spawn that would hit the wall.
+
+    field: dual-run comparison — Docker was down in both runs. One never ran
+    its Testcontainers integration test at all and shipped that path with
+    code-review verification only; the other lost ~1h38m mid-develop
+    discovering it, asking, starting Docker, and re-running. The requirement
+    was knowable at plan time in both cases; nothing asked.
+
+    Scoped to `--task` when given, else every non-terminal task in the run —
+    a done task's requirement is no longer this run's problem. Each distinct
+    requirement is probed once. Returns the full picture (probed, present,
+    missing) rather than short-circuiting, so one round-trip tells the human
+    everything to fix. A missing requirement logs a flagged event and the CLI
+    refuses; it never auto-starts anything (surface, never auto-fix)."""
+    from .transitions import ensure_live
+    with state_mod.locked_read(run):   # torn-read guard, same as show/verify
+        st = state_mod.load(run, workspace)
+    ensure_live(st, "env-check")
+    tasks = st.get("tasks", [])
+    if task_id is not None:
+        scoped = [t for t in tasks if t["id"] == task_id]
+        if not scoped:
+            raise state_mod.StateError(
+                f"unknown task '{task_id}' — check --task")
+    else:
+        scoped = [t for t in tasks
+                  if t.get("status") not in ("done", "archived")]
+    declared = (config or {}).get("env_requirements") or {}
+    if not isinstance(declared, dict):
+        # `env_requirements` is not schema-validated (nor is `language.*`), so
+        # a list-shaped typo used to escape the CLI's JSON error contract as a
+        # raw AttributeError traceback (re-verify finding).
+        raise state_mod.StateError(
+            "config `env_requirements` must be a mapping of name -> "
+            f"{{probe, hint}} (got {type(declared).__name__})")
+    names: list[str] = []
+    for t in scoped:
+        for r in t.get("env_requires") or []:
+            if r not in names:
+                names.append(r)
+    checked, missing = [], []
+    for name in names:
+        spec = declared.get(name)
+        if not isinstance(spec, dict) or not str(spec.get("probe") or "").strip():
+            # A requirement whose probe vanished from config AFTER
+            # plan-register validated it (a workspace-config edit mid-run).
+            # Treated as MISSING, never as satisfied: "cannot check" must
+            # never render as "checked".
+            missing.append({"name": name, "probe": None,
+                            "hint": "no `probe` declared in config "
+                                    "`env_requirements` — add one, or drop "
+                                    "the requirement from the plan",
+                            "detail": "unprobeable"})
+            continue
+        probe = str(spec["probe"])
+        try:
+            proc = subprocess.run(probe, shell=True, capture_output=True,
+                                  text=True, timeout=60,
+                                  encoding="utf-8", errors="replace")
+            ok, detail = proc.returncode == 0, (
+                proc.stdout + proc.stderr).strip().splitlines()[-1:] or [""]
+            detail = detail[0][:200]
+        except (subprocess.SubprocessError, OSError) as exc:
+            ok, detail = False, f"{type(exc).__name__}: {exc}"[:200]
+        entry = {"name": name, "probe": probe, "detail": detail}
+        checked.append({**entry, "present": ok})
+        if not ok:
+            missing.append({**entry,
+                            "hint": str(spec.get("hint") or "").strip()
+                            or "make this available, then re-run env-check"})
+    if missing:
+        ndjson.append_record(
+            run / "events.ndjson",
+            {"kind": "env-prereq-missing",
+             "tasks": [t["id"] for t in scoped],
+             "missing": [m["name"] for m in missing],
+             # `reason` is the key the metrics report's flagged table renders
+             # and `task` is its Task column (whole-branch adversarial review:
+             # FOUR kinds landed in this change wrote neither, so every row
+             # came out with both non-timestamp columns blank — the event
+             # named the fact and the one surface a human actually reads did
+             # not. The same slip was already caught and fixed once, for
+             # `write-back-failed`, and not carried to its siblings).
+             # `task` only when the scope is genuinely one task: a run-wide
+             # probe covering five of them must not label itself with the
+             # first.
+             "reason": "; ".join(f"{m['name']} unavailable — {m['hint']}"
+                                 for m in missing),
+             **({"task": scoped[0]["id"]} if len(scoped) == 1 else {}),
+             "actor": "env-check"})
+    elif task_id is None and _has_open_env_miss(run):
+        # Unlike its sibling kinds this one is genuinely RESOLVABLE — the
+        # human starts the service and re-runs — so a permanent flag would
+        # leave every such run reading DEGRADED forever (re-verify finding).
+        # Paired off in outstanding_flagged like deferral-pending/-recorded.
+        # RUN-WIDE invocations only (pre-release review, both lenses,
+        # reproduced): outstanding_flagged clears every open miss on one
+        # satisfied event, on the strength of "the whole set is re-probed" —
+        # which a `--task`-scoped probe makes false. Fixing docker and
+        # re-checking only T1 must not clear T2's emulator flag; the
+        # run-wide check the develop step documents is the one that clears.
+        # No `checked` requirement: a plan revision that REMOVED the failing
+        # requirement leaves nothing to probe, and that too resolves the
+        # outstanding miss rather than flagging it forever.
+        ndjson.append_record(run / "events.ndjson",
+                             {"kind": "env-prereq-satisfied",
+                              "checked": [c["name"] for c in checked],
+                              "actor": "env-check"})
+    return {"tasks": [t["id"] for t in scoped], "checked": checked,
+            "missing": missing}
+
+
 def preflight(workspace: Path, run: Path, config: dict, manifest: dict,
-              repo: Path, base_branch: str | None = None) -> dict:
+              repo: Path, base_branch: str | None = None,
+              feature_branch_suffix: str | None = None) -> dict:
     """Create the feature branch from the declared naming template and record
     the `branches` artifact — an owned, mechanical step. Ensures the repo is
     clean and on its default branch first (gitops.ensure_default_branch) so
@@ -1442,6 +2277,22 @@ def preflight(workspace: Path, run: Path, config: dict, manifest: dict,
     # this, or a post-advance resume would hard-error instead of no-op'ing).
     existing = ((pre.get("artifacts") or {}).get("branches") or {}).get(name)
     if existing:
+        # …but a suffix the caller asked for and did NOT get back is a silent
+        # lie (adversarial-review): applying the branch-aside remedy to a repo
+        # whose branch was already recorded used to return `ok: true` with the
+        # ORIGINAL name, leaving the run on the colliding branch believing it
+        # had moved aside. Idempotency means "same request, same answer" — a
+        # different request must not be answered by the cached one.
+        wanted = _render_feature_branch(config, pre, feature_branch_suffix)
+        if feature_branch_suffix and existing.get("branch") != wanted:
+            raise state_mod.StateError(
+                f"{name}: this run already cut branch "
+                f"'{existing.get('branch')}'; --feature-branch-suffix "
+                f"'{feature_branch_suffix}' would name it '{wanted}'. "
+                "Preflight is idempotent per repo and will not rename a "
+                "branch that may already carry commits — rename or delete it "
+                "by hand, or leave the suffix off to keep the recorded name. "
+                "(Branch-aside is for a repo preflight has NOT yet cut.)")
         return existing
     # F4 (validation-walk): for a FRESH preflight, validate the step
     # precondition BEFORE any git side effect. Running preflight with the cursor
@@ -1454,6 +2305,14 @@ def preflight(workspace: Path, run: Path, config: dict, manifest: dict,
         raise TransitionError(
             f"step '{_step}' does not declare producing 'branches' — advance "
             "the cursor to the preflight step before running preflight")
+    # Prior-work probe BEFORE any git side effect, and before the run lock:
+    # `ls-remote` reaches the network (up to its timeout) and holding the
+    # lock across that would stall every concurrent reader. Rendering off
+    # `pre` is safe — change_type and work_item are bootstrap-fixed and the
+    # in-lock render below produces the same name from the reloaded state.
+    _probe_prior_remote_branch(run, repo, name,
+                               _render_feature_branch(config, pre,
+                                                      feature_branch_suffix))
     resolved = gitops.ensure_default_branch(repo, base_branch)
     # pin `.harness-key` out of `git add -A`'s reach in this repo and every
     # task worktree it will spawn (shared via the common git dir)
@@ -1464,10 +2323,7 @@ def preflight(workspace: Path, run: Path, config: dict, manifest: dict,
         existing = branches.get(name)
         if existing:
             return existing
-        branch = gitops.render(config["naming"]["branch"],
-                               type=st["change_type"],
-                               id=st["work_item"]["id"],
-                               slug=slug(st["work_item"]["title"]))
+        branch = _render_feature_branch(config, st, feature_branch_suffix)
         # F4 (validation-walk): a crash after `checkout -b` but before recording
         # leaves the feature branch AT the base tip — ADOPT only that, a branch
         # pointing exactly where a fresh cut would. The branch name is

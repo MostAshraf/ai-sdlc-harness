@@ -113,6 +113,34 @@ class ValidatorCatchesBrokenManifest(unittest.TestCase):
         schema.validate_configs(broken, issues)
         self.assertFalse(any("default_mode" in e for e in issues.errors))
 
+    def test_verdict_bound_round_marker_must_be_a_nonempty_kind(self):
+        # A blank/non-string marker would silently degrade the stall guard's
+        # round anchor to "no marker" instead of failing at declaration
+        # (field: dual-run comparison).
+        for bad in ("", "   ", 7, True):
+            broken = copy.deepcopy(self.manifest)
+            broken["steps"]["plan-review"]["verdict_bound"]["round_marker"] = bad
+            self.assertTrue(
+                any("round_marker must be" in e for e in self._errors(broken)),
+                f"round_marker {bad!r} was accepted")
+
+    def test_declared_round_markers_are_kinds_the_code_actually_emits(self):
+        # adversarial-review: schema can only type-check the marker, so a
+        # typo (`plan-register` for `plan-registered`) would validate clean
+        # and then never match — the anchor would lose mark (c) and refuse
+        # every genuine stall from round 2 on. Pin the declared value against
+        # the kinds production code really appends.
+        from pathlib import Path
+        src = "".join(
+            p.read_text(encoding="utf-8")
+            for p in (Path(__file__).resolve().parent.parent / "harness")
+            .rglob("*.py"))
+        for sid, step in self.manifest["steps"].items():
+            marker = (step.get("verdict_bound") or {}).get("round_marker")
+            if marker:
+                self.assertIn(f'"kind": "{marker}"', src,
+                              f"{sid}: round_marker '{marker}' is never emitted")
+
     def test_verdict_bound_mode_must_be_spawned_by_the_step(self):
         # A step gated on a verdict it can never produce would deadlock at
         # runtime — the validator must refuse it at declaration.

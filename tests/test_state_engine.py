@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -1233,6 +1234,214 @@ class TaskFsm(Harness):
         run, st = _bootstrap(self.workspace, "quick")
         actions = [transitions.record_stall(st, self.config, "T1") for _ in range(3)]
         self.assertEqual(actions, ["reinvoke", "recovery", "human"])
+
+
+class StallVerdictGuard(Harness):
+    """`stall` must not count a stall the run's own verdict ledger already
+    answers (field: dual-run comparison — the orchestrator looked for
+    a plan-review verdict in events.ndjson, where verdicts never live, and
+    re-ran a whole lens panel for a verdict already on disk; the duplicate
+    CHANGES_REQUESTED burned one of five rounds straight into exhaustion).
+
+    Round counting and the exhaustion latch stay untouched by design — this
+    closes the false stall UPSTREAM instead."""
+
+    KEY = "step:plan-review"
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def setUp(self):
+        super().setUp()
+        self.run, self.st = _bootstrap(self.workspace, "full")
+        self.advance_to(self.st, self.run, "plan-review")
+
+    def _cli(self, *args) -> dict:
+        proc = subprocess.run(
+            [sys.executable, "-m", "harness", "--workspace",
+             str(self.workspace), "--run", str(self.run), *args],
+            cwd=self.ROOT, capture_output=True, text=True,
+            encoding="utf-8", timeout=120)
+        return json.loads(proc.stdout) if proc.stdout.strip() else {}
+
+    def _guard(self, key=None):
+        transitions.guard_stall_verdict(self.st, self.manifest, self.run,
+                                        key or self.KEY)
+
+    def test_in_round_verdict_refuses_and_mutates_nothing(self):
+        support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        before = json.dumps(self.st, sort_keys=True, default=str)
+        events_before = len(ndjson.read_records(self.run / "events.ndjson"))
+        with self.assertRaises(transitions.TransitionError) as ctx:
+            self._guard()
+        msg = str(ctx.exception)
+        self.assertIn("CHANGES_REQUESTED", msg)
+        self.assertIn("reviews.ndjson", msg)
+        self.assertIn("--confirm-no-verdict", msg)
+        # state untouched: no step_stalls key, no counter, no event
+        self.assertEqual(json.dumps(self.st, sort_keys=True, default=str),
+                         before)
+        self.assertNotIn(self.KEY, self.st.get("step_stalls", {}))
+        self.assertEqual(len(ndjson.read_records(self.run / "events.ndjson")),
+                         events_before)
+
+    def test_genuine_stall_with_no_verdict_still_counts(self):
+        self._guard()   # no verdict in the ledger at all -> no refusal
+        self.assertEqual(
+            transitions.record_stall(self.st, self.config, self.KEY),
+            "reinvoke")
+
+    def test_previous_round_verdict_does_not_over_refuse(self):
+        # Round 1 rejects; the plan is re-registered (the declared
+        # round_marker), and round 2's synthesizer genuinely stalls. The
+        # round-1 verdict is still inside _verdict_window's window, so a
+        # naive "any verdict exists" check would refuse here forever.
+        support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        ndjson.append_record(self.run / "events.ndjson",
+                             {"kind": "plan-registered", "actor": "plan-register"})
+        self._guard()
+        self.assertEqual(
+            transitions.record_stall(self.st, self.config, self.KEY),
+            "reinvoke")
+
+    def test_recorded_stall_reopens_the_window(self):
+        # Two genuine stalls in a row, with a verdict captured only before
+        # the first: the recorded stall itself is a round mark, so the
+        # second stall must still count (escalation must stay reachable).
+        support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        ndjson.append_record(self.run / "events.ndjson",
+                             {"kind": "plan-registered", "actor": "plan-register"})
+        transitions.record_stall(self.st, self.config, self.KEY)
+        ndjson.append_record(self.run / "events.ndjson",
+                             {"kind": "stall", "task": self.KEY,
+                              "action": "reinvoke"})
+        self._guard()
+        self.assertEqual(
+            transitions.record_stall(self.st, self.config, self.KEY),
+            "recovery")
+
+    def test_gate_decision_reopens_the_window(self):
+        # A human rejection at approve-plan starts a fresh cycle; the
+        # pre-decision verdict must stop suppressing stalls (same anchor
+        # _verdict_window uses, so the two can never disagree).
+        support.seed_review_verdict(self.run, verdict="APPROVED")
+        self.st["gates"]["approve-plan"] = {
+            "decision": "rejected", "decided_at": "2999-01-01T00:00:00+00:00"}
+        self._guard()
+
+    def test_per_task_stall_is_unaffected(self):
+        # No verdict_bound governs a per-task spawn — the guard is a no-op
+        # there even with a fresh plan-review verdict on the ledger.
+        support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        self._guard("T1")
+        self.assertEqual(
+            transitions.record_stall(self.st, self.config, "T1"), "reinvoke")
+
+    def test_step_without_verdict_bound_is_unaffected(self):
+        support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        self._guard("step:develop")
+        # a lens sub-key resolves to no manifest step at all: also a no-op
+        self._guard("step:plan-review:contradictions")
+
+    def test_corrupt_verdict_ledger_fails_open_not_closed(self):
+        # adversarial-review, both lenses: _verdict_window reads
+        # reviews.ndjson with strict=True and raises on a torn line — and a
+        # torn tail there is written by a capture hook killed mid-append,
+        # the event most correlated with the stall being recorded. A guard
+        # that SUPPRESSES must fail open, or `stall` (the only escalation
+        # route to the human) dies exactly when it is needed.
+        support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        with open(self.run / "reviews.ndjson", "a", encoding="utf-8") as fh:
+            fh.write("{torn record\n")
+        self._guard()
+        self.assertEqual(
+            transitions.record_stall(self.st, self.config, self.KEY),
+            "reinvoke")
+
+    def test_unreadable_ledger_fails_open_like_a_corrupt_one(self):
+        # pre-release review: only the CORRUPTION spelling (LedgerCorruption
+        # -> TransitionError) was caught, so an exists-but-unreadable ledger
+        # (EACCES/EIO) failed CLOSED on exactly the wedged-run path — the
+        # I/O failures most likely to accompany a wedge
+        support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        from unittest import mock
+        with mock.patch("harness.transitions.ndjson.read_records",
+                        side_effect=OSError("EACCES")):
+            self._guard()   # no refusal: cannot-read is not proof-of-verdict
+
+    def test_corrupt_events_ledger_does_not_brick_the_procedure(self):
+        # The anchor reads events leniently: a torn line may only LOWER the
+        # anchor (-> over-refusal, escapable), never raise and wedge the one
+        # path a stuck run depends on.
+        ndjson.append_record(self.run / "events.ndjson",
+                             {"kind": "plan-registered", "actor": "plan-register"})
+        with open(self.run / "events.ndjson", "a", encoding="utf-8") as fh:
+            fh.write("{torn record\n")
+        self._guard()
+
+    def test_cli_refuses_then_honours_the_escape_hatch(self):
+        state_mod.save(self.run, self.workspace, self.st)
+        support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        blocked = self._cli("stall")
+        self.assertFalse(blocked["ok"])
+        self.assertIn("--confirm-no-verdict", blocked["error"])
+        st = state_mod.load(self.run, self.workspace)
+        self.assertNotIn(self.KEY, st.get("step_stalls", {}))
+
+        forced = self._cli("stall", "--confirm-no-verdict")
+        self.assertTrue(forced["ok"], forced)
+        self.assertEqual(forced["action"], "reinvoke")
+        st = state_mod.load(self.run, self.workspace)
+        self.assertEqual(st["step_stalls"][self.KEY], 1)
+
+    def test_the_override_is_visible_in_the_ledger(self):
+        """Whole-branch adversarial review: every OTHER escape hatch here is
+        flagged and reviewer-visible (`verify-red --revise` -> test-revision,
+        coverage-skipped, pr-recorded-manually), while this one wrote a stall
+        record byte-identical to a guarded one — so nobody reviewing a
+        DEGRADED run could tell a suppressed refusal from a genuine stall."""
+        state_mod.save(self.run, self.workspace, self.st)
+        support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        self._cli("stall", "--confirm-no-verdict")
+        events = ndjson.read_records(self.run / "events.ndjson")
+        stall = next(e for e in events if e["kind"] == "stall")
+        self.assertEqual(stall.get("override"), "confirm-no-verdict")
+        override = next(e for e in events
+                        if e["kind"] == "stall-verdict-override")
+        self.assertEqual(override["task"], self.KEY)
+        self.assertIn("CHANGES_REQUESTED", override["reason"])
+        # …and it counts on the same gauge the other escape hatches do
+        from harness.workflow import FLAGGED_EVENT_KINDS
+        self.assertIn("stall-verdict-override", FLAGGED_EVENT_KINDS)
+
+    def test_a_malformed_ledger_cannot_break_the_escape_hatch(self):
+        """Re-verification finding: before the visibility marker, the flag
+        SKIPPED the guard entirely, so nothing the guard could do was able to
+        break the escape hatch. Running it for the marker handed it that
+        power back — a record with a non-string `at` makes _verdict_window's
+        comparison raise TypeError, which took `stall --confirm-no-verdict`
+        out of the JSON error contract on the one path a wedged run depends
+        on. The flag's contract is 'record it anyway'."""
+        state_mod.save(self.run, self.workspace, self.st)
+        ndjson.append_record(self.run / "reviews.ndjson",
+                             {"task": None, "mode": "plan-review",
+                              "verdict": "CHANGES_REQUESTED", "at": 12345})
+        forced = self._cli("stall", "--confirm-no-verdict")
+        self.assertTrue(forced.get("ok"), forced)     # never an empty stdout
+        self.assertEqual(forced["action"], "reinvoke")
+        st = state_mod.load(self.run, self.workspace)
+        self.assertEqual(st["step_stalls"][self.KEY], 1)
+
+    def test_the_flag_on_a_genuine_stall_records_nothing_extra(self):
+        # the marker means "a refusal was suppressed", not "the flag was
+        # passed" — an orchestrator that always passes it must not paint
+        # every genuine stall as an override
+        state_mod.save(self.run, self.workspace, self.st)
+        forced = self._cli("stall", "--confirm-no-verdict")
+        self.assertTrue(forced["ok"], forced)
+        events = ndjson.read_records(self.run / "events.ndjson")
+        stall = next(e for e in events if e["kind"] == "stall")
+        self.assertNotIn("override", stall)
+        self.assertNotIn("stall-verdict-override",
+                         [e["kind"] for e in events])
 
 
 if __name__ == "__main__":

@@ -95,7 +95,7 @@ def _verdict_bound_filter(cur_def: dict, state: dict, config: dict,
     vb = cur_def["verdict_bound"]
     if run is None:
         return {}  # no ledger access -> fail closed (CLI always passes run)
-    latest_verdict, rounds = _verdict_window(state, run, vb["mode"])
+    latest_verdict, rounds, _at = _verdict_window(state, run, vb["mode"])
     if latest_verdict is None:
         return {}
     bound = _config_get(config, vb["bound"]["config"])
@@ -105,15 +105,24 @@ def _verdict_bound_filter(cur_def: dict, state: dict, config: dict,
     return {ret: "returns_to"} if ret in candidates else {}
 
 
-def _verdict_window(state: dict, run: Path, mode: str) -> tuple[str | None, int]:
-    """(latest in-window verdict, CHANGES_REQUESTED count) for `mode` —
-    THE one computation both the exit filter and the outcome-artifact
-    recording read, so the gate a downstream `when` predicate consults can
-    never disagree with the exits that were actually derived. Window:
-    records strictly after the latest human gate decision. Timestamp ties
-    fail closed: two hook processes can stamp identical `at` (per-process
-    monotonic clamp, coarse OS clocks), and a plain max() is first-wins —
-    which would let an APPROVED beat a same-instant CHANGES_REQUESTED."""
+def _verdict_window(state: dict, run: Path,
+                    mode: str) -> tuple[str | None, int, str]:
+    """(latest in-window verdict, CHANGES_REQUESTED count, its timestamp) for
+    `mode` — THE one computation the exit filter, the outcome-artifact
+    recording AND the stall guard read, so the gate a downstream `when`
+    predicate consults can never disagree with the exits that were actually
+    derived. Window: records strictly after the latest human gate decision.
+    Timestamp ties fail closed: two hook processes can stamp identical `at`
+    (per-process monotonic clamp, coarse OS clocks), and a plain max() is
+    first-wins — which would let an APPROVED beat a same-instant
+    CHANGES_REQUESTED.
+
+    The third element is the winning record's `at` (empty string when there
+    is no in-window verdict). field: dual-run comparison — the stall
+    guard needs to know not just THAT a verdict exists but WHEN, to tell a
+    verdict this round already produced from one an earlier round did; it
+    reads it from here rather than growing a second reader of the same
+    ledger."""
     anchor = max((g.get("decided_at", "") or ""
                   for g in (state.get("gates") or {}).values()), default="")
     try:
@@ -125,7 +134,7 @@ def _verdict_window(state: dict, run: Path, mode: str) -> tuple[str | None, int]
     qualifying = [r for r in records
                   if r.get("mode") == mode and r.get("at", "") > anchor]
     if not qualifying:
-        return None, 0
+        return None, 0, ""
     latest_at = max(r.get("at", "") for r in qualifying)
     at_tie = [r for r in qualifying if r.get("at", "") == latest_at]
     if any(r.get("verdict") == "CHANGES_REQUESTED" for r in at_tie):
@@ -134,7 +143,7 @@ def _verdict_window(state: dict, run: Path, mode: str) -> tuple[str | None, int]
         latest_verdict = at_tie[-1].get("verdict")
     rounds = sum(1 for r in qualifying
                  if r.get("verdict") == "CHANGES_REQUESTED")
-    return latest_verdict, rounds
+    return latest_verdict, rounds, latest_at
 
 
 def cursor_candidates(state: dict, manifest: dict, config: dict,
@@ -156,7 +165,8 @@ def cursor_candidates(state: dict, manifest: dict, config: dict,
         # undecided or mid-revision, approved/exhausted once the ledger
         # says so. The caller persists state after advancing, so the value
         # the gate later reads is exactly the one that legalized the move.
-        latest_verdict, rounds = _verdict_window(state, run, vb_cur["mode"])
+        latest_verdict, rounds, _at = _verdict_window(state, run,
+                                                      vb_cur["mode"])
         # Exhaustion LATCHES within a window (adversarial-review, lean
         # round: once the bound is hit, returns_to is closed — no
         # legitimate revision can exist in this window — so a later
@@ -564,6 +574,112 @@ def transition_task(state: dict, fsm: dict, config: dict, run: Path, key: bytes,
     return task
 
 
+def _stall_round_anchor(state: dict, run: Path, stall_key: str,
+                        round_marker: str | None) -> str:
+    """The timestamp a captured verdict must POST-DATE before it counts as
+    "this round already has its verdict" (field: dual-run comparison).
+
+    A bare "any in-window verdict exists" test would be wrong: round 1's
+    CHANGES_REQUESTED stays inside `_verdict_window`'s window (only a human
+    gate decision re-anchors that) while round 2's reviewer genuinely
+    stalls, so the guard would refuse every subsequent stall forever. The
+    anchor is therefore the newest of three round-opening marks:
+
+      (a) the latest human gate decision — `_verdict_window`'s own window
+          floor, included so the two never disagree about the window;
+      (b) the latest `stall` event for THIS stall key — a recorded stall
+          means the orchestrator already re-spawned, so anything captured
+          before it belongs to the previous attempt;
+      (c) the latest `verdict_bound.round_marker` event, when the step
+          declares one — for plan-review that is `plan-registered`: a new
+          plan revision opens a new review round, so the previous round's
+          verdict must stop suppressing stalls.
+
+    Read leniently (strict=False, unlike the verdict ledger): a torn line
+    here can only LOWER the anchor, and a lower anchor makes the guard
+    refuse a stall it might have counted — recoverable via
+    --confirm-no-verdict. Raising on corruption would instead brick the
+    stalled-agent procedure, which is the one path a wedged run depends on.
+    """
+    marks = [max((g.get("decided_at", "") or ""
+                  for g in (state.get("gates") or {}).values()), default="")]
+    events = ndjson.read_records(run / "events.ndjson")
+    marks += [e.get("at", "") for e in events
+              if e.get("kind") == "stall" and e.get("task") == stall_key]
+    if round_marker:
+        # Deliberately NOT actor-checked, unlike outstanding_flagged's
+        # plan-registered consumers: the marker kind is generic declared
+        # data, and a forged marker here only WIDENS the anchor — which
+        # ALLOWS a stall, burning budget toward the human. That is the
+        # design's safe direction, the same reason timestamp ties resolve
+        # the same way (pre-release review adjudication).
+        marks += [e.get("at", "") for e in events
+                  if e.get("kind") == round_marker]
+    return max(marks, default="")
+
+
+def guard_stall_verdict(state: dict, manifest: dict, run: Path,
+                        stall_key: str) -> None:
+    """Refuse a stall the run's own verdict ledger already answers.
+
+    field: dual-run comparison — a run's orchestrator finished a
+    plan-review synthesis, looked for the verdict in `events.ndjson` (where
+    verdicts have never lived), found nothing, and called `stall`. The verb
+    dutifully said "reinvoke" and a whole lens panel + synthesis re-ran for
+    a verdict already on disk. The duplicate CHANGES_REQUESTED burned one of
+    five rounds, the four genuine rounds then hit the bound, and the run
+    exhausted into a multi-hour human gate.
+
+    Closed HERE, upstream, and nowhere else: round counting deliberately
+    lets duplicate captures burn budget toward the human (manifest.yaml's
+    anti-manipulation note) and the exhaustion latch depends on that, so
+    neither may be softened to compensate. Only steps declaring
+    `verdict_bound` have a verdict to check; everything else (every per-task
+    spawn) passes straight through."""
+    if not stall_key.startswith("step:"):
+        return  # per-task spawn: no verdict ledger governs it
+    step = stall_key[len("step:"):]
+    vb = (manifest.get("steps", {}).get(step) or {}).get("verdict_bound") or {}
+    if not vb.get("mode"):
+        return
+    try:
+        latest_verdict, _rounds, at = _verdict_window(state, run, vb["mode"])
+    except (TransitionError, OSError):
+        # A guard whose job is to SUPPRESS an action must fail OPEN, the
+        # opposite of the exit filter this shares a reader with (adversarial-
+        # review, both lenses independently). _verdict_window reads
+        # reviews.ndjson with strict=True and raises on a torn line — and a
+        # torn tail there is written by a capture hook killed mid-append,
+        # i.e. exactly the event most correlated with the stall being
+        # recorded. Refusing then would brick the stalled-agent procedure,
+        # the one path a wedged run depends on, with a message about
+        # `verdict_bound` that says nothing about stalls. A ledger that
+        # cannot be read cannot prove a verdict exists: let the stall
+        # through. OSError joins TransitionError (pre-release review): an
+        # exists-but-unreadable ledger (EACCES/EIO) is the same "cannot
+        # read" — only the corruption spelling was caught, so the wedged-run
+        # path failed CLOSED on exactly the I/O failures most likely to
+        # accompany a wedge.
+        return
+    if latest_verdict is None:
+        return
+    try:
+        anchor = _stall_round_anchor(state, run, stall_key,
+                                     vb.get("round_marker"))
+    except OSError:
+        return  # unreadable events ledger: same fail-open reasoning
+    if at <= anchor:
+        return  # an EARLIER round's verdict — this stall is genuine
+    raise TransitionError(
+        f"step '{step}': a {latest_verdict} verdict for mode "
+        f"'{vb['mode']}' was already captured at {at} in reviews.ndjson — "
+        "refusing to record a stall the ledger already answers. Proceed on "
+        "the ledger: verdicts live in reviews.ndjson; events.ndjson carries "
+        "stall/hook/status-block events, never verdicts. If the spawn "
+        "genuinely stalled AFTER that capture, re-run with "
+        "--confirm-no-verdict.")
+
+
 def record_stall(state: dict, config: dict, task_id: str) -> str:
     """Bounded stalled-agent procedure (coverage B4). Returns the declared
     next action: reinvoke -> recovery -> human.
@@ -572,7 +688,11 @@ def record_stall(state: dict, config: dict, task_id: str) -> str:
     pre-pr, …) at run level — the same declared bounds apply
     (adversarial-review, plan-accuracy round: the task-keyed-only verb left
     the plan-review reviewer, whose verdict is exit-blocking, with an
-    UNBOUNDED re-spawn loop and no human escalation trigger)."""
+    UNBOUNDED re-spawn loop and no human escalation trigger).
+
+    The ledger check that gates this lives in `guard_stall_verdict`, called
+    by the CLI BEFORE this function so a refusal mutates nothing — same
+    validate-before-side-effect split preflight uses."""
     if task_id.startswith("step:"):
         counters = state.setdefault("step_stalls", {})
         counters[task_id] = counters.get(task_id, 0) + 1

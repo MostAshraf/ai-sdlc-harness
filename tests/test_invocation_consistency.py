@@ -176,6 +176,29 @@ class InvocationConsistency(unittest.TestCase):
                            / f"{s}.md").is_file()]
         self.assertFalse(missing, f"manifest steps without a step file: {missing}")
 
+    def test_agent_run_suites_resolve_the_test_command_through_the_verb(self):
+        """Every step that hands an agent a command to run a repo's suite
+        must build it with `resolve-test-cmd`, never by reading
+        `language.repos.<name>.test_cmd` out of config.
+
+        adversarial-review, re-verified: the quarantine mechanism applied to
+        the suites the HARNESS runs (verify-red/green) while develop,
+        review-task, pre-pr-review and harden handed agents a raw config
+        value — so the reviewer re-running the suite still hit the
+        pre-existing failure and issued CHANGES_REQUESTED, which is the exact
+        field loop the quarantine exists to end. Reverting any of those doc
+        edits used to leave the whole suite green."""
+        steps = ROOT / "skills" / "dev-workflow" / "steps"
+        for name in ("develop.md", "harden.md", "pre-pr-review.md",
+                     "plan-task.md"):
+            text = (steps / name).read_text(encoding="utf-8")
+            self.assertIn("resolve-test-cmd", text,
+                          f"{name} must resolve the test command through "
+                          "`harness resolve-test-cmd` (quarantine-aware)")
+        # review-task.md runs the header verbatim rather than resolving it
+        self.assertIn("VERBATIM",
+                      (steps / "review-task.md").read_text(encoding="utf-8"))
+
     def test_gate_md_disposition_example_matches_the_manifest(self):
         # gate.md shows the human a numbered security-gate option list; the
         # CLI resolves numbers against the manifest's declared dispositions

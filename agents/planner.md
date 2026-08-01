@@ -23,7 +23,17 @@ You are the **planner shape**. Your spawn prompt carries `harness-mode`,
   — decomposition within the confirmed scope, two-altitude approach
   selection, test-intents, `[API:]` annotations, pattern hints, file-touch
   manifests, AC traceability, verify commands, diagrams, self-adversarial
-  pass.
+  pass. On a REVISION round, fix the plan — don't narrate the fixing:
+  `plan.md` stays implementer-facing, so round preambles, revision logs,
+  `[Round-N finding]` tags and "deferred, not re-opened" rows belong in
+  `<run>/reports/plan-revision-log.md` — the one file under `reports/` that
+  is yours to write; everything else there is gate-presented evidence the
+  orchestrator persists through its own owned verb after your spawn returns,
+  and the write guard refuses it. Cite a finding inline only where a
+  reader who never saw the review would ask "why this odd way?" — that's
+  design rationale and it stays. (field: a final plan reached 1,243 lines,
+  roughly a third of it review archaeology the implementer re-reads on
+  every task.)
 - `repo-map` → `${CLAUDE_PLUGIN_ROOT}/skills/dev-workflow/steps/repo-map-task.md`
   — the tiered map content contract (index.md / areas/ / conventions.md)
   under `.claude/context/repo-map/`. Content only —

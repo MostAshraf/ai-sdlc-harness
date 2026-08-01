@@ -111,6 +111,20 @@ omitting the key — tell the user harden will re-ask at run time. Write the
 whole set in one `--section language` call, e.g. `{"language": {"repos":
 {"backend": {"test_cmd": "sh mvnw -q test", "coverage_cmd": "sh mvnw -q
 test jacoco:report"}, "frontend": {"test_cmd": "npm test"}}}}`.
+A repo carrying a **known-failing spec unrelated to any run** can declare a
+`quarantine` sibling — `{"exclude_template": "--exclude {test}", "tests":
+[{"test": "…", "reason": "…", "since": "YYYY-MM-DD"}]}` — applied to the
+test command *and* to coverage (give coverage its own
+`coverage_exclude_template` when it's a different tool). `reason` and
+`since` are required; the template is the FLAG only, must contain `{test}`,
+and is runner-specific — never guessed. Flags are APPENDED, so the command
+must be a single one (no unquoted `&&`/`|`/`;`) and the flag must reach the
+runner: an `npm test` wrapper swallows `--exclude` unless the template
+passes it through (`-- --exclude {test}`), so prefer invoking the runner
+directly. Test paths are repo-relative, forward-slashed, no `./` prefix.
+Each run logs one flagged event naming the exclusions.
+Don't offer this proactively at setup; it's for a failure the user already
+has.
 
 ## 3 · Choose-or-default (offer "default" explicitly, every time)
 

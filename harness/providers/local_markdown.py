@@ -17,6 +17,7 @@ The normalize part turns that into the generic contract every caller sees
 """
 from __future__ import annotations
 
+import glob as globlib
 import re
 from pathlib import Path
 
@@ -50,6 +51,36 @@ def _header(text: str) -> tuple[str, str]:
     return (text, "") if m is None else (text[:m.start()], text[m.start():])
 
 
+def _within(path: Path, stories: Path) -> bool:
+    """Does `path` resolve INSIDE stories_dir? Resolves symlinks, so a link
+    planted in stories_dir that points out of it reads as outside."""
+    return path.resolve().is_relative_to(stories.resolve())
+
+
+def _declared_id(path: Path) -> str | None:
+    """The id this file CLAIMS in its H1 (`# US-42: Title` -> 'US-42'), or
+    None when the heading declares no id prefix.
+
+    Scoped to the HEADER region, the same way Type/Status already are: an
+    `# US-8: ...` line QUOTED inside a `## ` section of a grooming note is
+    prose about a story, not a claim to be one, and a whole-file scan read it
+    as the latter — re-bricking the story with "matches multiple files"
+    (re-verify finding, the same header-scoping lesson FIELD_RE records).
+
+    Never raises: this runs over arbitrary files that merely share a filename
+    prefix with a work item. `UnicodeDecodeError` is NOT an OSError, and a
+    single cp1252 smart quote in a sibling file was enough to abort the run —
+    with `write_back` and (post-merge) `reconcile` dying on an exception
+    `_best_effort_transition` does not catch, which is verbatim the field
+    failure this whole change exists to prevent (re-verify finding)."""
+    try:
+        head, _ = _header(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):   # unreadable / directory / dead link / not UTF-8
+        return None                 # (UnicodeDecodeError subclasses ValueError)
+    m = H1_RE.search(head)
+    return m.group("id") if m and m.group("id") else None
+
+
 def _path(config: dict, item_id: str) -> Path:
     raw = (config.get("provider") or {}).get("stories_dir") or ""
     if not str(raw).strip():
@@ -64,12 +95,77 @@ def _path(config: dict, item_id: str) -> Path:
     # Confine to stories_dir: an id like '../../x' resolved OUTSIDE it, and
     # transition()/add_comment() would then WRITE there — silent wrong-file
     # I/O, not an error (adversarial-review finding).
-    if not path.resolve().is_relative_to(stories.resolve()):
+    if not _within(path, stories):
         raise ProviderError(
             f"work item id {item_id!r} escapes stories_dir — refusing")
-    if not path.exists():
-        raise ProviderError(f"work item '{item_id}' not found at {path}")
-    return path
+    # field: US-CHAT-00 run. A story file may carry a descriptive slug suffix
+    # (`US-CHAT-00-frontend-test-infrastructure.md`) while its H1 declares the
+    # short id (`# US-CHAT-00: ...`). fetch() is located by the FULL filename
+    # and then hands back that SHORT id (below) — which is what
+    # `_bootstrap_from_item` writes to state and what write_back / reconcile
+    # later replay into transition(). So the id that resolved going in no
+    # longer resolved coming back, and a milestone write-back raised on a
+    # fetch that had succeeded moments earlier.
+    #
+    # Candidates are collected UNIFORMLY — the exact filename plus any slug
+    # sibling that DECLARES this id — and >1 refuses. Gating the ambiguity
+    # check on "no exact match" instead (the first cut of this fix) left the
+    # stated "two files claiming one id is refused" guarantee false in exactly
+    # the case where a write is most dangerous: `WORK-7.md` and
+    # `WORK-7-add-multiply.md` both declaring `# WORK-7:` silently wrote the
+    # former while the run's provider_ref pointed at the latter
+    # (adversarial-review, lens A).
+    candidates = [path] if path.exists() else []
+    # `item_id` is an IDENTIFIER, never a pattern. glob-escape it: unescaped,
+    # `US-1[0]` / `SECRE?-9` / `*` each silently resolved a DIFFERENT item's
+    # file whenever the pattern happened to hit exactly one — no ambiguity
+    # refusal fires on a single match — and `**/../secrets/X` escaped
+    # stories_dir outright, because the confinement check above reads the id
+    # as a literal path component (where `**` is a directory name and
+    # `**/..` collapses back inside) while glob reads it as the recursive
+    # wildcard matching zero segments (leaving `..` a real parent hop).
+    # CONFIRMED escape, both lenses, reproduced through the shipped CLI.
+    for hit in sorted(stories.glob(f"{globlib.escape(item_id)}-*.md")):
+        # Confine the path we are actually RETURNING, and do it BEFORE
+        # opening it. The check above validated `stories/<id>.md` — a path
+        # that by definition does not exist on this branch — so it says
+        # nothing about what the glob produced: a symlink planted at
+        # `<id>-slug.md` pointing outside stories_dir was refused under its
+        # exact name and accepted here (adversarial-review, lens B).
+        # Ordered ahead of the read because the first cut checked it AFTER,
+        # so every candidate — including out-of-tree symlinks — was opened
+        # and slurped whole before anything decided it was in-tree
+        # (re-verify finding).
+        if not _within(hit, stories):
+            raise ProviderError(
+                f"work item id {item_id!r} resolves through {hit.name} to a "
+                f"path outside stories_dir — refusing")
+        # Regular files only. This directory is human-managed, so a candidate
+        # can be a directory named `<id>-x.md`, a device node, or a FIFO —
+        # and reading a FIFO with no writer blocks FOREVER, wedging every op
+        # on that id with no timeout anywhere (re-verify finding).
+        if not hit.is_file():
+            continue
+        # A slug sibling answers to this id only if it SAYS so. The harness's
+        # own /story-workflow writes `<id>-readiness.md` / `<id>-technical-
+        # notes.md` into this same directory (analyze.md, groom.md); matching
+        # on filename shape alone made every one of those brick the story it
+        # documents — every op refusing "matches multiple files", telling the
+        # human to rename an artifact the harness itself had just created
+        # (adversarial-review, lens A). Those reports open `## Story
+        # Readiness Report`, declaring no id, so this filter separates a
+        # report from a story without either having to know about the other.
+        if _declared_id(hit) != item_id:
+            continue
+        candidates.append(hit)
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        raise ProviderError(
+            f"work item id {item_id!r} matches multiple files in "
+            f"{stories}: {', '.join(p.name for p in candidates)} — "
+            f"rename to disambiguate")
+    raise ProviderError(f"work item '{item_id}' not found at {path}")
 
 
 def _section(text: str, heading: str) -> str:
@@ -139,8 +235,13 @@ def create(config: dict, title: str, description: str = "") -> dict:
     stories = Path(raw)
     if not stories.is_dir():
         raise ProviderError(f"stories_dir {stories} does not exist")
+    # The optional `-<slug>` tail keeps the minter's namespace identical to
+    # the RESOLVER's: since `_path` answers `FU-1` with `FU-1-fix-login.md`,
+    # a scan that only counted bare `FU-1.md` re-minted `FU-1` and wrote a
+    # second file the resolver then preferred — shadowing an existing item
+    # behind the id the gate had just recorded (adversarial-review, lens A).
     taken = [int(m.group(1)) for p in stories.glob("FU-*.md")
-             if (m := re.fullmatch(r"FU-(\d+)", p.stem))]
+             if (m := re.fullmatch(r"FU-(\d+)(?:-.*)?", p.stem))]
     item_id = f"FU-{max(taken, default=0) + 1}"
     path = stories / f"{item_id}.md"
     body = (f"# {item_id}: {title}\nType: Task\nStatus: Open\n\n"

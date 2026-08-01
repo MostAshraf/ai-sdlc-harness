@@ -24,6 +24,16 @@ the instruction). Run step-one in the orchestrator instead:
    `--from-raw` runs the identical normalize → classify → bootstrap, writing
    `work-item.json` and `state.yaml`. On success note `run`, `mode`.
 
+## Already-done work items
+
+If `fetch`'s output carries `already_done` / `warning`, the provider still
+has this item in a finished state — an earlier run may already have built
+and shipped it. This warns rather than blocks (replays and re-plans are
+legitimate), and logs a flagged `work-item-already-done` event. **Surface it
+to the user and confirm the re-run is intentional before planning**, and
+expect `preflight` to refuse outright if a prior run's branch still occupies
+the remote.
+
 ## Advance
 
 Nothing further to do here. Advance:

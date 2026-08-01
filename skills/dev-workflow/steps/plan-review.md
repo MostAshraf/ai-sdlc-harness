@@ -11,18 +11,23 @@ independent evidence attached, not just the planner's word.
    change_type-aware declared data (`plan_review.lenses` overlaid per
    `lenses_by_change_type`; chore/docs ship with an empty panel by
    default). Never hand-derive the list from config files.
-   FIRST, if any `<run>/reports/plan-attack-*.md` exist from a previous
-   round, snapshot them aside (`plan-attack-<lens>-r<n>.md`, same
-   convention as plan-r<n>) — a stale lens report left at the live path
-   is indistinguishable from a current one. Then, for EACH configured
+   For EACH configured
    lens, spawn `reviewer` with `harness-mode: plan-attack` (+
    `harness-run`, `harness-repo` — NO `harness-task`), naming the lens in
    the ask; each follows `steps/plan-attack-task.md` (the lens vocabulary
    and findings format). Batch ALL lens spawns in ONE message (foreground
    — the standard parallelism rule; hook-CHECKED, not just stated: a lens
    spawn arriving after a sibling completed this round logs a flagged
-   `panel-serialized` event). Lenses are read-only: persist each
-   report verbatim to `<run>/reports/plan-attack-<lens>.md`. A lens's
+   `panel-serialized` event). Lenses are read-only, so YOU persist each
+   report — through the owned verb, never by hand. Write the reply body to
+   a scratch file first, then:
+   `${CLAUDE_PLUGIN_ROOT}/bin/harness save-report --mode plan-attack --lens
+   <lens> --body-file /tmp/<lens>.md --run <run>`. (Use `--body-file`, not a
+   pipe: a report on the command line breaks on its own apostrophes and
+   trips the bash guard the moment it quotes a run path or a `>` blockquote.)
+   It writes the live path AND this round's `-r<n>` snapshot — round derived
+   from the plan generation — so a stale report can't sit at the live path
+   looking current. A lens's
    `verdict:` line is its advisory recommendation — the engine never
    reads it (verdict_bound filters on mode `plan-review`), so it can
    neither move the window nor burn the round budget. An EMPTY lens list
@@ -41,13 +46,13 @@ independent evidence attached, not just the planner's word.
    (independent convergence of two lenses on one root cause is a
    confidence signal — say so), runs its own checklist (AC coverage,
    conventions, graph/contract audit, scope containment), and issues THE
-   verdict — the one the exit rule below reads. Persist its report to
-   `<run>/reports/plan-review.md` verbatim and record the declared
-   artifact: `${CLAUDE_PLUGIN_ROOT}/bin/harness artifact
+   verdict — the one the exit rule below reads. Persist its report the same
+   owned way — `${CLAUDE_PLUGIN_ROOT}/bin/harness save-report --mode
+   plan-review --body-file /tmp/plan-review.md --run <run>` — then record
+   the declared artifact: `${CLAUDE_PLUGIN_ROOT}/bin/harness artifact
    --name plan-review-report --value reports/plan-review.md --run <run>`.
-   Re-persist on every round — the report at the gate must be the LATEST
-   round's, and keep prior rounds recoverable as
-   `reports/plan-review-r<n>.md` (same snapshot convention as plan-r<n>).
+   Re-run save-report on every round: the live path the gate reads is
+   always the latest, and each round's `-r<n>` snapshot stays recoverable.
    **Every revision round re-runs the FULL panel** (lenses + synthesis) —
    a revised plan can introduce new contradictions that a fix-focused
    re-check alone would miss; the round budget already bounds the cost.
@@ -89,10 +94,15 @@ counter would hit `human_after` on unrelated hiccups):
 - **Synthesizer** stalled (no status block, or an uncaptured verdict —
   its verdict is the one the engine needs): `${CLAUDE_PLUGIN_ROOT}/bin/harness
   stall --run <run>` (no `--task` → counted as `step:plan-review`).
-  EXCEPT: a `status-block-malformed` event in `<run>/events.ndjson` means
-  the verdict WAS captured despite the loose block — proceed on the
-  ledger, never stall (a stall here re-runs the whole panel to re-derive
-  a verdict the engine already holds).
+  Look for the verdict in `<run>/reviews.ndjson` — that is the ONLY ledger
+  verdicts are written to; `<run>/events.ndjson` holds stall/hook/
+  status-block events. EXCEPT: a `status-block-malformed` event in
+  `<run>/events.ndjson` means the verdict WAS captured despite the loose
+  block — proceed on the ledger, never stall (a stall here re-runs the whole
+  panel to re-derive a verdict the engine already holds, and the duplicate
+  capture burns a review round). The verb refuses this itself when a verdict
+  for the current round exists; if the synthesizer genuinely stalled AFTER
+  that capture, re-run with `--confirm-no-verdict`.
 - **A lens** stalled (no status block / no report — an oddly-formatted
   advisory verdict alone is NOT a stall; the engine never reads lens
   verdicts): `${CLAUDE_PLUGIN_ROOT}/bin/harness stall --run <run>

@@ -20,7 +20,8 @@
 #                             {value: <produced artifact>, at_least: {config: key}}
 #   steps.<id>.on_reject      declared re-entry target on gate rejection (B10)
 #   steps.<id>.returns_to     declared return edge for an off-sequence side-step
-#   steps.<id>.verdict_bound  {mode, bound: {config: key}, outcome_artifact?}
+#   steps.<id>.verdict_bound  {mode, bound: {config: key}, outcome_artifact?,
+#                              round_marker?}
 #                             — the step's exits are derived from the hook-
 #                             captured reviewer-verdict ledger
 #                             (reviews.ndjson) for that mode: no in-window
@@ -36,6 +37,13 @@
 #                             approved | exhausted | pending — ledger-
 #                             derived, never orchestrator-claimed (a
 #                             downstream `when` gate can trust it).
+#                             round_marker names the events.ndjson kind that
+#                             OPENS a fresh review round for this step; the
+#                             `stall` verb refuses to count a stall when a
+#                             verdict was captured after the newest round
+#                             mark (see harness/transitions.py
+#                             guard_stall_verdict). Declared, not inferred:
+#                             what starts a new round is step-specific.
 #   steps.<id>.selects_mode   the single declared classify branch (fetch only),
 #                             schema-validated AND runtime-interpreted:
 #                             workflow.classify() returns a named mode_verdict
@@ -158,9 +166,15 @@ steps:
     # CHANGES_REQUESTED RECORDS, not revision cycles: a duplicate capture
     # (double spawn, stall re-invoke) burns budget toward the human —
     # deliberately the safe direction, not a bug to compensate for.
+    # round_marker: a re-registered plan is what opens a new review round
+    # here, so a verdict captured after the newest `plan-registered` belongs
+    # to the CURRENT round and the stall verb refuses to double-count it;
+    # a verdict older than it is the previous round's and stalls normally
+    # (field: dual-run comparison).
     returns_to: plan
     verdict_bound: {mode: plan-review, bound: {config: review_rounds.max},
-                    outcome_artifact: plan-review.outcome}
+                    outcome_artifact: plan-review.outcome,
+                    round_marker: plan-registered}
 
   approve-plan:
     gate: true
