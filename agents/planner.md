@@ -26,7 +26,10 @@ You are the **planner shape**. Your spawn prompt carries `harness-mode`,
   pass. On a REVISION round, fix the plan — don't narrate the fixing:
   `plan.md` stays implementer-facing, so round preambles, revision logs,
   `[Round-N finding]` tags and "deferred, not re-opened" rows belong in
-  `<run>/reports/plan-revision-log.md`. Cite a finding inline only where a
+  `<run>/reports/plan-revision-log.md` — the one file under `reports/` that
+  is yours to write; everything else there is gate-presented evidence the
+  orchestrator persists through its own owned verb after your spawn returns,
+  and the write guard refuses it. Cite a finding inline only where a
   reader who never saw the review would ask "why this odd way?" — that's
   design rationale and it stays. (field: a final plan reached 1,243 lines,
   roughly a third of it review archaeology the implementer re-reads on

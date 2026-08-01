@@ -470,6 +470,15 @@ class SaveReport(BreadthHarness):
         out = self._save("--mode", "plan-review", "--round", "1",
                          body="rewritten\n", expect=1)
         self.assertIn("immutable", out["error"])
+        # Whole-branch review: the refusal used to name only "record the
+        # stall first (`harness stall`)" — which at plan-review is REFUSED by
+        # the stall guard in the commonest way of arriving here (a duplicate
+        # spawn whose verdict this round already holds) — and "the event that
+        # opens the next round was never recorded", which is false when the
+        # round genuinely is round 1. Every remedy it names must be reachable.
+        self.assertIn("--confirm-no-verdict", out["error"])
+        self.assertIn("flagged override", out["error"])
+        self.assertIn("not written by `save-report`", out["error"])
 
     def test_typoed_run_refuses_instead_of_manufacturing_a_phantom(self):
         # pre-release review: save-report was the one run-scoped verb that
@@ -669,6 +678,41 @@ class EnvPrerequisites(BreadthHarness):
                        if r["run"] == self.run_dir.name)["flagged_events"]
         self.assertEqual(cleared, flagged - 1)
 
+    def test_a_forged_satisfied_record_cannot_clear_the_gauge(self):
+        """Whole-branch review (reproduced 1 -> 0): this resolver was the one
+        gauge-clearing kind left un-actor-checked, while its two siblings
+        (`write-back-succeeded`, `plan-registered`) both carry the check and
+        both say why. `log-event` is unvalidated AND is named as an owned
+        entry point in two guard messages, so any Bash-holding shape — the
+        developer this probe just blocked, most of all — could clear its own
+        flag. It would also bypass the run-wide-only emission rule that stops
+        a --task-scoped probe clearing a flag it never checked."""
+        self._declare("exit 1")
+        self._register()
+        self.cli("env-check", run=self.run_dir, expect=1)
+
+        def _flagged():
+            return next(r for r in self.cli("status")["runs"]
+                        if r["run"] == self.run_dir.name)["flagged_events"]
+
+        before = _flagged()
+        self.assertGreaterEqual(before, 1)
+        miss = next(e for e in ndjson.read_records(
+            self.run_dir / "events.ndjson")
+            if e.get("kind") == "env-prereq-missing")
+        # renders in the metrics flagged table; `task` only when the scope
+        # really is one task, which it is here
+        self.assertTrue(miss.get("reason"))
+        self.assertEqual(miss.get("task"), "T1")
+        self.cli("log-event", "--json",
+                 json.dumps({"kind": "env-prereq-satisfied",
+                             "checked": ["docker"]}), run=self.run_dir)
+        self.assertEqual(_flagged(), before)      # the wall is still there
+        # the real emitter, which carries the actor, still clears it
+        self._declare(support.NOP_CMD)
+        self.assertTrue(self.cli("env-check", run=self.run_dir)["ok"])
+        self.assertEqual(_flagged(), before - 1)
+
     def test_revision_that_drops_the_requirement_clears_the_flag(self):
         # a plan revision may remove env_requires entirely: nothing left to
         # probe still RESOLVES the outstanding miss (pre-release review)
@@ -833,6 +877,45 @@ class PreflightPriorWork(PreflightDefaultBranch):
                       if e["kind"] == "remote-branch-unverified"]
         self.assertEqual(len(unverified), 1)
 
+    def test_collision_flag_is_appended_once_per_run(self):
+        # Whole-branch review: the once-per-run dedup was written for the
+        # sibling `remote-branch-unverified` and not carried here — and THIS
+        # refusal is retried at least as often (the human re-runs preflight
+        # after each remedy), on a class-(a) permanent kind with no resolver,
+        # so every copy stays on the gauge forever.
+        run = self._to_preflight("W-55")
+        bare = self._add_bare_origin()
+        gitops.run_git(bare, "branch", self._expected_branch(run), "main")
+        self.cli("preflight", "--repo", str(self.repo), run=run, expect=1)
+        self.cli("preflight", "--repo", str(self.repo), run=run, expect=1)
+        hits = [e for e in ndjson.read_records(run / "events.ndjson")
+                if e["kind"] == "remote-branch-exists"]
+        self.assertEqual(len(hits), 1)
+        # `reason` is the key the metrics flagged table renders — without it
+        # the row shows a timestamp and a kind and nothing else (whole-branch
+        # review: four of this change's kinds wrote a payload `_detail` does
+        # not read, so the event named the fact and the dashboard did not)
+        self.assertTrue(hits[0].get("reason"))
+
+    def test_the_refusal_names_only_remedies_that_terminate(self):
+        """Whole-branch review, reproduced against a real bare remote: the
+        first cut led with "resume that work — fetch and reconcile the remote
+        branch by hand, then re-run preflight", which loops forever. Nothing
+        done locally removes the remote ref, so the re-run hits the identical
+        refusal."""
+        run = self._to_preflight("W-56")
+        bare = self._add_bare_origin()
+        branch = self._expected_branch(run)
+        gitops.run_git(bare, "branch", branch, "main")
+        err = self.cli("preflight", "--repo", str(self.repo),
+                       run=run, expect=1)["error"]
+        self.assertIn("--feature-branch-suffix", err)     # (1) terminates
+        self.assertIn("merge or delete the remote branch", err)   # (2) does
+        # resuming is named as what it actually is — a different run dir,
+        # not something this run can do by re-running preflight
+        self.assertNotIn("then re-run preflight; (2)", err)
+        self.assertIn("never adopts a remote branch", err)
+
     def test_idempotent_retry_does_not_reprobe(self):
         # The recorded-`branches` fast path returns BEFORE the probe: a
         # crash-and-retry must not start refusing just because the first
@@ -868,9 +951,11 @@ class FetchAlreadyDone(BreadthHarness):
         status = next(r for r in self.cli("status")["runs"]
                       if r["run"] == run.name)
         self.assertGreaterEqual(status["flagged_events"], 1)
-        self.assertIn("work-item-already-done",
-                      [e.get("kind")
-                       for e in ndjson.read_records(run / "events.ndjson")])
+        flag = next(e for e in ndjson.read_records(run / "events.ndjson")
+                    if e.get("kind") == "work-item-already-done")
+        # `reason` is the key the metrics flagged table renders; without it
+        # the row carries a timestamp and a kind and nothing else
+        self.assertIn("W-50", flag.get("reason", ""))
 
     def test_list_shaped_status_mapping_stays_in_the_error_contract(self):
         # pre-release review: an unvalidated status_mapping reached

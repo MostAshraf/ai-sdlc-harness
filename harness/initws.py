@@ -487,7 +487,18 @@ def quarantine_cmd(config: dict, repo_path, cmd: str,
                                  {"kind": "tests-quarantined", "repo": name,
                                   "tests": names,
                                   "reasons": {e["test"]: e["reason"]
-                                              for e in excluded}})
+                                              for e in excluded},
+                                  # SINGULAR `reason` too — that is the key
+                                  # the metrics report's flagged table
+                                  # renders, and `reasons` (the per-entry map
+                                  # a machine reads) is not it, so this row
+                                  # came out blank in the one surface a human
+                                  # actually reads: the event named the
+                                  # exclusions and the dashboard did not
+                                  # (whole-branch adversarial review).
+                                  "reason": f"{name}: excluded " + "; ".join(
+                                      f"{e['test']} ({e['reason']})"
+                                      for e in excluded)})
     if cmd.rstrip().endswith(flags):
         # Already applied — re-applying is the documented develop path
         # (`resolve-test-cmd` builds the `harness-test-cmd` header, which

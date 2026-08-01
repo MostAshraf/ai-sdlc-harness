@@ -578,6 +578,42 @@ def _quarantined(config: dict, task_repo, cmd: str,
     return initws.quarantine_cmd(config, task_repo, cmd, run)
 
 
+def _quarantine_covers(entry: str, locked_path: str) -> bool:
+    """Does one quarantine entry cover this locked test file? Both arguments
+    are already normalized and case-folded.
+
+    Exact string equality is NOT enough (whole-branch adversarial review,
+    reproduced end to end). The declaration vocabulary refuses backslashes,
+    absolutes, `..` and non-canonical spellings — but a DIRECTORY
+    (`tests/legacy`) and a GLOB (`tests/**`, `tests/*.spec.ts`) are both
+    perfectly canonical, and both are what a real runner wants: pytest's
+    `--ignore` takes a directory and vitest's `--exclude` — the template the
+    shipped example uses — is glob-native. Either one excludes a task's own
+    locked test while a set intersection sees no overlap at all, which is
+    precisely the silently-wrong-pass `_refuse_quarantine_overlap` exists to
+    make impossible.
+
+    A directory entry is string-indistinguishable from a file path, so this
+    could never have been closed by tightening the declaration vocabulary
+    alone — the comparison itself has to understand the shapes the runner
+    understands.
+
+    Deliberately GREEDY: `fnmatch`'s `*` spans `/`, so `tests/*` is read as
+    covering `tests/a/b.spec.ts`. Over-refusal here is loud, immediate and
+    fixable by narrowing the entry; under-refusal is the false green. Same
+    asymmetry the case-folding rule above already states.
+    """
+    if entry == locked_path:
+        return True
+    if locked_path.startswith(entry + "/"):
+        return True                              # directory-shaped entry
+    # Matched both ways: the entry is the pattern in every realistic config,
+    # but a locked path carrying a metacharacter must not become the one
+    # spelling that slips through.
+    return (fnmatch.fnmatchcase(locked_path, entry)
+            or fnmatch.fnmatchcase(entry, locked_path))
+
+
 def _refuse_quarantine_overlap(config: dict, task_repo, locked: dict) -> None:
     """Refuse when a quarantine entry covers one of the red-proof's OWN
     locked test files.
@@ -598,14 +634,23 @@ def _refuse_quarantine_overlap(config: dict, task_repo, locked: dict) -> None:
     # is the silent false green (re-verify finding).
     quarantined = {p.casefold(): p
                    for p in initws.quarantined_paths(config, task_repo)}
-    locked_norm = {initws.normalize_test_path(p).casefold() for p in locked}
-    overlap = sorted(quarantined[k] for k in quarantined.keys() & locked_norm)
+    locked_norm = {initws.normalize_test_path(p).casefold(): p for p in locked}
+    # Reported as PAIRS: with directory and glob entries in play, naming only
+    # the entry leaves a developer guessing which of the task's own files it
+    # swallowed (whole-branch review).
+    overlap = sorted({(orig, locked_norm[lk])
+                      for k, orig in quarantined.items()
+                      for lk in locked_norm
+                      if _quarantine_covers(k, lk)})
     if overlap:
+        pairs = ", ".join(f"{q} covers {l}" for q, l in overlap)
         raise RedProofError(
-            f"quarantined test file(s) {', '.join(overlap)} are also part of "
-            "this task's locked test set — the task's own test would be "
-            "excluded from the run and never execute. Narrow the quarantine "
-            "entry, or move this task's test to another file; never both.")
+            f"quarantine overlaps this task's locked test set ({pairs}) — "
+            "the task's own test would be excluded from the run and never "
+            "execute. A quarantine entry covers a locked file when it names "
+            "it exactly, when it is a parent directory of it, or when it is "
+            "a glob matching it. Narrow the quarantine entry, or move this "
+            "task's test to another file; never both.")
 
 
 def _declared_test_intents(workspace: Path, run: Path, task_id: str) -> list[str]:

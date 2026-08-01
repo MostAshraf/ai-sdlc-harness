@@ -54,6 +54,15 @@ FLAGGED_EVENT_KINDS = (
     #     O(tasks) repeated assertion (adversarial-review, both lenses).
     "remote-branch-exists", "remote-branch-unverified",
     "work-item-already-done", "tests-quarantined",
+    # …and the stall guard's own escape hatch, on the same footing as
+    # `test-revision` / `coverage-skipped` / `pr-recorded-manually`: a
+    # deliberate human-or-orchestrator override of a mechanical refusal is
+    # exactly what a flagged event is for. Emitted ONLY when the guard would
+    # actually have refused, so `--confirm-no-verdict` on a genuine stall
+    # stays silent (whole-branch adversarial review: the override wrote a
+    # stall record byte-identical to a guarded one, leaving the one escape
+    # hatch in this change the only invisible one).
+    "stall-verdict-override",
     # (b) LIVE PLAN STATE, superseded by the next `plan-registered`: a weak
     #     contract fragment describes the currently-registered plan, exactly
     #     like risk-without-tests.
@@ -128,10 +137,27 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
             resolved.add(id(open_pending.pop(0)))   # resolve earliest open pending
         elif kind == "env-prereq-missing":
             open_env.append(e)
-        elif kind == "env-prereq-satisfied":
+        elif (kind == "env-prereq-satisfied"
+                and e.get("actor") == "env-check"):
             # A prerequisite the human then made available is RESOLVED, not a
             # permanent occurrence — every earlier miss is superseded by one
             # clean probe (the whole set is re-probed each time).
+            #
+            # actor-checked, exactly like its two siblings below (whole-branch
+            # adversarial review, reproduced 1 -> 0): `log-event` is
+            # unvalidated AND is named as an owned entry point in two guard
+            # messages, so without this a hand-appended record from any
+            # Bash-holding shape — the developer the probe just blocked, most
+            # of all — cleared the gauge, and bypassed the deliberate
+            # run-wide-only emission rule below that stops a `--task`-scoped
+            # probe clearing a flag it never checked.
+            #
+            # This stops a STRAY record, not a determined one: the actor is
+            # caller-supplied, so a caller that writes it still clears
+            # (re-verification finding, reproduced). That is the same bound
+            # the two siblings have, and it is the convention rather than a
+            # gap in this one — worth stating so the check is not read as
+            # more than it is.
             resolved.update(id(x) for x in open_env)
             open_env.clear()
         elif kind == "write-back-failed":
@@ -487,6 +513,9 @@ def _bootstrap_from_item(workspace: Path, config: dict, manifest: dict,
         ndjson.append_record(run / "events.ndjson",
                              {"kind": "work-item-already-done",
                               "item": item["id"], "state": already_done,
+                              # renders in the metrics flagged table
+                              "reason": f"{item['id']} is already "
+                                        f"'{already_done}' in the tracker",
                               "actor": "fetch"})
         result["already_done"] = already_done
         result["warning"] = (
@@ -1338,7 +1367,16 @@ def create_pr(workspace: Path, run: Path, config: dict, manifest: dict,
     ndjson.append_record(run / "events.ndjson", {
         "kind": "pr-recorded-manually" if manual_url else "pr-created",
         "title": title, "repo": name, "actor": "create-pr",
-        **({"url": manual_url} if manual_url else {})})
+        # `reason` on the flagged variant, for the same rendering rule the
+        # four kinds this change added were just given it for: `_detail`
+        # reads `reason`/`verdict` and nothing else, so this row had been
+        # showing a timestamp and a kind and nothing more. Predates this
+        # change; caught by the same re-verification sweep and one line to
+        # close, which makes the "all eight carry it" claim true of the
+        # whole gauge rather than just the new half.
+        **({"url": manual_url,
+            "reason": f"{name}: PR recorded by hand — {manual_url}"}
+           if manual_url else {})})
     return pr
 
 
@@ -1845,18 +1883,41 @@ def _probe_prior_remote_branch(run: Path, repo: Path, name: str,
         return
     if not hit:
         return
-    ndjson.append_record(run / "events.ndjson",
-                         {"kind": "remote-branch-exists", "repo": name,
-                          "branch": branch, "actor": "preflight"})
+    # Once per run per (repo, branch), exactly like the sibling three lines
+    # up — this refusal is retried at least as often as that one (the human
+    # re-runs preflight after each remedy), and it is a class-(a) PERMANENT
+    # kind with no resolver, so every copy stays on the gauge forever
+    # (whole-branch adversarial review: the dedup was written for
+    # `remote-branch-unverified` and not carried to its neighbour).
+    prior = ndjson.read_records(run / "events.ndjson")
+    if not any(e.get("kind") == "remote-branch-exists"
+               and e.get("repo") == name and e.get("branch") == branch
+               for e in prior):
+        ndjson.append_record(run / "events.ndjson",
+                             {"kind": "remote-branch-exists", "repo": name,
+                              "branch": branch,
+                              # renders in the metrics flagged table
+                              "reason": f"{branch} already on the remote",
+                              "actor": "preflight"})
+    # The remedies are the ones that actually TERMINATE. The first cut of
+    # this message opened with "resume that work — fetch and reconcile the
+    # remote branch by hand, then re-run preflight", which loops forever:
+    # nothing done locally removes the remote ref, so the re-run hits this
+    # same refusal (whole-branch adversarial review, reproduced against a
+    # real bare remote). Resuming genuinely means going back to the prior
+    # RUN, whose recorded `branches` artifact short-circuits this probe
+    # before it fires — it is not something this run can do.
     raise state_mod.StateError(
         f"{name}: branch '{branch}' already exists on the remote — a prior "
         "run of this work item already claimed the deterministic branch "
         "name, and continuing would collide at push (possibly on top of an "
-        "already-open PR/MR). Refusing to guess. Either: (1) resume that "
-        "work — fetch and reconcile the remote branch by hand, then re-run "
-        "preflight; (2) branch aside — re-run preflight with "
-        "--feature-branch-suffix <s> to cut a distinct name; or (3) delete "
-        "the remote branch if it is abandoned. Never auto-adopted.")
+        "already-open PR/MR). Refusing to guess. Either: (1) branch aside — "
+        "re-run preflight with --feature-branch-suffix <s> to cut a distinct "
+        "name; or (2) free the name — merge or delete the remote branch (and "
+        "close its PR/MR) by hand, then re-run preflight. To RESUME the "
+        "prior work instead, continue in that run's directory rather than "
+        "this one: its recorded `branches` artifact is what lets preflight "
+        "skip this probe. This run never adopts a remote branch.")
 
 
 #: report mode -> canonical basename under `<run>/reports/`. `{lens}` is
@@ -1994,14 +2055,34 @@ def save_report(run: Path, mode: str, body: str, lens: str | None = None,
             and e.get("at", "") > last_save
             for e in events)
         if not stalled_since:
+            # Both remedies this used to name could be UNREACHABLE from the
+            # state the caller is actually in (whole-branch adversarial
+            # review, converged on from two sides):
+            #   * "record the stall first (`harness stall`)" — at plan-review
+            #     the new stall guard REFUSES exactly when a verdict for this
+            #     round was captured, which is the common way to arrive here
+            #     (a double synthesizer spawn: the manifest itself names the
+            #     duplicate-capture case). The escape exists, but it is
+            #     `--confirm-no-verdict`, and it is not free, so say so.
+            #   * "the event that opens it was never recorded" — false, and
+            #     misleading, when the round genuinely IS round 1 and the
+            #     snapshot was pre-seeded by something other than a save.
             raise state_mod.StateError(
                 f"reports/{snapshot.name} already exists with different "
-                f"content — round {round_n}'s snapshot is immutable. If the "
-                "spawn was re-invoked after a stall, record the stall first "
-                "(`harness stall`) and re-save; if this is genuinely the "
-                "next round, the event that opens it was never recorded "
-                "(plan-review rounds open on plan re-registration, pre-pr "
-                "rounds on an approve-pre-pr rejection).")
+                f"content — round {round_n}'s snapshot is immutable. Three "
+                "ways to be here. (1) The spawn was re-invoked after a stall: "
+                "record it (`harness stall`) and re-save. If that refuses "
+                "because this round's verdict is already captured, the spawn "
+                "was a DUPLICATE rather than a re-invocation — "
+                "`harness stall --confirm-no-verdict` records it anyway and "
+                "supersedes this snapshot, at the cost of a flagged override "
+                "and a stall counted toward the human gate. (2) This is "
+                "genuinely the next round but the event that opens it was "
+                "never recorded (plan-review rounds open on plan "
+                "re-registration, pre-pr rounds on an approve-pre-pr "
+                "rejection) — record that first. (3) Nothing wrote this "
+                "round's report and the file is still here: it was not "
+                "written by `save-report`, so inspect it before removing it.")
     written = []
     for name in (f"{template}.md", snapshot.name):
         (reports / name).write_text(body, encoding="utf-8")
@@ -2023,10 +2104,21 @@ def _has_open_env_miss(run: Path) -> bool:
     latest = ""
     open_miss = False
     for e in ndjson.read_records(run / "events.ndjson"):
-        if e.get("kind") in ("env-prereq-missing", "env-prereq-satisfied") \
+        kind = e.get("kind")
+        if kind == "env-prereq-satisfied" and e.get("actor") != "env-check":
+            # Same actor rule `outstanding_flagged` applies to this kind, and
+            # it has to be the SAME rule: with the check added there only, a
+            # forged record stopped clearing the gauge (good) but still read
+            # as "nothing outstanding" HERE, which suppressed the real
+            # emitter — so the next genuine clean probe emitted nothing and
+            # the flag stayed up forever. A stray record must be inert in
+            # both readers, not merely harmless in one (whole-branch
+            # adversarial review, caught by the fix's own test).
+            continue
+        if kind in ("env-prereq-missing", "env-prereq-satisfied") \
                 and e.get("at", "") >= latest:
             latest = e.get("at", "")
-            open_miss = e.get("kind") == "env-prereq-missing"
+            open_miss = kind == "env-prereq-missing"
     return open_miss
 
 
@@ -2104,11 +2196,25 @@ def env_check(workspace: Path, run: Path, config: dict,
                             "hint": str(spec.get("hint") or "").strip()
                             or "make this available, then re-run env-check"})
     if missing:
-        ndjson.append_record(run / "events.ndjson",
-                             {"kind": "env-prereq-missing",
-                              "tasks": [t["id"] for t in scoped],
-                              "missing": [m["name"] for m in missing],
-                              "actor": "env-check"})
+        ndjson.append_record(
+            run / "events.ndjson",
+            {"kind": "env-prereq-missing",
+             "tasks": [t["id"] for t in scoped],
+             "missing": [m["name"] for m in missing],
+             # `reason` is the key the metrics report's flagged table renders
+             # and `task` is its Task column (whole-branch adversarial review:
+             # FOUR kinds landed in this change wrote neither, so every row
+             # came out with both non-timestamp columns blank — the event
+             # named the fact and the one surface a human actually reads did
+             # not. The same slip was already caught and fixed once, for
+             # `write-back-failed`, and not carried to its siblings).
+             # `task` only when the scope is genuinely one task: a run-wide
+             # probe covering five of them must not label itself with the
+             # first.
+             "reason": "; ".join(f"{m['name']} unavailable — {m['hint']}"
+                                 for m in missing),
+             **({"task": scoped[0]["id"]} if len(scoped) == 1 else {}),
+             "actor": "env-check"})
     elif task_id is None and _has_open_env_miss(run):
         # Unlike its sibling kinds this one is genuinely RESOLVABLE — the
         # human starts the service and re-runs — so a permanent flag would

@@ -1392,6 +1392,57 @@ class StallVerdictGuard(Harness):
         st = state_mod.load(self.run, self.workspace)
         self.assertEqual(st["step_stalls"][self.KEY], 1)
 
+    def test_the_override_is_visible_in_the_ledger(self):
+        """Whole-branch adversarial review: every OTHER escape hatch here is
+        flagged and reviewer-visible (`verify-red --revise` -> test-revision,
+        coverage-skipped, pr-recorded-manually), while this one wrote a stall
+        record byte-identical to a guarded one — so nobody reviewing a
+        DEGRADED run could tell a suppressed refusal from a genuine stall."""
+        state_mod.save(self.run, self.workspace, self.st)
+        support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        self._cli("stall", "--confirm-no-verdict")
+        events = ndjson.read_records(self.run / "events.ndjson")
+        stall = next(e for e in events if e["kind"] == "stall")
+        self.assertEqual(stall.get("override"), "confirm-no-verdict")
+        override = next(e for e in events
+                        if e["kind"] == "stall-verdict-override")
+        self.assertEqual(override["task"], self.KEY)
+        self.assertIn("CHANGES_REQUESTED", override["reason"])
+        # …and it counts on the same gauge the other escape hatches do
+        from harness.workflow import FLAGGED_EVENT_KINDS
+        self.assertIn("stall-verdict-override", FLAGGED_EVENT_KINDS)
+
+    def test_a_malformed_ledger_cannot_break_the_escape_hatch(self):
+        """Re-verification finding: before the visibility marker, the flag
+        SKIPPED the guard entirely, so nothing the guard could do was able to
+        break the escape hatch. Running it for the marker handed it that
+        power back — a record with a non-string `at` makes _verdict_window's
+        comparison raise TypeError, which took `stall --confirm-no-verdict`
+        out of the JSON error contract on the one path a wedged run depends
+        on. The flag's contract is 'record it anyway'."""
+        state_mod.save(self.run, self.workspace, self.st)
+        ndjson.append_record(self.run / "reviews.ndjson",
+                             {"task": None, "mode": "plan-review",
+                              "verdict": "CHANGES_REQUESTED", "at": 12345})
+        forced = self._cli("stall", "--confirm-no-verdict")
+        self.assertTrue(forced.get("ok"), forced)     # never an empty stdout
+        self.assertEqual(forced["action"], "reinvoke")
+        st = state_mod.load(self.run, self.workspace)
+        self.assertEqual(st["step_stalls"][self.KEY], 1)
+
+    def test_the_flag_on_a_genuine_stall_records_nothing_extra(self):
+        # the marker means "a refusal was suppressed", not "the flag was
+        # passed" — an orchestrator that always passes it must not paint
+        # every genuine stall as an override
+        state_mod.save(self.run, self.workspace, self.st)
+        forced = self._cli("stall", "--confirm-no-verdict")
+        self.assertTrue(forced["ok"], forced)
+        events = ndjson.read_records(self.run / "events.ndjson")
+        stall = next(e for e in events if e["kind"] == "stall")
+        self.assertNotIn("override", stall)
+        self.assertNotIn("stall-verdict-override",
+                         [e["kind"] for e in events])
+
 
 if __name__ == "__main__":
     unittest.main()

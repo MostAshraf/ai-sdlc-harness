@@ -452,6 +452,27 @@ def main(argv: list[str] | None = None) -> int:
         p.error(f"--run is required for '{args.cmd}'")
 
     try:
+        if (args.cmd in ("resolve-test-cmd", "resolve-coverage-cmd")
+                and args.run is not None
+                and not state_mod.state_path(args.run).exists()):
+            # `--run` is OPTIONAL on these two (they resolve a command with
+            # or without a run in scope), which is why they sit in NO_RUN and
+            # skip the required-run check above — but when one IS given it
+            # must name a real run. `quarantine_cmd` appends the
+            # `tests-quarantined` flagged event through `ndjson.append_record`,
+            # whose `mkdir(parents=True)` will happily build an entire phantom
+            # run directory out of a typo'd path and return `ok: true`, while
+            # the REAL run never receives the event and the exclusions apply
+            # invisibly — the one thing this mechanism must not do.
+            #
+            # save_report closed exactly this hazard and called itself "the
+            # one run-scoped verb that used to skip this check"; the
+            # whole-branch adversarial pass reproduced it on both of these
+            # (which the step files now mandate `--run` for), leaving that
+            # comment false by two verbs.
+            raise state_mod.StateError(
+                f"{args.run} is not a run (no state.yaml) — check --run; "
+                "refusing to manufacture a phantom run directory")
         if args.cmd == "init":
             def kv(flag, specs):
                 # `--repo myrepo` (no '=') used to die inside dict() with
@@ -1378,17 +1399,57 @@ def main(argv: list[str] | None = None) -> int:
                 transitions.set_artifact(st, manifest, args.name, args.value)
             elif args.cmd == "stall":
                 stall_key = args.task or f"step:{st['cursor']['current_step']}"
+                # Checked BEFORE record_stall so a refusal leaves the
+                # counters untouched (field: dual-run comparison —
+                # a stall recorded for an already-captured verdict cost a
+                # full lens panel + one of five review rounds).
+                #
+                # The escape hatch runs the guard too, and keeps what it
+                # would have said: every OTHER escape hatch in this codebase
+                # is visible afterwards (`verify-red --revise` -> a
+                # `test-revision` flag, `coverage-skipped`,
+                # `pr-recorded-manually`), while this one wrote a stall
+                # record byte-identical to a guarded one — so the reviewer of
+                # a DEGRADED run could not tell an overridden stall from a
+                # genuine one (whole-branch adversarial review). The guard
+                # fails open on an unreadable ledger, so the only thing this
+                # catch can see is a real, suppressed refusal — passing the
+                # flag on a genuine stall records nothing extra.
+                overridden = None
                 if not args.confirm_no_verdict:
-                    # Checked BEFORE record_stall so a refusal leaves the
-                    # counters untouched (field: dual-run comparison —
-                    # a stall recorded for an already-captured verdict cost a
-                    # full lens panel + one of five review rounds).
                     transitions.guard_stall_verdict(st, manifest, args.run,
                                                     stall_key)
+                else:
+                    try:
+                        transitions.guard_stall_verdict(st, manifest, args.run,
+                                                        stall_key)
+                    except Exception as exc:      # noqa: BLE001 — see below
+                        # Deliberately every exception, not just
+                        # TransitionError. Before this, the flag SKIPPED the
+                        # guard entirely, so nothing the guard could do was
+                        # able to break the escape hatch; running it for the
+                        # marker handed it that power back. A malformed
+                        # ledger record (a non-string `at` makes
+                        # _verdict_window's comparison raise TypeError) then
+                        # took `stall --confirm-no-verdict` out of the JSON
+                        # error contract entirely — on the one path a wedged
+                        # run depends on, whose fail-open property the guard's
+                        # own comment calls load-bearing (re-verification
+                        # finding, reproduced). The flag's contract is
+                        # "record it anyway"; anything the guard says on the
+                        # way is a note, never a veto.
+                        overridden = f"{type(exc).__name__}: {exc}"[:200]
                 action = transitions.record_stall(st, config, stall_key)
-                ndjson.append_record(args.run / "events.ndjson",
-                                     {"kind": "stall", "task": stall_key,
-                                      "action": action})
+                ndjson.append_record(
+                    args.run / "events.ndjson",
+                    {"kind": "stall", "task": stall_key, "action": action,
+                     **({"override": "confirm-no-verdict"} if overridden
+                        else {})})
+                if overridden:
+                    ndjson.append_record(
+                        args.run / "events.ndjson",
+                        {"kind": "stall-verdict-override", "task": stall_key,
+                         "reason": overridden, "actor": "stall"})
                 state_mod.save(args.run, args.workspace, st)
                 _emit({"ok": True, "action": action})
                 return 0

@@ -583,11 +583,15 @@ class BashGuard(GuardHarness):
     def test_subagents_cannot_save_reports(self):
         """save-report joined the orchestrator-only set (pre-release review,
         both lenses): a run's reports/ are GATE-PRESENTED evidence — an
-        exhausted plan-review decision rests on reports/plan-review.md — and
-        before the verb existed no subagent had any path into that directory.
-        A reviewer persisting its own reply would author the evidence the
+        exhausted plan-review decision rests on reports/plan-review.md. A
+        reviewer persisting its own reply would author the evidence the
         human reads AND, via the snapshot immutability check, could wedge
-        the orchestrator's own documented save."""
+        the orchestrator's own documented save.
+
+        This covers the BASH surface only; the Write surface has its own
+        test below (whole-branch review: the planner's write confinement
+        admitted all of `ai/`, so blocking the verb here left the directory
+        reachable by the shape live at the two cursors before the gate)."""
         for shape in ("ai-sdlc-reviewer", "ai-sdlc-developer",
                       "ai-sdlc-planner"):
             self.assert_blocks(
@@ -598,6 +602,63 @@ class BashGuard(GuardHarness):
         self.assert_allows(
             "bash", bash("${CLAUDE_PLUGIN_ROOT}/bin/harness save-report "
                          "--mode pre-pr --body-file /tmp/x.md --run ai/r"))
+
+    def test_subagents_cannot_register_artifacts(self):
+        """Whole-branch review: blocking the WRITE half of report
+        persistence left the REGISTRATION half open, and registration is
+        what a gate reads. `set_artifact` validates only that the name is
+        in the live step's `produces` — and the reviewer is alive exactly
+        while the cursor sits on `plan-review`, whose produces includes
+        `plan-review-report`."""
+        for shape in ("ai-sdlc-reviewer", "ai-sdlc-developer",
+                      "ai-sdlc-planner"):
+            self.assert_blocks(
+                "bash",
+                bash("${CLAUDE_PLUGIN_ROOT}/bin/harness artifact "
+                     "--name plan-review-report --value reports/plan-review.md "
+                     "--run ai/r", shape),
+                "orchestrator-only")
+        self.assert_allows(
+            "bash", bash("${CLAUDE_PLUGIN_ROOT}/bin/harness artifact "
+                         "--name plan-review-report "
+                         "--value reports/plan-review.md --run ai/r"))
+        # Anchored on the `--name` the verb always carries: the gap spans
+        # the whole command, so a bare `\bartifact\b` would also fire on an
+        # unrelated path that merely contains the word.
+        self.assert_allows(
+            "bash", bash("${CLAUDE_PLUGIN_ROOT}/bin/harness verify "
+                         "--run ai/artifact-run", "ai-sdlc-reviewer"))
+        # Re-verification findings — two evasions of that anchor. A shell
+        # line continuation is still ONE command (and the step files render
+        # long harness invocations exactly this way), and argparse's default
+        # allow_abbrev makes `--n`/`--na`/`--nam` real spellings of the flag.
+        self.assert_blocks(
+            "bash",
+            bash("${CLAUDE_PLUGIN_ROOT}/bin/harness artifact \\\n"
+                 "  --name plan-review-report --value reports/plan-review.md "
+                 "--run ai/r", "ai-sdlc-reviewer"),
+            "orchestrator-only")
+        for abbrev in ("--n", "--na", "--nam"):
+            self.assert_blocks(
+                "bash",
+                bash(f"${{CLAUDE_PLUGIN_ROOT}}/bin/harness artifact {abbrev} "
+                     "plan-review-report --value reports/plan-review.md "
+                     "--run ai/r", "ai-sdlc-reviewer"),
+                "orchestrator-only")
+        # the continuation widening covers the three older verbs too
+        self.assert_blocks(
+            "bash",
+            bash("${CLAUDE_PLUGIN_ROOT}/bin/harness save-report \\\n"
+                 "  --mode pre-pr --body-file /tmp/x.md --run ai/r",
+                 "ai-sdlc-reviewer"),
+            "orchestrator-only")
+        # global flags legally precede the verb, so the gap is still needed
+        self.assert_blocks(
+            "bash",
+            bash("${CLAUDE_PLUGIN_ROOT}/bin/harness --workspace . artifact "
+                 "--name plan-review-report --value reports/x.md --run ai/r",
+                 "ai-sdlc-reviewer"),
+            "orchestrator-only")
 
     def test_unparseable_payload_fails_open(self):
         proc = subprocess.run([sys.executable, str(GUARDS), "bash"],
@@ -875,6 +936,72 @@ class WriteGuard(GuardHarness):
             str(self.workspace / ".claude" / "context" / "repo-map" / "m.md"), pl))
         self.assert_blocks("write", self._w(str(self.workspace / "src" / "x.py"), pl),
                            "repo source")
+
+    def test_planner_cannot_write_gate_evidence_into_reports(self):
+        """Whole-branch review: SUBAGENT_REGISTER_RE's comment claimed no
+        subagent had a path into `<run>/reports/`. True for the reviewer
+        (blocked outright) and the developer (confined to repos), FALSE for
+        the planner — whose artifact root is all of `ai/`, and which is live
+        at intake/plan, the two cursors immediately before the gate that
+        reads this evidence. Pre-seeding `plan-review-r1.md` also arms the
+        snapshot-immutability wedge against the orchestrator's FIRST
+        legitimate save."""
+        pl = "x:planner"
+        reports = self.workspace / "ai" / "r" / "reports"
+        for name in ("plan-review.md", "plan-review-r1.md", "pre-pr.md",
+                     "plan-attack-contradictions.md"):
+            self.assert_blocks("write", self._w(str(reports / name), pl),
+                               "gate-presented evidence")
+        # An exemption, not a blanket block — the plan's revision archaeology
+        # is the planner's own output (agents/planner.md).
+        self.assert_allows(
+            "write", self._w(str(reports / "plan-revision-log.md"), pl))
+        # A nested path under reports/ is still reports/.
+        self.assert_blocks("write",
+                           self._w(str(reports / "round-2" / "plan-review.md"), pl),
+                           "gate-presented evidence")
+        # Regression guard: the rule is scoped to reports/, not to ai/.
+        self.assert_allows("write",
+                           self._w(str(self.workspace / "ai" / "r" / "plan.md"), pl))
+        # Re-verification finding, reproduced on macOS: on a case-insensitive
+        # filesystem `Reports/` and `reports/` are ONE directory, and a file
+        # written through either spelling is read back through the other —
+        # including by save_report's own snapshot-immutability check.
+        self.assert_blocks(
+            "write",
+            self._w(str(self.workspace / "ai" / "r" / "Reports" / "plan-review.md"),
+                    pl),
+            "gate-presented evidence")
+        # …and the exemption is casefolded with it, so the same file does not
+        # block under a different spelling
+        self.assert_allows("write", self._w(
+            str(reports / "Plan-Revision-Log.md"), pl))
+
+    def test_planner_bash_writes_into_reports_are_blocked_too(self):
+        """Re-verification finding (HIGH): the first cut of the reports/ rule
+        closed Write/Edit only. The reviewer and the developer each have a
+        bash-write confinement; the planner had none — so `echo >`, `tee`,
+        `cp` and an inline `open(...,'w')` all still reached gate-presented
+        evidence for the one shape that was the hole. Closing one surface of
+        two is the exact shape of the finding the rule exists to fix."""
+        pl = "x:planner"
+        run = self.workspace / "ai" / "r"
+        tgt = run / "reports" / "plan-review.md"
+        for cmd in (f"echo hi > {tgt}",
+                    f"echo hi | tee {tgt}",
+                    f"cp /tmp/x.md {tgt}",
+                    f"python3 -c \"open('{tgt}','w').write('x')\""):
+            self.assert_blocks("bash", bash(cmd, pl), "gate-presented evidence")
+        # a planner's cwd IS the workspace, so the relative spelling is the
+        # natural one here — the developer branch skips relative targets, and
+        # this rule must not
+        self.assert_blocks("bash", bash("echo hi > ai/r/reports/pre-pr.md", pl),
+                           "gate-presented evidence")
+        # its own file, and an unrelated artifact write, still pass
+        self.assert_allows(
+            "bash", bash(f"echo hi > {run / 'reports' / 'plan-revision-log.md'}", pl))
+        self.assert_allows("bash", bash(f"echo hi > {run / 'plan.md'}", pl))
+        self.assert_allows("bash", bash("npm test > /dev/null", pl))
 
     def test_planner_lexical_traversal_escape_blocked(self):
         # adversarial-review finding: `is_relative_to` never resolved `..`

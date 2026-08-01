@@ -415,17 +415,51 @@ PLANNER_STAMP_RE = re.compile(
 # spawn would anchor "user-confirmed" to nothing (adversarial-review,
 # plan-accuracy round: the intake planner has Bash and is live at exactly
 # the cursors where these verbs are legal).
+#: `_CMD_GAP` stops at a newline, but a shell LINE CONTINUATION is still one
+#: command — and the step files themselves render long `harness` invocations
+#: with trailing `\`. Every alternative below therefore spans it
+#: (re-verification finding: `harness artifact \`⏎`  --name …` sailed through
+#: while the identical one-line spelling blocked; the three older verbs were
+#: exposed to the same evasion and are widened with it).
+_CMD_GAP_NL = r"(?:[^|;&\n\r]|\\\r?\n)*"
 SUBAGENT_REGISTER_RE = re.compile(
-    r"\bharness\b" + _CMD_GAP + r"\b(?:scope-register|plan-register|"
+    r"\bharness\b" + _CMD_GAP_NL + r"\b(?:scope-register|plan-register|"
     # save-report joins the orchestrator-only set (pre-release adversarial
     # review, both lenses independently): reports/ under a run is
     # GATE-PRESENTED evidence — an exhausted plan-review decision rests on
-    # reports/plan-review.md — and before this verb existed no subagent had
-    # any path into it (Write/Edit and bash-write confinement both block the
-    # directory). A reviewer that "helpfully" persisted its own reply would
+    # reports/plan-review.md. This comment used to add "and before this verb
+    # existed no subagent had any path into it (Write/Edit and bash-write
+    # confinement both block the directory)"; the whole-branch adversarial
+    # pass reproduced that as FALSE for the planner, whose write confinement
+    # admits all of `ai/` — see the reports/ rule in `guard_write`, which
+    # closes the Write half the claim was resting on.
+    # A reviewer that "helpfully" persisted its own reply would
     # both author the evidence the human reads AND, via the snapshot
     # immutability check, wedge the orchestrator's own documented save.
-    r"save-report)\b")
+    r"save-report)\b"
+    # `artifact` joins them (adversarial-review, whole-branch pass): blocking
+    # the WRITE half of report persistence leaves the REGISTRATION half open,
+    # and registration is what a gate actually reads. `set_artifact` validates
+    # only that the name is in the live step's `produces` (transitions.py) —
+    # and the reviewer is alive exactly while the cursor sits on `plan-review`,
+    # whose `produces` includes `plan-review-report`. A flag-only `harness`
+    # invocation trips neither the bash-write guard nor AUTHORITY_RE (which
+    # names this verb as the SANCTIONED path to state.yaml — sanctioned for
+    # the orchestrator). Every documented caller is a step file, i.e. the
+    # orchestrator recording what a returned spawn produced.
+    #
+    # Anchored on the `--name` it always carries rather than on the bare word:
+    # the gap spans the whole command, so a lone `\bartifact\b` would also
+    # fire on an unrelated path like `--body-file /tmp/artifact.md`. The verb
+    # cannot simply be required to follow `harness` directly — global flags
+    # legally precede it (`harness --workspace X artifact …`).
+    #
+    # `--n`/`--na`/`--nam` are matched too: argparse's default `allow_abbrev`
+    # accepts all three, so each is a real invocation of this verb and a
+    # one-character bypass of a rule whose whole point is being unbypassable
+    # (re-verification finding).
+    r"|\bharness\b" + _CMD_GAP_NL + r"\bartifact\b" + _CMD_GAP_NL
+    + r"--n(?:a(?:m(?:e)?)?)?\b")
 # `(?!<)` after the colon: spawn prompts routinely quote
 # shared/status-block.md's reply template verbatim as instructions to the
 # subagent — including its literal `harness-task: <task-id or ->` example —
@@ -737,16 +771,39 @@ def guard_bash(p: dict) -> None:
                     resolved, _session_workspace(cwd).resolve())
                 if reason:
                     block(reason, cwd, p)
-        if shape_of(p.get("agent_type")) == "planner" and PLANNER_STAMP_RE.search(target):
-            block("the planner never stamps its own repo-map output — "
-                  "`repo-map-stamp` is the orchestrator's job, run once after "
-                  "the planner's spawn returns (agents/planner.md).", cwd, p)
+        if shape_of(p.get("agent_type")) == "planner":
+            if PLANNER_STAMP_RE.search(target):
+                block("the planner never stamps its own repo-map output — "
+                      "`repo-map-stamp` is the orchestrator's job, run once "
+                      "after the planner's spawn returns (agents/planner.md).",
+                      cwd, p)
+            # Bash half of guard_write's gate-evidence rule. The reviewer and
+            # the developer each have a bash-write confinement above; the
+            # planner had none, so the Write/Edit-only first cut of that rule
+            # left `echo >`, `tee`, `cp` and `python -c "open(...,'w')"`
+            # reaching <run>/reports/ untouched — all four reproduced by the
+            # re-verification pass, and all four already blocked for the two
+            # shapes that were never the hole.
+            #
+            # Unlike the developer branch, RELATIVE targets are resolved
+            # rather than skipped: a planner's cwd IS the workspace, so
+            # `> ai/<run>/reports/x.md` is the natural spelling here, not the
+            # cross-boundary absolute path that branch is watching for.
+            for tgt in _developer_bash_write_targets(target):
+                if tgt in _BASH_WRITE_SINK_OK:
+                    continue
+                reason = _gate_evidence_write_reason(
+                    _resolve_write_path(_bash_path(tgt).as_posix(), cwd),
+                    _session_workspace(cwd).resolve())
+                if reason:
+                    block(reason, cwd, p)
         if shape_of(p.get("agent_type")) and SUBAGENT_REGISTER_RE.search(target):
-            block("scope-register, plan-register and save-report are "
-                  "orchestrator-only: the scope records the HUMAN's "
+            block("scope-register, plan-register, save-report and artifact "
+                  "are orchestrator-only: the scope records the HUMAN's "
                   "confirmation, the task list is what the plan gate "
-                  "ratifies, and a run's reports/ are the evidence a human "
-                  "gate presents — report your proposal/review in your "
+                  "ratifies, a run's reports/ are the evidence a human "
+                  "gate presents, and `artifact` is what makes that evidence "
+                  "the gate's — report your proposal/review in your "
                   "status block; the orchestrator confirms, registers, and "
                   "persists.", cwd, p)
 
@@ -1024,6 +1081,55 @@ def _resolve_write_path(fp: str, cwd: Path) -> Path:
     return path.resolve()
 
 
+def _gate_evidence_write_reason(path: Path, ws: Path) -> str | None:
+    """Why a subagent write to `path` under a run's `reports/` is blocked, or
+    None if it may proceed. Both arguments are RESOLVED.
+
+    `<run>/reports/` is GATE-PRESENTED evidence owned by the orchestrator's
+    report verb (orchestrator-only, SUBAGENT_REGISTER_RE). The planner's
+    artifact-root check admits all of `ai/`, so this directory needs its own
+    filename-specific rule inside an otherwise-writable root — exactly like
+    the `.meta.json` rule (adversarial-review, whole-branch pass:
+    SUBAGENT_REGISTER_RE's own comment claimed "no subagent had any path into
+    it", which holds for the reviewer and the developer and was FALSE for the
+    planner, live at intake/plan — the two cursors immediately before the gate
+    that reads this evidence, and one filename away from pre-seeding the round
+    snapshot that wedges the orchestrator's first legitimate save).
+
+    Shared by the Write/Edit AND Bash surfaces. The first cut of this rule
+    closed only Write/Edit, leaving `echo >`, `tee`, `cp` and an inline
+    `open(...,'w')` open to the same shape — the re-verification pass
+    reproduced all four. Closing one surface of two is the very shape of the
+    finding this rule exists to fix, so the predicate lives here once and
+    both guards call it.
+
+    Casefolded for the reason `_refuse_quarantine_overlap` states about the
+    same class of comparison: on a case-insensitive filesystem `Reports/` and
+    `reports/` are ONE directory, and a file written through either spelling
+    is read back through the other — including by the snapshot-immutability
+    check in `save_report` (re-verification finding, reproduced on macOS).
+    """
+    try:
+        rel = path.relative_to(ws / "ai")
+    except ValueError:
+        return None
+    if not any(part.casefold() == "reports" for part in rel.parts):
+        return None
+    if path.name.casefold() == "plan-revision-log.md":
+        # An exemption, not a blanket block: the plan's revision archaeology
+        # is the planner's OWN output (agents/planner.md). Casefolded too —
+        # on the filesystems this rule is casefolded FOR, a differently-cased
+        # spelling is the same file, so it must not block where the exact
+        # spelling would not.
+        return None
+    return ("<run>/reports/ holds gate-presented evidence — it is persisted "
+            "by the orchestrator's own report verb after your spawn returns, "
+            "and by the harness's report steps, never by a subagent (on any "
+            "surface: Write/Edit, a redirect, tee, cp, or an inline "
+            "interpreter). Return your report in your reply; the only file "
+            "here that is yours is reports/plan-revision-log.md.")
+
+
 def guard_read(p: dict) -> None:
     """Raw red-proof reads bypass the chain (Read/Grep-tool side; the Bash
     side lives in guard_bash): `harness show-redproof` is the ONE verified
@@ -1088,6 +1194,11 @@ def guard_write(p: dict) -> None:
             block("planner writes are confined to run artifacts (ai/<run>/) and "
                   ".claude/context/ — it never touches repo source "
                   "(design.md piece 3 path-guard).", cwd, p)
+        # Bash half of this same rule lives in guard_bash — see
+        # _gate_evidence_write_reason for why it is one shared predicate.
+        reason = _gate_evidence_write_reason(path, ws.resolve())
+        if reason:
+            block(reason, cwd, p)
         if path.name == ".meta.json":
             # Otherwise legal by the path check above — repo-map/<name>/ is
             # squarely inside .claude/context/ — so this needs its own,

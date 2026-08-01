@@ -1087,6 +1087,11 @@ class TestQuarantine(GitopsHarness):
         flagged = [e for e in ndjson.read_records(self.run / "events.ndjson")
                    if e["kind"] == "tests-quarantined"]
         self.assertEqual(len(flagged), 1)
+        # SINGULAR `reason` is what the metrics flagged table renders —
+        # `reasons` (the per-entry map) is not it, so the row that was
+        # supposed to name the exclusions came out blank in the one surface
+        # a human reads (whole-branch adversarial review)
+        self.assertIn("harden-fe010", flagged[0].get("reason", ""))
 
     def test_overlap_with_the_locked_test_set_refuses(self):
         # the one silently-wrong pass this mechanism must not produce: the
@@ -1155,6 +1160,17 @@ class TestQuarantine(GitopsHarness):
                                     run=self.run)
         self.assertIn("locked test set", str(ctx.exception))
 
+        # …and the shape-aware half at THIS call site too, not only at
+        # verify_red's (re-verification: the new coverage exercised verify_red
+        # only, and verify-green is the call that produces the silent pass)
+        by_dir = self._config({"exclude_template": "--ignore={test}",
+                               "tests": [{"test": "tests", "reason": "r",
+                                          "since": "2026-07-22"}]})
+        with mock.patch("harness.gitops.blob_sha", return_value="sha"):
+            with self.assertRaises(gitops.RedProofError):
+                gitops.verify_green(proof, self.repo, "pytest", config=by_dir,
+                                    task_repo=self.repo, run=self.run)
+
     def test_overlap_check_is_spelling_insensitive(self):
         """Every spelling a RUNNER treats as the same file must either be
         refused at declaration or be caught by the overlap guard — never
@@ -1186,6 +1202,65 @@ class TestQuarantine(GitopsHarness):
             gitops.verify_red(self.run, self.workspace, self.repo, cfg, "T1",
                               TEST_CMD, declared=["tests/test_x.py"],
                               intents=["test_val"])
+
+    def test_a_typod_run_refuses_instead_of_manufacturing_one(self):
+        """Whole-branch review, reproduced: `--run` is optional on these two
+        verbs, so they sit in NO_RUN and skip the required-run check — and
+        `ndjson.append_record`'s mkdir(parents=True) then built an entire
+        phantom run directory from a typo, returned ok:true, and left the
+        REAL run without its `tests-quarantined` event while the exclusions
+        applied invisibly. `save_report` closed exactly this and called
+        itself "the one run-scoped verb" that had skipped the check."""
+        ghost = self.workspace / "ai" / "2026-07-25-TYPO"
+        for verb in ("resolve-test-cmd", "resolve-coverage-cmd"):
+            proc = subprocess.run([sys.executable, "-m", "harness", "--workspace",
+                           str(self.workspace), verb, "--repo", str(self.repo),
+                           "--run", str(ghost)],
+                          cwd=Path(__file__).resolve().parent.parent,
+                          capture_output=True, text=True, encoding="utf-8",
+                          timeout=120)
+            out = json.loads(proc.stdout)
+            self.assertFalse(out["ok"], out)
+            self.assertIn("not a run", out["error"])
+            self.assertFalse(ghost.exists())
+
+    def test_directory_and_glob_entries_trip_the_overlap_guard(self):
+        """Whole-branch review, reproduced end to end: the guard was an exact
+        set intersection, so a DIRECTORY (`tests/legacy`) or a GLOB
+        (`tests/**`) excluded the task's own locked test with no overlap
+        seen at all — verify-green passing while the assertion never ran.
+
+        Neither shape is exotic or malformed: pytest's `--ignore` takes a
+        directory and vitest's `--exclude` (the shipped example template) is
+        glob-native, and both spellings are perfectly canonical, so the
+        declaration vocabulary could never have caught them."""
+        self._write_test()          # tests/test_x.py
+        for entry in ("tests", "tests/**", "tests/*.py", "tests/test_?.py",
+                      "tests/test_[wxy].py", "tests/*"):
+            cfg = self._config({"exclude_template": "--ignore={test}",
+                                "tests": [{"test": entry, "reason": "r",
+                                           "since": "2026-07-22"}]})
+            with self.assertRaises(gitops.RedProofError) as ctx:
+                gitops.verify_red(self.run, self.workspace, self.repo, cfg,
+                                  "T1", TEST_CMD,
+                                  declared=["tests/test_x.py"],
+                                  intents=["test_val"])
+            self.assertIn("locked test set", str(ctx.exception))
+            # the pair is named — with a directory or glob entry, naming only
+            # the entry leaves the developer guessing which file it swallowed
+            self.assertIn("tests/test_x.py", str(ctx.exception))
+
+    def test_a_non_covering_directory_or_glob_still_runs(self):
+        # the other half of the shape-aware comparison: over-refusal is the
+        # safe direction, but it must not swallow a legitimate quarantine of
+        # a NEIGHBOURING directory or spec family (regression guard)
+        self._write_test()
+        for entry in ("tests/legacy", "tests/*.spec.ts", "e2e/**"):
+            cfg = self._config({"exclude_template": "--ignore={test}",
+                                "tests": [{"test": entry, "reason": "r",
+                                           "since": "2026-07-22"}]})
+            gitops._refuse_quarantine_overlap(cfg, self.repo,
+                                              {"tests/test_x.py": "sha"})
 
     def test_overlap_refusal_fires_before_the_misleading_passes_message(self):
         """pre-release review: with the overlap check AFTER the code==0

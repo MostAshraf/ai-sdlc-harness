@@ -136,3 +136,13 @@ language:
 #             - test: "tests/harden-fe010.spec.ts"
 #               reason: "pre-existing appVersion mismatch, fails on main"
 #               since: "2026-07-22"
+#
+# An entry may name a single file, a DIRECTORY (`tests/legacy`, what pytest's
+# `--ignore` takes) or a GLOB (`tests/**`, what vitest's `--exclude` takes) —
+# whatever the runner's own flag understands. The overlap guard that refuses a
+# quarantine covering a task's OWN locked test file understands all three, and
+# reads a glob greedily (`*` spans `/`): over-refusing is loud and fixed by
+# narrowing the entry, while under-refusing is a task whose test is excluded
+# from its own verify-green and never executes (whole-branch adversarial
+# review — the guard was an exact string match, so a directory or glob entry
+# produced exactly that silent false green).

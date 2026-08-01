@@ -23,10 +23,13 @@ against the *same* repo path can race here (no repo-level lock exists yet)
 It then renders `naming.branch` (`{type}/{id}-{slug}`) from state and
 **probes the remote for that name before touching anything**. Because the
 template is deterministic per work item, a re-run of the same story collides
-by construction; a hit refuses with three remedies (resume the prior branch
-by hand, branch aside with `--feature-branch-suffix <s>`, or delete the
-abandoned remote branch) rather than discovering the clash hours later as a
-non-fast-forward at push. A probe that cannot answer — no remote, offline,
+by construction; a hit refuses with two remedies (branch aside with
+`--feature-branch-suffix <s>`, or free the name by merging/deleting the
+remote branch and closing its PR/MR) rather than discovering the clash hours
+later as a non-fast-forward at push. Resuming the prior work is a third
+route but not one *this* run can take: it means continuing in that run's
+directory, whose recorded `branches` artifact is what makes preflight skip
+the probe. Preflight never adopts a remote branch. A probe that cannot answer — no remote, offline,
 auth — continues; a remote that resolved but wouldn't answer logs a flagged
 `remote-branch-unverified` event first (a repo with no remote at all is
 structural, not a signal, and is skipped silently). Only a confirmed hit
