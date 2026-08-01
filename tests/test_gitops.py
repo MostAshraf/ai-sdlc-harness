@@ -709,6 +709,77 @@ class WriteBackMcpCarveOut(GitopsHarness):
         mock_dispatch.assert_called_once()
 
 
+class WriteBackIsBestEffort(GitopsHarness):
+    """field: US-CHAT-00 run. Both milestone write-back call sites dispatched
+    the provider transition bare, so a provider refusal propagated out of a
+    step whose own contract calls it "never a blocking requirement" — a real
+    run aborted `develop` at its very first verb because the story file
+    carried a slug-suffixed filename. The refusal must be RECORDED and
+    reported, never raised — and never silently swallowed either."""
+
+    def _events(self):
+        return ndjson.read_records(self.run / "events.ndjson")
+
+    def test_provider_refusal_is_flagged_and_reported_not_raised(self):
+        self.config["provider"] = {"work_item": "github"}
+        boom = ProviderError("work item 'GIT-1' not found at /s/GIT-1.md")
+        with mock.patch("harness.providers.dispatch", side_effect=boom):
+            result = workflow.write_back(self.workspace, self.run, self.config,
+                                         "develop_start")
+        self.assertEqual(result["written"], False)
+        self.assertIn("not found", result["error"])       # reported, not lost
+        flagged = [e for e in self._events() if e["kind"] == "write-back-failed"]
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0]["actor"], "write-back")
+        self.assertEqual(flagged[0]["item"], "GIT-1")
+
+    def test_the_failure_reaches_the_flagged_events_gauge(self):
+        # a swallow nothing surfaced would be worse than the raise it replaced
+        self.assertIn("write-back-failed", workflow.FLAGGED_EVENT_KINDS)
+        events = [{"kind": "write-back-failed", "actor": "write-back"}]
+        self.assertEqual(len(workflow.outstanding_flagged(events)), 1)
+        # ...but the run's own machinery is intact — only the tracker is stale
+        self.assertEqual(workflow.run_health(events)[0], "HEALTHY")
+
+    def test_reconcile_completes_its_ledger_work_despite_a_refusal(self):
+        # reconcile runs POST-merge: raising here fails a run whose work is
+        # already landed, and leaves worktrees swept but the ledger unreconciled
+        self.config["provider"] = {"work_item": "github"}
+        with mock.patch("harness.providers.dispatch",
+                        side_effect=ProviderError("tracker down")):
+            result = workflow.reconcile_flow(self.workspace, self.run,
+                                             self.config, self.fsm)
+        self.assertEqual(result["reconciled"], True)
+        kinds = [e["kind"] for e in self._events()]
+        self.assertIn("reconciled", kinds)                # the step still closed
+        flagged = [e for e in self._events() if e["kind"] == "write-back-failed"]
+        self.assertEqual([f["actor"] for f in flagged], ["reconcile"])
+
+    def test_mcp_transport_refusal_is_not_demoted_to_best_effort(self):
+        # caught building this change: the first cut of the swallow also ate
+        # reconcile's MCP carve-out, whose raise is the MECHANISM telling the
+        # orchestrator to invoke the mapped tool itself and pass
+        # --skip-transition. Best-effort covers "the provider said no", never
+        # "this transport is not script-callable" — demoting it would let a
+        # run reconcile with its tracker silently never synced.
+        self.config["provider"] = {"work_item": "jira"}
+        with self.assertRaises(ProviderError):
+            workflow.reconcile_flow(self.workspace, self.run, self.config,
+                                    self.fsm)
+        self.assertEqual(
+            [e for e in self._events() if e["kind"] == "write-back-failed"], [])
+
+    def test_a_non_provider_error_still_raises(self):
+        # best-effort covers "the provider said no", not a bug in our own
+        # dispatch layer — swallowing that would hide a real defect
+        self.config["provider"] = {"work_item": "github"}
+        with mock.patch("harness.providers.dispatch",
+                        side_effect=RuntimeError("bug in dispatch")):
+            with self.assertRaises(RuntimeError):
+                workflow.write_back(self.workspace, self.run, self.config,
+                                    "develop_start")
+
+
 class SecurityScanTimeout(GitopsHarness):
     def test_scanner_timeout_is_surfaced_as_worst_severity_not_a_crash(self):
         # adversarial-review finding: subprocess.TimeoutExpired was uncaught

@@ -85,6 +85,85 @@ class LocalMarkdownContract(unittest.TestCase):
         with self.assertRaises(ProviderError):
             dispatch(self.config, "work_item.fetch", id="NOPE-1")
 
+    def test_slug_suffixed_filename_resolves_by_its_short_h1_id(self):
+        # field: US-CHAT-00 run. The round trip that used to break: a story
+        # file named with a descriptive slug suffix is fetched by its FULL
+        # filename, hands back the SHORT id from its H1 — and that short id
+        # is what lands in state and what write_back replays into
+        # transition(). Every op must accept both spellings, or the id that
+        # resolved going in stops resolving coming back.
+        (self.stories / "US-CHAT-00-frontend-test-infrastructure.md").write_text(
+            "# US-CHAT-00: Frontend test infrastructure\nType: Story\n"
+            "Status: Open\n\n## Description\nStand up vitest.\n\n"
+            "## Acceptance Criteria\n- [ ] suite runs green\n", encoding="utf-8")
+        item = dispatch(self.config, "work_item.fetch",
+                        id="US-CHAT-00-frontend-test-infrastructure")
+        self.assertEqual(item["id"], "US-CHAT-00")          # the short form
+        self.assertTrue(item["provider_ref"].endswith(
+            "US-CHAT-00-frontend-test-infrastructure.md"))  # the long one
+        # the short id now resolves every op, not just the one that was
+        # handed the full filename
+        self.assertEqual(dispatch(self.config, "work_item.fetch",
+                                  id="US-CHAT-00")["id"], "US-CHAT-00")
+        dispatch(self.config, "work_item.transition", id="US-CHAT-00",
+                 to="In Progress")
+        dispatch(self.config, "work_item.add_comment", id="US-CHAT-00",
+                 text="round 1 done")
+        body = (self.stories
+                / "US-CHAT-00-frontend-test-infrastructure.md").read_text(
+                    encoding="utf-8")
+        self.assertIn("Status: In Progress", body)   # wrote the RIGHT file
+        self.assertIn("- round 1 done", body)
+
+    def test_exact_filename_wins_over_a_slug_sibling(self):
+        # the fallback is a fallback: it must never shadow a file that
+        # literally answers to the id, or a transition would silently write
+        # the neighbour instead.
+        (self.stories / "WORK-7-some-slug.md").write_text(
+            "# WORK-7: decoy\nStatus: Open\n", encoding="utf-8")
+        dispatch(self.config, "work_item.transition", id="WORK-7", to="Done")
+        self.assertIn("Status: Done",
+                      (self.stories / "WORK-7.md").read_text(encoding="utf-8"))
+        self.assertIn("Status: Open",     # decoy untouched
+                      (self.stories / "WORK-7-some-slug.md").read_text(
+                          encoding="utf-8"))
+
+    def test_ambiguous_slug_match_refuses_rather_than_picking_one(self):
+        # two files claiming one id is a workspace mistake; picking a side
+        # would land the write in an arbitrary one of them
+        from harness.providers import ProviderError
+        for slug in ("US-9-first.md", "US-9-second.md"):
+            (self.stories / slug).write_text("# US-9: dup\nStatus: Open\n",
+                                             encoding="utf-8")
+        for op, kwargs in (("work_item.fetch", {}),
+                           ("work_item.transition", {"to": "Done"}),
+                           ("work_item.add_comment", {"text": "hi"})):
+            with self.assertRaises(ProviderError) as ctx:
+                dispatch(self.config, op, id="US-9", **kwargs)
+            self.assertIn("matches multiple files", str(ctx.exception))
+        for slug in ("US-9-first.md", "US-9-second.md"):    # neither written
+            self.assertIn("Status: Open",
+                          (self.stories / slug).read_text(encoding="utf-8"))
+
+    def test_traversal_id_is_refused_before_the_slug_fallback(self):
+        # the confinement check must run BEFORE the glob, or a traversal id
+        # with no exact-match file would fall through to a pattern carrying
+        # the `..` itself — reaching outside stories_dir by the back door.
+        from harness.providers import ProviderError
+        outside = self.stories.parent / f"{self.stories.name}-escape"
+        outside.mkdir()
+        (outside / "X-1-slug.md").write_text("# X-1: outside\nStatus: Open\n",
+                                             encoding="utf-8")
+        try:
+            with self.assertRaises(ProviderError) as ctx:
+                dispatch(self.config, "work_item.transition",
+                         id=f"../{outside.name}/X-1", to="Done")
+            self.assertIn("escapes stories_dir", str(ctx.exception))
+            self.assertIn("Status: Open",
+                          (outside / "X-1-slug.md").read_text(encoding="utf-8"))
+        finally:
+            support.rmtree(outside)
+
     def test_create_writes_a_fetchable_follow_up(self):
         # B9: the security gate's `defer` disposition runs work_item.create
         # — previously a declared dead end on local-markdown (only the

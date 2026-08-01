@@ -61,7 +61,16 @@ FLAGGED_EVENT_KINDS = (
     # (c) RESOLVABLE, paired off by `env-prereq-satisfied`: the human starts
     #     the service and re-runs. Permanent here would leave every such run
     #     reading DEGRADED forever (re-verify finding).
-    "env-prereq-missing")
+    "env-prereq-missing",
+    # field: US-CHAT-00 run. Class (a) again — a permanent occurrence. The
+    # milestone write-back is declared best-effort ("never a blocking
+    # requirement", write_back below), so a provider that refuses the
+    # transition must not abort the run; but swallowing it silently would
+    # leave the live tracker stale with nothing anywhere saying so. Surface
+    # it on the same gauge a human already reads, and never auto-fix — the
+    # house stance. Not HEALTH_DEGRADING: the run's own machinery is intact
+    # and no evidence was lost, only the external tracker is behind.
+    "write-back-failed")
 # None of the six are HEALTH_DEGRADING (below): each means "a human should
 # look", not "this run's machinery degraded / evidence was lost". The closest
 # call is `remote-branch-unverified` — evidence genuinely not obtained — but
@@ -1334,6 +1343,52 @@ def resolve_write_back_status(config: dict, milestone: str,
     return {**provider_defaults, **override}.get(key, _MILESTONE_FALLBACK.get(milestone))
 
 
+def _best_effort_transition(run: Path, config: dict, item_id: str, target: str,
+                            actor: str) -> dict:
+    """Push one provider status, best-effort: a `ProviderError` is recorded as
+    a flagged `write-back-failed` and reported, never raised.
+
+    field: US-CHAT-00 run. Both milestone write-back call sites (write_back
+    and reconcile_flow) dispatched the transition bare, so a provider refusal
+    propagated out of a step whose own contract calls it "never a blocking
+    requirement" — a run whose story file carried a slug-suffixed filename
+    aborted `develop` at its very first verb. The resolution bug behind that
+    specific case is fixed in the local-markdown provider, but the contract
+    gap is separate and outlives it: ANY provider refusal here (a tracker
+    down, a credential expired, a status name the tracker rejects) should
+    leave the run walking and the staleness visible, not halt it.
+
+    ONE definition for both call sites — the same anti-drift rule
+    FLAGGED_EVENT_KINDS and outstanding_flagged state above; a swallow that
+    logged on one path and not the other would make the gauge lie about which
+    milestones actually landed. Only `ProviderError` is caught: it is the
+    declared "the provider said no" channel. A bug in our own dispatch layer
+    still raises, because that is not a best-effort condition.
+
+    MCP transport is deliberately NOT best-effort and propagates: `dispatch`
+    raises there before reaching any provider, and that refusal is the
+    MECHANISM telling the orchestrator to invoke the mapped tool itself (then
+    pass `reconcile --skip-transition`). Demoting it to a flagged event would
+    let a run reconcile with its tracker never synced and nothing forcing the
+    question — the trust-the-prose shape this codebase refuses everywhere.
+    `write_back` short-circuits MCP earlier with its own guidance return, so
+    only `reconcile_flow` reaches this branch."""
+    from .providers import ProviderError, dispatch, get_module
+    # resolved OUTSIDE the try: an unknown provider name is a config error,
+    # not "the provider said no", and must keep raising like it always has
+    mcp = getattr(get_module(config), "TRANSPORT", "") == "mcp"
+    try:
+        dispatch(config, "work_item.transition", id=item_id, to=target)
+    except ProviderError as exc:
+        if mcp:
+            raise
+        ndjson.append_record(run / "events.ndjson",
+                             {"kind": "write-back-failed", "item": item_id,
+                              "to": target, "error": str(exc), "actor": actor})
+        return {"written": False, "to": target, "error": str(exc)}
+    return {"written": True, "to": target}
+
+
 def write_back(workspace: Path, run: Path, config: dict, milestone: str) -> dict:
     """`harness write-back --milestone <develop_start|in_review|done>` —
     the orchestrator-owned call for the two milestones that used to have NO
@@ -1351,7 +1406,11 @@ def write_back(workspace: Path, run: Path, config: dict, milestone: str) -> dict
     transport directly (same check `dispatch()` makes internally) and
     returns guidance instead of raising, mirroring fetch.md's pattern: the
     orchestrator invokes the mapped tool itself if it cares about live
-    status sync; write-back is best-effort, never a blocking requirement."""
+    status sync; write-back is best-effort, never a blocking requirement.
+
+    That best-effort promise is enforced, not just stated: a provider that
+    refuses the transition is recorded as a flagged `write-back-failed` and
+    reported in the result, never raised (see `_best_effort_transition`)."""
     from .transitions import ensure_live
     with state_mod.locked_read(run):  # torn-read guard, same as show/verify
         st = state_mod.load(run, workspace)
@@ -1359,15 +1418,15 @@ def write_back(workspace: Path, run: Path, config: dict, milestone: str) -> dict
     target = resolve_write_back_status(config, milestone, st["work_item"].get("type"))
     if target is None:
         return {"written": False}
-    from .providers import dispatch, get_module
+    from .providers import get_module
     if getattr(get_module(config), "TRANSPORT", "") == "mcp":
         return {"written": False, "mcp_target": target,
                "mcp_guidance": f"MCP-transport provider — a script can't call "
                                f"an MCP tool; invoke the mapped work_item."
                                f"transition tool yourself if you want live "
                                f"status sync (to={target!r})."}
-    dispatch(config, "work_item.transition", id=st["work_item"]["id"], to=target)
-    return {"written": True, "to": target}
+    return _best_effort_transition(run, config, st["work_item"]["id"], target,
+                                   "write-back")
 
 
 def reconcile_flow(workspace: Path, run: Path, config: dict, fsm: dict,
@@ -1383,7 +1442,6 @@ def reconcile_flow(workspace: Path, run: Path, config: dict, fsm: dict,
     default on. The orchestrator invokes the mapped MCP tool itself first,
     then passes this flag so archiving/worktree-sweep still run normally."""
     from . import chain as chain_mod
-    from .providers import dispatch
     from .transitions import transition_task
     key = chain_mod.load_key(workspace)  # strict: never mint from a drifted cwd
     with state_mod.locked(run):
@@ -1405,8 +1463,12 @@ def reconcile_flow(workspace: Path, run: Path, config: dict, fsm: dict,
     if not skip_transition:
         target = resolve_write_back_status(config, "done", st["work_item"].get("type"))
         if target is not None:
-            dispatch(config, "work_item.transition",
-                     id=st["work_item"]["id"], to=target)
+            # best-effort, same contract as write_back's — reconcile runs
+            # POST-merge, so raising here would fail a run whose work is
+            # already landed and leave its worktrees swept but its ledger
+            # unreconciled (field: US-CHAT-00 run)
+            _best_effort_transition(run, config, st["work_item"]["id"], target,
+                                    "reconcile")
     ndjson.append_record(run / "events.ndjson",
                          {"kind": "reconciled", "actor": "reconcile"})
     return {"reconciled": True}

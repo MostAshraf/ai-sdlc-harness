@@ -339,7 +339,11 @@ Work-item integrations are code modules behind one interface — callers name an
 | `jira` | MCP | Jira MCP server connected |
 | `zoho` | MCP | Zoho MCP server connected |
 
+`local-markdown` story files may be named `<id>.md` or `<id>-<descriptive-slug>.md` (`US-42.md`, `US-42-add-multiply.md`) — the id is whatever the file's `# <id>: <title>` heading declares, and both spellings resolve for every operation. Two files claiming one id is refused, not guessed at: a status write-back would otherwise land in an arbitrary one of them.
+
 CLI/file-transport providers execute inside the harness process. MCP-transport providers can't be script-called: the module declares a tool **mapping**, the model invokes the MCP tool, and pipes the raw result to `harness fetch --from-raw` for the same shared normalize + bootstrap path.
+
+Milestone status write-back is **best-effort** on script-callable transports: a provider that refuses the transition is recorded as a flagged `write-back-failed` event and the run continues, rather than failing a step whose work already landed. The MCP carve-out is not best-effort — there the refusal is the signal to invoke the mapped tool yourself and pass `reconcile --skip-transition`.
 
 ## Project Structure
 
@@ -369,7 +373,7 @@ ai-sdlc-harness/
 │   └── init-workspace/ · add-repo/ · migrate-workspace/ · workspace-config/ · workflow-status/ · repo-map-refresh/
 ├── bin/harness                  # wrapper script resolving the plugin venv (+ harness.cmd for Windows)
 ├── tools/                       # meta-tooling: line-budget checker, sandbox workspace generators
-└── tests/                       # 825 stdlib-unittest tests
+└── tests/                       # 848 stdlib-unittest tests
 ```
 
 Workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside *your* working directory by `/init-workspace` and the pipeline. They never live inside this plugin repo.
@@ -399,7 +403,7 @@ python -m venv .venv; .venv\Scripts\pip install pyyaml
 .venv\Scripts\python -m unittest discover -s tests
 ```
 
-The test suite (825 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (848 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 

@@ -63,11 +63,34 @@ def _path(config: dict, item_id: str) -> Path:
     path = stories / f"{item_id}.md"
     # Confine to stories_dir: an id like '../../x' resolved OUTSIDE it, and
     # transition()/add_comment() would then WRITE there — silent wrong-file
-    # I/O, not an error (adversarial-review finding).
+    # I/O, not an error (adversarial-review finding). Must run before the
+    # exists() check — and so before the slug fallback below — so a traversal
+    # id is refused even when no exact-match file exists, rather than falling
+    # through to a glob whose pattern would carry the `..` itself.
     if not path.resolve().is_relative_to(stories.resolve()):
         raise ProviderError(
             f"work item id {item_id!r} escapes stories_dir — refusing")
     if not path.exists():
+        # field: US-CHAT-00 run. A story file may carry a descriptive slug
+        # suffix (`US-CHAT-00-frontend-test-infrastructure.md`) while its H1
+        # declares the short id (`# US-CHAT-00: ...`). fetch() is located by
+        # the FULL filename and then hands back that SHORT id (below) — which
+        # is what `_bootstrap_from_item` writes to state and what write_back /
+        # reconcile later replay into transition(). So the id that resolved
+        # going in no longer resolves coming back, and a milestone write-back
+        # raised on a fetch that had succeeded moments earlier.
+        #
+        # Resolve the short form too, but only when it is UNAMBIGUOUS: two
+        # files claiming one id is a workspace mistake we must not silently
+        # pick a side in — the write would land in an arbitrary one of them.
+        matches = sorted(stories.glob(f"{item_id}-*.md"))
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ProviderError(
+                f"work item id {item_id!r} matches multiple files in "
+                f"{stories}: {', '.join(p.name for p in matches)} — "
+                f"rename to disambiguate")
         raise ProviderError(f"work item '{item_id}' not found at {path}")
     return path
 
