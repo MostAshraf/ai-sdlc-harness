@@ -985,8 +985,14 @@ class WriteGuard(GuardHarness):
         evidence for the one shape that was the hole. Closing one surface of
         two is the exact shape of the finding the rule exists to fix."""
         pl = "x:planner"
-        run = self.workspace / "ai" / "r"
-        tgt = run / "reports" / "plan-review.md"
+        # Commands spell paths the way the EXECUTING shell sees them —
+        # forward slashes on every OS, since the Bash tool is Git Bash on
+        # Windows — the same convention (and the same reason) as
+        # test_developer_bash_writes_confined_to_repo_and_worktree above. A
+        # backslash spelling trivially misses the target-detection regex, so
+        # it would leave this rule untested exactly where it is least tested.
+        run_sh = (self.workspace / "ai" / "r").as_posix()
+        tgt = f"{run_sh}/reports/plan-review.md"
         for cmd in (f"echo hi > {tgt}",
                     f"echo hi | tee {tgt}",
                     f"cp /tmp/x.md {tgt}",
@@ -999,8 +1005,8 @@ class WriteGuard(GuardHarness):
                            "gate-presented evidence")
         # its own file, and an unrelated artifact write, still pass
         self.assert_allows(
-            "bash", bash(f"echo hi > {run / 'reports' / 'plan-revision-log.md'}", pl))
-        self.assert_allows("bash", bash(f"echo hi > {run / 'plan.md'}", pl))
+            "bash", bash(f"echo hi > {run_sh}/reports/plan-revision-log.md", pl))
+        self.assert_allows("bash", bash(f"echo hi > {run_sh}/plan.md", pl))
         self.assert_allows("bash", bash("npm test > /dev/null", pl))
 
     def test_planner_lexical_traversal_escape_blocked(self):

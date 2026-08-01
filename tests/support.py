@@ -47,6 +47,17 @@ HARNESS_BIN = ROOT / "bin" / ("harness.cmd" if os.name == "nt" else "harness")
 # NOT fine as a git editor — see gitops.autosquash for that story.)
 NOP_CMD = "cmd /c exit 0" if os.name == "nt" else "true"
 
+# A declared `language.repos.<name>.test_cmd` for config fixtures — a PLAIN
+# runner invocation on every OS, never executed by the tests that use it.
+# Deliberately NOT NOP_CMD: on Windows that is `cmd /c exit 0`, and the
+# quarantine's shell-wrapper check correctly refuses to append exclusion
+# flags to a `cmd /c` wrapper (they would attach to the wrapper, not the
+# runner — the silent-full-suite failure that check exists to prevent). Using
+# it as a declared test_cmd made the FIXTURE the thing under test on Windows,
+# not the mechanism (first CI run of this branch: two quarantine tests failed
+# there on exactly this, while the product behaviour was correct).
+NOP_TEST_CMD = "npm test"
+
 # dir= argument for tempfile.mkdtemp when a fixture must sit inside the
 # guards' scratch root (None = the platform default temp dir, which on
 # Windows is exactly what guards' _tmp_roots() returns there)

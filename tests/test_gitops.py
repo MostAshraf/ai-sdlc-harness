@@ -971,7 +971,7 @@ class TestQuarantine(GitopsHarness):
     def _config(self, quarantine=None, coverage_cmd=None):
         cfg = dict(self.config)
         cfg["repos"] = {"repo": str(self.repo)}
-        entry = {"test_cmd": support.NOP_CMD}
+        entry = {"test_cmd": support.NOP_TEST_CMD}
         if coverage_cmd:
             entry["coverage_cmd"] = coverage_cmd
         if quarantine is not None:
@@ -1129,7 +1129,7 @@ class TestQuarantine(GitopsHarness):
         self.assertEqual(
             initws.quarantine_cmd(cfg, self.repo,
                                   initws.resolve_test_cmd(cfg, self.repo)),
-            f"{support.NOP_CMD} --exclude tests/harden-fe010.spec.ts")
+            f"{support.NOP_TEST_CMD} --exclude tests/harden-fe010.spec.ts")
 
     def test_verify_green_applies_it_and_refuses_an_overlap(self):
         # re-verify finding: BOTH halves of verify-green's quarantine wiring

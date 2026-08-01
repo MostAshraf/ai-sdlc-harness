@@ -936,9 +936,16 @@ class FetchAlreadyDone(BreadthHarness):
 
     def test_done_item_warns_and_flags_but_still_bootstraps(self):
         self.story("W-50", "already shipped")
+        # encoding pinned on BOTH ends: the status vocabulary this test
+        # exercises is emoji-bearing (the field tracker's own spelling), and
+        # Windows' default cp1252 cannot encode it — the fixture write itself
+        # raised UnicodeEncodeError before the harness was ever reached
+        # (first CI run of this branch; the product path already specifies
+        # its encoding, this was the test writing the story)
         (self.stories / "W-50.md").write_text(
-            (self.stories / "W-50.md").read_text().replace(
-                "Status: Open", "Status: ✅ Done — 2026-07-22"))
+            (self.stories / "W-50.md").read_text(encoding="utf-8").replace(
+                "Status: Open", "Status: ✅ Done — 2026-07-22"),
+            encoding="utf-8")
         self.init()
         out = self.cli("fetch", "--id", "W-50", "--date", "2026-02-11")
         run = Path(out["run"])
