@@ -741,6 +741,139 @@ class WriteBackIsBestEffort(GitopsHarness):
         # ...but the run's own machinery is intact — only the tracker is stale
         self.assertEqual(workflow.run_health(events)[0], "HEALTHY")
 
+    def test_the_failure_carries_a_detail_the_metrics_report_renders(self):
+        # adversarial-review, both lenses: the payload key was `error`, which
+        # metrics' _detail() does not read — so the flagged row a human sees
+        # rendered a bare kind name with an empty Detail cell, carrying none of
+        # the information needed to act on it.
+        self.config["provider"] = {"work_item": "github"}
+        with mock.patch("harness.providers.dispatch",
+                        side_effect=ProviderError("tracker down")):
+            workflow.write_back(self.workspace, self.run, self.config,
+                                "develop_start")
+        flagged = [e for e in self._events() if e["kind"] == "write-back-failed"]
+        self.assertIn("tracker down", flagged[0]["reason"])
+        report = workflow.metrics_report(self.workspace, self.run, self.manifest)
+        row = [ln for ln in report.read_text(encoding="utf-8").splitlines()
+               if "write-back-failed" in ln]
+        self.assertTrue(row)
+        self.assertIn("tracker down", row[0])
+
+    def test_a_later_success_clears_the_earlier_miss(self):
+        # adversarial-review, both lenses: filed permanent, the miss outlived
+        # the condition that caused it — a run whose `done` write-back landed
+        # has a correct tracker and nothing outstanding, but the gauge kept
+        # reporting 1 forever. Same resolver shape as env-prereq-satisfied.
+        self.config["provider"] = {"work_item": "github"}
+        with mock.patch("harness.providers.dispatch",
+                        side_effect=ProviderError("tracker down")):
+            workflow.write_back(self.workspace, self.run, self.config,
+                                "develop_start")
+        self.assertEqual(len(workflow.outstanding_flagged(self._events())), 1)
+        with mock.patch("harness.providers.dispatch"):      # human fixed it
+            self.assertEqual(                               # the `done` milestone
+                workflow.write_back(self.workspace, self.run, self.config,
+                                    "done")["written"], True)
+        self.assertEqual(workflow.outstanding_flagged(self._events()), [])
+
+    def test_a_stray_log_event_cannot_clear_a_genuine_miss(self):
+        # re-verify finding: `log-event` is unvalidated, and this resolver
+        # CLEARS an audit gauge — verified going 1 -> 0 on a hand-appended
+        # kind. Actor-checked now, exactly like `plan-registered`.
+        events = [{"kind": "write-back-failed", "actor": "write-back"},
+                  {"kind": "write-back-succeeded"}]                 # no actor
+        self.assertEqual(len(workflow.outstanding_flagged(events)), 1)
+        events[1]["actor"] = "reconcile"                            # the real one
+        self.assertEqual(workflow.outstanding_flagged(events), [])
+
+    def test_the_success_marker_fires_once_not_on_every_later_run(self):
+        # re-verify finding: gated on "a miss appears anywhere in the ledger",
+        # which stays true forever once resolved — so every clean write-back
+        # after the first miss appended another marker. Same bug
+        # `_has_open_env_miss` exists to prevent for env-prereq-satisfied.
+        self.config["provider"] = {"work_item": "github"}
+        with mock.patch("harness.providers.dispatch",
+                        side_effect=ProviderError("tracker down")):
+            workflow.write_back(self.workspace, self.run, self.config,
+                                "develop_start")
+        with mock.patch("harness.providers.dispatch"):
+            for _ in range(3):
+                workflow.write_back(self.workspace, self.run, self.config,
+                                    "done")
+        self.assertEqual(
+            len([e for e in self._events()
+                 if e["kind"] == "write-back-succeeded"]), 1)
+
+    def test_an_unwritable_ledger_does_not_break_a_successful_write_back(self):
+        # re-verify finding: the success branch's ledger read/append were left
+        # bare while the failure branch was guarded — so a full or read-only
+        # run dir raised out of a call that had already succeeded, post-merge
+        # from reconcile.
+        self.config["provider"] = {"work_item": "github"}
+        with mock.patch("harness.providers.dispatch",
+                        side_effect=ProviderError("tracker down")):
+            workflow.write_back(self.workspace, self.run, self.config,
+                                "develop_start")
+        with mock.patch("harness.providers.dispatch"), \
+             mock.patch("harness.ndjson.read_records",
+                        side_effect=OSError(28, "No space left on device")):
+            result = workflow.write_back(self.workspace, self.run, self.config,
+                                         "done")
+        self.assertEqual(result["written"], True)
+
+    def test_a_clean_write_back_emits_no_success_marker(self):
+        self.config["provider"] = {"work_item": "github"}
+        with mock.patch("harness.providers.dispatch"):
+            workflow.write_back(self.workspace, self.run, self.config,
+                                "develop_start")
+        self.assertEqual([e for e in self._events()
+                          if e["kind"] == "write-back-succeeded"], [])
+
+    def test_reconcile_reports_the_refusal_it_no_longer_raises(self):
+        # adversarial-review, both lenses: reconcile dropped the helper's
+        # result, so `harness reconcile` returned a bare {"reconciled": true}
+        # — a refused transition was indistinguishable from a clean sync at
+        # the one decision point the orchestrator actually reads.
+        self.config["provider"] = {"work_item": "github"}
+        with mock.patch("harness.providers.dispatch",
+                        side_effect=ProviderError("tracker down")):
+            result = workflow.reconcile_flow(self.workspace, self.run,
+                                             self.config, self.fsm)
+        self.assertEqual(result["reconciled"], True)
+        self.assertEqual(result["write_back"]["written"], False)
+        self.assertIn("tracker down", result["write_back"]["error"])
+
+    def test_declared_unsupported_still_refuses_rather_than_flagging(self):
+        # adversarial-review, lens B: ProviderUnsupported subclasses
+        # ProviderError, so the bare catch swallowed it too — turning a
+        # provider that DECLARES no transition support into a flagged event on
+        # every milestone of every run, instead of the config-time refusal it
+        # is. Declared-unsupported is a statement about the provider, not a
+        # runtime "no".
+        from harness.providers import ProviderUnsupported
+        self.config["provider"] = {"work_item": "github"}
+        with mock.patch("harness.providers.dispatch",
+                        side_effect=ProviderUnsupported("declares no support")):
+            with self.assertRaises(ProviderUnsupported):
+                workflow.write_back(self.workspace, self.run, self.config,
+                                    "develop_start")
+        self.assertEqual(
+            [e for e in self._events() if e["kind"] == "write-back-failed"], [])
+
+    def test_an_unwritable_ledger_does_not_replace_the_suppressed_error(self):
+        # adversarial-review, lens B: the append lives INSIDE the except, so a
+        # full or read-only run dir converted a suppressed ProviderError into a
+        # different, raised OSError. "Never raises" is stated unconditionally.
+        self.config["provider"] = {"work_item": "github"}
+        with mock.patch("harness.providers.dispatch",
+                        side_effect=ProviderError("tracker down")), \
+             mock.patch("harness.ndjson.append_record",
+                        side_effect=OSError(28, "No space left on device")):
+            result = workflow.write_back(self.workspace, self.run, self.config,
+                                         "develop_start")
+        self.assertEqual(result["written"], False)
+        self.assertIn("tracker down", result["error"])
+
     def test_reconcile_completes_its_ledger_work_despite_a_refusal(self):
         # reconcile runs POST-merge: raising here fails a run whose work is
         # already landed, and leaves worktrees swept but the ledger unreconciled

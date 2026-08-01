@@ -339,11 +339,11 @@ Work-item integrations are code modules behind one interface — callers name an
 | `jira` | MCP | Jira MCP server connected |
 | `zoho` | MCP | Zoho MCP server connected |
 
-`local-markdown` story files may be named `<id>.md` or `<id>-<descriptive-slug>.md` (`US-42.md`, `US-42-add-multiply.md`) — the id is whatever the file's `# <id>: <title>` heading declares, and both spellings resolve for every operation. Two files claiming one id is refused, not guessed at: a status write-back would otherwise land in an arbitrary one of them.
+`local-markdown` story files may be named `<id>.md` or `<id>-<descriptive-slug>.md` (`US-42.md`, `US-42-add-multiply.md`), and both spellings resolve for every operation. A slug-named file claims its id in its `# <id>: <title>` heading — that heading is what makes `US-42` resolve `US-42-add-multiply.md`, so keep it when you edit the file. Sibling notes that declare no id of their own (`US-42-readiness.md` and the rest of `/story-workflow`'s output) sit in the same directory harmlessly. Two files *claiming the same id* is refused rather than guessed at, whichever is named which: a status write-back would otherwise land in an arbitrary one of them.
 
 CLI/file-transport providers execute inside the harness process. MCP-transport providers can't be script-called: the module declares a tool **mapping**, the model invokes the MCP tool, and pipes the raw result to `harness fetch --from-raw` for the same shared normalize + bootstrap path.
 
-Milestone status write-back is **best-effort** on script-callable transports: a provider that refuses the transition is recorded as a flagged `write-back-failed` event and the run continues, rather than failing a step whose work already landed. The MCP carve-out is not best-effort — there the refusal is the signal to invoke the mapped tool yourself and pass `reconcile --skip-transition`.
+Milestone status write-back is **best-effort** on script-callable transports: a provider that refuses the transition is recorded as a flagged `write-back-failed` event and the run continues, rather than failing a step whose work already landed. A later milestone that does land clears the flag (`write-back-succeeded`), so a tracker that was briefly down doesn't leave a permanent mark on a run that ended in sync. Two things are deliberately *not* best-effort: the MCP carve-out, where the refusal is the signal to invoke the mapped tool yourself and pass `reconcile --skip-transition`, and a provider that declares no transition support at all, which is a capability gap rather than a runtime refusal.
 
 ## Project Structure
 
@@ -373,7 +373,7 @@ ai-sdlc-harness/
 │   └── init-workspace/ · add-repo/ · migrate-workspace/ · workspace-config/ · workflow-status/ · repo-map-refresh/
 ├── bin/harness                  # wrapper script resolving the plugin venv (+ harness.cmd for Windows)
 ├── tools/                       # meta-tooling: line-budget checker, sandbox workspace generators
-└── tests/                       # 848 stdlib-unittest tests
+└── tests/                       # 866 stdlib-unittest tests
 ```
 
 Workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside *your* working directory by `/init-workspace` and the pipeline. They never live inside this plugin repo.
@@ -403,7 +403,7 @@ python -m venv .venv; .venv\Scripts\pip install pyyaml
 .venv\Scripts\python -m unittest discover -s tests
 ```
 
-The test suite (848 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (866 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 

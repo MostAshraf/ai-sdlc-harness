@@ -62,16 +62,26 @@ FLAGGED_EVENT_KINDS = (
     #     the service and re-runs. Permanent here would leave every such run
     #     reading DEGRADED forever (re-verify finding).
     "env-prereq-missing",
-    # field: US-CHAT-00 run. Class (a) again — a permanent occurrence. The
-    # milestone write-back is declared best-effort ("never a blocking
-    # requirement", write_back below), so a provider that refuses the
-    # transition must not abort the run; but swallowing it silently would
-    # leave the live tracker stale with nothing anywhere saying so. Surface
-    # it on the same gauge a human already reads, and never auto-fix — the
-    # house stance. Not HEALTH_DEGRADING: the run's own machinery is intact
-    # and no evidence was lost, only the external tracker is behind.
+    # field: US-CHAT-00 run. Class (c), RESOLVABLE — paired off by
+    # `write-back-succeeded`. The milestone write-back is declared best-effort
+    # ("never a blocking requirement", write_back below), so a provider that
+    # refuses the transition must not abort the run; but swallowing it
+    # silently would leave the live tracker stale with nothing anywhere
+    # saying so. Surface it on the same gauge a human already reads, and
+    # never auto-fix — the house stance.
+    #
+    # Class (c) rather than (a) for exactly the reason `env-prereq-missing`
+    # is: the trigger is an external dependency the human restores (tracker
+    # down, credential expired), and the harness then RETRIES by construction
+    # — up to three milestones per run (develop_start, in_review, done). A
+    # run whose `done` write-back succeeded has a correct tracker and nothing
+    # outstanding; leaving the earlier miss permanent made that run report a
+    # stale flag forever, the same false reading the re-verify finding
+    # rejected one class above (adversarial-review, both lenses
+    # independently). Not HEALTH_DEGRADING either: no evidence was lost and
+    # the run's own machinery is intact — only the external tracker is behind.
     "write-back-failed")
-# None of the six are HEALTH_DEGRADING (below): each means "a human should
+# None of the seven are HEALTH_DEGRADING (below): each means "a human should
 # look", not "this run's machinery degraded / evidence was lost". The closest
 # call is `remote-branch-unverified` — evidence genuinely not obtained — but
 # preflight continuing without it is the declared, safe behaviour (a
@@ -108,6 +118,7 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
     open_pending: list[dict] = []
     open_plan: list[dict] = []
     open_env: list[dict] = []
+    open_wb: list[dict] = []
     resolved: set[int] = set()
     for e in events:
         kind = e.get("kind")
@@ -123,6 +134,24 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
             # clean probe (the whole set is re-probed each time).
             resolved.update(id(x) for x in open_env)
             open_env.clear()
+        elif kind == "write-back-failed":
+            open_wb.append(e)
+        elif (kind == "write-back-succeeded"
+                and e.get("actor") in ("write-back", "reconcile")):
+            # Same resolver shape as env-prereq: a later milestone that DID
+            # land proves the tracker is no longer behind, so every earlier
+            # miss on this run is superseded. Each milestone pushes the one
+            # current status, so one success supersedes the whole batch
+            # rather than pairing 1:1.
+            #
+            # actor-checked, exactly like `plan-registered` below: this
+            # CLEARS an audit gauge, and `log-event` is unvalidated, so
+            # without the check a stray record cleared a genuine outstanding
+            # miss — `status.flagged_events` verified going 1 -> 0 on a
+            # hand-appended kind (re-verify finding). The real emitter always
+            # writes the actor.
+            resolved.update(id(x) for x in open_wb)
+            open_wb.clear()
         elif kind in ("risk-without-tests", "tests-without-production",
                       "contract-fragment-weak"):
             open_plan.append(e)
@@ -1373,19 +1402,73 @@ def _best_effort_transition(run: Path, config: dict, item_id: str, target: str,
     question — the trust-the-prose shape this codebase refuses everywhere.
     `write_back` short-circuits MCP earlier with its own guidance return, so
     only `reconcile_flow` reaches this branch."""
-    from .providers import ProviderError, dispatch, get_module
+    from .providers import (ProviderError, ProviderUnsupported, dispatch,
+                            get_module)
     # resolved OUTSIDE the try: an unknown provider name is a config error,
     # not "the provider said no", and must keep raising like it always has
     mcp = getattr(get_module(config), "TRANSPORT", "") == "mcp"
     try:
         dispatch(config, "work_item.transition", id=item_id, to=target)
+    except ProviderUnsupported:
+        # `ProviderUnsupported` subclasses ProviderError, so the bare catch
+        # below swallowed it too — turning a provider that DECLARES no
+        # transition support into a flagged event on every milestone of every
+        # run. Declared-unsupported is a statement about the PROVIDER, not a
+        # runtime "the tracker said no", and flagging it would report the same
+        # non-news on every run forever (adversarial-review, lens B).
+        #
+        # Honest limit (re-verify finding): no config-time check refuses this
+        # earlier — nothing outside providers/ reads `SUPPORTS`, and
+        # init-verify does not probe it. All seven shipped providers implement
+        # work_item.transition, so this is unreachable on stock config; a FORK
+        # provider that omits it would abort develop's first verb and
+        # reconcile post-merge. Raising is still right — silently flagging a
+        # permanent capability gap is worse — but it is a refusal at first
+        # use, not at configuration time.
+        raise
     except ProviderError as exc:
         if mcp:
             raise
-        ndjson.append_record(run / "events.ndjson",
-                             {"kind": "write-back-failed", "item": item_id,
-                              "to": target, "error": str(exc), "actor": actor})
+        try:
+            ndjson.append_record(
+                run / "events.ndjson",
+                {"kind": "write-back-failed", "item": item_id, "to": target,
+                 # `reason` is the key metrics' _detail() renders — named
+                 # `error` in the first cut, the flagged row came out blank,
+                 # so the surfacing this whole path exists for showed a human
+                 # only the kind (adversarial-review, both lenses)
+                 "reason": f"{target!r}: {exc}", "actor": actor})
+        except OSError:
+            # a full or read-only run dir must not convert a suppressed
+            # ProviderError into a DIFFERENT raised exception — the contract
+            # is "never raises", unqualified (adversarial-review, lens B)
+            pass
         return {"written": False, "to": target, "error": str(exc)}
+    # Emitted only when there is an OUTSTANDING miss to supersede: the
+    # resolver above needs a marker, but a success marker on every clean run
+    # would be three ledger lines per run recording that nothing happened.
+    # Gating on "a miss appears anywhere in the ledger" is not the same test —
+    # it stays true forever once one has been resolved, so three clean
+    # write-backs after one miss appended three markers, only the first
+    # superseding anything. `_has_open_env_miss` exists because this exact
+    # bug was found for env-prereq-satisfied; same lesson, same shape
+    # (re-verify finding).
+    #
+    # Wrapped like the failure branch above, and for the same reason: the
+    # contract is "never raises", unqualified, and this branch is reached
+    # post-merge from reconcile. Leaving the success-path ledger I/O bare
+    # meant a full or read-only run dir raised out of a call that had already
+    # succeeded (re-verify finding).
+    try:
+        if any(e.get("kind") == "write-back-failed"
+               for e in outstanding_flagged(
+                   ndjson.read_records(run / "events.ndjson"))):
+            ndjson.append_record(run / "events.ndjson",
+                                 {"kind": "write-back-succeeded",
+                                  "item": item_id, "to": target,
+                                  "actor": actor})
+    except OSError:
+        pass
     return {"written": True, "to": target}
 
 
@@ -1460,18 +1543,28 @@ def reconcile_flow(workspace: Path, run: Path, config: dict, fsm: dict,
             # declared and recorded by nothing)
             set_artifact(st, manifest, "reconciled", True)
         state_mod.save(run, workspace, st)
+    written: dict | None = None
     if not skip_transition:
         target = resolve_write_back_status(config, "done", st["work_item"].get("type"))
         if target is not None:
             # best-effort, same contract as write_back's — reconcile runs
             # POST-merge, so raising here would fail a run whose work is
             # already landed and leave its worktrees swept but its ledger
-            # unreconciled (field: US-CHAT-00 run)
-            _best_effort_transition(run, config, st["work_item"]["id"], target,
-                                    "reconcile")
+            # unreconciled (field: US-CHAT-00 run). The result is REPORTED,
+            # not dropped: `harness reconcile` returning a bare
+            # {"reconciled": true} made a refused transition indistinguishable
+            # from a clean sync at the one decision point where the
+            # orchestrator reads it, leaving the staleness discoverable only
+            # by separately running `status` (adversarial-review, both lenses)
+            written = _best_effort_transition(run, config,
+                                              st["work_item"]["id"], target,
+                                              "reconcile")
     ndjson.append_record(run / "events.ndjson",
                          {"kind": "reconciled", "actor": "reconcile"})
-    return {"reconciled": True}
+    # only present when a transition was actually attempted — an unchanged
+    # shape for the flag-off and --skip-transition paths
+    return ({"reconciled": True} if written is None
+            else {"reconciled": True, "write_back": written})
 
 
 def abort_run(workspace: Path, run: Path, reason: str) -> dict:
