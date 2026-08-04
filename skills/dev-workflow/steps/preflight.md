@@ -20,7 +20,18 @@ precondition `discover` also uses at `/init-workspace` time, standalone as
 [--branch <name>]` for any future step that needs it) — a dirty repo, or
 one mid-rebase/merge, refuses
 (surface to the human, never auto-stash/discard/continue); a clean repo on
-a different branch is switched, no confirmation needed. Pass `--branch
+a different branch is switched, no confirmation needed.
+
+**On, not at.** That check fetches and reports `behind` — how far the base
+trails its remote — but deliberately does NOT pull: the branch is still cut
+from the LOCAL tip, because pulling could conflict or absorb upstream code
+the human never asked for. A non-zero count logs a flagged
+`base-branch-behind` event, and it matters more than it looks: every suite
+this run executes (the red-proof, develop, the reviewer's re-run) runs
+against that base, so a stale one means green tests that say nothing about
+what the change will merge into. **Surface the count to the user** and let
+them decide to update the base first; `behind: null` just means the question
+was unanswerable (no remote, offline, auth) and is not a signal. Pass `--branch
 <name>` to override the auto-resolved guess. Idempotent on retry, per
 repo: a `branches` entry already recorded for *this* repo is returned
 directly rather than re-derived — a second repo's preflight is never

@@ -54,6 +54,12 @@ FLAGGED_EVENT_KINDS = (
     #     O(tasks) repeated assertion (adversarial-review, both lenses).
     "remote-branch-exists", "remote-branch-unverified",
     "work-item-already-done", "tests-quarantined",
+    # `base-branch-behind` joins them, earning it the same way: once per run
+    # per repo, not once per preflight retry. It records a fact true at cut
+    # time and never becomes false afterwards — rebasing later doesn't undo
+    # that the suite ran against a stale base — so it is an occurrence with
+    # no resolver, not a condition to be paired off.
+    "base-branch-behind",
     # …and the stall guard's own escape hatch, on the same footing as
     # `test-revision` / `coverage-skipped` / `pr-recorded-manually`: a
     # deliberate human-or-orchestrator override of a mechanical refusal is
@@ -2440,6 +2446,37 @@ def preflight(workspace: Path, run: Path, config: dict, manifest: dict,
                                _render_feature_branch(config, pre,
                                                       feature_branch_suffix))
     resolved = gitops.ensure_default_branch(repo, base_branch)
+    # Being ON the default branch is not being AT it (field question,
+    # 2026-08-04). Nothing in the pipeline ever fetched, so a local base last
+    # updated weeks ago passed every check and the feature branch was cut from
+    # it — the red-proof, develop's suite and the reviewer's re-run then all
+    # ran against code that is not what the change merges into, and the
+    # divergence surfaced as conflicts at PR time instead of here.
+    #
+    # Reported, never auto-fixed: pulling could conflict or absorb upstream
+    # code the human never asked for, which is precisely what the dirty-tree
+    # and in-progress refusals above exist to prevent. `behind is None` is the
+    # unanswerable case (no remote, offline, auth) — structural or transient,
+    # and already covered by the branch probe's own flag, so it stays silent
+    # here rather than double-reporting one connectivity blip.
+    # Once per run per repo, like tests-quarantined / remote-branch-unverified:
+    # this is a class-(a) PERMANENT kind with no resolver, and preflight is
+    # retried (the human re-runs it after each refusal), so every copy would
+    # sit on the gauge forever restating one fact.
+    if resolved.get("behind") and not any(
+            e.get("kind") == "base-branch-behind" and e.get("repo") == name
+            for e in ndjson.read_records(run / "events.ndjson")):
+        ndjson.append_record(run / "events.ndjson",
+                             {"kind": "base-branch-behind", "repo": name,
+                              "branch": resolved["branch"],
+                              "behind": resolved["behind"],
+                              "reason": f"{resolved['branch']} is "
+                                        f"{resolved['behind']} commit(s) "
+                                        "behind its remote — this branch is "
+                                        "cut from the local tip, so tests run "
+                                        "against code the change will not "
+                                        "merge into",
+                              "actor": "preflight"})
     # pin `.harness-key` out of `git add -A`'s reach in this repo and every
     # task worktree it will spawn (shared via the common git dir)
     gitops.ensure_repo_excludes(repo)

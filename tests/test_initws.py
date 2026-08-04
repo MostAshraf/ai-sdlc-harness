@@ -197,7 +197,7 @@ class Discovery(M7Harness):
         self.assertEqual(out["default_branch"], "main")
         self.assertEqual(out["branch_check"],
                          {"switched": True, "branch": "main",
-                          "from_branch": "experiment"})
+                          "from_branch": "experiment", "behind": None})
         self.assertEqual(
             gitops.run_git(self.repo, "rev-parse", "--abbrev-ref", "HEAD"), "main")
 

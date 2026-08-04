@@ -988,6 +988,72 @@ class FetchAlreadyDone(BreadthHarness):
                              Path(out["run"]) / "events.ndjson")])
 
 
+class StaleBaseBranch(BreadthHarness):
+    """Field question, 2026-08-04: "is main pulled to latest before preflight,
+    in all modes?" It was not — nothing in the package fetched, so a local
+    base last updated weeks ago passed every ensure_default_branch check and
+    the feature branch was cut from it. The red-proof, develop's suite and the
+    reviewer's re-run then all ran against code the change would not merge
+    into, and the divergence surfaced as conflicts at PR time.
+    """
+
+    def test_preflight_flags_a_base_behind_its_remote(self):
+        origin = make_repo(self.workspace, "origin-repo")
+        gitops.run_git(self.workspace, "clone", str(origin), "cloned")
+        clone = self.workspace / "cloned"
+        gitops.run_git(clone, "config", "user.email", "t@t")
+        gitops.run_git(clone, "config", "user.name", "t")
+        (origin / "moved-on.txt").write_text("upstream\n")   # base advances
+        gitops.run_git(origin, "add", "-A")
+        gitops.run_git(origin, "commit", "-m", "upstream work")
+
+        self.story("S-1", "fix typo", body="Mode: quick\njust a typo",
+                   type_="Task")
+        self.cli("init", "--stories-dir", str(self.stories),
+                 "--repo", f"cloned={clone}", "--test-cmd", "cloned=true")
+        run = Path(self.cli("fetch", "--id", "S-1", "--date", "2026-05-01")["run"])
+        self.cli("cursor", "--to", "preflight", run=run)
+        self.cli("preflight", "--repo", str(clone), run=run)
+
+        flagged = [e for e in ndjson.read_records(run / "events.ndjson")
+                   if e["kind"] == "base-branch-behind"]
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0]["behind"], 1)
+        self.assertEqual(flagged[0]["repo"], "cloned")
+        self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 1)
+        # reported, NEVER auto-fixed: local base untouched, tree still clean
+        self.assertEqual(gitops.changed_files(clone), [])
+        self.assertEqual(
+            gitops.run_git(clone, "rev-list", "--count", "main"), "1")
+
+    def test_a_current_base_flags_nothing(self):
+        origin = make_repo(self.workspace, "origin-repo2")
+        gitops.run_git(self.workspace, "clone", str(origin), "cloned2")
+        clone = self.workspace / "cloned2"
+        gitops.run_git(clone, "config", "user.email", "t@t")
+        gitops.run_git(clone, "config", "user.name", "t")
+        self.story("S-2", "fix typo", body="Mode: quick\njust a typo",
+                   type_="Task")
+        self.cli("init", "--stories-dir", str(self.stories),
+                 "--repo", f"cloned2={clone}", "--test-cmd", "cloned2=true")
+        run = Path(self.cli("fetch", "--id", "S-2", "--date", "2026-05-02")["run"])
+        self.cli("cursor", "--to", "preflight", run=run)
+        self.cli("preflight", "--repo", str(clone), run=run)
+        self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 0)
+
+    def test_no_remote_is_structural_not_a_signal(self):
+        # the default fixture has no remote at all — `behind` is unanswerable,
+        # and an unanswerable probe must not park a permanent flag on every
+        # preflight in every local-only workspace
+        self.story("S-3", "fix typo", body="Mode: quick\njust a typo",
+                   type_="Task")
+        self.init()
+        run = Path(self.cli("fetch", "--id", "S-3", "--date", "2026-05-03")["run"])
+        self.cli("cursor", "--to", "preflight", run=run)
+        self.cli("preflight", "--repo", str(self.repo), run=run)
+        self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 0)
+
+
 class GateRePresentGuard(BreadthHarness):
     """A re-present must not silently throw away a reply the human gave.
 

@@ -1441,14 +1441,17 @@ class DefaultBranch(GitopsHarness):
     def test_switches_from_other_branch_when_clean(self):
         gitops.run_git(self.repo, "checkout", "-b", "feature")
         result = gitops.ensure_default_branch(self.repo)
+        # `behind` is None here: this fixture has no remote, so the staleness
+        # question is unanswerable rather than answered "current"
         self.assertEqual(result, {"switched": True, "branch": "main",
-                                  "from_branch": "feature"})
+                                  "from_branch": "feature", "behind": None})
         self.assertEqual(
             gitops.run_git(self.repo, "rev-parse", "--abbrev-ref", "HEAD"), "main")
 
     def test_noop_when_already_on_default(self):
         result = gitops.ensure_default_branch(self.repo)
-        self.assertEqual(result, {"switched": False, "branch": "main"})
+        self.assertEqual(result, {"switched": False, "branch": "main",
+                                  "behind": None})
 
     def test_refuses_on_uncommitted_changes_without_switching(self):
         gitops.run_git(self.repo, "checkout", "-b", "feature")
@@ -1473,7 +1476,7 @@ class DefaultBranch(GitopsHarness):
         gitops.run_git(self.repo, "checkout", "-b", "other")
         result = gitops.ensure_default_branch(self.repo, branch="release")
         self.assertEqual(result, {"switched": True, "branch": "release",
-                                  "from_branch": "other"})
+                                  "from_branch": "other", "behind": None})
 
     def test_slashed_default_branch_parsed_whole(self):
         """Adversarial-review finding: `rsplit('/')` mangled a default
@@ -1490,6 +1493,37 @@ class DefaultBranch(GitopsHarness):
         self.assertEqual(gitops.default_branch(clone), "release/2026")
         result = gitops.ensure_default_branch(clone)
         self.assertEqual(result["branch"], "release/2026")
+
+    def _clone_with_upstream(self, name="clone"):
+        remote = make_repo(self.workspace, f"origin-{name}")
+        clone = self.workspace / name
+        gitops.run_git(self.workspace, "clone", str(remote), name)
+        gitops.run_git(clone, "config", "user.email", "t@t")
+        gitops.run_git(clone, "config", "user.name", "t")
+        return remote, clone
+
+    def test_reports_how_far_the_base_trails_its_remote(self):
+        """Field question, 2026-08-04: "is main pulled to latest before
+        preflight?" It was not, in any mode — and being ON the default branch
+        passed every check while being weeks behind it. The count is measured
+        (fetch, read-only) and reported; the branch is NOT moved."""
+        remote, clone = self._clone_with_upstream()
+        self.assertEqual(gitops.ensure_default_branch(clone)["behind"], 0)
+        before = gitops.run_git(clone, "rev-parse", "HEAD")
+        for n in range(2):              # upstream moves on
+            (remote / f"up{n}.txt").write_text("x\n")
+            gitops.run_git(remote, "add", "-A")
+            gitops.run_git(remote, "commit", "-m", f"upstream {n}")
+        result = gitops.ensure_default_branch(clone)
+        self.assertEqual(result["behind"], 2)
+        # measured, never auto-fixed: the local branch has NOT been moved
+        self.assertEqual(gitops.run_git(clone, "rev-parse", "HEAD"), before)
+        self.assertEqual(gitops.changed_files(clone), [])
+
+    def test_behind_is_none_when_unanswerable(self):
+        # no remote at all — structural, not a signal; must not raise
+        self.assertIsNone(gitops.base_branch_behind(self.repo, "main"))
+        self.assertIsNone(gitops.ensure_default_branch(self.repo)["behind"])
 
     def test_refuses_when_target_branch_does_not_exist(self):
         """A guessed/passed branch that isn't real must fail closed with a
