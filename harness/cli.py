@@ -251,6 +251,16 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
                     help="JSON array of registered repo PATHS (config repos "
                          "values) the human confirmed for this run")
 
+    cr_ = sub.add_parser("confirm-repo", parents=[common],
+                         help="ratify which registered repo a quick run targets")
+    cr_.add_argument("--repo", required=True,
+                     help="the registered repo PATH (config repos value) the "
+                          "human confirmed for this run")
+    cr_.add_argument("--basis", default=None,
+                     help="one line of evidence for the choice (repo-map "
+                          "index, files the item names) — recorded in state "
+                          "and the ledger")
+
     pr_ = sub.add_parser("plan-register", parents=[common], help="replace seeded tasks with the plan's")
     pr_.add_argument("--tasks-json", default=None,
                      help="inline JSON array of tasks (or use --tasks-json-file)")
@@ -378,6 +388,11 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
     mode = g.add_mutually_exclusive_group(required=True)
     mode.add_argument("--present", action="store_true")
     mode.add_argument("--decide", action="store_true")
+    g.add_argument("--re-present", action="store_true",
+                   help="with --present: re-stamp the window even though "
+                        "un-decided replies are waiting, discarding them. For "
+                        "a reply that genuinely cannot decide (a qualified "
+                        "\"APPROVED but…\") after resolving it with the user")
     g.add_argument("--options", default=None,
                    help="ONLY for a `select` gate, at --present time: the "
                         "runtime candidate list (e.g. comment ids). Binary "
@@ -769,6 +784,12 @@ def main(argv: list[str] | None = None) -> int:
             _emit({"ok": True, **result})
             return 0
 
+        if args.cmd == "confirm-repo":
+            result = workflow.confirm_repo(args.workspace, args.run, manifest,
+                                           config, args.repo, args.basis)
+            _emit({"ok": True, **result})
+            return 0
+
         if args.cmd == "plan-register":
             tasks = _json_source("--tasks-json", args.tasks_json,
                                  args.tasks_json_file, None)
@@ -1019,8 +1040,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.cmd == "sync-branch":
-            gitops.sync_branch(args.repo, args.onto)
-            _emit({"ok": True, "synced_onto": args.onto})
+            synced = gitops.sync_branch(args.repo, args.onto)
+            # `remote_verified: false` means the rebase used the LOCAL ref
+            # because the remote could not be reached — the branch may still
+            # be behind upstream. Reported, not silently equated with a real
+            # sync (that equation was the original defect).
+            _emit({"ok": True, "synced_onto": args.onto, **synced})
             return 0
 
         if args.cmd == "push":
@@ -1261,8 +1286,21 @@ def main(argv: list[str] | None = None) -> int:
                     # an evaluation, not an omission — the ledger must be able
                     # to prove it happened (e2e E2E-1: approve-security's
                     # silent self-skip was indistinguishable from a hole)
+                    #
+                    # A skipped NON-gate step is a different fact and gets its
+                    # own unflagged kind (adversarial-review B/5): `gate-skipped`
+                    # is in FLAGGED_EVENT_KINDS because a gate that didn't ask a
+                    # human is worth a human's attention, but confirm-repo — the
+                    # first conditional non-gate step — skips on EVERY
+                    # single-repo quick run by design, which would park a
+                    # permanent flagged row on the zero-ceremony path the
+                    # predicate exists to keep clear. Still ledgered either way:
+                    # the skip and its false predicate stay provable.
+                    kind = ("gate-skipped"
+                            if (manifest["steps"].get(s["step"]) or {}).get("gate")
+                            else "step-skipped")
                     ndjson.append_record(args.run / "events.ndjson",
-                                         {"kind": "gate-skipped", **s})
+                                         {"kind": kind, **s})
             elif args.cmd == "task":
                 transitions.transition_task(st, fsm, config, args.run, key,
                                             args.id, args.to, args.context,
@@ -1298,6 +1336,40 @@ def main(argv: list[str] | None = None) -> int:
                                 "only for select gates")
                         options = list(gate_def.get("dispositions")
                                        or ["approved", "rejected"])
+                    # Re-presenting re-stamps `presented_at`, which INVALIDATES
+                    # any reply the human already gave: decide qualifies only
+                    # records strictly after the stamp. Field, 2026-08-04
+                    # (BUG-2's approve-pre-pr): the human's APPROVED was
+                    # captured at 13:04:30, a re-present at ~13:06 aged it out,
+                    # decide refused "no human input after presentation", and
+                    # they were asked to type it a second time. The step file's
+                    # own retry advice ("`--present` again … and repeat") walks
+                    # straight into this, so it was a remedy that could not
+                    # terminate — the class the 3.3.0 whole-branch pass called
+                    # out. Refuse instead of silently discarding the evidence;
+                    # `--re-present` is the deliberate escape (a qualified
+                    # "APPROVED but…" that can't decide genuinely does need a
+                    # fresh window).
+                    prev = st["gates"].get(args.id) or {}
+                    if (prev.get("presented_at") and prev.get("decision") is None
+                            and not args.re_present):
+                        try:
+                            waiting = [
+                                r for r in ndjson.read_records(
+                                    args.run / "human-input.ndjson")
+                                if r.get("at", "") > prev["presented_at"]]
+                        except (OSError, ndjson.LedgerCorruption):
+                            waiting = []   # unreadable → let the present through
+                        if waiting:
+                            raise gates.GateRefusal(
+                                f"gate '{args.id}' is already presented and has "
+                                f"{len(waiting)} un-decided repl(y/ies) waiting "
+                                "— re-presenting would re-stamp the window and "
+                                "throw them away, making the human type it "
+                                "again. Run `--decide` instead. If the reply "
+                                "genuinely cannot decide (a qualified "
+                                "\"APPROVED but…\"), resolve it with the user "
+                                "and re-present with --re-present")
                     gates.present(st, args.id, now, options)
                 else:
                     if args.options is not None:
@@ -1382,6 +1454,16 @@ def main(argv: list[str] | None = None) -> int:
                         "the 'scope' artifact is written only by `harness "
                         "scope-register` — the generic artifact verb would "
                         "bypass its validation")
+                if args.name == "repo-ambiguity":
+                    # Written by fetch from the actual repos.yaml, and read by
+                    # confirm-repo's `when` predicate. A generic write here
+                    # would let `--value single` skip the confirming step in a
+                    # multi-repo workspace — i.e. re-open the very hole
+                    # confirm-repo exists to close.
+                    raise state_mod.StateError(
+                        "the 'repo-ambiguity' artifact is written only by "
+                        "`harness fetch`, from the workspace's registered "
+                        "repos — it is not orchestrator-settable")
                 engine_owned = {vb["outcome_artifact"]
                                 for s in manifest["steps"].values()
                                 for vb in [s.get("verdict_bound") or {}]

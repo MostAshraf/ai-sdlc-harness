@@ -580,6 +580,25 @@ class BashGuard(GuardHarness):
             "bash", bash("${CLAUDE_PLUGIN_ROOT}/bin/harness scope-register "
                          "--repos-json '[\"/p\"]' --run ai/r"))
 
+    def test_subagents_cannot_confirm_the_target_repo(self):
+        """confirm-repo is the same class of fact as scope-register: it
+        records that a HUMAN was asked which repo a quick run targets, and it
+        is the sole writer of the `repo_confirmed` marker the cursor is gated
+        on. A subagent minting it answers the question on the user's behalf
+        AND unblocks the run — and `always_legal_spawns` keeps a Bash-capable
+        request-triage reviewer spawnable at any cursor, so the path is
+        reachable, not theoretical."""
+        for shape in ("ai-sdlc-harness:planner:ai-sdlc-planner",
+                      "ai-sdlc-reviewer", "ai-sdlc-developer"):
+            self.assert_blocks(
+                "bash",
+                bash("${CLAUDE_PLUGIN_ROOT}/bin/harness confirm-repo "
+                     "--repo /p --run ai/r", shape),
+                "orchestrator-only")
+        self.assert_allows(
+            "bash", bash("${CLAUDE_PLUGIN_ROOT}/bin/harness confirm-repo "
+                         "--repo /p --run ai/r"))
+
     def test_subagents_cannot_save_reports(self):
         """save-report joined the orchestrator-only set (pre-release review,
         both lenses): a run's reports/ are GATE-PRESENTED evidence — an

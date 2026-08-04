@@ -20,6 +20,10 @@ request; deterministic code decides (design.md RC3).
    is never captured, and the decide call will refuse with "no human
    input after presentation" (dogfood-run finding — do not burn attempts
    rediscovering this). Do not interpret the reply yourself.
+   **Steps 1 and 4 are separate tool calls in separate turns.** Chaining
+   `--present` and `--decide` into one Bash invocation ALWAYS refuses: a
+   prompt cannot arrive between two commands of the same call, and decide
+   qualifies only replies captured strictly after the presentation.
 4. `${CLAUDE_PLUGIN_ROOT}/bin/harness gate --id <gate> --decide --run <run>`
    — never pass `--options` here: what a numbered reply means is DECLARED
    data (the manifest's `dispositions`, e.g. the security gate's
@@ -34,8 +38,15 @@ request; deterministic code decides (design.md RC3).
      approval like "APPROVED but…" (or "waive if…") never decides.
    - refused (no qualifying reply / qualified FORWARD reply)
      → the reply routes to **ad-hoc handling**: triage it
-     (`request-triage`), resolve with the user, then `--present` again
-     (re-presenting re-stamps the window) and repeat.
+     (`request-triage`), resolve with the user, then `--present
+     --re-present` and repeat.
+     **Re-presenting re-stamps the window, which ages out any reply
+     already captured** — so it is right only when the reply genuinely
+     cannot decide. When the refusal says a captured reply merely
+     PREDATES the presentation, do NOT present again: ask for one more
+     reply and `--decide` alone. `--present` refuses without
+     `--re-present` while un-decided replies are waiting, precisely so a
+     retry cannot silently make the human type their answer twice.
 6. Security gate only: a `defer` decision → the decide result carries a
    `follow_up` field and logs a flagged `deferral-pending` event that
    stays on the dashboard until you pair it — act on it now: create

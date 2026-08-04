@@ -2,6 +2,7 @@
 round-bound escalation, red-proof guard, stall procedure, escalation edge."""
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -20,13 +21,20 @@ T0 = "2026-01-01T00:00:00+00:00"
 
 
 def _bootstrap(workspace: Path, mode: str, tasks=None,
-               intents=("test_val",)) -> tuple[Path, dict]:
+               intents=("test_val",), repo_ambiguity="single") -> tuple[Path, dict]:
     run = workspace / "ai" / "2026-01-01-TEST-1"
+    # `repo-ambiguity` is a fetch-produced artifact that quick's `confirm-repo`
+    # predicate reads, and eval_predicate RAISES on a missing artifact rather
+    # than reading it as false — so these raw-bootstrap fixtures (which bypass
+    # the fetch verb) have to seed it exactly as fetch would. Default
+    # "single": these are one-repo fixtures, which is the case where
+    # confirm-repo is skipped and the walk stays fetch -> preflight.
     st = state_mod.bootstrap(
         run, workspace,
         work_item={"id": "TEST-1", "title": "t", "provider_ref": ""},
         mode=mode, change_type="fix",
-        tasks=tasks or [{"id": "T1"}], entry_step="fetch")
+        tasks=tasks or [{"id": "T1"}], entry_step="fetch",
+        artifacts={"repo-ambiguity": repo_ambiguity})
     # a full-mode TDD task carries plan-declared intents; `intents=()`
     # models the docs/chore opt-out (`test_intents: []`), which exempts
     # the red-proof completion guard
@@ -522,6 +530,26 @@ class VerdictBoundExits(Harness):
             t.pop("provisional", None)
         self.assertIn("plan-review", transitions.cursor_candidates(
             self.st, self.manifest, self.config, run=self.run))
+
+    def test_returns_to_reentry_rearms_the_repo_confirmation(self):
+        # The repo marker's half of the same rule (adversarial-review B/8:
+        # the re-arm shipped with no test at all). cursor_candidates hardens
+        # `requires_repo_confirmed` against EVERY exit including future loop
+        # edges — but a marker that never cleared would satisfy a re-entered
+        # confirming step on the PREVIOUS round's confirmation and release it
+        # immediately. No mode has such an edge today, so this is driven
+        # against a synthetic one, exactly as the hardening is written for.
+        manifest = copy.deepcopy(self.manifest)
+        manifest["steps"]["plan"]["requires_repo_confirmed"] = True
+        self.st["repo_confirmed"] = {"repo": "/p", "at": T0}
+        for t in self.st["tasks"]:      # isolate from the sibling re-arm
+            t.pop("provisional", None)
+        support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
+        transitions.advance_cursor(self.st, manifest, self.config,
+                                   "plan", T0, run=self.run)
+        self.assertNotIn("repo_confirmed", self.st)
+        self.assertEqual(transitions.cursor_candidates(
+            self.st, manifest, self.config, run=self.run), {})
 
     def test_gate_decision_is_consumed_by_the_edge_it_legalizes(self):
         # A stale rejection must not re-open its on_reject edge on a later
@@ -1053,7 +1081,8 @@ class TaskFsm(Harness):
             run2, self.workspace,
             work_item={"id": "TEST-2", "title": "t", "provider_ref": ""},
             mode="quick", change_type="fix",
-            tasks=[{"id": "T1"}], entry_step="fetch")
+            tasks=[{"id": "T1"}], entry_step="fetch",
+            artifacts={"repo-ambiguity": "single"})
         st2["tasks"][0]["test_intents"] = ["test_val"]
         state_mod.save(run2, self.workspace, st2)
         self.advance_to(st2, run2, "develop")

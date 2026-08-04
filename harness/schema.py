@@ -144,6 +144,10 @@ def validate_manifest(manifest: dict, surfaces: dict, config: dict, issues: Issu
         if step.get("requires_tasks_registered") and step.get("gate"):
             issues.err(f"{where}: `requires_tasks_registered` is not meaningful "
                        "on a gate step (registration happens before the gate)")
+        if step.get("requires_repo_confirmed") and step.get("gate"):
+            issues.err(f"{where}: `requires_repo_confirmed` is not meaningful "
+                       "on a gate step (the repo is ratified before the gate, "
+                       "and a gate's exits derive from the human decision)")
         vb = step.get("verdict_bound")
         if vb is not None:
             # Half-enforced vocabulary is the failure mode here: a shape the

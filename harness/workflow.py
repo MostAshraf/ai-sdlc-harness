@@ -54,6 +54,12 @@ FLAGGED_EVENT_KINDS = (
     #     O(tasks) repeated assertion (adversarial-review, both lenses).
     "remote-branch-exists", "remote-branch-unverified",
     "work-item-already-done", "tests-quarantined",
+    # `base-branch-behind` joins them, earning it the same way: once per run
+    # per repo, not once per preflight retry. It records a fact true at cut
+    # time and never becomes false afterwards — rebasing later doesn't undo
+    # that the suite ran against a stale base — so it is an occurrence with
+    # no resolver, not a condition to be paired off.
+    "base-branch-behind",
     # …and the stall guard's own escape hatch, on the same footing as
     # `test-revision` / `coverage-skipped` / `pr-recorded-manually`: a
     # deliberate human-or-orchestrator override of a mechanical refusal is
@@ -458,7 +464,16 @@ def _bootstrap_from_item(workspace: Path, config: dict, manifest: dict,
     # default, no content analysis). It is flagged `provisional` so anyone
     # inspecting state.yaml / `show` sees it isn't a ratified plan — the real
     # task list is set at plan-register, which replaces this wholesale.
+    #
+    # Quick mode has no plan-register, so the flag alone was never enough:
+    # nothing replaced the seed and it silently became the operative repo
+    # (field, 2026-08-04 — a frontend bug seeded against a backend repo, a
+    # branch cut there, develop reached). `repo-ambiguity` is what lets the
+    # manifest route quick through `confirm-repo` when — and only when —
+    # repos.yaml actually offers a choice; a single-repo workspace has
+    # nothing to ratify and skips it.
     seed_repo = repos[0]
+    repo_ambiguity = "single" if len(repos) == 1 else "multi"
     # Written BEFORE bootstrap (adversarial-review round 1 finding): a crash
     # between a successful bootstrap and this write used to leave a run with
     # sealed state.yaml but no work-item.json — and no way to retry, since
@@ -490,16 +505,20 @@ def _bootstrap_from_item(workspace: Path, config: dict, manifest: dict,
                    "type": item.get("type")},
         mode=mode, change_type=change_type,
         tasks=[{"id": "T1", "repo": seed_repo, "provisional": True}],
-        entry_step=manifest["entry"], manifest=manifest)
+        entry_step=manifest["entry"], manifest=manifest,
+        artifacts={"repo-ambiguity": repo_ambiguity})
     ndjson.append_record(run / "events.ndjson",
                          {"kind": "fetched", "item": item["id"], "mode": mode,
                           "mode_verdict": mode_verdict,
                           "classify_reason": reason,
                           "change_type": change_type,
+                          "repo_ambiguity": repo_ambiguity,
                           "seed_task": {
                               "id": "T1", "repo": seed_repo,
                               "basis": "positional-default (repos[0]); "
-                                       "provisional until plan-register"},
+                                       "provisional until ratified "
+                                       "(plan-register, or confirm-repo in "
+                                       "quick)"},
                           "actor": "fetch"})
     result = {"run": str(run), "mode": mode, "change_type": change_type,
               "classify_reason": reason}
@@ -712,6 +731,20 @@ def scope_register(workspace: Path, run: Path, manifest: dict, config: dict,
                 f"the new scope: {', '.join(stranded)} — re-run plan-register "
                 "with a task list inside the new set first, or include those "
                 "repos")
+        # The stranded check above skips provisional tasks and tolerates a
+        # SUPERSET, so neither notices a scope that contradicts an already-
+        # ratified repo (adversarial-review A/F3, reproduced: after
+        # confirm-repo --repo B, `scope-register '["A","B"]'` left
+        # state.scope = [A, B] against repo_confirmed = B, cursor already
+        # released and nothing reconciling the two — a false audit record of
+        # what the human actually confirmed).
+        confirmed = (st.get("repo_confirmed") or {}).get("repo")
+        if confirmed is not None and scoped != [confirmed]:
+            raise state_mod.StateError(
+                f"scope-register: this run's repo was already confirmed as "
+                f"{confirmed} — a scope of {', '.join(scoped)} would "
+                "contradict it. Re-run `harness confirm-repo` to change the "
+                "ratified repo; scope-register cannot overrule it")
         set_artifact(st, manifest, "scope", scoped)
         st["scope"] = {"repos": scoped, "at": ndjson.now_iso()}
         state_mod.save(run, workspace, st)
@@ -719,6 +752,105 @@ def scope_register(workspace: Path, run: Path, manifest: dict, config: dict,
                          {"kind": "scope-registered", "repos": scoped,
                           "actor": "scope-register"})
     return {"scope": scoped}
+
+
+def confirm_repo(workspace: Path, run: Path, manifest: dict, config: dict,
+                 repo: str, basis: str | None = None) -> dict:
+    """Ratify which repo a quick run actually targets — the human-confirmed
+    replacement for fetch's positional-default seed, and quick mode's
+    counterpart to full/lean's intake→scope-register→plan-register chain.
+
+    Records THREE things in one atomic act, because splitting them is what
+    made the field failure possible: the scope artifact, the retargeted task
+    repo, and `state.repo_confirmed` — the marker `requires_repo_confirmed`
+    gates the cursor on.
+
+    The marker exists because the two facts already in state are both
+    reachable WITHOUT anyone having chosen a repo, so neither can carry the
+    guard:
+
+      - `provisional`: transition_task never reads the cursor, and
+        `pending -> in-progress` is guarded only by dependencies-done. A
+        single `task --to in-progress` at this step pops the flag (see the
+        in-progress branch of transition_task) and would dissolve a
+        provisional-keyed guard — reintroducing the exact failure this step
+        closes.
+      - `scope`: scope-register is legal here (this step declares
+        `produces: scope`) but deliberately never touches `tasks[*].repo`,
+        and its stranded-task check SKIPS provisional tasks — so a
+        scope-keyed guard is satisfiable with T1 still pointing at
+        `repos[0]`.
+
+    Only this verb writes `repo_confirmed`, and the guards keep it
+    orchestrator-only, so the marker means what it says: a human was asked.
+
+    For the same reason, the retarget below is UNCONDITIONAL rather than
+    keyed on `provisional`: a guarantee must not depend on a flag some other
+    verb is free to clear. That also makes the verb re-runnable, which the
+    step's confirm-a-default presentation requires — "no, the other repo"
+    has to actually move the task, not just the marker."""
+    from .transitions import ensure_live
+    registered = set((config.get("repos") or {}).values())
+    if repo not in registered:
+        raise state_mod.StateError(
+            f"confirm-repo: '{repo}' is not registered in this workspace's "
+            "repos — --repo takes the exact registered repo PATH string "
+            "(config repos VALUES, e.g. /abs/path/to/frontend), never the "
+            "short NAME")
+    with state_mod.locked(run):
+        st = state_mod.load(run, workspace)
+        ensure_live(st, "confirm-repo")
+        cursor = st["cursor"]["current_step"]
+        # Derived from the manifest, never a hardcoded step name — same rule
+        # (and same reason) as scope-register's producer derivation above.
+        owners = sorted(sid for sid, s in (manifest.get("steps") or {}).items()
+                        if s.get("requires_repo_confirmed"))
+        if cursor not in owners:
+            raise state_mod.StateError(
+                "confirm-repo is legal only at a step the manifest declares "
+                f"`requires_repo_confirmed` ({', '.join(owners)}) — cursor: "
+                f"{cursor}")
+        # This verb ratifies a SINGLE-task seed onto ONE repo; the retarget
+        # below is unconditional, so on a multi-task list it would silently
+        # flatten every task onto `repo` (adversarial-review B/7). Not
+        # reachable today — quick seeds exactly one task and is the only mode
+        # declaring the flag — but the legality above is manifest-derived, so
+        # a future mode declaring `requires_repo_confirmed` after a multi-lane
+        # plan-register would hit it. Refuse rather than flatten.
+        if len(st.get("tasks", [])) > 1:
+            raise state_mod.StateError(
+                f"confirm-repo: this run has {len(st['tasks'])} tasks — the "
+                "verb ratifies a single seeded task onto one repo and would "
+                "otherwise retarget them all. A multi-task decomposition "
+                "belongs to plan-register, inside a scope-register'd set")
+        # Retarget UNCONDITIONALLY — never keyed on `provisional`
+        # (adversarial-review A/F1+F2, reproduced): that flag is not this
+        # verb's to depend on. `task --to in-progress` is legal at any cursor
+        # and pops it, and a `provisional`-keyed retarget then finds nothing
+        # to move while still writing the marker and releasing the cursor —
+        # develop runs in repos[0] anyway, the 2026-08-04 incident reached
+        # THROUGH the step built to stop it. The same conditional also made a
+        # correction ("no, the other repo") a silent no-op: marker and scope
+        # moved, the task didn't.
+        retargeted = [{"task": t["id"], "from": t.get("repo", "."), "to": repo}
+                      for t in st.get("tasks", [])
+                      if t.get("repo", ".") != repo]
+        for t in st.get("tasks", []):
+            t["repo"] = repo
+            # The seed is ratified now; leaving it flagged would be the
+            # cosmetic lie the flag exists to prevent.
+            t.pop("provisional", None)
+        set_artifact(st, manifest, "scope", [repo])
+        st["scope"] = {"repos": [repo], "at": ndjson.now_iso()}
+        st["repo_confirmed"] = {"repo": repo, "at": ndjson.now_iso(),
+                                **({"basis": basis} if basis else {})}
+        state_mod.save(run, workspace, st)
+    ndjson.append_record(run / "events.ndjson",
+                         {"kind": "repo-confirmed", "repo": repo,
+                          "retargeted": retargeted,
+                          **({"basis": basis} if basis else {}),
+                          "actor": "confirm-repo"})
+    return {"repo": repo, "retargeted": retargeted, "scope": [repo]}
 
 
 def plan_register(workspace: Path, run: Path, manifest: dict,
@@ -2314,6 +2446,37 @@ def preflight(workspace: Path, run: Path, config: dict, manifest: dict,
                                _render_feature_branch(config, pre,
                                                       feature_branch_suffix))
     resolved = gitops.ensure_default_branch(repo, base_branch)
+    # Being ON the default branch is not being AT it (field question,
+    # 2026-08-04). Nothing in the pipeline ever fetched, so a local base last
+    # updated weeks ago passed every check and the feature branch was cut from
+    # it — the red-proof, develop's suite and the reviewer's re-run then all
+    # ran against code that is not what the change merges into, and the
+    # divergence surfaced as conflicts at PR time instead of here.
+    #
+    # Reported, never auto-fixed: pulling could conflict or absorb upstream
+    # code the human never asked for, which is precisely what the dirty-tree
+    # and in-progress refusals above exist to prevent. `behind is None` is the
+    # unanswerable case (no remote, offline, auth) — structural or transient,
+    # and already covered by the branch probe's own flag, so it stays silent
+    # here rather than double-reporting one connectivity blip.
+    # Once per run per repo, like tests-quarantined / remote-branch-unverified:
+    # this is a class-(a) PERMANENT kind with no resolver, and preflight is
+    # retried (the human re-runs it after each refusal), so every copy would
+    # sit on the gauge forever restating one fact.
+    if resolved.get("behind") and not any(
+            e.get("kind") == "base-branch-behind" and e.get("repo") == name
+            for e in ndjson.read_records(run / "events.ndjson")):
+        ndjson.append_record(run / "events.ndjson",
+                             {"kind": "base-branch-behind", "repo": name,
+                              "branch": resolved["branch"],
+                              "behind": resolved["behind"],
+                              "reason": f"{resolved['branch']} is "
+                                        f"{resolved['behind']} commit(s) "
+                                        "behind its remote — this branch is "
+                                        "cut from the local tip, so tests run "
+                                        "against code the change will not "
+                                        "merge into",
+                              "actor": "preflight"})
     # pin `.harness-key` out of `git add -A`'s reach in this repo and every
     # task worktree it will spawn (shared via the common git dir)
     gitops.ensure_repo_excludes(repo)

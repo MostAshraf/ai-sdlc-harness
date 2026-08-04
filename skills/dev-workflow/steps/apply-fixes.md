@@ -14,7 +14,11 @@ its decision is a LIST of the comment IDs the human picked, read from
    `${CLAUDE_PLUGIN_ROOT}/bin/harness push --repo <repo> --branch <feature-branch>
    --force-with-lease --run <run>`. If the base moved upstream too,
    `${CLAUDE_PLUGIN_ROOT}/bin/harness sync-branch --onto <default-branch>
-   --repo <repo> --run <run>` FIRST (rebase), then the push.
+   --repo <repo> --run <run>` FIRST (fetches, then rebases onto the fetched
+   tip), then the push. Check `remote_verified` in its result: `false` means
+   the remote could not be reached and the rebase used the local ref, so the
+   branch may still be behind upstream — say so rather than reporting a
+   clean sync.
    Record the declared artifact: `${CLAUDE_PLUGIN_ROOT}/bin/harness artifact
    --name fix-commits --value "<comment-ids fixed> @ <new HEAD sha>" --run <run>`.
 3. `${CLAUDE_PLUGIN_ROOT}/bin/harness publish-mirror --repo <repo> --run <run>`.

@@ -988,6 +988,387 @@ class FetchAlreadyDone(BreadthHarness):
                              Path(out["run"]) / "events.ndjson")])
 
 
+class StaleBaseBranch(BreadthHarness):
+    """Field question, 2026-08-04: "is main pulled to latest before preflight,
+    in all modes?" It was not — nothing in the package fetched, so a local
+    base last updated weeks ago passed every ensure_default_branch check and
+    the feature branch was cut from it. The red-proof, develop's suite and the
+    reviewer's re-run then all ran against code the change would not merge
+    into, and the divergence surfaced as conflicts at PR time.
+    """
+
+    def test_preflight_flags_a_base_behind_its_remote(self):
+        origin = make_repo(self.workspace, "origin-repo")
+        gitops.run_git(self.workspace, "clone", str(origin), "cloned")
+        clone = self.workspace / "cloned"
+        gitops.run_git(clone, "config", "user.email", "t@t")
+        gitops.run_git(clone, "config", "user.name", "t")
+        (origin / "moved-on.txt").write_text("upstream\n")   # base advances
+        gitops.run_git(origin, "add", "-A")
+        gitops.run_git(origin, "commit", "-m", "upstream work")
+
+        self.story("S-1", "fix typo", body="Mode: quick\njust a typo",
+                   type_="Task")
+        self.cli("init", "--stories-dir", str(self.stories),
+                 "--repo", f"cloned={clone}", "--test-cmd", "cloned=true")
+        run = Path(self.cli("fetch", "--id", "S-1", "--date", "2026-05-01")["run"])
+        self.cli("cursor", "--to", "preflight", run=run)
+        self.cli("preflight", "--repo", str(clone), run=run)
+
+        flagged = [e for e in ndjson.read_records(run / "events.ndjson")
+                   if e["kind"] == "base-branch-behind"]
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0]["behind"], 1)
+        self.assertEqual(flagged[0]["repo"], "cloned")
+        self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 1)
+        # reported, NEVER auto-fixed: local base untouched, tree still clean
+        self.assertEqual(gitops.changed_files(clone), [])
+        self.assertEqual(
+            gitops.run_git(clone, "rev-list", "--count", "main"), "1")
+
+    def test_a_current_base_flags_nothing(self):
+        origin = make_repo(self.workspace, "origin-repo2")
+        gitops.run_git(self.workspace, "clone", str(origin), "cloned2")
+        clone = self.workspace / "cloned2"
+        gitops.run_git(clone, "config", "user.email", "t@t")
+        gitops.run_git(clone, "config", "user.name", "t")
+        self.story("S-2", "fix typo", body="Mode: quick\njust a typo",
+                   type_="Task")
+        self.cli("init", "--stories-dir", str(self.stories),
+                 "--repo", f"cloned2={clone}", "--test-cmd", "cloned2=true")
+        run = Path(self.cli("fetch", "--id", "S-2", "--date", "2026-05-02")["run"])
+        self.cli("cursor", "--to", "preflight", run=run)
+        self.cli("preflight", "--repo", str(clone), run=run)
+        self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 0)
+
+    def test_no_remote_is_structural_not_a_signal(self):
+        # the default fixture has no remote at all — `behind` is unanswerable,
+        # and an unanswerable probe must not park a permanent flag on every
+        # preflight in every local-only workspace
+        self.story("S-3", "fix typo", body="Mode: quick\njust a typo",
+                   type_="Task")
+        self.init()
+        run = Path(self.cli("fetch", "--id", "S-3", "--date", "2026-05-03")["run"])
+        self.cli("cursor", "--to", "preflight", run=run)
+        self.cli("preflight", "--repo", str(self.repo), run=run)
+        self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 0)
+
+
+class GateRePresentGuard(BreadthHarness):
+    """A re-present must not silently throw away a reply the human gave.
+
+    Field, 2026-08-04 (BUG-2's approve-pre-pr): the human's APPROVED was
+    captured at 13:04:30; the orchestrator hit "gate is not the current step",
+    advanced the cursor, then ran `--present` and `--decide` in ONE Bash call.
+    The present re-stamped the window, aging out the real reply; the decide
+    refused "no human input after presentation"; the human was asked to type
+    it again. The step file's own retry advice walks straight into this.
+    """
+
+    def _at_gate(self, sid="G-1"):
+        self.story(sid, "fix typo", body="Mode: quick\njust a typo",
+                   type_="Task")
+        self.init()
+        run = Path(self.cli("fetch", "--id", sid, "--date", "2026-04-01")["run"])
+        self.cli("cursor", "--to", "preflight", run=run)
+        self.cli("preflight", "--repo", str(self.repo), run=run)
+        self.cli("cursor", "--to", "develop", run=run)
+        self.cli("task", "--id", "T1", "--to", "in-progress", run=run)
+        (self.repo / "docs.md").write_text("fixed\n")
+        self.cli("commit", "--repo", str(self.repo), "--task-id", "T1",
+                 "--summary", "typo", run=run)
+        self.cli("task", "--id", "T1", "--to", "in-review", run=run)
+        self.review_approve(run, "T1")
+        self.cli("task", "--id", "T1", "--to", "done", run=run)
+        self.cli("cursor", "--to", "quick-recheck", run=run)
+        self.cli("quick-recheck", "--repo", str(self.repo), "--base", "main",
+                 run=run)
+        self.cli("cursor", "--to", "pre-pr", run=run)
+        (run / "reports").mkdir(exist_ok=True)
+        (run / "reports" / "pre-pr.md").write_text("# Pre-PR\nok\n")
+        self.cli("cursor", "--to", "approve-pre-pr", run=run)
+        return run
+
+    def test_re_present_refuses_while_a_reply_is_waiting(self):
+        run = self._at_gate()
+        self.cli("gate", "--id", "approve-pre-pr", "--present", run=run)
+        ndjson.append_record(run / "human-input.ndjson", {"text": "APPROVED"})
+        out = self.cli("gate", "--id", "approve-pre-pr", "--present",
+                       run=run, expect=1)
+        self.assertIn("un-decided repl", out["error"])
+        # …and the reply it protected still decides (not yet consumed — that
+        # happens at the cursor move the decision legalizes)
+        out = self.cli("gate", "--id", "approve-pre-pr", "--decide", run=run)
+        self.assertEqual(out["decision"], "approved")
+        self.assertEqual(
+            self.cli("show", run=run)["state"]["gates"]["approve-pre-pr"]
+            ["decision"], "approved")
+
+    def test_re_present_flag_is_the_deliberate_escape(self):
+        # A qualified "APPROVED but…" cannot decide, so a fresh window is
+        # genuinely needed — the guard must not become its own dead end.
+        run = self._at_gate("G-2")
+        self.cli("gate", "--id", "approve-pre-pr", "--present", run=run)
+        ndjson.append_record(run / "human-input.ndjson",
+                             {"text": "APPROVED but rename T1 first"})
+        self.cli("gate", "--id", "approve-pre-pr", "--decide", run=run, expect=1)
+        self.cli("gate", "--id", "approve-pre-pr", "--present", run=run,
+                 expect=1)                                    # guarded
+        self.cli("gate", "--id", "approve-pre-pr", "--present", "--re-present",
+                 run=run)                                     # escape works
+        ndjson.append_record(run / "human-input.ndjson", {"text": "APPROVED"})
+        self.cli("gate", "--id", "approve-pre-pr", "--decide", run=run)
+
+    def test_first_present_is_never_blocked(self):
+        # nothing captured yet -> the guard must stay out of the way
+        run = self._at_gate("G-3")
+        self.cli("gate", "--id", "approve-pre-pr", "--present", run=run)
+        self.cli("gate", "--id", "approve-pre-pr", "--present", run=run)
+
+
+class QuickRepoConfirmation(BreadthHarness):
+    """Quick mode's repo reconciliation (field, 2026-08-04).
+
+    fetch seeds T1 with `repos[0]` — a positional default with no content
+    analysis — and quick has no plan-register to replace it, so in a
+    multi-repo workspace a frontend bug was seeded against a backend repo,
+    preflight cut a branch THERE, and the run reached develop before a human
+    noticed. `confirm-repo` is the step that now stands between the two.
+    """
+
+    def _multi(self, sid="Q-R1", date="2026-03-01"):
+        """A two-repo workspace with a quick-hinted item, parked at fetch."""
+        self.repo_b = make_repo(self.workspace, "repo-b")
+        self.story(sid, "fix typo in docs page",
+                   body="Mode: quick\njust a typo", type_="Task")
+        self.init(extra_repos=f"repo-b={self.repo_b}",
+                  extra_test_cmd="repo-b=true")
+        run = Path(self.cli("fetch", "--id", sid, "--date", date)["run"])
+        self.assertEqual(self.cli("show", run=run)["state"]["mode"], "quick")
+        return run
+
+    def test_multi_repo_quick_cannot_reach_preflight_unconfirmed(self):
+        run = self._multi()
+        self.cli("cursor", "--to", "confirm-repo", run=run)
+        # The enforcement is cursor_candidates emptying the candidate set —
+        # NOT merely a nicer error on an already-refused move. Assert the
+        # engine offers nothing at all, or a later refactor could move the
+        # message and leave the gate open.
+        self.assertEqual(self.cli("show", run=run)["next_steps"], {})
+        out = self.cli("cursor", "--to", "preflight", run=run, expect=1)
+        self.assertIn("confirm-repo", out["error"])
+
+    def test_confirm_repo_retargets_the_seed_and_releases_the_cursor(self):
+        run = self._multi()
+        self.cli("cursor", "--to", "confirm-repo", run=run)
+        seeded = self.cli("show", run=run)["state"]["tasks"][0]["repo"]
+        self.assertEqual(seeded, str(self.repo))          # repos[0], the default
+        out = self.cli("confirm-repo", "--repo", str(self.repo_b),
+                       "--basis", "repo-map index names the framework", run=run)
+        self.assertEqual(out["retargeted"],
+                         [{"task": "T1", "from": str(self.repo),
+                           "to": str(self.repo_b)}])
+        state = self.cli("show", run=run)["state"]
+        self.assertEqual(state["tasks"][0]["repo"], str(self.repo_b))
+        self.assertNotIn("provisional", state["tasks"][0])
+        self.assertEqual(state["repo_confirmed"]["repo"], str(self.repo_b))
+        self.assertEqual(state["artifacts"]["scope"], [str(self.repo_b)])
+        self.assertIn("repo-confirmed",
+                      [e.get("kind") for e in ndjson.read_records(
+                          run / "events.ndjson")])
+        # released — and preflight cuts the branch in the CONFIRMED repo
+        self.cli("cursor", "--to", "preflight", run=run)
+        self.cli("preflight", "--repo", str(self.repo_b), run=run)
+        branches = self.cli("show", run=run)["state"]["artifacts"]["branches"]
+        self.assertEqual(list(branches), ["repo-b"])
+
+    def test_task_in_progress_cannot_forge_the_confirmation(self):
+        # transition_task never reads the cursor, and the in-progress branch
+        # POPS `provisional` (that pop is what keeps single-repo quick honest).
+        # So a guard keyed on `provisional` would be dissolvable by a plain
+        # `task --to in-progress` here — the incident's own mechanism. The
+        # dedicated marker is what makes this refusal hold.
+        run = self._multi()
+        self.cli("cursor", "--to", "confirm-repo", run=run)
+        self.cli("task", "--id", "T1", "--to", "in-progress", run=run)
+        self.assertNotIn("provisional",
+                         self.cli("show", run=run)["state"]["tasks"][0])
+        out = self.cli("cursor", "--to", "preflight", run=run, expect=1)
+        self.assertIn("confirm-repo", out["error"])
+        # …and the retarget itself must not depend on that flag either
+        # (adversarial-review A/F2): blocking the cursor is only half the
+        # job. If the verb's retarget is `provisional`-keyed, the LEGITIMATE
+        # confirmation that follows finds nothing to move, writes the marker,
+        # releases the cursor — and develop runs in repos[0] anyway, which is
+        # the 2026-08-04 incident reached THROUGH the step built to stop it.
+        out = self.cli("confirm-repo", "--repo", str(self.repo_b), run=run)
+        self.assertEqual(out["retargeted"],
+                         [{"task": "T1", "from": str(self.repo),
+                           "to": str(self.repo_b)}])
+        self.assertEqual(self.cli("show", run=run)["state"]["tasks"][0]["repo"],
+                         str(self.repo_b))
+
+    def test_confirm_repo_is_correctable(self):
+        # adversarial-review A/F1: the confirm-a-default presentation invites
+        # "no, the other one", so a second call must actually MOVE the task.
+        # Keyed on `provisional` it didn't — the first call popped the flag,
+        # the second found nothing, and marker/scope/event all said B while
+        # the task (which is what worktree-add and verify-red resolve from)
+        # stayed on A.
+        run = self._multi()
+        self.cli("cursor", "--to", "confirm-repo", run=run)
+        self.cli("confirm-repo", "--repo", str(self.repo), run=run)
+        out = self.cli("confirm-repo", "--repo", str(self.repo_b), run=run)
+        self.assertEqual(out["retargeted"],
+                         [{"task": "T1", "from": str(self.repo),
+                           "to": str(self.repo_b)}])
+        state = self.cli("show", run=run)["state"]
+        self.assertEqual(state["tasks"][0]["repo"], str(self.repo_b))
+        self.assertEqual(state["repo_confirmed"]["repo"], str(self.repo_b))
+        self.assertEqual(state["artifacts"]["scope"], [str(self.repo_b)])
+
+    def test_scope_register_cannot_contradict_a_confirmed_repo(self):
+        # adversarial-review A/F3: scope-register is legal at this cursor
+        # (the step declares `produces: scope`), its stranded check skips
+        # provisional tasks AND tolerates a superset — so nothing stopped it
+        # recording a scope that disagreed with what the human confirmed.
+        run = self._multi()
+        self.cli("cursor", "--to", "confirm-repo", run=run)
+        self.cli("confirm-repo", "--repo", str(self.repo_b), run=run)
+        out = self.cli("scope-register", "--repos-json",
+                       json.dumps([str(self.repo), str(self.repo_b)]),
+                       run=run, expect=1)
+        self.assertIn("already confirmed", out["error"])
+        self.assertEqual(self.cli("show", run=run)["state"]["scope"]["repos"],
+                         [str(self.repo_b)])
+        # re-registering the SAME single repo is still fine (idempotent)
+        self.cli("scope-register", "--repos-json",
+                 json.dumps([str(self.repo_b)]), run=run)
+
+    def test_scope_register_alone_does_not_release_the_cursor(self):
+        # scope-register IS legal here (this step declares `produces: scope`)
+        # but never touches tasks[*].repo, and its stranded-task check skips
+        # provisional tasks — so a scope-keyed guard would pass with T1 still
+        # on repos[0]. Same reason the marker is its own fact.
+        run = self._multi()
+        self.cli("cursor", "--to", "confirm-repo", run=run)
+        self.cli("scope-register", "--repos-json",
+                 json.dumps([str(self.repo_b)]), run=run)
+        self.assertEqual(self.cli("show", run=run)["state"]["tasks"][0]["repo"],
+                         str(self.repo))          # still the positional default
+        self.cli("cursor", "--to", "preflight", run=run, expect=1)
+
+    def test_single_repo_quick_skips_confirm_repo_entirely(self):
+        # The no-regression guard: one repo means repos[0] is the ONLY repo,
+        # there is nothing to ratify, and quick stays zero-ceremony.
+        self.story("Q-R2", "fix typo", body="Mode: quick\njust a typo",
+                   type_="Task")
+        self.init()
+        run = Path(self.cli("fetch", "--id", "Q-R2", "--date", "2026-03-02")["run"])
+        self.assertEqual(
+            self.cli("show", run=run)["state"]["artifacts"]["repo-ambiguity"],
+            "single")
+        self.cli("cursor", "--to", "preflight", run=run)   # straight past it
+        self.cli("preflight", "--repo", str(self.repo), run=run)
+
+    def test_skip_is_ledgered_and_does_not_flag_the_run(self):
+        # Two claims, both previously unpinned (adversarial-review B/5, B/8):
+        # the skip must stay PROVABLE (naming its false predicate), and it
+        # must NOT land on the flagged-events gauge — confirm-repo skips on
+        # every single-repo quick run by design, so `gate-skipped` there would
+        # park a permanent flagged row on the zero-ceremony path.
+        self.story("Q-R3", "fix typo", body="Mode: quick\njust a typo",
+                   type_="Task")
+        self.init()
+        run = Path(self.cli("fetch", "--id", "Q-R3", "--date", "2026-03-03")["run"])
+        self.cli("cursor", "--to", "preflight", run=run)
+        skips = [e for e in ndjson.read_records(run / "events.ndjson")
+                 if e.get("step") == "confirm-repo"]
+        self.assertEqual([e["kind"] for e in skips], ["step-skipped"])
+        self.assertIn("repo-ambiguity", skips[0]["reason"])
+        self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 0)
+
+    def test_basis_is_optional_and_recorded_when_given(self):
+        run = self._multi()
+        self.cli("cursor", "--to", "confirm-repo", run=run)
+        self.cli("confirm-repo", "--repo", str(self.repo_b),
+                 "--basis", "repo-map index: Nuxt 3 SSR", run=run)
+        state = self.cli("show", run=run)["state"]
+        self.assertEqual(state["repo_confirmed"]["basis"],
+                         "repo-map index: Nuxt 3 SSR")
+        event = [e for e in ndjson.read_records(run / "events.ndjson")
+                 if e["kind"] == "repo-confirmed"][-1]
+        self.assertEqual(event["basis"], "repo-map index: Nuxt 3 SSR")
+
+    def test_basis_omitted_leaves_no_empty_key(self):
+        run = self._multi()
+        self.cli("cursor", "--to", "confirm-repo", run=run)
+        self.cli("confirm-repo", "--repo", str(self.repo_b), run=run)
+        self.assertNotIn("basis",
+                         self.cli("show", run=run)["state"]["repo_confirmed"])
+
+    def test_fetch_event_records_the_repo_ambiguity(self):
+        run = self._multi()
+        fetched = [e for e in ndjson.read_records(run / "events.ndjson")
+                   if e["kind"] == "fetched"][0]
+        self.assertEqual(fetched["repo_ambiguity"], "multi")
+        self.assertIn("confirm-repo", fetched["seed_task"]["basis"])
+
+    def test_confirm_repo_refuses_a_multi_task_list(self):
+        # adversarial-review B/7: the retarget is unconditional, so a future
+        # mode declaring the flag after a multi-lane plan-register would have
+        # had every lane silently collapsed onto one repo.
+        run = self._multi()
+        self.cli("cursor", "--to", "confirm-repo", run=run)
+        state = state_mod.load(run, self.workspace)
+        state["tasks"].append({**state["tasks"][0], "id": "T2"})
+        state_mod.save(run, self.workspace, state)
+        out = self.cli("confirm-repo", "--repo", str(self.repo_b),
+                       run=run, expect=1)
+        self.assertIn("2 tasks", out["error"])
+
+    def test_pre_upgrade_run_wedges_closed_with_a_named_remedy(self):
+        # adversarial-review B/1: a run bootstrapped before `repo-ambiguity`
+        # existed has NO legal move — eval_predicate raises rather than
+        # reading a missing artifact as false. That is correct (fail closed),
+        # but the raise is the only thing a human sees, so it has to name the
+        # way out. `show` must degrade rather than crash, and `abort` must
+        # still work — it never walks the cursor.
+        run = self._multi("Q-R4", "2026-03-04")
+        state = state_mod.load(run, self.workspace)
+        del state["artifacts"]["repo-ambiguity"]
+        state_mod.save(run, self.workspace, state)
+        shown = self.cli("show", run=run)
+        self.assertEqual(shown["next_steps"], {})
+        self.assertIn("repo-ambiguity", shown["probe_error"])
+        out = self.cli("cursor", "--to", "confirm-repo", run=run, expect=1)
+        self.assertIn("abort", out["error"])
+        self.cli("abort", "--reason", "pre-upgrade run", run=run)
+
+    def test_confirm_repo_refuses_an_unregistered_repo(self):
+        run = self._multi()
+        self.cli("cursor", "--to", "confirm-repo", run=run)
+        out = self.cli("confirm-repo", "--repo",
+                       str(self.workspace / "not-a-repo"), run=run, expect=1)
+        self.assertIn("not registered", out["error"])
+
+    def test_confirm_repo_refused_outside_its_declaring_step(self):
+        # legality derived from the manifest's `requires_repo_confirmed`
+        # steps, never a hardcoded cursor name
+        run = self._multi()
+        out = self.cli("confirm-repo", "--repo", str(self.repo_b),
+                       run=run, expect=1)          # cursor is still `fetch`
+        self.assertIn("requires_repo_confirmed", out["error"])
+
+    def test_repo_ambiguity_is_not_orchestrator_settable(self):
+        # Otherwise `--value single` skips the step in a multi-repo workspace
+        # and re-opens the hole outright.
+        run = self._multi()
+        out = self.cli("artifact", "--name", "repo-ambiguity", "--value",
+                       "single", run=run, expect=1)
+        self.assertIn("not orchestrator-settable", out["error"])
+
+
 class QuickWalk(BreadthHarness):
     def _to_quick_recheck(self, sid, touch_auth: bool):
         self.story(sid, "fix typo in docs page", body="Mode: quick\njust a typo",
@@ -2158,14 +2539,17 @@ class ScopeRegisterValidation(BreadthHarness):
         return Path(self.cli("fetch", "--id", sid,
                              "--date", "2026-02-01")["run"])
 
-    def test_refused_outside_intake_or_plan(self):
+    def test_refused_outside_scope_producing_steps(self):
         run = self._fetch()
         out = self.cli("scope-register", "--repos-json",
                        json.dumps([str(self.repo)]), run=run, expect=1)
         # legality is DERIVED from the manifest's `produces: scope` steps,
-        # never a hardcoded step list
+        # never a hardcoded step list — quick's `confirm-repo` joining that
+        # set is exactly the "future mode's scope-producing step" the
+        # derivation was written to accommodate, and it showed up here as a
+        # message change rather than as a silent refusal.
         self.assertIn("a step the manifest declares producing 'scope' "
-                      "(intake, plan)", out["error"])
+                      "(confirm-repo, intake, plan)", out["error"])
 
     def test_unregistered_path_refused(self):
         run = self._fetch()
@@ -2436,7 +2820,15 @@ class RejectionWithNotes(BreadthHarness):
         out = self.cli("gate", "--id", "approve-plan", "--decide", run=run,
                        expect=1)
         self.assertIn("FORWARD", out["error"])
-        self.cli("gate", "--id", "approve-plan", "--present", run=run)
+        # THE case --re-present exists for: a qualified forward reply is
+        # captured and un-decidable, so the window genuinely has to be
+        # re-stamped. A bare --present is refused here on purpose — that
+        # refusal is what stops a retry from silently discarding a reply the
+        # human gave (field 2026-08-04); discarding an un-decidable one is a
+        # deliberate act, and this flag is how the caller says so.
+        self.cli("gate", "--id", "approve-plan", "--present", run=run, expect=1)
+        self.cli("gate", "--id", "approve-plan", "--present", "--re-present",
+                 run=run)
         ndjson.append_record(run / "human-input.ndjson",
                              {"text": "REJECTED — split T1 into two tasks"})
         self.cli("gate", "--id", "approve-plan", "--decide", run=run)

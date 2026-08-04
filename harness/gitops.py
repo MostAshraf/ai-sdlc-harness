@@ -299,15 +299,38 @@ def publish_mirror(repo: Path, run_dir: Path, config: dict, run_name: str) -> st
     return head_sha(repo)
 
 
-def sync_branch(repo: Path, onto: str) -> None:
-    """`harness sync-branch` — the owned update-from-main entry point (RC4)."""
-    proc = subprocess.run(["git", "-C", str(repo), "rebase", onto],
+def sync_branch(repo: Path, onto: str) -> dict:
+    """`harness sync-branch` — the owned update-from-main entry point (RC4).
+
+    FETCHES first, then rebases onto the freshly-fetched tip. It used to
+    rebase onto the LOCAL `onto` ref, which nothing in the package had ever
+    fetched — so its one documented purpose ("if the base moved upstream,
+    sync FIRST", apply-fixes.md) was unachievable: on a stale local base the
+    rebase was a no-op that reported success, and the caller pushed believing
+    it had caught up. A sync verb that cannot see the thing it syncs to is
+    worse than no verb, because it launders the staleness as handled.
+
+    Unlike `ensure_default_branch` — which measures and refuses to move
+    anything — moving the branch IS this verb's mandate: the caller invoked
+    an update. So it rebases onto FETCH_HEAD (the same explicit-refspec
+    reasoning as `base_branch_behind`: the remote-tracking ref is only
+    written when the refspec is configured for it).
+
+    An unanswerable remote does NOT block — the PR-comment loop this serves
+    must still work offline — but the result says so (`remote_verified`),
+    because "rebased onto a local ref I could not confirm" and "rebased onto
+    the real upstream tip" are different facts and reporting them
+    identically is the original bug in miniature."""
+    verified = fetch_base(repo, onto)
+    target = "FETCH_HEAD" if verified else onto
+    proc = subprocess.run(["git", "-C", str(repo), "rebase", target],
                           capture_output=True, text=True,
                           encoding="utf-8", errors="replace")
     if proc.returncode != 0:
         run_git(repo, "rebase", "--abort", check=False)
         raise GitError(f"sync-branch rebase onto {onto} conflicted (aborted cleanly): "
                        f"{proc.stderr.strip()[:300]}")
+    return {"onto": onto, "remote_verified": verified}
 
 
 def _push_remote(repo: Path) -> str:
@@ -411,6 +434,64 @@ def remote_branch_exists(repo: Path, branch: str) -> bool | None:
                for line in proc.stdout.splitlines() if line.strip())
 
 
+def base_branch_behind(repo: Path, branch: str) -> int | None:
+    """How many commits `branch` is behind its remote counterpart — or None
+    when that is unanswerable (no remote, ambiguous remotes, offline, auth,
+    no such branch upstream). Same tri-state fail-open contract as
+    `remote_branch_exists`, and the same reason: a connectivity blip must
+    never brick preflight.
+
+    FETCH, never pull (field question, 2026-08-04: "is main pulled to latest
+    before preflight?" — it was not, in any mode). `ensure_default_branch`
+    guarantees you are ON the default branch, which is not the same as being
+    AT it: a local `main` last updated weeks ago passes every one of its
+    checks, and preflight then cuts the feature branch from that stale
+    commit — so the red-proof, develop's suite and the reviewer's re-run all
+    execute against code that is not what the change will merge into.
+
+    Fetch is the honest tool here. It moves only remote-tracking refs —
+    never the working tree, never local `main` — so it can answer the
+    question without violating this module's "surface, never auto-fix"
+    stance (a `pull` could conflict, or absorb upstream code the human never
+    asked for, exactly what the dirty-tree and in-progress refusals exist to
+    prevent). The caller reports the number; the human decides."""
+    if not fetch_base(repo, branch):
+        return None
+    count = run_git(repo, "rev-list", "--count", f"{branch}..FETCH_HEAD",
+                    check=False)
+    return int(count) if count.isdigit() else None
+
+
+def fetch_base(repo: Path, branch: str) -> bool:
+    """Refresh `branch` from its remote into FETCH_HEAD. True when the remote
+    genuinely answered; False for every unanswerable case (no remote,
+    ambiguous remotes, offline, auth, no such branch upstream) — the
+    tri-state fail-open contract `remote_branch_exists` established, so a
+    connectivity blip never bricks a step.
+
+    One implementation, two callers (`base_branch_behind` measures the gap,
+    `sync_branch` rebases across it) — they must never disagree about what
+    "the current base" means, and duplicating the remote-resolution and
+    fail-open branches is exactly how that drift starts.
+
+    Read-only by construction: fetching an explicit refspec writes
+    FETCH_HEAD and the remote-tracking ref, never the working tree and never
+    the local branch. Callers that then MOVE something (sync_branch) are
+    doing so on their own mandate, not this function's."""
+    try:
+        remote = _push_remote(repo)
+    except (GitError, OSError):
+        return False                   # no remote, or ambiguous — structural
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "fetch", "--quiet", remote, branch],
+            capture_output=True, text=True, timeout=60,
+            encoding="utf-8", errors="replace")
+    except (subprocess.SubprocessError, OSError):
+        return False                   # includes TimeoutExpired (auth prompt)
+    return proc.returncode == 0
+
+
 def _in_progress_operation(repo: Path) -> str | None:
     """A mid-rebase/merge/cherry-pick repo can look clean to changed_files()
     (conflicts already resolved-and-staged, operation just not concluded)
@@ -444,7 +525,14 @@ def ensure_default_branch(repo: Path, branch: str | None = None) -> dict:
     here — never auto-stashed/committed/discarded/continued; the human
     decides what to do with them (same "surface, never auto-fix" pattern
     as contract drift / security findings). A clean tree on the wrong
-    branch is safely switched, no confirmation needed."""
+    branch is safely switched, no confirmation needed.
+
+    Reports `behind`: how many commits the target trails its remote (None if
+    unanswerable). This function's guarantee is "clean, and ON the default
+    branch" — it deliberately does NOT make that branch current, because
+    pulling is the kind of auto-mutation everything above refuses to do. It
+    now MEASURES the gap instead of leaving it invisible; acting on the
+    number is the caller's call."""
     target = branch or default_branch(repo)
     if not _branch_exists(repo, target):
         raise GitError(
@@ -463,11 +551,13 @@ def ensure_default_branch(repo: Path, branch: str | None = None) -> dict:
             f"{repo} has {len(dirty)} uncommitted change(s) ({shown}) — "
             "resolve, commit, or stash them yourself before continuing; "
             "never auto-discarded")
+    behind = base_branch_behind(repo, target)
     current = run_git(repo, "rev-parse", "--abbrev-ref", "HEAD")
     if current == target:
-        return {"switched": False, "branch": target}
+        return {"switched": False, "branch": target, "behind": behind}
     run_git(repo, "checkout", target)
-    return {"switched": True, "branch": target, "from_branch": current}
+    return {"switched": True, "branch": target, "from_branch": current,
+            "behind": behind}
 
 
 # ------------------------------------------------------------- worktrees

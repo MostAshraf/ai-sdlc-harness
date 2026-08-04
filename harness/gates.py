@@ -116,10 +116,30 @@ def decide(state: dict, gate_id: str, human_records: list[dict],
         raise GateRefusal(f"gate '{gate_id}' was never presented — nothing to decide")
     qualifying = [r for r in human_records if r.get("at", "") > presented_at]
     if not qualifying:
+        # Two very different causes, previously reported identically — and the
+        # advice that fits one is actively wrong for the other (field,
+        # 2026-08-04): "re-present and have the human reply again" is right
+        # when nothing was ever captured, and is what DESTROYS the evidence
+        # when a reply exists but predates this presentation. Name which one
+        # this is, from the ledger itself.
+        stale = [r for r in human_records if r.get("at", "")]
+        if stale:
+            newest = max(stale, key=lambda r: r["at"])["at"]
+            raise GateRefusal(
+                f"gate '{gate_id}': {len(stale)} human repl(y/ies) captured, "
+                f"but the newest ({newest}) PREDATES this presentation "
+                f"({presented_at}) — a re-present after the human replied "
+                "re-stamps the window and ages their reply out. Do NOT "
+                "present again: ask the human to reply once more, then "
+                "`--decide` alone. (Presenting and deciding in one shell "
+                "invocation always lands here — no prompt can arrive between "
+                "two commands of the same call.)"
+            )
         raise GateRefusal(
-            f"gate '{gate_id}': no human input after presentation — refusing to "
-            "write a token (re-present after any interleaved interaction). If "
-            "the human DID reply, check capture: the UserPromptSubmit hook "
+            f"gate '{gate_id}': no human input captured after presentation — "
+            "refusing to write a token. Present, WAIT for a plain typed chat "
+            "reply in its own turn, then decide in a separate call. If the "
+            "human DID reply, check capture: the UserPromptSubmit hook "
             "scopes to its cwd's workspace, so a session whose shell cwd "
             "drifted away from the workspace root drops evidence silently — "
             "cd back to the workspace root, re-present, and have the human "

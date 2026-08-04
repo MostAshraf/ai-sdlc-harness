@@ -1,5 +1,7 @@
 # ai-sdlc-harness · v3.0
 
+[![Available on CodeGuilds](https://img.shields.io/badge/Available_on-CodeGuilds-6366f1)](https://codeguilds.dev/packages/ai-sdlc-harness)
+
 **A governed multi-agent SDLC pipeline for Claude Code** — a ground-up rewrite of [ai-sdlc-harness](https://github.com/MostAshraf/ai-sdlc-harness). Drives a real engineering workflow — fetch → scope-confirmed plan → independent plan review → proven-red TDD → review → security → PR → comment rounds → reconcile → metrics — across one or many repos. No application code lives here: only the pipeline manifest, the Python core that enforces it, and the agents, skills, and hooks that run it.
 
 | Command | Purpose |
@@ -86,6 +88,7 @@ flowchart LR
     H[harden]:::agent
     S[security scan]:::orch
     G25{approve-security, when findings meet the threshold}:::human
+    CR[confirm-repo — only when several repos are registered]:::orch
     QR[quick-recheck]:::orch
     PP[pre-pr review]:::agent
     G3{approve-pre-pr}:::human
@@ -106,7 +109,8 @@ flowchart LR
     G1 -->|rejected| P
     G1L -->|approved| PF
     G1L -->|rejected| P
-    F -->|quick| PF
+    F -->|quick, one repo registered| PF
+    F -->|quick, several repos| CR --> PF
     PF --> D
     D -->|full| G2
     D -.->|lean — no impl gate| H
@@ -237,7 +241,7 @@ Three modes, selected at fetch from declared data — never at the model's discr
 |---|---|---|
 | **full** | Everything: scoped plan, adversarial panel, proven-red TDD, harden, security | Plan, implementation, pre-PR (+ security when findings meet the threshold) |
 | **lean** | Identical rigor to full | **Pre-PR only** on the happy path — the plan gate fires only if the panel exhausts its rounds; no implementation gate |
-| **quick** | Short path: no plan step, no red-proof machinery | Pre-PR only |
+| **quick** | Short path: no plan step, no red-proof machinery; confirms the target repo first in a multi-repo workspace | Pre-PR only |
 
 Pick one per work item with a **`Mode:` hint on its own line in the work item's description** (the story file for `local-markdown`, the issue body for github/gitlab/…):
 
@@ -276,6 +280,8 @@ The trade to accept knowingly: on a lean happy path, the panel's approval is the
 ### Quick mode — with a mechanical escape hatch
 
 Trivial changes (explicit `Mode: quick` hint in the work item, no risk keywords) run the short pipeline: no plan step, no red-proof machinery, one gate. Because eligibility was classified *before code existed*, `quick-recheck` re-examines the **real diff** after develop: touching disqualifying patterns (security/auth/migration/API paths) or exceeding size caps (80 changed lines / 5 files, configurable) triggers the declared escalation edge into full mode's security step — forcibly, not at the model's discretion.
+
+Skipping the plan step means skipping the step that decides **which repo** the work belongs in. `fetch` seeds its single task with `repos[0]` — a positional default, no content analysis — and in full/lean `plan-register` replaces that wholesale. Quick has no plan-register, so in a **multi-repo workspace** it stops at `confirm-repo`: the orchestrator proposes one target repo from the repo-map indexes and the work item's own content, the human confirms, and `harness confirm-repo` ratifies it before `preflight` cuts a branch anywhere. The cursor has no legal move until it does. A single-repo workspace has nothing to ratify, so the step is skipped by its declared predicate and quick stays zero-ceremony.
 
 ### The security step
 
@@ -317,7 +323,7 @@ All ~50 owned verbs run through the wrapper `${CLAUDE_PLUGIN_ROOT}/bin/harness` 
 | Group | Verbs |
 |---|---|
 | Workspace setup | `init` · `discover` · `ensure-default-branch` · `init-verify` · `init-section` · `init-finalize` · `add-repo` · `migrate-detect` · `migrate-extract` · `resolve-model` · `resolve-coverage-cmd` |
-| Pipeline steps | `fetch` · `scope-register` · `preflight` · `plan-register` · `quick-recheck` · `security-scan` · `reconcile-contracts` · `create-pr` · `fetch-pr-comments` · `reconcile` · `write-back` · `metrics` |
+| Pipeline steps | `fetch` · `scope-register` · `confirm-repo` · `preflight` · `plan-register` · `quick-recheck` · `security-scan` · `reconcile-contracts` · `create-pr` · `fetch-pr-comments` · `reconcile` · `write-back` · `metrics` |
 | State & evidence | `bootstrap` · `cursor` · `task` · `artifact` · `gate` · `stall` · `log-event` · `verify` · `show` · `status` · `abort` · `complete` · `reseal` |
 | TDD proof | `verify-red` (and `--revise`) · `show-redproof` |
 | Git (owned) | `worktree-add` · `worktree-remove` · `commit` · `merge-task` · `sync-branch` · `push` · `publish-mirror` |
@@ -403,7 +409,7 @@ python -m venv .venv; .venv\Scripts\pip install pyyaml
 .venv\Scripts\python -m unittest discover -s tests
 ```
 
-The test suite (878 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (909 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 

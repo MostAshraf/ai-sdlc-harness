@@ -92,3 +92,9 @@ resupply the whole map, not just this repo's entry).
 which repo a given `/dev-workflow` run's tasks touch — avoid running
 `/add-repo` while another run is active for an unrelated repo, in case the
 newly-added one isn't a valid checkout yet.
+
+Going from one repo to several does not reach an in-flight **quick** run: its
+`confirm-repo` predicate reads the `repo-ambiguity` artifact recorded once at
+`fetch`, so it still walks straight to `preflight` on the only repo it knew
+about. Runs fetched after this command see the choice; to move an in-flight
+one, abort and re-fetch.
