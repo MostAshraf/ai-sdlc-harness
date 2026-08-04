@@ -424,6 +424,15 @@ PLANNER_STAMP_RE = re.compile(
 _CMD_GAP_NL = r"(?:[^|;&\n\r]|\\\r?\n)*"
 SUBAGENT_REGISTER_RE = re.compile(
     r"\bharness\b" + _CMD_GAP_NL + r"\b(?:scope-register|plan-register|"
+    # confirm-repo is the same class of fact as scope-register — it records
+    # that a HUMAN was asked which repo a quick run targets, and it is the
+    # sole writer of the `repo_confirmed` marker the cursor is gated on. A
+    # subagent minting it would answer the question on the user's behalf and
+    # unblock the run, which is precisely the failure the step exists to
+    # prevent; `always_legal_spawns` keeps a Bash-capable request-triage
+    # reviewer spawnable at ANY cursor, so this is a reachable path, not a
+    # theoretical one.
+    r"confirm-repo|"
     # save-report joins the orchestrator-only set (pre-release adversarial
     # review, both lenses independently): reports/ under a run is
     # GATE-PRESENTED evidence — an exhausted plan-review decision rests on
@@ -798,12 +807,13 @@ def guard_bash(p: dict) -> None:
                 if reason:
                     block(reason, cwd, p)
         if shape_of(p.get("agent_type")) and SUBAGENT_REGISTER_RE.search(target):
-            block("scope-register, plan-register, save-report and artifact "
-                  "are orchestrator-only: the scope records the HUMAN's "
-                  "confirmation, the task list is what the plan gate "
-                  "ratifies, a run's reports/ are the evidence a human "
-                  "gate presents, and `artifact` is what makes that evidence "
-                  "the gate's — report your proposal/review in your "
+            block("scope-register, confirm-repo, plan-register, save-report "
+                  "and artifact are orchestrator-only: the scope records the "
+                  "HUMAN's confirmation, confirm-repo records which repo the "
+                  "human said this run targets, the task list is what the "
+                  "plan gate ratifies, a run's reports/ are the evidence a "
+                  "human gate presents, and `artifact` is what makes that "
+                  "evidence the gate's — report your proposal/review in your "
                   "status block; the orchestrator confirms, registers, and "
                   "persists.", cwd, p)
 

@@ -299,10 +299,18 @@ def next_run_slot(base: Path, workspace: Path, manifest: dict) -> Path:
 
 def bootstrap(run: Path, workspace: Path, *, work_item: dict, mode: str,
               change_type: str, tasks: list[dict], entry_step: str,
-              manifest: dict | None = None) -> dict:
+              manifest: dict | None = None,
+              artifacts: dict | None = None) -> dict:
     """The declared from-nothing transition (RC2). Refuses collision (B5):
     the exact run dir, AND — when `manifest` is given — any other live
-    (non-terminal) run for the same work item under a different date."""
+    (non-terminal) run for the same work item under a different date.
+
+    `artifacts` seeds the entry step's own declared outputs — the ones that
+    are known at bootstrap because bootstrap is what determines them (today:
+    `repo-ambiguity`). They must appear here rather than via a later
+    `set_artifact` call because a `when` predicate on the very next step
+    reads them, and eval_predicate raises on a missing artifact rather than
+    treating it as false."""
     # THE one legitimate key-creation moment: every other load/save path is
     # strict (chain.load_key), so a drifted-cwd workspace can never mint a
     # stray key and phantom-fail integrity
@@ -366,7 +374,7 @@ def bootstrap(run: Path, workspace: Path, *, work_item: dict, mode: str,
                 for t in tasks
             ],
             "contracts": [],
-            "artifacts": {},
+            "artifacts": dict(artifacts or {}),
             "metrics": {entry_step: {"started_at": now_iso(), "ended_at": None}},
         }
         save(run, workspace, state)

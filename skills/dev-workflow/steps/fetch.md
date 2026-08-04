@@ -42,4 +42,15 @@ Nothing further to do here. Advance:
 ${CLAUDE_PLUGIN_ROOT}/bin/harness cursor --to <next-per-manifest> --run <run>
 ```
 
-(`intake` in full and lean modes, `preflight` in quick.)
+(`intake` in full and lean modes; in quick, `confirm-repo` when the workspace
+registers more than one repo, `preflight` when it registers exactly one.)
+
+The seeded task's repo is fetch's **positional default** (`repos[0]`), not a
+scope decision — full/lean replace it at plan-register, quick ratifies it at
+`confirm-repo`. Don't present it to the user as a chosen repo.
+
+**Upgrading mid-run:** a run bootstrapped before `repo-ambiguity` existed has
+no such artifact, so the quick sequence's predicate raises ("predicate needs
+artifact 'repo-ambiguity' which was never recorded") rather than guessing. The
+artifact is deliberately not orchestrator-settable — abort the run and
+re-fetch, which re-bootstraps it correctly into a fresh same-day slot.

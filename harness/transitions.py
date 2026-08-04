@@ -49,8 +49,19 @@ def _config_get(config: dict, dotted: str):
 def eval_predicate(pred: dict, artifacts: dict, config: dict) -> bool:
     value = artifacts.get(pred.get("value"))
     if value is None:
+        # Naming the remedy here, not only in the step file (adversarial-review
+        # B/1): the overwhelmingly likely cause is a run bootstrapped BEFORE
+        # the producing step declared this artifact — an upgrade landing
+        # mid-run. Such a run has no legal move at all (every sequence walk
+        # hits this raise), and the message it wedges on is the only thing the
+        # human sees; the step doc that explains it is one they have no reason
+        # to re-open.
         raise TransitionError(
-            f"predicate needs artifact '{pred.get('value')}' which was never recorded"
+            f"predicate needs artifact '{pred.get('value')}' which was never "
+            "recorded — if this run was started before an upgrade that added "
+            "the artifact, its producing step never ran and no move is legal: "
+            "`harness abort --reason 'pre-upgrade run'` then re-fetch (a "
+            "same-day re-fetch gets its own run slot)"
         )
     if "equals" in pred:
         return value == pred["equals"]
@@ -193,6 +204,15 @@ def cursor_candidates(state: dict, manifest: dict, config: dict,
             t.get("provisional") for t in state.get("tasks", [])):
         return {}  # nothing legal until plan-register replaces the seed
 
+    # Same shape, same reason, different fact: quick mode has no
+    # plan-register, so `requires_tasks_registered` can't be what holds its
+    # seed repo shut. This gates EVERY exit for the same hardening reason as
+    # above — a future returns_to/group/escalation edge into or out of the
+    # confirming step must not leak past an unratified repo.
+    if (cur_def.get("requires_repo_confirmed")
+            and not state.get("repo_confirmed")):
+        return {}  # nothing legal until confirm-repo ratifies the seed's repo
+
     # gate-precedence: advancing PAST a gate needs a recorded forward decision.
     # A `select` gate (e.g. select-comments) picks a subset of items rather
     # than approving/rejecting a single proposal — any parsed selection
@@ -293,6 +313,18 @@ def advance_cursor(state: dict, manifest: dict, config: dict, target: str,
                 "list is still the fetch-seeded provisional placeholder — "
                 "run `harness plan-register` with the approved plan's tasks "
                 "first")
+        if (cur_def.get("requires_repo_confirmed")
+                and not state.get("repo_confirmed")):
+            seeded = ", ".join(sorted({t.get("repo", ".")
+                                       for t in state.get("tasks", [])}))
+            raise TransitionError(
+                f"cursor move '{current}' -> '{target}' is blocked: this "
+                f"run's target repo is still fetch's positional default "
+                f"({seeded}) — repos.yaml lists more than one repo and "
+                "nothing has ratified which one this work item belongs to. "
+                "Propose one from the repo-map evidence, confirm it with the "
+                "user, then run `harness confirm-repo --repo <registered "
+                "path>`")
         if cur_def.get("verdict_bound") and not candidates:
             raise TransitionError(
                 f"cursor move '{current}' -> '{target}' is blocked by "
@@ -336,6 +368,16 @@ def advance_cursor(state: dict, manifest: dict, config: dict, target: str,
         # reopened by any loop edge for every round after the first.
         for t in state.get("tasks", []):
             t["provisional"] = True
+    if (reason in ("returns_to", "on_reject")
+            and manifest["steps"].get(target, {}).get("requires_repo_confirmed")):
+        # Same re-arming, same reason, for the repo marker (adversarial-review
+        # A/F4): cursor_candidates hardens `requires_repo_confirmed` against
+        # every exit edge INCLUDING future loop edges, but a marker that never
+        # clears would satisfy the re-entered step on the PREVIOUS round's
+        # confirmation and release it immediately. Unreachable on today's
+        # manifest — quick has no loop edge into confirm-repo — so this keeps
+        # the module's own stated bar rather than fixing a live bug.
+        state.pop("repo_confirmed", None)
     skipped: list[dict] = []
     if reason == "sequence":
         # a farther-than-adjacent sequence target is only ever legal when

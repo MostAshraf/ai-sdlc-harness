@@ -59,6 +59,27 @@ class ValidatorCatchesBrokenManifest(unittest.TestCase):
         errs = self._errors(broken)
         self.assertTrue(any("develop" in e and "'tasks'" in e for e in errs), errs)
 
+    def test_requires_repo_confirmed_rejected_on_a_gate_step(self):
+        # same bar its two siblings get: a flag the engine can't meaningfully
+        # honour on a gate must be refused at validation, not discovered as a
+        # deadlocked cursor mid-run (a gate's exits derive from the human
+        # decision, so there is nothing for this to hold shut)
+        broken = copy.deepcopy(self.manifest)
+        broken["steps"]["approve-pre-pr"]["requires_repo_confirmed"] = True
+        errs = self._errors(broken)
+        self.assertTrue(any("requires_repo_confirmed" in e and "gate" in e
+                            for e in errs), errs)
+
+    def test_confirm_repo_predicate_needs_an_earlier_producer(self):
+        # confirm-repo's `when` reads an artifact fetch produces; drop that
+        # declaration and the sequence walk must catch it, because
+        # eval_predicate RAISES on a missing artifact at runtime rather than
+        # treating it as false — a silent manifest would strand every quick run
+        broken = copy.deepcopy(self.manifest)
+        broken["steps"]["fetch"]["produces"].remove("repo-ambiguity")
+        errs = self._errors(broken)
+        self.assertTrue(any("repo-ambiguity" in e for e in errs), errs)
+
     def test_mode_must_share_entry_prefix(self):
         broken = copy.deepcopy(self.manifest)
         broken["modes"]["quick"].remove("fetch")

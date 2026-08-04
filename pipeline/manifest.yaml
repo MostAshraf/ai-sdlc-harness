@@ -67,8 +67,19 @@ steps:
     owner: orchestrator
     # Fetch work item -> work-item.json; resolve change_type; run the
     # eligibility classifier; seed state.yaml (from-nothing transition) with a
-    # single task. In quick mode that seed IS the task list.
-    produces: [work-item, change-type, tasks]
+    # single task. In quick mode that seed is the task list ONCE RATIFIED —
+    # see `confirm-repo`, which is where quick reconciles the seed's
+    # positional-default repo against the work item.
+    #
+    # `repo-ambiguity` (single | multi) reports whether repos.yaml offers any
+    # CHOICE about where the seed should point. It is recorded here because
+    # this is where the seed is minted, and it is carried as an artifact
+    # rather than read from config at predicate time because eval_predicate
+    # reads artifacts only — a config-reading predicate would be new
+    # vocabulary for one call site. Consequence, accepted: the repo count is
+    # frozen at bootstrap, so an `/add-repo` that turns a single-repo
+    # workspace multi leaves an already-in-flight quick run exempt.
+    produces: [work-item, change-type, tasks, repo-ambiguity]
     # Named verdicts, not booleans: classify() mints a VERDICT (its
     # vocabulary), this mapping alone turns it into a mode — an explicit
     # `Mode: full` hint outranks everything (more gating is always
@@ -81,6 +92,41 @@ steps:
       quick-eligible: quick
       lean-requested: lean
       default: full
+
+  confirm-repo:
+    owner: orchestrator
+    # Quick mode's repo reconciliation — the step full/lean get from `intake`
+    # (its `## Target Repos` proposal + scope-register) and quick otherwise
+    # has nowhere to put.
+    #
+    # Field finding 2026-08-04: fetch seeds T1 with `repos[0]` — a positional
+    # default with, by its own comment, "no content analysis" — flagged
+    # provisional because "plan-register replaces this wholesale". Quick has
+    # no plan-register, so in a two-repo workspace a Nuxt frontend bug was
+    # seeded against a Java/Maven backend, preflight cut a branch THERE, and
+    # the run reached develop before a human noticed. The orchestrator
+    # diagnosed it correctly and found no verb existed to reassign the repo.
+    #
+    # Skipped outright when repos.yaml holds exactly one repo: `repos[0]` is
+    # then the only repo, there is no choice to ratify, and quick stays
+    # zero-ceremony (the sequence walk names the skip and its false predicate
+    # in the ledger).
+    when: {value: repo-ambiguity, equals: multi}
+    # `scope` only, deliberately NOT `tasks` — even though the verb does
+    # re-point the seeded task. This step is conditionally skipped, but the
+    # schema's sequence walk adds `produces` unconditionally, so anything
+    # claimed here counts as satisfied for later steps even on the runs where
+    # the step never executes. Claiming `tasks` would have let it stand in
+    # for fetch's own `tasks` output and silently defeat the mutation test
+    # that proves develop's precondition is really enforced. `scope` is safe
+    # to claim: nothing later in quick consumes it.
+    produces: [scope]
+    # Enforcement, not decoration: the cursor cannot LEAVE this step until
+    # `harness confirm-repo` has recorded state.repo_confirmed. That marker
+    # is deliberately not `provisional` and not `scope` — both are reachable
+    # by other means and would leave the guard satisfiable without anyone
+    # having chosen a repo (see confirm_repo() for the two forge paths).
+    requires_repo_confirmed: true
 
   intake:
     # Besides the requirements summary (with NUMBERED acceptance criteria —
@@ -364,6 +410,7 @@ modes:
     - metrics
   quick:
     - fetch
+    - confirm-repo
     - preflight
     - develop
     - quick-recheck

@@ -251,6 +251,16 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
                     help="JSON array of registered repo PATHS (config repos "
                          "values) the human confirmed for this run")
 
+    cr_ = sub.add_parser("confirm-repo", parents=[common],
+                         help="ratify which registered repo a quick run targets")
+    cr_.add_argument("--repo", required=True,
+                     help="the registered repo PATH (config repos value) the "
+                          "human confirmed for this run")
+    cr_.add_argument("--basis", default=None,
+                     help="one line of evidence for the choice (repo-map "
+                          "index, files the item names) — recorded in state "
+                          "and the ledger")
+
     pr_ = sub.add_parser("plan-register", parents=[common], help="replace seeded tasks with the plan's")
     pr_.add_argument("--tasks-json", default=None,
                      help="inline JSON array of tasks (or use --tasks-json-file)")
@@ -769,6 +779,12 @@ def main(argv: list[str] | None = None) -> int:
             _emit({"ok": True, **result})
             return 0
 
+        if args.cmd == "confirm-repo":
+            result = workflow.confirm_repo(args.workspace, args.run, manifest,
+                                           config, args.repo, args.basis)
+            _emit({"ok": True, **result})
+            return 0
+
         if args.cmd == "plan-register":
             tasks = _json_source("--tasks-json", args.tasks_json,
                                  args.tasks_json_file, None)
@@ -1261,8 +1277,21 @@ def main(argv: list[str] | None = None) -> int:
                     # an evaluation, not an omission — the ledger must be able
                     # to prove it happened (e2e E2E-1: approve-security's
                     # silent self-skip was indistinguishable from a hole)
+                    #
+                    # A skipped NON-gate step is a different fact and gets its
+                    # own unflagged kind (adversarial-review B/5): `gate-skipped`
+                    # is in FLAGGED_EVENT_KINDS because a gate that didn't ask a
+                    # human is worth a human's attention, but confirm-repo — the
+                    # first conditional non-gate step — skips on EVERY
+                    # single-repo quick run by design, which would park a
+                    # permanent flagged row on the zero-ceremony path the
+                    # predicate exists to keep clear. Still ledgered either way:
+                    # the skip and its false predicate stay provable.
+                    kind = ("gate-skipped"
+                            if (manifest["steps"].get(s["step"]) or {}).get("gate")
+                            else "step-skipped")
                     ndjson.append_record(args.run / "events.ndjson",
-                                         {"kind": "gate-skipped", **s})
+                                         {"kind": kind, **s})
             elif args.cmd == "task":
                 transitions.transition_task(st, fsm, config, args.run, key,
                                             args.id, args.to, args.context,
@@ -1382,6 +1411,16 @@ def main(argv: list[str] | None = None) -> int:
                         "the 'scope' artifact is written only by `harness "
                         "scope-register` — the generic artifact verb would "
                         "bypass its validation")
+                if args.name == "repo-ambiguity":
+                    # Written by fetch from the actual repos.yaml, and read by
+                    # confirm-repo's `when` predicate. A generic write here
+                    # would let `--value single` skip the confirming step in a
+                    # multi-repo workspace — i.e. re-open the very hole
+                    # confirm-repo exists to close.
+                    raise state_mod.StateError(
+                        "the 'repo-ambiguity' artifact is written only by "
+                        "`harness fetch`, from the workspace's registered "
+                        "repos — it is not orchestrator-settable")
                 engine_owned = {vb["outcome_artifact"]
                                 for s in manifest["steps"].values()
                                 for vb in [s.get("verdict_bound") or {}]

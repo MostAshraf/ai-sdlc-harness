@@ -1,5 +1,12 @@
 # Step: preflight (orchestrator-owned, fully mechanical)
 
+Pass the run's **ratified** repos — plan-register's task list in full/lean,
+`confirm-repo`'s in quick — never "whichever repo is first in repos.yaml".
+Reaching this step proves a ratification *happened* (the cursor refuses to
+leave the owning step otherwise), but `--repo` itself is not checked against
+it: this verb cuts a branch wherever you point it. Read the repo off
+`show`'s `tasks[*].repo`, don't retype it.
+
 Create the feature branch in each affected repo from the declared naming
 template — one owned command per repo:
 
