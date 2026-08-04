@@ -1,5 +1,7 @@
 # ai-sdlc-harness · v3.0
 
+[![Available on CodeGuilds](https://img.shields.io/badge/Available_on-CodeGuilds-6366f1)](https://codeguilds.dev/packages/ai-sdlc-harness)
+
 **A governed multi-agent SDLC pipeline for Claude Code** — a ground-up rewrite of [ai-sdlc-harness](https://github.com/MostAshraf/ai-sdlc-harness). Drives a real engineering workflow — fetch → scope-confirmed plan → independent plan review → proven-red TDD → review → security → PR → comment rounds → reconcile → metrics — across one or many repos. No application code lives here: only the pipeline manifest, the Python core that enforces it, and the agents, skills, and hooks that run it.
 
 | Command | Purpose |
