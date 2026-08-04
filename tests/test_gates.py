@@ -46,6 +46,23 @@ class GateDecisions(unittest.TestCase):
         with self.assertRaises(gates.GateRefusal):
             gates.decide(self.state, "g", records, self.options, "now")
 
+    def test_stale_capture_and_no_capture_refuse_DIFFERENTLY(self):
+        """Field, 2026-08-04 (BUG-2's approve-pre-pr): both causes reported
+        identically, and the advice that fits one ("re-present and have the
+        human reply again") is what DESTROYS the evidence in the other. The
+        human ended up typing APPROVED twice."""
+        gates.present(self.state, "g", "2026-01-01T00:05:00+00:00")
+        with self.assertRaises(gates.GateRefusal) as none_yet:
+            gates.decide(self.state, "g", [], self.options, "now")
+        self.assertIn("no human input captured", str(none_yet.exception))
+        stale = [_rec("2026-01-01T00:01:00+00:00", "APPROVED")]
+        with self.assertRaises(gates.GateRefusal) as aged_out:
+            gates.decide(self.state, "g", stale, self.options, "now")
+        msg = str(aged_out.exception)
+        self.assertIn("PREDATES this presentation", msg)
+        self.assertIn("Do NOT", msg)          # names the trap explicitly
+        self.assertIn("2026-01-01T00:01:00+00:00", msg)   # which reply aged out
+
     def test_rejection_with_notes_decides_when_lenient(self):
         """Field (session D): 'REJECTED — split the web work' refused,
         costing a triage spawn + a re-present round-trip for the canonical

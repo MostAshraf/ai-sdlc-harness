@@ -6,6 +6,17 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
+### A gate re-presentation no longer throws away the reply the human just gave
+
+**The human typed `APPROVED`, and the harness asked them to type it again.** Field, 2026-08-04 (BUG-2's `approve-pre-pr`): the reply was captured at 13:04:30 and was perfectly valid. The orchestrator's `--decide` then refused because the cursor sat at `pre-pr` rather than the gate; it advanced the cursor and ran `--present` and `--decide` **in one Bash invocation**. The present re-stamped `presented_at`, which aged the real reply out — `decide` qualifies only records strictly after the stamp — and the decide refused with "no human input after presentation." The gate resolved only because the next attempt happened to run `--decide` alone.
+
+Two compounding defects, both closed:
+
+- **Chaining `--present` and `--decide` in one shell invocation can never succeed.** A `UserPromptSubmit` event cannot occur between two commands of the same call, so the qualifying set is necessarily empty. `steps/gate.md` said "wait for the user's reply" but never that these are *separate tool calls in separate turns*; it does now.
+- **Re-presenting silently discarded captured evidence** — and the step file's own retry advice ("`--present` again … and repeat") recommended exactly that. `gate --present` now **refuses** when the gate is presented, undecided, and has un-decided replies waiting, telling the caller to `--decide` instead. That refusal is escapable by design: a qualified "APPROVED but…" genuinely cannot decide and needs a fresh window, so `--re-present` performs the discard deliberately. Without an escape the guard would itself have been a remedy that cannot terminate — the class this whole change is about.
+
+`decide`'s refusal now also distinguishes its two causes, because the advice that fits one is actively destructive for the other: "no human input captured" (present, wait, decide in separate calls) versus "N replies captured but the newest PREDATES this presentation" (do **not** present again — ask for one more reply and decide alone), naming the aged-out timestamp.
+
 ### Quick mode confirms which repo it is building in
 
 **A frontend bug was built in a backend repo, and nothing in the pipeline could have noticed.** Field, 2026-08-04: a `Mode: quick` item about a Nuxt component (`WelcomeView.vue`, failing `nuxt build`) was seeded against a Spring Boot / Java service, `preflight` cut a feature branch there, and the run reached `develop` before a human read the task repo. Nothing malfunctioned — `fetch` seeds its single task with `repos[0]`, a positional default its own comment describes as "no content analysis", flagged `provisional` because "plan-register replaces this wholesale." Quick has no `plan-register`. The placeholder simply *became* the answer. The run's own orchestrator diagnosed it correctly and then found there was no verb to reassign a task's repo, so it aborted — the right call, and the gap this closes.
@@ -18,7 +29,7 @@ The marker is its own fact for a reason both review lenses reproduced: the two f
 
 ### Upgrade notes
 
-- **New CLI** — `harness confirm-repo --repo <registered path> [--basis <text>]`. Orchestrator-only, like `scope-register`/`plan-register`: it records that a *human* was asked, so a subagent shape running it is blocked.
+- **New CLI** — `harness confirm-repo --repo <registered path> [--basis <text>]`. Orchestrator-only, like `scope-register`/`plan-register`: it records that a *human* was asked, so a subagent shape running it is blocked. Also `harness gate --present --re-present`, the deliberate-discard escape described above.
 - **New manifest key** — optional `steps.<id>.requires_repo_confirmed`, schema-validated and refused on a gate step, joining `requires_tasks_registered`/`requires_tasks_terminal`. Manifests without it are unaffected.
 - **New artifact** — `repo-ambiguity` (`single` | `multi`), produced by `fetch` from the registered repo count. Not orchestrator-settable: the generic `artifact` verb refuses it, since `--value single` would skip the confirming step outright. It also means the repo count is **frozen at bootstrap** — an `/add-repo` that turns a single-repo workspace multi does not reach an already-in-flight quick run (documented in `/add-repo`).
 - **New event kinds** — `repo-confirmed` (the ratification, carrying the retarget diff and any `--basis`), and `step-skipped` for a skipped **non-gate** step. The latter is deliberately *not* flagged: `gate-skipped` is, and reusing it would have parked a permanent flagged row on every single-repo quick run — the zero-ceremony path the predicate exists to protect. Gate skips are unchanged.

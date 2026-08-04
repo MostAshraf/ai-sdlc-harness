@@ -388,6 +388,11 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
     mode = g.add_mutually_exclusive_group(required=True)
     mode.add_argument("--present", action="store_true")
     mode.add_argument("--decide", action="store_true")
+    g.add_argument("--re-present", action="store_true",
+                   help="with --present: re-stamp the window even though "
+                        "un-decided replies are waiting, discarding them. For "
+                        "a reply that genuinely cannot decide (a qualified "
+                        "\"APPROVED but…\") after resolving it with the user")
     g.add_argument("--options", default=None,
                    help="ONLY for a `select` gate, at --present time: the "
                         "runtime candidate list (e.g. comment ids). Binary "
@@ -1327,6 +1332,40 @@ def main(argv: list[str] | None = None) -> int:
                                 "only for select gates")
                         options = list(gate_def.get("dispositions")
                                        or ["approved", "rejected"])
+                    # Re-presenting re-stamps `presented_at`, which INVALIDATES
+                    # any reply the human already gave: decide qualifies only
+                    # records strictly after the stamp. Field, 2026-08-04
+                    # (BUG-2's approve-pre-pr): the human's APPROVED was
+                    # captured at 13:04:30, a re-present at ~13:06 aged it out,
+                    # decide refused "no human input after presentation", and
+                    # they were asked to type it a second time. The step file's
+                    # own retry advice ("`--present` again … and repeat") walks
+                    # straight into this, so it was a remedy that could not
+                    # terminate — the class the 3.3.0 whole-branch pass called
+                    # out. Refuse instead of silently discarding the evidence;
+                    # `--re-present` is the deliberate escape (a qualified
+                    # "APPROVED but…" that can't decide genuinely does need a
+                    # fresh window).
+                    prev = st["gates"].get(args.id) or {}
+                    if (prev.get("presented_at") and prev.get("decision") is None
+                            and not args.re_present):
+                        try:
+                            waiting = [
+                                r for r in ndjson.read_records(
+                                    args.run / "human-input.ndjson")
+                                if r.get("at", "") > prev["presented_at"]]
+                        except (OSError, ndjson.LedgerCorruption):
+                            waiting = []   # unreadable → let the present through
+                        if waiting:
+                            raise gates.GateRefusal(
+                                f"gate '{args.id}' is already presented and has "
+                                f"{len(waiting)} un-decided repl(y/ies) waiting "
+                                "— re-presenting would re-stamp the window and "
+                                "throw them away, making the human type it "
+                                "again. Run `--decide` instead. If the reply "
+                                "genuinely cannot decide (a qualified "
+                                "\"APPROVED but…\"), resolve it with the user "
+                                "and re-present with --re-present")
                     gates.present(st, args.id, now, options)
                 else:
                     if args.options is not None:

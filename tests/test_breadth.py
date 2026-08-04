@@ -988,6 +988,78 @@ class FetchAlreadyDone(BreadthHarness):
                              Path(out["run"]) / "events.ndjson")])
 
 
+class GateRePresentGuard(BreadthHarness):
+    """A re-present must not silently throw away a reply the human gave.
+
+    Field, 2026-08-04 (BUG-2's approve-pre-pr): the human's APPROVED was
+    captured at 13:04:30; the orchestrator hit "gate is not the current step",
+    advanced the cursor, then ran `--present` and `--decide` in ONE Bash call.
+    The present re-stamped the window, aging out the real reply; the decide
+    refused "no human input after presentation"; the human was asked to type
+    it again. The step file's own retry advice walks straight into this.
+    """
+
+    def _at_gate(self, sid="G-1"):
+        self.story(sid, "fix typo", body="Mode: quick\njust a typo",
+                   type_="Task")
+        self.init()
+        run = Path(self.cli("fetch", "--id", sid, "--date", "2026-04-01")["run"])
+        self.cli("cursor", "--to", "preflight", run=run)
+        self.cli("preflight", "--repo", str(self.repo), run=run)
+        self.cli("cursor", "--to", "develop", run=run)
+        self.cli("task", "--id", "T1", "--to", "in-progress", run=run)
+        (self.repo / "docs.md").write_text("fixed\n")
+        self.cli("commit", "--repo", str(self.repo), "--task-id", "T1",
+                 "--summary", "typo", run=run)
+        self.cli("task", "--id", "T1", "--to", "in-review", run=run)
+        self.review_approve(run, "T1")
+        self.cli("task", "--id", "T1", "--to", "done", run=run)
+        self.cli("cursor", "--to", "quick-recheck", run=run)
+        self.cli("quick-recheck", "--repo", str(self.repo), "--base", "main",
+                 run=run)
+        self.cli("cursor", "--to", "pre-pr", run=run)
+        (run / "reports").mkdir(exist_ok=True)
+        (run / "reports" / "pre-pr.md").write_text("# Pre-PR\nok\n")
+        self.cli("cursor", "--to", "approve-pre-pr", run=run)
+        return run
+
+    def test_re_present_refuses_while_a_reply_is_waiting(self):
+        run = self._at_gate()
+        self.cli("gate", "--id", "approve-pre-pr", "--present", run=run)
+        ndjson.append_record(run / "human-input.ndjson", {"text": "APPROVED"})
+        out = self.cli("gate", "--id", "approve-pre-pr", "--present",
+                       run=run, expect=1)
+        self.assertIn("un-decided repl", out["error"])
+        # …and the reply it protected still decides (not yet consumed — that
+        # happens at the cursor move the decision legalizes)
+        out = self.cli("gate", "--id", "approve-pre-pr", "--decide", run=run)
+        self.assertEqual(out["decision"], "approved")
+        self.assertEqual(
+            self.cli("show", run=run)["state"]["gates"]["approve-pre-pr"]
+            ["decision"], "approved")
+
+    def test_re_present_flag_is_the_deliberate_escape(self):
+        # A qualified "APPROVED but…" cannot decide, so a fresh window is
+        # genuinely needed — the guard must not become its own dead end.
+        run = self._at_gate("G-2")
+        self.cli("gate", "--id", "approve-pre-pr", "--present", run=run)
+        ndjson.append_record(run / "human-input.ndjson",
+                             {"text": "APPROVED but rename T1 first"})
+        self.cli("gate", "--id", "approve-pre-pr", "--decide", run=run, expect=1)
+        self.cli("gate", "--id", "approve-pre-pr", "--present", run=run,
+                 expect=1)                                    # guarded
+        self.cli("gate", "--id", "approve-pre-pr", "--present", "--re-present",
+                 run=run)                                     # escape works
+        ndjson.append_record(run / "human-input.ndjson", {"text": "APPROVED"})
+        self.cli("gate", "--id", "approve-pre-pr", "--decide", run=run)
+
+    def test_first_present_is_never_blocked(self):
+        # nothing captured yet -> the guard must stay out of the way
+        run = self._at_gate("G-3")
+        self.cli("gate", "--id", "approve-pre-pr", "--present", run=run)
+        self.cli("gate", "--id", "approve-pre-pr", "--present", run=run)
+
+
 class QuickRepoConfirmation(BreadthHarness):
     """Quick mode's repo reconciliation (field, 2026-08-04).
 
@@ -2682,7 +2754,15 @@ class RejectionWithNotes(BreadthHarness):
         out = self.cli("gate", "--id", "approve-plan", "--decide", run=run,
                        expect=1)
         self.assertIn("FORWARD", out["error"])
-        self.cli("gate", "--id", "approve-plan", "--present", run=run)
+        # THE case --re-present exists for: a qualified forward reply is
+        # captured and un-decidable, so the window genuinely has to be
+        # re-stamped. A bare --present is refused here on purpose — that
+        # refusal is what stops a retry from silently discarding a reply the
+        # human gave (field 2026-08-04); discarding an un-decidable one is a
+        # deliberate act, and this flag is how the caller says so.
+        self.cli("gate", "--id", "approve-plan", "--present", run=run, expect=1)
+        self.cli("gate", "--id", "approve-plan", "--present", "--re-present",
+                 run=run)
         ndjson.append_record(run / "human-input.ndjson",
                              {"text": "REJECTED — split T1 into two tasks"})
         self.cli("gate", "--id", "approve-plan", "--decide", run=run)
