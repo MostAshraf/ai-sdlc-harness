@@ -299,15 +299,38 @@ def publish_mirror(repo: Path, run_dir: Path, config: dict, run_name: str) -> st
     return head_sha(repo)
 
 
-def sync_branch(repo: Path, onto: str) -> None:
-    """`harness sync-branch` — the owned update-from-main entry point (RC4)."""
-    proc = subprocess.run(["git", "-C", str(repo), "rebase", onto],
+def sync_branch(repo: Path, onto: str) -> dict:
+    """`harness sync-branch` — the owned update-from-main entry point (RC4).
+
+    FETCHES first, then rebases onto the freshly-fetched tip. It used to
+    rebase onto the LOCAL `onto` ref, which nothing in the package had ever
+    fetched — so its one documented purpose ("if the base moved upstream,
+    sync FIRST", apply-fixes.md) was unachievable: on a stale local base the
+    rebase was a no-op that reported success, and the caller pushed believing
+    it had caught up. A sync verb that cannot see the thing it syncs to is
+    worse than no verb, because it launders the staleness as handled.
+
+    Unlike `ensure_default_branch` — which measures and refuses to move
+    anything — moving the branch IS this verb's mandate: the caller invoked
+    an update. So it rebases onto FETCH_HEAD (the same explicit-refspec
+    reasoning as `base_branch_behind`: the remote-tracking ref is only
+    written when the refspec is configured for it).
+
+    An unanswerable remote does NOT block — the PR-comment loop this serves
+    must still work offline — but the result says so (`remote_verified`),
+    because "rebased onto a local ref I could not confirm" and "rebased onto
+    the real upstream tip" are different facts and reporting them
+    identically is the original bug in miniature."""
+    verified = fetch_base(repo, onto)
+    target = "FETCH_HEAD" if verified else onto
+    proc = subprocess.run(["git", "-C", str(repo), "rebase", target],
                           capture_output=True, text=True,
                           encoding="utf-8", errors="replace")
     if proc.returncode != 0:
         run_git(repo, "rebase", "--abort", check=False)
         raise GitError(f"sync-branch rebase onto {onto} conflicted (aborted cleanly): "
                        f"{proc.stderr.strip()[:300]}")
+    return {"onto": onto, "remote_verified": verified}
 
 
 def _push_remote(repo: Path) -> str:
@@ -432,26 +455,41 @@ def base_branch_behind(repo: Path, branch: str) -> int | None:
     stance (a `pull` could conflict, or absorb upstream code the human never
     asked for, exactly what the dirty-tree and in-progress refusals exist to
     prevent). The caller reports the number; the human decides."""
+    if not fetch_base(repo, branch):
+        return None
+    count = run_git(repo, "rev-list", "--count", f"{branch}..FETCH_HEAD",
+                    check=False)
+    return int(count) if count.isdigit() else None
+
+
+def fetch_base(repo: Path, branch: str) -> bool:
+    """Refresh `branch` from its remote into FETCH_HEAD. True when the remote
+    genuinely answered; False for every unanswerable case (no remote,
+    ambiguous remotes, offline, auth, no such branch upstream) — the
+    tri-state fail-open contract `remote_branch_exists` established, so a
+    connectivity blip never bricks a step.
+
+    One implementation, two callers (`base_branch_behind` measures the gap,
+    `sync_branch` rebases across it) — they must never disagree about what
+    "the current base" means, and duplicating the remote-resolution and
+    fail-open branches is exactly how that drift starts.
+
+    Read-only by construction: fetching an explicit refspec writes
+    FETCH_HEAD and the remote-tracking ref, never the working tree and never
+    the local branch. Callers that then MOVE something (sync_branch) are
+    doing so on their own mandate, not this function's."""
     try:
         remote = _push_remote(repo)
     except (GitError, OSError):
-        return None                    # no remote, or ambiguous — structural
+        return False                   # no remote, or ambiguous — structural
     try:
         proc = subprocess.run(
             ["git", "-C", str(repo), "fetch", "--quiet", remote, branch],
             capture_output=True, text=True, timeout=60,
             encoding="utf-8", errors="replace")
     except (subprocess.SubprocessError, OSError):
-        return None                    # includes TimeoutExpired (auth prompt)
-    if proc.returncode != 0:
-        return None
-    # FETCH_HEAD, not `<remote>/<branch>`: a fetch of an explicit refspec
-    # updates FETCH_HEAD on every git version, while the remote-tracking ref
-    # is only written when the refspec is configured for it — reading the
-    # tracking ref would silently report a stale count as if it were fresh.
-    count = run_git(repo, "rev-list", "--count", f"{branch}..FETCH_HEAD",
-                    check=False)
-    return int(count) if count.isdigit() else None
+        return False                   # includes TimeoutExpired (auth prompt)
+    return proc.returncode == 0
 
 
 def _in_progress_operation(repo: Path) -> str | None:

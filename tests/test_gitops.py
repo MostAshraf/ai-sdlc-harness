@@ -555,6 +555,43 @@ class MirrorAndSync(GitopsHarness):
         gitops.sync_branch(self.repo, "main")
         self.assertTrue((self.repo / "main.txt").exists())
 
+    def test_sync_branch_picks_up_commits_only_on_the_REMOTE_base(self):
+        """The defect this verb existed to fix but couldn't: it rebased onto
+        the LOCAL base, which nothing in the package ever fetched. Its one
+        documented use is "if the base moved upstream, sync FIRST" — and a
+        base that moved ONLY upstream was invisible, so the rebase was a
+        no-op that reported success and the caller pushed believing it had
+        caught up. Local main is deliberately left stale here: if the fetch
+        were removed, the rebase would still "succeed" and upstream.txt would
+        not exist."""
+        origin = make_repo(self.workspace, "origin-sync")
+        gitops.run_git(self.workspace, "clone", str(origin), "sync-clone")
+        clone = self.workspace / "sync-clone"
+        gitops.run_git(clone, "config", "user.email", "t@t")
+        gitops.run_git(clone, "config", "user.name", "t")
+        gitops.run_git(clone, "checkout", "-b", "feature")
+        (clone / "feat.txt").write_text("f\n")
+        gitops.run_git(clone, "add", "-A")
+        gitops.run_git(clone, "commit", "-m", "feat")
+        (origin / "upstream.txt").write_text("u\n")      # base moves UPSTREAM only
+        gitops.run_git(origin, "add", "-A")
+        gitops.run_git(origin, "commit", "-m", "upstream work")
+
+        out = gitops.sync_branch(clone, "main")
+        self.assertTrue(out["remote_verified"])
+        self.assertTrue((clone / "upstream.txt").exists())
+        self.assertTrue((clone / "feat.txt").exists())   # own work preserved
+
+    def test_sync_branch_without_a_remote_says_it_could_not_verify(self):
+        # offline / no remote must not block the PR-comment loop, but must
+        # not be reported as a real sync either
+        gitops.run_git(self.repo, "checkout", "-b", "feature")
+        (self.repo / "feat.txt").write_text("f\n")
+        gitops.run_git(self.repo, "add", "-A")
+        gitops.run_git(self.repo, "commit", "-m", "feat")
+        out = gitops.sync_branch(self.repo, "main")
+        self.assertFalse(out["remote_verified"])
+
     def test_sync_branch_conflict_aborts_cleanly(self):
         gitops.run_git(self.repo, "checkout", "-b", "feature")
         (self.repo / "README.md").write_text("feature version\n")

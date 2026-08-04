@@ -1040,8 +1040,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.cmd == "sync-branch":
-            gitops.sync_branch(args.repo, args.onto)
-            _emit({"ok": True, "synced_onto": args.onto})
+            synced = gitops.sync_branch(args.repo, args.onto)
+            # `remote_verified: false` means the rebase used the LOCAL ref
+            # because the remote could not be reached — the branch may still
+            # be behind upstream. Reported, not silently equated with a real
+            # sync (that equation was the original defect).
+            _emit({"ok": True, "synced_onto": args.onto, **synced})
             return 0
 
         if args.cmd == "push":
