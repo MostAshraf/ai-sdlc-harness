@@ -699,10 +699,21 @@ def guard_bash(p: dict) -> None:
             if is_harness_ws is None:
                 is_harness_ws = _is_harness_workspace(cwd)
             if is_harness_ws:
+                # `update-base` is named explicitly, and the ordering of the
+                # two update verbs matters: a human blocked on `git pull`
+                # while standing on a stale BASE used to read this list and
+                # reach for `sync-branch`, which rebases the CURRENT branch
+                # onto a base — the wrong tool, and until update-base existed
+                # the only one offered (field: US-CHAT-01 lean run). A block
+                # message that cannot name the terminating remedy is half the
+                # bug it is trying to prevent.
                 block(f"raw `git {m.group(1)}` is blocked (RC1): commits, history "
                       "rewrites, and remote updates go through the owned entry points — "
-                      "`harness commit`, `harness merge-task`, `harness sync-branch`, "
-                      "`harness push`, `harness publish-mirror`.", cwd, p)
+                      "`harness commit`, `harness merge-task`, `harness push`, "
+                      "`harness publish-mirror`, and for updates: "
+                      "`harness update-base` (fast-forward a BASE branch onto "
+                      "its remote) or `harness sync-branch` (rebase the "
+                      "CURRENT branch onto a base that moved).", cwd, p)
         if AUTHORITY_RE.search(target) and WRITE_HINT_RE.search(target):
             block("run-authority files mutate only via the owned entry points — "
                   "`harness cursor` / `harness task` / `harness gate` / "

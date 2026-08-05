@@ -40,7 +40,8 @@ FLAGGED_EVENT_KINDS = (
     "coverage-skipped", "risk-without-tests", "tests-without-production",
     "pr-recorded-manually", "secret-sweep-blocked", "gate-skipped",
     "deferral-pending", "panel-serialized",
-    # field: dual-run comparison. Six kinds, in three resolution classes —
+    # field: dual-run comparison, and everything added to this block since.
+    # Ten kinds now, in three resolution classes —
     # each stated explicitly, because getting this wrong is what makes the
     # flagged-events gauge either over- or under-report (see
     # outstanding_flagged below).
@@ -77,6 +78,15 @@ FLAGGED_EVENT_KINDS = (
     #     the service and re-runs. Permanent here would leave every such run
     #     reading DEGRADED forever (re-verify finding).
     "env-prereq-missing",
+    # field: US-CHAT-01 lean run. Class (c), RESOLVABLE — paired off per repo
+    # by `base-branch-current`. A DISTINCT kind from its class-(a) sibling
+    # `base-branch-behind` above, and the difference is the whole point:
+    # preflight's records a fact true AT CUT TIME that nothing later undoes,
+    # while this one is emitted at PLAN time, before any branch exists — so
+    # `update-base` genuinely makes it false, and leaving it permanent would
+    # park a solved problem on the gauge the human reads at the plan gate.
+    # Same shape as env-prereq: surface early, human decides, re-probe clears.
+    "base-branch-stale",
     # field: US-CHAT-00 run. Class (c), RESOLVABLE — paired off by
     # `write-back-succeeded`. The milestone write-back is declared best-effort
     # ("never a blocking requirement", write_back below), so a provider that
@@ -96,11 +106,20 @@ FLAGGED_EVENT_KINDS = (
     # independently). Not HEALTH_DEGRADING either: no evidence was lost and
     # the run's own machinery is intact — only the external tracker is behind.
     "write-back-failed")
-# None of the seven are HEALTH_DEGRADING (below): each means "a human should
+# None of the ten are HEALTH_DEGRADING (below): each means "a human should
 # look", not "this run's machinery degraded / evidence was lost". The closest
 # call is `remote-branch-unverified` — evidence genuinely not obtained — but
 # preflight continuing without it is the declared, safe behaviour (a
 # connectivity blip must not brick a run), not a degraded one.
+
+
+def _base_key(e: dict) -> tuple:
+    """The identity a `base-branch-stale` flag and its `base-branch-current`
+    resolver must agree on: one repo's one BASE branch. Shared by the gauge
+    and by `base_check`'s own open-flag probe, so a stray record is inert in
+    both readers rather than merely harmless in one (the lesson
+    `_has_open_env_miss` records)."""
+    return (e.get("repo"), e.get("branch"))
 
 
 def outstanding_flagged(events: list[dict]) -> list[dict]:
@@ -128,12 +147,17 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
     survived the revision round that withdrew the opt-out, misreporting the
     approved plan at every later gate). Both events assert live plan STATE,
     unlike gate-skipped/hook-blocked, which record occurrences and stay
-    permanent correctly."""
+    permanent correctly.
+
+    `base-branch-stale` pairs off the same way but keyed BY REPO — see the
+    branch below for why a whole-set supersede would under-count a multi-repo
+    run."""
     flagged = [e for e in events if e.get("kind") in FLAGGED_EVENT_KINDS]
     open_pending: list[dict] = []
     open_plan: list[dict] = []
     open_env: list[dict] = []
     open_wb: list[dict] = []
+    open_base: dict[tuple, list[dict]] = {}
     resolved: set[int] = set()
     for e in events:
         kind = e.get("kind")
@@ -184,6 +208,30 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
             # writes the actor.
             resolved.update(id(x) for x in open_wb)
             open_wb.clear()
+        elif kind == "base-branch-stale":
+            open_base.setdefault(_base_key(e), []).append(e)
+        elif (kind == "base-branch-current"
+                and e.get("actor") == "base-check"):
+            # Keyed by (REPO, BRANCH), unlike env-prereq's whole-set
+            # supersede: base freshness is measured one repo AND one base at a
+            # time, so a clean probe clears only what it actually measured.
+            # Repo-only was the first draft, and adversarial review reproduced
+            # its failure on a release-train repo: probing `release/2026`
+            # (current) cleared the open flag for `main` (4 behind) in the SAME
+            # repo, so the gauge a human reads at the plan gate went 1 -> 0
+            # while the stale base was still stale. `--branch` is a
+            # first-class override on both verbs and `default_branch` exists
+            # to handle `release/2026`-shaped bases, so two bases in one repo
+            # is a supported shape, not a corner. That is the silent
+            # under-count the per-repo keying was introduced to prevent,
+            # stopping one granularity short of preventing it.
+            #
+            # actor-checked, like its three siblings: this CLEARS an audit
+            # gauge and `log-event` is unvalidated, so a stray hand-appended
+            # record must not do it. Same bound they have — a caller that
+            # writes the actor still clears — stated so the check is not read
+            # as more than it is.
+            resolved.update(id(x) for x in open_base.pop(_base_key(e), []))
         elif kind in ("risk-without-tests", "tests-without-production",
                       "contract-fragment-weak"):
             open_plan.append(e)
@@ -2367,6 +2415,133 @@ def env_check(workspace: Path, run: Path, config: dict,
                               "actor": "env-check"})
     return {"tasks": [t["id"] for t in scoped], "checked": checked,
             "missing": missing}
+
+
+def _open_base_stale(run: Path, key: tuple) -> bool:
+    """Is there a `base-branch-stale` for this (repo, base branch) not yet
+    cleared by a `base-branch-current`? Read in ORDER, last-writer-wins — the
+    same live-gauge question `outstanding_flagged` answers, asked here so
+    base-check neither restates an open flag nor writes a clearing record
+    that clears nothing.
+
+    Keyed through the shared `_base_key`, so this reader and the gauge cannot
+    drift on what "the same flag" means — repo-only keying made them agree on
+    the wrong thing (see the resolver's comment)."""
+    open_ = False
+    for e in ndjson.read_records(run / "events.ndjson"):
+        if _base_key(e) != key:
+            continue
+        if e.get("kind") == "base-branch-stale":
+            open_ = True
+        elif (e.get("kind") == "base-branch-current"
+                and e.get("actor") == "base-check"):
+            open_ = False
+    return open_
+
+
+def base_check(workspace: Path, run: Path, config: dict, repo: Path,
+               branch: str | None = None) -> dict:
+    """Read-only base-branch freshness for ONE repo, for the plan step.
+
+    field (US-CHAT-01 lean run): the target repo's local `main` was 4 commits
+    behind `origin/main`, and those 4 commits were a just-landed
+    test-infrastructure story. Planning happens BEFORE preflight in every mode,
+    and the planner grounds itself by reading the real working tree
+    (plan-task.md §0) — so it would have concluded "this repo has no test
+    runner" and planned either to build one from scratch or to write tests
+    against a base whose history does not contain one. A human then approves
+    that plan at the gate. Preflight measures the staleness, but by then the
+    plan is ratified AND the feature branch is cut from the same stale tip, so
+    its warning arrives after both decisions it should have informed.
+
+    So the count has to be taken where the grounding happens. Deliberately
+    NOT a gate: it reports and flags, never refuses. The design goal is to put
+    the decision in front of the human EARLIER, not to add a blocker or to
+    pull anything automatically — `update-base` is the verb that acts, and
+    only when a human says so.
+
+    Read-only in every sense `base_branch_behind` is (fetch moves
+    remote-tracking refs, never the working tree, never a local branch), so
+    unlike preflight it needs neither a clean tree nor the base checked out:
+    at plan time the human may well have work in progress, and refusing on it
+    here would be a new gate smuggled in as a check.
+
+    `behind: null` is unanswerable (no remote, offline, auth), not a signal —
+    silent, exactly as preflight treats it."""
+    from . import initws
+    from .transitions import ensure_live
+    with state_mod.locked_read(run):   # torn-read guard, same as show/verify
+        st = state_mod.load(run, workspace)
+    ensure_live(st, "base-check")
+    name = initws.repo_name(config, repo) or str(repo)
+    target = branch or gitops.default_branch(repo)
+    if not gitops._branch_exists(repo, target):
+        # `default_branch` is a documented BEST GUESS; acting on a wrong one
+        # would measure a branch that isn't the base and report a confident
+        # number for it. Same refusal ensure_default_branch makes, for the
+        # same reason.
+        raise gitops.GitError(
+            f"{repo}: branch '{target}' does not exist locally — could not "
+            "confirm this is really the base branch (no resolvable "
+            "origin/HEAD); pass --branch explicitly")
+    behind = gitops.base_branch_behind(repo, target)
+    # WHICH TREE the planner will actually read (re-verification finding, and
+    # the sharpest one in the round). This function's whole warrant is the
+    # working tree — "the planner grounds itself in this working tree" — but
+    # what it MEASURES is the base ref. Once `update_base` stopped switching
+    # branches (it must not; that defect squash-merged tasks onto the base),
+    # the two came apart: on a repo standing on a leftover feature branch —
+    # precisely the state a prior run's preflight leaves behind — the loop ran
+    # flag -> update-base -> re-check -> `behind: 0`, wrote `base-branch-
+    # current`, and cleared the gauge while the planner's tree still lacked
+    # every upstream commit. A green audit trail over the exact condition the
+    # check exists to catch is worse than no check.
+    #
+    # Reported, never refused (this step reports; that is its contract) — but
+    # `behind` alone can no longer be read as the answer, so the answer now
+    # says which branch it is about.
+    current = gitops.run_git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    on_base = current == target
+    out = {"repo": name, "branch": target, "behind": behind,
+           "current_branch": current, "grounded_on_base": on_base}
+    key = (name, target)
+    was_open = _open_base_stale(run, key)
+    if not on_base:
+        out["grounding_warning"] = (
+            f"the working tree is on '{current}', not the base '{target}' — "
+            f"the planner reads '{current}', so this `behind` count does NOT "
+            "describe what it will ground itself in, and update-base (which "
+            "never switches your checkout) will not change that. Surface this "
+            "to the user with the count.")
+    if behind:
+        # Not restated while already open: base-check is re-run after the
+        # human updates (that is the whole loop), and a plan revision round
+        # re-enters this step — every pass would otherwise stack another
+        # identical assertion onto the gauge. The RESOLVED case re-flags
+        # normally, because upstream moving again is genuinely new.
+        if not was_open:
+            ndjson.append_record(
+                run / "events.ndjson",
+                {"kind": "base-branch-stale", "repo": name, "branch": target,
+                 "behind": behind,
+                 "reason": f"{target} is {behind} commit(s) behind its "
+                           "remote — the planner grounds itself in this "
+                           "working tree, so the plan describes code that is "
+                           "not what the change will merge into. Remedy: "
+                           "`harness update-base --repo <path>` (fast-forward "
+                           "only), then re-run base-check",
+                 "actor": "base-check"})
+        out["flagged"] = not was_open
+    elif behind == 0 and was_open and on_base:
+        # Only when something is actually open: an unconditional clean record
+        # would write ledger noise on every run that was never stale. And only
+        # when the tree is ON the base — clearing the flag while the planner
+        # reads a different branch is the false clean bill of health above.
+        ndjson.append_record(run / "events.ndjson",
+                             {"kind": "base-branch-current", "repo": name,
+                              "branch": target, "actor": "base-check"})
+        out["resolved"] = True
+    return out
 
 
 def preflight(workspace: Path, run: Path, config: dict, manifest: dict,

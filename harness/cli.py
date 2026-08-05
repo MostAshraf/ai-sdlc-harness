@@ -150,6 +150,22 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
     edb.add_argument("--repo", type=Path, required=True)
     edb.add_argument("--branch", default=None)
 
+    ub = sub.add_parser("update-base", parents=[common],
+                        help="owned fast-forward of the BASE branch onto its "
+                             "remote (the remedy for a `behind` count)")
+    ub.add_argument("--repo", type=Path, required=True)
+    ub.add_argument("--branch", default=None,
+                    help="override the auto-resolved default branch — the "
+                         "BASE to fast-forward, never a feature branch "
+                         "(that is `sync-branch`)")
+
+    bc = sub.add_parser("base-check", parents=[common],
+                        help="read-only base-branch freshness for one repo "
+                             "(plan step 0) — reports, never refuses")
+    bc.add_argument("--repo", type=Path, required=True)
+    bc.add_argument("--branch", default=None,
+                    help="override the auto-resolved default branch")
+
     rm = sub.add_parser("resolve-model", parents=[common],
                         help="resolve the model override for a shape/mode "
                              "spawn (subagent_models)")
@@ -459,7 +475,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     now = ndjson.now_iso()
     NO_RUN = ("init", "fetch", "provider", "provider-normalize", "discover",
-              "ensure-default-branch", "init-verify", "init-section",
+              "ensure-default-branch", "update-base", "init-verify", "init-section",
               "init-finalize", "add-repo", "migrate-detect", "migrate-extract",
               "status", "repo-map-check", "repo-map-stamp", "validate-mermaid",
               "resolve-model", "resolve-coverage-cmd", "resolve-test-cmd")
@@ -622,6 +638,23 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.cmd == "ensure-default-branch":
             result = gitops.ensure_default_branch(args.repo, args.branch)
+            _emit({"ok": True, **result})
+            return 0
+
+        if args.cmd == "update-base":
+            # `advanced: false` is a legitimate success (already current), so
+            # the caller must read that field rather than the exit code to
+            # know whether anything moved — every refusal path raises instead.
+            _emit({"ok": True, **gitops.update_base(args.repo, args.branch)})
+            return 0
+
+        if args.cmd == "base-check":
+            result = workflow.base_check(args.workspace, args.run, config,
+                                         args.repo, args.branch)
+            # Exit 0 even when stale — deliberately NOT env-check's refusal
+            # contract. This surfaces a decision for the human at the plan
+            # gate; it is not a gate itself, and a plan step that hard-failed
+            # on an upstream commit would be a new blocker nobody asked for.
             _emit({"ok": True, **result})
             return 0
 

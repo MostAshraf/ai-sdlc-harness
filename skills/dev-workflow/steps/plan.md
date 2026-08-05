@@ -17,6 +17,47 @@
      via `${CLAUDE_PLUGIN_ROOT}/bin/harness repo-map-stamp` after it
      returns — a plan grounded in a stale map cites patterns that no longer
      exist.
+0a. **Base-branch freshness — same scope, same reason.** The map is only half
+   the grounding: plan-task.md §0 also has the planner read the REAL working
+   tree, and planning happens before preflight in every mode, so that tree can
+   be arbitrarily behind `origin/<base>` with nothing having said so. Per
+   CONFIRMED SCOPE repo:
+   `${CLAUDE_PLUGIN_ROOT}/bin/harness base-check --repo <path> --run <run>`
+   (read-only fetch; `--branch <name>` overrides the auto-resolved base).
+   - `behind: 0` or `null` (unanswerable — no remote/offline) → nothing to do.
+   - `behind: <n>` → it logs a flagged `base-branch-stale` event (first time
+     only — a plan re-entry per 0b reports the same count without restating
+     it), and **you must surface the count to the user before spawning the
+     planner** and name it in the ask, so the planner records it in its status
+     block and weighs it in the self-adversarial pass. A plan grounded in a
+     base that is n commits behind can propose work that already landed
+     upstream — the human ratifies it at the plan gate, and preflight then
+     cuts the branch from that same stale tip. Never pull silently: the remedy
+     is `${CLAUDE_PLUGIN_ROOT}/bin/harness update-base --repo <path>`
+     (fetch + fast-forward only), run **only on the user's decision**. It
+     moves the base REF and never your checkout, so uncommitted work on a
+     different branch is fine. It refuses — surface the message, never work
+     around it — when the base has diverged (local-only commits), when the
+     base itself is checked out and dirty, mid-rebase/merge, or when the
+     remote can't be reached. A refusal the user chooses not to resolve is a
+     legitimate outcome: the flag stays open and rides to the plan gate, which
+     is the point.
+   - `grounded_on_base: false` → **stop and surface `grounding_warning`
+     verbatim.** The working tree is on some other branch (a prior run's
+     feature branch is the common cause), so the planner will read THAT, and
+     `behind` describes a base it isn't standing on. `update-base` will not
+     fix this — it deliberately never switches your checkout. Ask the user to
+     put the repo on the base, or to confirm they want the plan grounded in
+     the branch that's there. The flag stays open until the tree is on a
+     current base, by design: clearing it while the planner reads something
+     else is the false all-clear this whole step exists to prevent.
+   - After a successful `update-base` (`advanced: true`) **with
+     `checked_out: true`**: **re-run step 0's `repo-map-check`** — the
+     fast-forward moved `HEAD` past the commit the map was stamped against, so
+     a map that read `fresh` a moment ago may now be `stale`. (On
+     `checked_out: false` only the ref moved, `HEAD` didn't, and the map
+     verdict can't have changed.) Then re-run `base-check`; `resolved: true`
+     in its output is the confirmation the clear landed.
 0b. **Re-entering plan** (plan-review's revision loop / gate rejection /
    approved mid-run amendment)? Snapshot the current plan first — copy
    `<run>/plan.md` to `<run>/plan-r<n>.md` — so the previous text stays

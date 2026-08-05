@@ -231,7 +231,7 @@ The property that matters — *the test genuinely failed before the fix existed*
 
 ### Owned git entry points
 
-Once a workspace has completed `/init-workspace`, raw commit-creating / history-rewriting git verbs (`commit`, `merge`, `rebase`, `cherry-pick`, `revert`, `am`, `pull`, `push`) are blocked for Claude for the life of that workspace — the guard cannot know a "harness" commit from any other, so it blocks the whole verb rather than trying to tell one commit's intent from another's (your own terminal outside Claude Code is unaffected, and a session that has never run `/init-workspace` sees ordinary git — see [Guardrail Hooks](#guardrail-hooks)). Mutations go through owned verbs that validate, execute, and ledger in one place: `commit` (declared classes `working`/`wip`, `--fixup-of`), `merge-task` (squash / `--autosquash` fold), `worktree-add`/`worktree-remove`, `sync-branch` (owned rebase), `push` (`--force-with-lease`), and `publish-mirror`. Branch and commit naming come from [config/defaults/naming.yaml](config/defaults/naming.yaml).
+Once a workspace has completed `/init-workspace`, raw commit-creating / history-rewriting git verbs (`commit`, `merge`, `rebase`, `cherry-pick`, `revert`, `am`, `pull`, `push`) are blocked for Claude for the life of that workspace — the guard cannot know a "harness" commit from any other, so it blocks the whole verb rather than trying to tell one commit's intent from another's (your own terminal outside Claude Code is unaffected, and a session that has never run `/init-workspace` sees ordinary git — see [Guardrail Hooks](#guardrail-hooks)). Mutations go through owned verbs that validate, execute, and ledger in one place: `commit` (declared classes `working`/`wip`, `--fixup-of`), `merge-task` (squash / `--autosquash` fold), `worktree-add`/`worktree-remove`, `update-base` (fast-forward a *base* branch onto its remote — fetch + `--ff-only`, refusing any divergence), `sync-branch` (owned rebase of the *current* branch onto a base that moved), `push` (`--force-with-lease`), and `publish-mirror`. Branch and commit naming come from [config/defaults/naming.yaml](config/defaults/naming.yaml).
 
 ### Choosing a mode
 
@@ -323,10 +323,10 @@ All ~50 owned verbs run through the wrapper `${CLAUDE_PLUGIN_ROOT}/bin/harness` 
 | Group | Verbs |
 |---|---|
 | Workspace setup | `init` · `discover` · `ensure-default-branch` · `init-verify` · `init-section` · `init-finalize` · `add-repo` · `migrate-detect` · `migrate-extract` · `resolve-model` · `resolve-coverage-cmd` |
-| Pipeline steps | `fetch` · `scope-register` · `confirm-repo` · `preflight` · `plan-register` · `quick-recheck` · `security-scan` · `reconcile-contracts` · `create-pr` · `fetch-pr-comments` · `reconcile` · `write-back` · `metrics` |
+| Pipeline steps | `fetch` · `scope-register` · `confirm-repo` · `base-check` · `preflight` · `plan-register` · `env-check` · `quick-recheck` · `security-scan` · `reconcile-contracts` · `create-pr` · `fetch-pr-comments` · `reconcile` · `write-back` · `metrics` |
 | State & evidence | `bootstrap` · `cursor` · `task` · `artifact` · `gate` · `stall` · `log-event` · `verify` · `show` · `status` · `abort` · `complete` · `reseal` |
 | TDD proof | `verify-red` (and `--revise`) · `show-redproof` |
-| Git (owned) | `worktree-add` · `worktree-remove` · `commit` · `merge-task` · `sync-branch` · `push` · `publish-mirror` |
+| Git (owned) | `worktree-add` · `worktree-remove` · `commit` · `merge-task` · `update-base` · `sync-branch` · `push` · `publish-mirror` |
 | Providers & misc | `provider` · `provider-normalize` · `validate-mermaid` · `repo-map-check` · `repo-map-stamp` |
 
 Exit codes: `0` ok · `1` refused (read the JSON `error`) · `2` usage error · `3` integrity violation (a sealed file changed out-of-band — recover with `harness reseal` after review).
@@ -409,7 +409,7 @@ python -m venv .venv; .venv\Scripts\pip install pyyaml
 .venv\Scripts\python -m unittest discover -s tests
 ```
 
-The test suite (909 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (942 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 

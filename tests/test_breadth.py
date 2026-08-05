@@ -1054,6 +1054,237 @@ class StaleBaseBranch(BreadthHarness):
         self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 0)
 
 
+class PlanTimeBaseFreshness(BreadthHarness):
+    """field (US-CHAT-01 lean run): preflight's count arrives too late.
+
+    Planning runs BEFORE preflight in every mode, and the planner grounds
+    itself by reading the real working tree — so a base 4 commits behind
+    (in that run: a just-landed test-infrastructure story) produces a plan
+    that describes code the change will not merge into, and a human ratifies
+    it at the plan gate before anything measures the gap. `base-check` takes
+    the measurement where the grounding happens; `update-base` is the verb
+    that makes the flag false.
+    """
+
+    def _cloned(self, name):
+        origin = make_repo(self.workspace, f"origin-{name}")
+        gitops.run_git(self.workspace, "clone", str(origin), name)
+        clone = self.workspace / name
+        gitops.run_git(clone, "config", "user.email", "t@t")
+        gitops.run_git(clone, "config", "user.name", "t")
+        return origin, clone
+
+    def _advance(self, origin, n=1):
+        for i in range(n):
+            (origin / f"up{i}.txt").write_text("upstream\n")
+            gitops.run_git(origin, "add", "-A")
+            gitops.run_git(origin, "commit", "-m", f"upstream {i}")
+
+    def _run_at_plan(self, sid, name, clone, mode="lean"):
+        self.story(sid, "add a feature", body=f"Mode: {mode}\nneeds tests",
+                   type_="Task")
+        self.cli("init", "--stories-dir", str(self.stories),
+                 "--repo", f"{name}={clone}", "--test-cmd", f"{name}=true")
+        return Path(self.cli("fetch", "--id", sid,
+                             "--date", "2026-06-01")["run"])
+
+    def test_flags_a_stale_base_at_plan_time_before_anything_is_cut(self):
+        origin, clone = self._cloned("app")
+        self._advance(origin, 4)             # the field case, exactly
+        run = self._run_at_plan("P-1", "app", clone)
+        out = self.cli("base-check", "--repo", str(clone), run=run)
+        self.assertEqual(out["behind"], 4)
+        self.assertEqual(out["repo"], "app")
+        self.assertTrue(out["flagged"])
+        flagged = [e for e in ndjson.read_records(run / "events.ndjson")
+                   if e["kind"] == "base-branch-stale"]
+        self.assertEqual(len(flagged), 1)
+        self.assertIn("update-base", flagged[0]["reason"])
+        self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 1)
+        # read-only: nothing cut, nothing moved, nothing pulled
+        self.assertEqual(gitops.changed_files(clone), [])
+        self.assertEqual(gitops.run_git(clone, "rev-list", "--count", "main"), "1")
+
+    def test_reports_but_never_refuses(self):
+        """Deliberately NOT env-check's contract: this surfaces a decision at
+        the plan gate, it is not a new blocker."""
+        origin, clone = self._cloned("app2")
+        self._advance(origin, 2)
+        run = self._run_at_plan("P-2", "app2", clone)
+        out = self.cli("base-check", "--repo", str(clone), run=run)  # expect=0
+        self.assertTrue(out["ok"])
+
+    def test_update_base_closes_it_and_a_re_check_clears_the_gauge(self):
+        """The remedy TERMINATES — the bug class this repo treats as real."""
+        origin, clone = self._cloned("app3")
+        self._advance(origin, 3)
+        run = self._run_at_plan("P-3", "app3", clone)
+        self.cli("base-check", "--repo", str(clone), run=run)
+        self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 1)
+
+        moved = self.cli("update-base", "--repo", str(clone))
+        self.assertTrue(moved["advanced"])
+        self.assertEqual(moved["behind"], 3)
+
+        again = self.cli("base-check", "--repo", str(clone), run=run)
+        self.assertEqual(again["behind"], 0)
+        self.assertTrue(again["resolved"])
+        self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 0)
+
+    def test_a_stale_flag_is_not_restated_on_every_re_check(self):
+        """Plan re-entry (revision round / gate rejection) re-runs step 0;
+        without this each pass stacks another identical assertion."""
+        origin, clone = self._cloned("app4")
+        self._advance(origin, 1)
+        run = self._run_at_plan("P-4", "app4", clone)
+        first = self.cli("base-check", "--repo", str(clone), run=run)
+        second = self.cli("base-check", "--repo", str(clone), run=run)
+        self.assertTrue(first["flagged"])
+        self.assertFalse(second["flagged"])
+        self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 1)
+
+    def test_upstream_moving_again_after_a_fix_re_flags(self):
+        """The suppression above must not become a one-shot: once resolved,
+        a genuinely NEW gap is a new fact."""
+        origin, clone = self._cloned("app5")
+        self._advance(origin, 1)
+        run = self._run_at_plan("P-5", "app5", clone)
+        self.cli("base-check", "--repo", str(clone), run=run)
+        self.cli("update-base", "--repo", str(clone))
+        self.cli("base-check", "--repo", str(clone), run=run)     # resolves
+        (origin / "later.txt").write_text("more upstream\n")
+        gitops.run_git(origin, "add", "-A")
+        gitops.run_git(origin, "commit", "-m", "more upstream")
+        out = self.cli("base-check", "--repo", str(clone), run=run)
+        self.assertTrue(out["flagged"])
+        self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 1)
+
+    def test_clearing_one_repo_does_not_clear_another(self):
+        """Multi-repo is the normal case; a cross-repo clear would be exactly
+        the silent under-count the fail-closed resolver rule exists to stop."""
+        origin_a, clone_a = self._cloned("aaa")
+        origin_b, clone_b = self._cloned("bbb")
+        self._advance(origin_a, 1)
+        self._advance(origin_b, 2)
+        self.story("P-6", "two repos", body="Mode: lean\nboth", type_="Task")
+        self.cli("init", "--stories-dir", str(self.stories),
+                 "--repo", f"aaa={clone_a}", "--repo", f"bbb={clone_b}",
+                 "--test-cmd", "aaa=true", "--test-cmd", "bbb=true")
+        run = Path(self.cli("fetch", "--id", "P-6",
+                            "--date", "2026-06-02")["run"])
+        self.cli("base-check", "--repo", str(clone_a), run=run)
+        self.cli("base-check", "--repo", str(clone_b), run=run)
+        self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 2)
+        self.cli("update-base", "--repo", str(clone_a))
+        self.cli("base-check", "--repo", str(clone_a), run=run)
+        # only aaa's is paired off — bbb is still genuinely stale
+        self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 1)
+        still = [e for e in ndjson.read_records(run / "events.ndjson")
+                 if e["kind"] == "base-branch-stale"]
+        self.assertEqual([e["repo"] for e in still], ["aaa", "bbb"])
+
+    def test_clearing_one_base_does_not_clear_another_in_the_same_repo(self):
+        """adversarial review, reproduced: keying the resolver on `repo` alone
+        was one granularity short. On a release-train repo, probing
+        `release/2026` (current) cleared `main`'s open flag (4 behind) in the
+        SAME repo, so the gauge went 1 -> 0 while the stale base stayed
+        stale — the exact under-count per-repo keying was introduced to stop.
+        `--branch` is a first-class override on both verbs, so two bases in
+        one repo is a supported shape, not a corner."""
+        origin, clone = self._cloned("trains")
+        gitops.run_git(origin, "checkout", "-b", "release/2026")
+        gitops.run_git(origin, "checkout", "main")
+        self._advance(origin, 4)                       # only main moves
+        gitops.run_git(clone, "fetch", "origin", "release/2026")
+        gitops.run_git(clone, "branch", "release/2026", "FETCH_HEAD")
+        run = self._run_at_plan("P-10", "trains", clone)
+
+        stale = self.cli("base-check", "--repo", str(clone), run=run)
+        self.assertEqual(stale["behind"], 4)
+        self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 1)
+        other = self.cli("base-check", "--repo", str(clone),
+                         "--branch", "release/2026", run=run)
+        self.assertEqual(other["behind"], 0)
+        # main is still 4 behind — its flag must survive the other base's probe
+        self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 1)
+        self.assertEqual(gitops.base_branch_behind(clone, "main"), 4)
+
+    def test_a_tree_not_on_the_base_cannot_clear_the_flag(self):
+        """Re-verification finding, and the sharpest of the round. base-check's
+        warrant is the tree THE PLANNER READS; what it measures is the base
+        REF. Once update-base stopped switching branches (it must not — that
+        defect squash-merged tasks onto the base), the two came apart: on a
+        repo left standing on a prior run's feature branch, the loop ran
+        flag -> update-base -> re-check -> `behind: 0` -> gauge cleared, while
+        the planner's tree still lacked every upstream commit. A green audit
+        trail over the exact condition the check exists to catch."""
+        origin, clone = self._cloned("app12")
+        (origin / "conftest.py").write_text("# the just-landed test infra\n")
+        gitops.run_git(origin, "add", "-A")
+        gitops.run_git(origin, "commit", "-m", "test infrastructure")
+        run = self._run_at_plan("P-12", "app12", clone)
+        gitops.run_git(clone, "checkout", "-b", "feat/left-over")
+
+        stale = self.cli("base-check", "--repo", str(clone), run=run)
+        self.assertEqual(stale["behind"], 1)
+        self.assertFalse(stale["grounded_on_base"])
+        self.assertEqual(stale["current_branch"], "feat/left-over")
+        self.assertIn("does NOT", stale["grounding_warning"])
+        self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 1)
+
+        self.cli("update-base", "--repo", str(clone))
+        again = self.cli("base-check", "--repo", str(clone), run=run)
+        self.assertEqual(again["behind"], 0)          # the base ref IS current
+        self.assertNotIn("resolved", again)           # …but the tree is not
+        self.assertFalse((clone / "conftest.py").exists())
+        # the flag must survive: the planner still reads a tree without it
+        self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 1)
+
+    def test_on_the_base_the_loop_still_closes(self):
+        """The guard above must not make the flag unclearable in the normal
+        case — standing on the base, update-base then re-check still resolves."""
+        origin, clone = self._cloned("app13")
+        self._advance(origin, 2)
+        run = self._run_at_plan("P-13", "app13", clone)
+        first = self.cli("base-check", "--repo", str(clone), run=run)
+        self.assertTrue(first["grounded_on_base"])
+        self.cli("update-base", "--repo", str(clone))
+        again = self.cli("base-check", "--repo", str(clone), run=run)
+        self.assertTrue(again["resolved"])
+        self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 0)
+
+    def test_refuses_on_a_terminal_run(self):
+        """`ensure_live`, same as every other run-scoped verb."""
+        _origin, clone = self._cloned("app11")
+        run = self._run_at_plan("P-11", "app11", clone)
+        self.cli("abort", "--reason", "not needed", run=run)
+        self.cli("base-check", "--repo", str(clone), run=run, expect=1)
+
+    def test_no_remote_is_structural_not_a_signal(self):
+        run = self._run_at_plan("P-7", "repo", self.repo)  # fixture, no remote
+        out = self.cli("base-check", "--repo", str(self.repo), run=run)
+        self.assertIsNone(out["behind"])
+        self.assertEqual(self.cli("status")["runs"][0]["flagged_events"], 0)
+
+    def test_dirty_tree_is_not_a_refusal_here(self):
+        """Read-only by construction — at plan time the human may well have
+        work in progress, and refusing on it would smuggle in a new gate."""
+        origin, clone = self._cloned("app8")
+        self._advance(origin, 1)
+        run = self._run_at_plan("P-8", "app8", clone)
+        (clone / "README.md").write_text("work in progress\n")
+        out = self.cli("base-check", "--repo", str(clone), run=run)
+        self.assertEqual(out["behind"], 1)
+        self.assertEqual((clone / "README.md").read_text(), "work in progress\n")
+
+    def test_refuses_a_base_branch_that_does_not_exist_locally(self):
+        origin, clone = self._cloned("app9")
+        run = self._run_at_plan("P-9", "app9", clone)
+        out = self.cli("base-check", "--repo", str(clone),
+                       "--branch", "nope", run=run, expect=1)
+        self.assertIn("does not exist locally", out["error"])
+
+
 class GateRePresentGuard(BreadthHarness):
     """A re-present must not silently throw away a reply the human gave.
 

@@ -1637,6 +1637,318 @@ class DefaultBranch(GitopsHarness):
         self.assertIn("rebase", str(ctx.exception))
 
 
+class UpdateBase(GitopsHarness):
+    """gitops.update_base — the owned fast-forward of the BASE branch.
+
+    field (US-CHAT-01 lean run): staleness was measurable in two places and
+    actionable in none — preflight's "let them decide to update the base
+    first" named a remedy with no verb behind it, and raw `git pull`/`git
+    merge` is guard-blocked. These assert the remedy terminates AND that the
+    three refusals bounding it hold."""
+
+    def _clone_with_upstream(self, name="clone"):
+        remote = make_repo(self.workspace, f"origin-{name}")
+        clone = self.workspace / name
+        gitops.run_git(self.workspace, "clone", str(remote), name)
+        gitops.run_git(clone, "config", "user.email", "t@t")
+        gitops.run_git(clone, "config", "user.name", "t")
+        return remote, clone
+
+    def _advance_remote(self, remote: Path, n: int = 1) -> None:
+        for i in range(n):
+            (remote / f"up{i}.txt").write_text("x\n")
+            gitops.run_git(remote, "add", "-A")
+            gitops.run_git(remote, "commit", "-m", f"upstream {i}")
+
+    def test_fast_forwards_a_behind_base_and_says_so(self):
+        remote, clone = self._clone_with_upstream()
+        before = gitops.head_sha(clone)
+        self._advance_remote(remote, 4)          # the field case, exactly
+        self.assertEqual(gitops.base_branch_behind(clone, "main"), 4)
+        result = gitops.update_base(clone)
+        self.assertTrue(result["advanced"])
+        self.assertEqual(result["behind"], 4)
+        self.assertEqual(result["ahead"], 0)
+        self.assertEqual(result["before"], before)
+        self.assertEqual(result["after"], gitops.head_sha(clone))
+        self.assertNotEqual(result["after"], before)
+        # the whole point: the gap is CLOSED, not merely reported
+        self.assertEqual(gitops.base_branch_behind(clone, "main"), 0)
+        self.assertTrue((clone / "up3.txt").exists())
+
+    def test_fast_forward_only_no_merge_commit(self):
+        """The base must end up byte-identical to what upstream published —
+        a merge commit would make the local base a shape no reviewer of the
+        upstream branch has ever seen."""
+        remote, clone = self._clone_with_upstream()
+        self._advance_remote(remote, 2)
+        gitops.update_base(clone)
+        self.assertEqual(gitops.head_sha(clone),
+                         gitops.run_git(remote, "rev-parse", "HEAD"))
+        # linear: HEAD's parent count is 1, never 2
+        parents = gitops.run_git(clone, "rev-list", "--parents", "-n", "1", "HEAD")
+        self.assertEqual(len(parents.split()), 2)
+
+    def test_already_current_is_a_no_op_not_an_error(self):
+        """Idempotent: the orchestrator re-runs this after a refusal, and
+        'you are already up to date' is a success, not a failure."""
+        _remote, clone = self._clone_with_upstream()
+        before = gitops.head_sha(clone)
+        result = gitops.update_base(clone)
+        self.assertFalse(result["advanced"])
+        self.assertEqual(result["behind"], 0)
+        self.assertEqual(result["before"], before)
+        self.assertEqual(result["after"], before)
+        self.assertEqual(gitops.head_sha(clone), before)
+
+    def test_refuses_a_diverged_base_without_touching_it(self):
+        remote, clone = self._clone_with_upstream()
+        self._advance_remote(remote, 2)
+        (clone / "local.txt").write_text("local only\n")   # local-only commit
+        gitops.run_git(clone, "add", "-A")
+        gitops.run_git(clone, "commit", "-m", "local only")
+        before = gitops.head_sha(clone)
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.update_base(clone)
+        msg = str(ctx.exception)
+        self.assertIn("diverged", msg)
+        self.assertIn("1 local-only commit(s), 2 upstream", msg)
+        self.assertIn("not a fast-forward", msg)
+        # never rebased, never merged, never reset
+        self.assertEqual(gitops.head_sha(clone), before)
+        self.assertTrue((clone / "local.txt").exists())
+
+    def test_ahead_only_is_reported_not_raised(self):
+        """Local commits with nothing upstream is not a blocked
+        fast-forward — there is nothing to fast-forward. Refusing "already
+        current" would be noise; the count still rides out in the result."""
+        _remote, clone = self._clone_with_upstream()
+        (clone / "local.txt").write_text("local only\n")
+        gitops.run_git(clone, "add", "-A")
+        gitops.run_git(clone, "commit", "-m", "local only")
+        result = gitops.update_base(clone)
+        self.assertFalse(result["advanced"])
+        self.assertEqual(result["behind"], 0)
+        self.assertEqual(result["ahead"], 1)
+
+    def test_refuses_when_the_remote_cannot_answer(self):
+        """The measuring helpers fail OPEN (a blip must not brick a step);
+        this one MOVES a ref, so it must fail CLOSED — a no-op reporting
+        success is the exact defect sync_branch's docstring documents."""
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.update_base(self.repo)        # fixture has no remote
+        self.assertIn("no usable remote", str(ctx.exception))
+
+    def test_a_local_only_base_is_not_reported_as_a_connectivity_failure(self):
+        """adversarial review: `fetch_base` returns False for "no such branch
+        upstream" too, so a base that was simply never pushed sent the human
+        off to fix a network that was fine — while `base_check` called the
+        very same repo `behind: null`, "nothing to do". Two verbs, one repo,
+        contradictory accounts."""
+        _remote, clone = self._clone_with_upstream()
+        gitops.run_git(clone, "branch", "integration")     # never pushed
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.update_base(clone, branch="integration")
+        msg = str(ctx.exception)
+        self.assertIn("has no branch 'integration'", msg)
+        self.assertIn("Connectivity is fine", msg)
+
+    def test_refuses_a_dirty_base_that_is_actually_checked_out(self):
+        """Only when the base IS current: that is the one case where a
+        fast-forward rewrites files under the human."""
+        remote, clone = self._clone_with_upstream()
+        self._advance_remote(remote, 1)
+        (clone / "README.md").write_text("uncommitted work\n")
+        before = gitops.head_sha(clone)
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.update_base(clone)
+        self.assertIn("uncommitted", str(ctx.exception))
+        self.assertEqual(gitops.head_sha(clone), before)
+        self.assertEqual((clone / "README.md").read_text(), "uncommitted work\n")
+
+    def test_a_dirty_tree_on_another_branch_does_not_block_the_base(self):
+        """Both adversarial lenses, independently: `base_check` deliberately
+        tolerates a dirty tree at plan time ("the human may well have work in
+        progress"), so its own advertised remedy must be reachable in exactly
+        that state. The first draft refused it — a remedy that cannot
+        terminate, the bug class this change exists to close, one seam over."""
+        remote, clone = self._clone_with_upstream()
+        self._advance_remote(remote, 3)
+        gitops.run_git(clone, "checkout", "-b", "feat/wip")
+        (clone / "README.md").write_text("work in progress\n")
+        (clone / "scratch.txt").write_text("untracked too\n")
+        result = gitops.update_base(clone)
+        self.assertTrue(result["advanced"])
+        self.assertEqual(result["behind"], 3)
+        self.assertFalse(result["checked_out"])
+        # the base moved; the human's working tree did not
+        self.assertEqual(gitops.base_branch_behind(clone, "main"), 0)
+        self.assertEqual((clone / "README.md").read_text(), "work in progress\n")
+        self.assertTrue((clone / "scratch.txt").exists())
+        self.assertFalse((clone / "up0.txt").exists())   # not checked out
+
+    def test_never_switches_the_checkout(self):
+        """THE regression test (adversarial review, high, reproduced end to
+        end). The first draft reused `ensure_default_branch` and inherited its
+        branch SWITCH, so the documented flow — preflight reports behind,
+        human runs update-base, re-run preflight — silently left the repo on
+        `main`. Preflight's idempotent re-run returns the cached `branches`
+        entry without switching back, so `merge-task` then squash-committed
+        every task onto the BASE and `create-pr` opened a PR whose head branch
+        had none of the work."""
+        remote, clone = self._clone_with_upstream()
+        self._advance_remote(remote, 2)
+        gitops.run_git(clone, "checkout", "-b", "feat/X-1-thing")
+        result = gitops.update_base(clone)
+        self.assertTrue(result["advanced"])
+        self.assertEqual(result["current_branch"], "feat/X-1-thing")
+        self.assertEqual(
+            gitops.run_git(clone, "rev-parse", "--abbrev-ref", "HEAD"),
+            "feat/X-1-thing")
+
+    def test_does_not_switch_on_a_refusal_either(self):
+        """The refusal messages claim nothing was moved. That has to be true
+        of the WORKING TREE, not just the ref — the first draft had already
+        switched the checkout before it ever reached a refusal."""
+        _remote, clone = self._clone_with_upstream()
+        gitops.run_git(clone, "checkout", "-b", "feat/X-1-thing")
+        gitops.run_git(clone, "remote", "remove", "origin")
+        with self.assertRaises(gitops.GitError):
+            gitops.update_base(clone)
+        self.assertEqual(
+            gitops.run_git(clone, "rev-parse", "--abbrev-ref", "HEAD"),
+            "feat/X-1-thing")
+
+    def test_fetches_the_branchs_configured_upstream_not_origin(self):
+        """adversarial review, high, reproduced on the standard fork layout:
+        `origin` = my fork, `upstream` = canonical, `main` tracking upstream.
+        `_push_remote` prefers `origin` unconditionally, so every staleness
+        question was answered against the FORK — "already current" while the
+        base was genuinely behind canonical. Same laundering as the defect
+        this verb was written to end, reached through remote resolution
+        instead of connectivity."""
+        canonical = make_repo(self.workspace, "canonical")
+        fork = self.workspace / "fork"
+        gitops.run_git(self.workspace, "clone", str(canonical), "fork")
+        clone = self.workspace / "forkclone"
+        gitops.run_git(self.workspace, "clone", str(fork), "forkclone")
+        gitops.run_git(clone, "config", "user.email", "t@t")
+        gitops.run_git(clone, "config", "user.name", "t")
+        gitops.run_git(clone, "remote", "add", "upstream", str(canonical))
+        gitops.run_git(clone, "config", "branch.main.remote", "upstream")
+        (canonical / "canon.txt").write_text("canonical work\n")
+        gitops.run_git(canonical, "add", "-A")
+        gitops.run_git(canonical, "commit", "-m", "canonical work")
+        # the fork (origin) is untouched and would answer "current"
+        self.assertEqual(gitops.base_branch_behind(clone, "main"), 1)
+        result = gitops.update_base(clone)
+        self.assertEqual(result["remote"], "upstream")
+        self.assertTrue(result["advanced"])
+        self.assertTrue((clone / "canon.txt").exists())
+
+    def test_refuses_mid_rebase(self):
+        _remote, clone = self._clone_with_upstream()
+        gitops.run_git(clone, "checkout", "-b", "feature")
+        (clone / "README.md").write_text("feature version\n")
+        gitops.run_git(clone, "add", "-A")
+        gitops.run_git(clone, "commit", "-m", "feature readme")
+        gitops.run_git(clone, "checkout", "main")
+        (clone / "README.md").write_text("main version\n")
+        gitops.run_git(clone, "add", "-A")
+        gitops.run_git(clone, "commit", "-m", "main readme")
+        gitops.run_git(clone, "checkout", "feature")
+        gitops.run_git(clone, "rebase", "main", check=False)   # conflicts
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.update_base(clone)
+        self.assertIn("rebase", str(ctx.exception))
+
+    def test_explicit_branch_override_updates_that_base_by_ref(self):
+        """A `release/2026`-shaped base, updated while `main` stays checked
+        out: the REF moves, the working tree does not."""
+        remote, clone = self._clone_with_upstream()
+        gitops.run_git(remote, "checkout", "-b", "release/2026")
+        (remote / "rel.txt").write_text("release work\n")
+        gitops.run_git(remote, "add", "-A")
+        gitops.run_git(remote, "commit", "-m", "release commit")
+        gitops.run_git(clone, "fetch", "origin", "release/2026")
+        gitops.run_git(clone, "checkout", "-b", "release/2026", "FETCH_HEAD~1")
+        gitops.run_git(clone, "checkout", "main")
+        result = gitops.update_base(clone, branch="release/2026")
+        self.assertEqual(result["branch"], "release/2026")
+        self.assertTrue(result["advanced"])
+        self.assertFalse(result["checked_out"])
+        self.assertEqual(
+            gitops.run_git(clone, "rev-parse", "--abbrev-ref", "HEAD"), "main")
+        self.assertFalse((clone / "rel.txt").exists())      # tree untouched
+        # …but the branch itself now carries the commit
+        self.assertIn("rel.txt", gitops.run_git(
+            clone, "ls-tree", "--name-only", "release/2026"))
+
+    def test_refuses_when_the_named_base_does_not_exist_locally(self):
+        _remote, clone = self._clone_with_upstream()
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.update_base(clone, branch="does-not-exist")
+        self.assertIn("does not exist locally", str(ctx.exception))
+
+    def test_refuses_a_base_checked_out_in_another_worktree(self):
+        """Re-verification finding, reproduced: `update-ref` — unlike `branch
+        -f` — will move a branch another worktree has checked out, and
+        `rev-parse --abbrev-ref HEAD` cannot see past the current one. The
+        other checkout was left holding a STAGED REVERSAL of the upstream
+        commits, which its next `harness commit` would have committed. Linked
+        worktrees are the normal runtime shape here — every task runs in one."""
+        remote, clone = self._clone_with_upstream()
+        self._advance_remote(remote, 2)
+        wt = self.workspace / "linked-wt"
+        gitops.run_git(clone, "worktree", "add", "-b", "task/T1", str(wt))
+        before = gitops.run_git(clone, "rev-parse", "main")
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.update_base(wt, branch="main")     # main is held by `clone`
+        msg = str(ctx.exception)
+        self.assertIn("checked out in another worktree", msg)
+        self.assertIn("staged reversal", msg)
+        self.assertEqual(gitops.run_git(clone, "rev-parse", "main"), before)
+        self.assertEqual(gitops.changed_files(clone), [])   # no staged revert
+
+    def test_a_stale_upstream_config_is_not_reported_as_connectivity(self):
+        """Re-verification finding: making `branch.<n>.remote` load-bearing
+        (so a fork layout measures against canonical) is exactly what put a
+        STALE value in reach — after a `git remote rename`, the fetch fails
+        and `remote_branch_exists` answers None, so it fell through to
+        "offline, auth, or timeout". The fix that widened the blind spot
+        closes it."""
+        _remote, clone = self._clone_with_upstream()
+        gitops.run_git(clone, "config", "branch.main.remote", "ghost")
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.update_base(clone)
+        msg = str(ctx.exception)
+        self.assertIn("names 'ghost', which is not a configured remote", msg)
+        self.assertIn("Connectivity is fine", msg)
+
+    def test_the_fast_forward_is_a_compare_and_swap(self):
+        """The off-checkout path writes with the value it measured against as
+        the expected old, so a ref that moved in between fails the swap
+        instead of being clobbered."""
+        remote, clone = self._clone_with_upstream()
+        self._advance_remote(remote, 1)
+        gitops.run_git(clone, "checkout", "-b", "feat/x")
+        real_rev_count = gitops._rev_count
+
+        def moving_rev_count(repo, spec):
+            out = real_rev_count(repo, spec)
+            if spec.startswith("FETCH_HEAD.."):      # after both counts read
+                (clone / "sneak.txt").write_text("concurrent\n")
+                gitops.run_git(clone, "add", "-A")
+                gitops.run_git(clone, "commit", "-m", "concurrent writer")
+                gitops.run_git(clone, "branch", "-f", "main", "HEAD")
+            return out
+
+        with mock.patch.object(gitops, "_rev_count", moving_rev_count):
+            with self.assertRaises(gitops.GitError) as ctx:
+                gitops.update_base(clone)
+        self.assertIn("update-ref", str(ctx.exception))
+
+
 class CliEndToEnd(GitopsHarness):
     ROOT = Path(__file__).resolve().parent.parent
 
