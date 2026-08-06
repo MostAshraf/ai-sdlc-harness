@@ -23,13 +23,17 @@ is the main tool.
      how far behind the checkout is.
    - **The harness blocks raw `git pull` / `merge` inside any workspace that has
      completed `/init-workspace`** (owned-entry-point rule; this skill only ever
-     runs inside one), so this command does **not** update the working
-     tree. If a repo is behind, say so and offer two choices: **(a)** analyze the
+     runs inside one), so this command never updates the working tree on its
+     own. If a repo is behind, say so and offer two choices: **(a)** analyze the
      current checkout as-is — and stamp the staleness into the notes so the
      reader knows the analysis reflects commit `<short-sha>`, N commits behind
-     `origin/<default>`; or **(b)** stop for that repo so the user can update it
-     themselves (outside the harness) and re-run `groom`. Never switch branches
-     or discard changes to "help".
+     `origin/<default>`; or **(b)** on the user's explicit say-so, run
+     `${CLAUDE_PLUGIN_ROOT}/bin/harness update-base --repo "<path>"` — the
+     owned fetch + fast-forward-only verb — and re-scan. It moves the base ref
+     without switching the checkout, and refuses rather than guessing when the
+     base has diverged, is checked out and dirty, or the remote won't answer;
+     surface any refusal and let the user resolve it. Never switch branches or
+     discard changes to "help".
 4. **Analyze each confirmed, fetched repo** against the story. Use `Grep` for
    content, `Glob` for file patterns, `Read` for inspection — not `Bash` for
    searches. Look for: affected files/classes/methods; database & migration

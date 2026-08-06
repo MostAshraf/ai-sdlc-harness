@@ -83,21 +83,51 @@ def scratch_path(*parts: str) -> str:
     return str(base.joinpath(*parts))
 
 
-def rmtree(path, ignore_errors: bool = False) -> None:
-    """shutil.rmtree that clears the read-only bit and retries — required
-    for any tree holding a .git (git object files are read-only, which
-    Windows honors on unlink where POSIX does not)."""
-    def _clear_readonly(func, p, _exc):
+def clear_readonly(func, p, _exc) -> None:
+    """`shutil.rmtree`'s error handler for this repo's temp trees: clear the
+    read-only bit and retry the removal.
+
+    Module level, not a closure inside `rmtree`, because it is the unit that
+    carries the logic and the only way to test it on every Python this repo
+    supports. From 3.12 the stdlib absorbs `FileNotFoundError` on unlink
+    itself (`except FileNotFoundError: continue`), so no end-to-end rmtree
+    test can reach this handler with a vanished path on a modern interpreter —
+    while on 3.10, which has no such carve-out, it is reached and mattered.
+    """
+    # ALREADY GONE is a success, not an error — and it must be checked BEFORE
+    # chmod, this handler's own first move, which raises on a missing path.
+    # CI, python-3.10 (cutting v3.4.1): git's background auto-maintenance
+    # deleted `.git/objects/maintenance.lock` between rmtree's scandir and its
+    # unlink, the FileNotFoundError routed here, `os.chmod` raised the same
+    # error a second time from INSIDE the handler, and that escaped to fail an
+    # otherwise-green 942-test run in tearDown. An error handler that dies on
+    # the error it is handling is no handler. Nothing stops git maintaining a
+    # repo in the background, so the race is unavoidable: absorb it.
+    if not os.path.lexists(p):            # lexists: a broken symlink is real
+        return
+    try:
         os.chmod(p, stat.S_IWRITE)
-        # Don't trust func's arity — POSIX's fd-based rmtree walker can hand
-        # us os.open (which needs a `flags` arg, not just a path) when a
-        # permission-locked entry blocks the directory scan itself, not just
-        # unlink/rmdir. Decide unlink vs. rmdir from the path's own type
-        # instead; that's a strict superset of what func(p) covered.
+    except FileNotFoundError:
+        return
+    # Don't trust func's arity — POSIX's fd-based rmtree walker can hand
+    # us os.open (which needs a `flags` arg, not just a path) when a
+    # permission-locked entry blocks the directory scan itself, not just
+    # unlink/rmdir. Decide unlink vs. rmdir from the path's own type
+    # instead; that's a strict superset of what func(p) covered.
+    try:
         if os.path.isdir(p) and not os.path.islink(p):
             os.rmdir(p)
         else:
             os.unlink(p)
+    except FileNotFoundError:
+        return                            # lost the same race one step later
+
+
+def rmtree(path, ignore_errors: bool = False) -> None:
+    """shutil.rmtree that clears the read-only bit and retries — required
+    for any tree holding a .git (git object files are read-only, which
+    Windows honors on unlink where POSIX does not)."""
+    _clear_readonly = clear_readonly
     kwargs = ({"onexc": _clear_readonly} if sys.version_info >= (3, 12)
               else {"onerror": _clear_readonly})  # onexc is 3.12+
     try:

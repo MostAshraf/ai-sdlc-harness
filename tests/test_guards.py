@@ -145,6 +145,15 @@ class BashGuard(GuardHarness):
         for cmd in ("git pull", "git pull origin main", "git pull --rebase"):
             self.assert_blocks("bash", bash(cmd), "harness")
 
+    def test_the_block_message_names_the_verb_that_updates_a_base(self):
+        """field (US-CHAT-01 lean run): `git pull` on a stale base is the
+        exact command this guard blocks, and the message used to offer only
+        `sync-branch` — which rebases the CURRENT branch, not the base. The
+        refusal has to name the remedy that actually terminates, or the human
+        is steered to the wrong verb by the guard itself."""
+        for cmd in ("git pull", "git merge --ff-only origin/main"):
+            self.assert_blocks("bash", bash(cmd), "harness update-base")
+
     def test_git_verb_inside_quoted_shell_c_payload_blocked(self):
         # adversarial-review finding: the quote anchor (correct for grep'd
         # literals) also hid `bash -c "git commit …"` — a real invocation

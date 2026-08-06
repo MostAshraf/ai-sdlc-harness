@@ -116,6 +116,37 @@ class InvocationConsistency(unittest.TestCase):
         intake = (steps / "intake.md").read_text(encoding="utf-8")
         self.assertIn(".claude/context/repo-map/", intake)
 
+    def test_plan_step_zero_checks_base_freshness_and_names_the_remedy(self):
+        """adversarial review: 21 tests covered the CLI and the library, and
+        NOT ONE pinned the plan-time wiring — deleting step 0a wholesale left
+        the whole suite green, while step 0a *is* the half of the fix that
+        moves the question before the plan gate. The repo-map bullet above is
+        the same pattern for the same reason: the map's grounding half was
+        also once documented-only and drifted.
+
+        preflight measures the same staleness, but by then the plan is
+        ratified and the branch is already cut from the stale tip — so plan.md
+        naming `base-check`, and naming a remedy that terminates, is the
+        mechanism, not a nicety."""
+        steps = ROOT / "skills" / "dev-workflow" / "steps"
+        plan = (steps / "plan.md").read_text(encoding="utf-8")
+        self.assertIn("harness base-check", plan)
+        self.assertIn("harness update-base", plan)
+        # the flag must be clearable, and the clear must be confirmable
+        self.assertIn("resolved", plan)
+        # …and it must come BEFORE the planner spawn. Re-verification finding:
+        # the first version of this test passed with the whole step-0a block
+        # moved verbatim to the END of the file — after the spawn and after
+        # `cursor --to plan-review` — which pins the words while leaving the
+        # actual finding (an ORDERING one: check the base before the planner
+        # grounds itself in it) entirely unenforced.
+        self.assertLess(plan.index("harness base-check"),
+                        plan.index("Spawn `planner`"),
+                        "base-check must be documented BEFORE the planner "
+                        "spawn — after it, the plan is already grounded")
+        preflight = (steps / "preflight.md").read_text(encoding="utf-8")
+        self.assertIn("harness update-base", preflight)
+
     def test_every_documented_verb_and_flag_exists_in_argparse(self):
         """Adversarial-review finding: the wrapper-only checks above can't
         see a nonexistent verb or flag AFTER the wrapper path — e.g. a

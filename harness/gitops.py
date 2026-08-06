@@ -333,6 +333,213 @@ def sync_branch(repo: Path, onto: str) -> dict:
     return {"onto": onto, "remote_verified": verified}
 
 
+def update_base(repo: Path, branch: str | None = None) -> dict:
+    """`harness update-base` — the owned entry point that fast-forwards the
+    BASE branch onto its remote. The terminating remedy for the staleness
+    `base_branch_behind` measures.
+
+    field (US-CHAT-01 lean run): the pipeline could MEASURE a stale base and
+    act on it nowhere. `sync_branch` rebases whatever branch is checked out (a
+    FEATURE branch catching up to a moved base — apply-fixes.md); nothing
+    updated the base itself. So preflight's stated remedy — "surface the count
+    and let them decide to update the base first" — named a decision with no
+    verb behind it, and the human's only route was the raw `git pull` /
+    `git merge` that `GIT_VERB_RE` blocks by design. A documented remedy that
+    cannot terminate is the bug class this repo already treats as real.
+
+    **It never switches branches, and never touches the working tree unless
+    the base is the branch you are standing on.** The first draft reused
+    `ensure_default_branch` for its clean/exists preconditions and inherited
+    the branch SWITCH that comes with them — adversarial review found the
+    consequence, reproduced end to end: preflight cuts `feat/X-1`, reports
+    `behind: 4`, the human runs this verb, and the checkout silently lands on
+    `main`. Preflight's idempotent re-run returns the cached `branches` entry
+    without switching back, and `merge-task` then squash-commits every task's
+    work ONTO THE BASE, with `create-pr` opening a PR whose head branch has
+    none of it. A verb whose whole job is "make the base current" must not be
+    able to lose the branch the run lives on.
+
+    So the branch ref moves, the HEAD does not. When the target is NOT checked
+    out, the fast-forward is a compare-and-swap on the ref itself
+    (`update-ref` with the old value) — nothing enters the working tree, which
+    also means a dirty tree elsewhere in the repo is irrelevant, exactly the
+    plan-time state `workflow.base_check` deliberately tolerates. Both lenses
+    landed on that mismatch independently: the remedy must be reachable in the
+    state its own trigger is designed to accept.
+
+    Four refusals bound it, because this is the first verb that moves a base
+    branch:
+
+    - **No in-progress operation**, and — only when the target IS the current
+      branch — **a clean tree**, since that is the one case where a
+      fast-forward rewrites files under the human. Never auto-stashed.
+    - **Fast-forward only.** `merge --ff-only` when checked out, an
+      old-value-checked `update-ref` when not: the base ends up byte-identical
+      to what upstream published, never a merge commit and never a rebase.
+      Genuine divergence (behind AND ahead) refuses with both counts; the human
+      resolves it, the harness never guesses.
+    - **The remote must have answered.** Unlike `base_branch_behind` /
+      `remote_branch_exists` — measurements, where failing open keeps a
+      connectivity blip from bricking a step — this one MOVES a ref, and a
+      no-op that reports success is exactly the defect `sync_branch`'s
+      docstring documents ("a sync verb that cannot see the thing it syncs to
+      is worse than no verb, because it launders the staleness as handled").
+
+    `ahead` is REPORTED, never raised on, when `behind` is 0: there is nothing
+    to fast-forward, so refusing "you are already current" would be noise —
+    but unpushed commits sitting on a base branch are worth seeing, so the
+    number rides out in the result either way.
+    """
+    target = branch or default_branch(repo)
+    if not _branch_exists(repo, target):
+        raise GitError(
+            f"{repo}: branch '{target}' does not exist locally — could not "
+            "confirm this is really the base branch (no resolvable "
+            "origin/HEAD); pass --branch explicitly")
+    in_progress = _in_progress_operation(repo)
+    if in_progress:
+        raise GitError(
+            f"{repo} has a {in_progress} in progress — finish or abort it "
+            "yourself before continuing; never auto-resolved")
+    current = run_git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    checked_out = current == target
+    elsewhere = _worktree_holding(repo, target) if not checked_out else None
+    if elsewhere is not None:
+        # `git update-ref` — unlike `git branch -f` — will happily move a
+        # branch that another worktree has checked out, and `rev-parse
+        # --abbrev-ref HEAD` only ever sees the worktree we were invoked in.
+        # Re-verification reproduced the consequence: advancing `main` from a
+        # linked worktree left the OTHER checkout holding a staged revert of
+        # the upstream commits, which the next `harness commit` there would
+        # have committed. Refuse instead — this verb has no mandate over a
+        # working tree it cannot see. (`_in_progress_operation` already
+        # resolves the git dir through rev-parse for the same reason: linked
+        # worktrees are a normal runtime shape here, since every task runs in
+        # one.)
+        raise GitError(
+            f"{repo}: '{target}' is checked out in another worktree "
+            f"({elsewhere}) — fast-forwarding the ref from here would leave "
+            "that working tree holding a staged reversal of the upstream "
+            "commits. Run update-base from that worktree, or detach/switch it "
+            "first; never moved out from under a checkout.")
+    if checked_out:
+        dirty = changed_files(repo)
+        if dirty:
+            shown = ", ".join(dirty[:5]) + ("..." if len(dirty) > 5 else "")
+            raise GitError(
+                f"{repo} has {len(dirty)} uncommitted change(s) ({shown}) on "
+                f"'{target}' itself — a fast-forward would rewrite them; "
+                "commit or stash them yourself first, never auto-discarded. "
+                "(Uncommitted work on ANY OTHER branch is fine: this verb "
+                "moves the base ref without touching your working tree.)")
+    before = run_git(repo, "rev-parse", target)
+    remote = _fetch_remote(repo, target)
+    if remote is None or not fetch_base(repo, target):
+        raise GitError(_unreachable_base_detail(repo, target, remote))
+    behind = _rev_count(repo, f"{target}..FETCH_HEAD")
+    ahead = _rev_count(repo, f"FETCH_HEAD..{target}")
+    if behind is None or ahead is None:
+        raise GitError(
+            f"{repo}: fetched, but could not count the gap between '{target}' "
+            "and its remote — refusing to move the branch on an unreadable "
+            "comparison")
+    out = {"branch": target, "remote": remote, "before": before,
+           "behind": behind, "ahead": ahead, "checked_out": checked_out,
+           "current_branch": current}
+    if behind and ahead:
+        raise GitError(
+            f"{repo}: '{target}' has diverged from '{remote}' ({ahead} local-"
+            f"only commit(s), {behind} upstream) — not a fast-forward, and "
+            "update-base will not rebase or merge a base branch. Resolve it "
+            "yourself (push, rebase, or reset those local commits), then "
+            "retry.")
+    if not behind:
+        # Re-read rather than echoing `before`: nothing moved here, but the
+        # value was sampled before the fetch, and reporting a sha the branch
+        # may no longer be at is the kind of small lie this module doesn't tell.
+        return {**out, "after": run_git(repo, "rev-parse", target),
+                "advanced": False}
+    if checked_out:
+        run_git(repo, "merge", "--ff-only", "FETCH_HEAD")
+    else:
+        # Compare-and-swap on the ref, with the value we measured against as
+        # the expected old: a concurrent update between the count and the
+        # write fails the swap instead of silently clobbering it. `-m` so the
+        # move lands in the reflog like every other branch update.
+        run_git(repo, "update-ref", "-m", "harness update-base: fast-forward",
+                f"refs/heads/{target}", "FETCH_HEAD", before)
+    return {**out, "after": run_git(repo, "rev-parse", target),
+            "advanced": True}
+
+
+def _worktree_holding(repo: Path, branch: str) -> str | None:
+    """The path of a linked worktree (or the primary checkout) that currently
+    has `branch` checked out, when it is NOT the one we were invoked in —
+    None otherwise. `git worktree list --porcelain` is the only input that
+    sees past the current worktree's HEAD."""
+    out = run_git(repo, "worktree", "list", "--porcelain", check=False)
+    try:
+        here = Path(run_git(repo, "rev-parse", "--show-toplevel")).resolve()
+    except (GitError, OSError):
+        here = Path(repo).resolve()
+    path: str | None = None
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree "):].strip()
+        elif line.strip() == f"branch refs/heads/{branch}" and path:
+            try:
+                if Path(path).resolve() != here:
+                    return path
+            except OSError:
+                return path
+    return None
+
+
+def _unreachable_base_detail(repo: Path, target: str, remote: str | None) -> str:
+    """Why the base could not be refreshed — the remote genuinely being
+    unreachable is only one of the reasons `fetch_base` returns False, and
+    reporting them all as connectivity sent the human to fix a network that
+    was fine (adversarial review, reproduced on a base branch that simply had
+    never been pushed — where `base_check` reports `behind: null`, "nothing to
+    do", about the very same repo)."""
+    if remote is None:
+        return (f"{repo}: no usable remote for '{target}' — no remote is "
+                "configured, or several are and none is named 'origin' and "
+                f"'{target}' has no configured upstream. Set "
+                f"`branch.{target}.remote`, or name a remote 'origin'.")
+    configured = [r for r in run_git(repo, "remote", check=False).splitlines()
+                  if r.strip()]
+    if remote not in configured and "://" not in remote and ":" not in remote:
+        # A stale `branch.<target>.remote` left behind by a `git remote
+        # rename`/removal. Making that config key load-bearing (so a fork
+        # layout measures against canonical) is what put this in reach, so the
+        # fix that widened the blind spot closes it too — otherwise it reports
+        # as connectivity, the exact misdiagnosis this function exists to end.
+        # URL-shaped values are legal in that key and are not remote names.
+        return (f"{repo}: `branch.{target}.remote` names '{remote}', which is "
+                f"not a configured remote ({', '.join(configured) or 'none'}) "
+                "— the branch's upstream config is stale, probably after a "
+                "`git remote rename`/removal. Repoint it, or unset it to fall "
+                "back to the push remote. (Connectivity is fine.)")
+    if remote_branch_exists(repo, target, remote=remote) is False:
+        return (f"{repo}: '{remote}' has no branch '{target}' — the base "
+                "exists only locally, so there is nothing to fast-forward "
+                "onto. Push it first, or pass --branch to name the base that "
+                "really tracks the remote. (Connectivity is fine; this is not "
+                "an offline/auth failure.)")
+    return (f"{repo}: could not reach '{remote}' to update '{target}' "
+            "(offline, auth, or timeout) — refusing rather than reporting a "
+            "fast-forward that did not happen. Fix connectivity and retry; "
+            "nothing was moved.")
+
+
+def _rev_count(repo: Path, range_spec: str) -> int | None:
+    """`rev-list --count`, None when git could not answer — the same
+    unreadable-comparison degradation `base_branch_behind` uses."""
+    count = run_git(repo, "rev-list", "--count", range_spec, check=False)
+    return int(count) if count.isdigit() else None
+
+
 def _push_remote(repo: Path) -> str:
     """`origin` when it exists, the sole remote otherwise — a repo whose
     remote is named anything else (common on forks: `upstream`+`fork`)
@@ -392,7 +599,38 @@ def _branch_exists(repo: Path, branch: str) -> bool:
     return proc.returncode == 0
 
 
-def remote_branch_exists(repo: Path, branch: str) -> bool | None:
+def _fetch_remote(repo: Path, branch: str) -> str | None:
+    """Which remote is `branch` actually tracking? Its CONFIGURED upstream
+    (`branch.<name>.remote`) when it has one, the push remote otherwise, None
+    when neither can be resolved.
+
+    adversarial review, reproduced on a fork layout — the standard
+    `origin`=my-fork / `upstream`=canonical setup, with `main` tracking
+    `upstream`. `_push_remote` prefers `origin` unconditionally, so every
+    staleness question was answered against the FORK: `base_branch_behind`
+    returned 0 and `update_base` reported "already current" while the base was
+    genuinely behind canonical. That is the same laundering `sync_branch`'s
+    docstring calls worse than no verb, reached through the remote-resolution
+    seam instead of the connectivity one — and the new resolver made it worse
+    than a missed measurement, because `base_check` would then write
+    `base-branch-current` into the audit ledger: a false clean bill of health.
+
+    Deliberately shared with `fetch_base`, so the measurer, the mover and
+    `sync_branch` can never disagree about which remote "the current base"
+    means — the same anti-drift reason `fetch_base` itself is one
+    implementation with several callers."""
+    configured = run_git(repo, "config", "--get", f"branch.{branch}.remote",
+                         check=False)
+    if configured.strip():
+        return configured.strip()
+    try:
+        return _push_remote(repo)
+    except (GitError, OSError):
+        return None            # no remote, or ambiguous — structural
+
+
+def remote_branch_exists(repo: Path, branch: str,
+                         remote: str | None = None) -> bool | None:
     """Does `branch` already exist on the repo's remote? Tri-state:
     True/False when the probe answered, **None when it could not be made** —
     no remote configured, an ambiguous remote set, an offline/auth/timeout
@@ -411,14 +649,19 @@ def remote_branch_exists(repo: Path, branch: str) -> bool | None:
     The pattern is the FULL `refs/heads/<branch>`, matching `_branch_exists`'s
     exactness: `ls-remote` matches patterns against the ref TAIL, so a bare
     `main` would also report a hit on `refs/heads/topic/main`. The returned
-    ref is re-compared exactly for the same reason."""
-    try:
-        remote = _push_remote(repo)
-    except (GitError, OSError):
-        # OSError covers a missing `git` binary (FileNotFoundError), so the
-        # tri-state contract holds for every unanswerable case the docstring
-        # enumerates rather than leaking a raw exception (adversarial-review)
-        return None  # no remote, or ambiguous — nothing to probe against
+    ref is re-compared exactly for the same reason.
+
+    `remote` overrides the resolution for callers that already know which one
+    they mean — `update_base` asks about the remote it actually fetched from,
+    which on a fork layout is not the one `_push_remote` would pick."""
+    if remote is None:
+        try:
+            remote = _push_remote(repo)
+        except (GitError, OSError):
+            # OSError covers a missing `git` binary (FileNotFoundError), so the
+            # tri-state contract holds for every unanswerable case the docstring
+            # enumerates rather than leaking a raw exception (adversarial-review)
+            return None  # no remote, or ambiguous — nothing to probe against
     try:
         proc = subprocess.run(
             ["git", "-C", str(repo), "ls-remote", "--heads", remote,
@@ -457,9 +700,7 @@ def base_branch_behind(repo: Path, branch: str) -> int | None:
     prevent). The caller reports the number; the human decides."""
     if not fetch_base(repo, branch):
         return None
-    count = run_git(repo, "rev-list", "--count", f"{branch}..FETCH_HEAD",
-                    check=False)
-    return int(count) if count.isdigit() else None
+    return _rev_count(repo, f"{branch}..FETCH_HEAD")
 
 
 def fetch_base(repo: Path, branch: str) -> bool:
@@ -469,18 +710,21 @@ def fetch_base(repo: Path, branch: str) -> bool:
     tri-state fail-open contract `remote_branch_exists` established, so a
     connectivity blip never bricks a step.
 
-    One implementation, two callers (`base_branch_behind` measures the gap,
-    `sync_branch` rebases across it) — they must never disagree about what
-    "the current base" means, and duplicating the remote-resolution and
-    fail-open branches is exactly how that drift starts.
+    One implementation, three callers (`base_branch_behind` measures the gap,
+    `sync_branch` rebases across it, `update_base` fast-forwards it) — they
+    must never disagree about what "the current base" means, and duplicating
+    the remote-resolution and fail-open branches is exactly how that drift
+    starts. The remote comes from `_fetch_remote`, which prefers the branch's
+    CONFIGURED upstream: on a fork layout every one of them used to answer
+    against `origin` (the fork) rather than the canonical remote the base
+    actually tracks — see that function.
 
     Read-only by construction: fetching an explicit refspec writes
     FETCH_HEAD and the remote-tracking ref, never the working tree and never
-    the local branch. Callers that then MOVE something (sync_branch) are
-    doing so on their own mandate, not this function's."""
-    try:
-        remote = _push_remote(repo)
-    except (GitError, OSError):
+    the local branch. Callers that then MOVE something (sync_branch,
+    update_base) are doing so on their own mandate, not this function's."""
+    remote = _fetch_remote(repo, branch)
+    if remote is None:
         return False                   # no remote, or ambiguous — structural
     try:
         proc = subprocess.run(

@@ -30,8 +30,23 @@ the human never asked for. A non-zero count logs a flagged
 this run executes (the red-proof, develop, the reviewer's re-run) runs
 against that base, so a stale one means green tests that say nothing about
 what the change will merge into. **Surface the count to the user** and let
-them decide to update the base first; `behind: null` just means the question
-was unanswerable (no remote, offline, auth) and is not a signal. Pass `--branch
+them decide to update the base first — the verb that executes that decision is
+`${CLAUDE_PLUGIN_ROOT}/bin/harness update-base --repo <repo-path> [--branch
+<name>]`: fetch + **fast-forward only**, refusing a diverged base, a base that
+is itself checked out and dirty, or a remote that didn't answer. It never runs
+on its own, and it moves the base REF without switching your checkout (raw
+`git pull`/`git merge` stays blocked — this is the owned entry point). Run it
+only on the user's word. **Do not "re-run preflight" to pick the update up:**
+this step is idempotent per repo (below), so a re-run returns the recorded
+branch rather than re-cutting it, and the feature branch would stay parked at
+the stale tip. By the time you read the count the branch already exists, so
+the sequence that actually terminates is `update-base` on the base, then
+`${CLAUDE_PLUGIN_ROOT}/bin/harness sync-branch --repo <repo-path> --onto
+<base>` from the feature branch to rebase it across the gap. In full/lean the
+question should already have been asked at plan step 0a (`base-check`); a
+count that still shows here means it wasn't acted on, and quick mode has no
+plan step at all, so this is that mode's only asking point. `behind: null` just means the
+question was unanswerable (no remote, offline, auth) and is not a signal. Pass `--branch
 <name>` to override the auto-resolved guess. Idempotent on retry, per
 repo: a `branches` entry already recorded for *this* repo is returned
 directly rather than re-derived — a second repo's preflight is never
