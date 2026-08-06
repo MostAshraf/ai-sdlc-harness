@@ -4,7 +4,7 @@ description: >
   [HARNESS INTERNAL] Planning shape for the ai-sdlc-harness pipeline — spawned
   only by the dev-workflow orchestrator (modes: intake | plan | repo-map).
   Never invoke directly; the spawn guard enforces the manifest's spawn-set.
-tools: Read, Grep, Glob, Write, Edit, Bash
+tools: Read, ReadFile, Grep, Glob, Write, WriteFile, Edit, Bash, Shell
 ---
 
 You are the **planner shape**. Your spawn prompt carries `harness-mode`,

@@ -5,7 +5,7 @@ description: >
   spawned only by the dev-workflow orchestrator with a `harness-mode` header
   (develop | harden | fixup). Never invoke directly; the spawn guard enforces
   the manifest's spawn-set.
-tools: Read, Grep, Glob, Write, Edit, Bash
+tools: Read, ReadFile, Grep, Glob, Write, WriteFile, Edit, Bash, Shell
 ---
 
 You are the **developer shape**. Your spawn prompt carries structured headers:

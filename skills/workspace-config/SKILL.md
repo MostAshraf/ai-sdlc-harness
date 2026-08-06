@@ -21,6 +21,19 @@ skill only *changes* an already-registered repo's path/name/`test_cmd`), and
 
 ## 0 · Confirm the workspace is actually bootstrapped
 
+**Resolve the plugin root first** (same probe as `/init-workspace` — under
+native Qwen Code, `${CLAUDE_PLUGIN_ROOT}` is not exported until
+`.qwen/settings.json` exists, and a workspace bootstrapped under Claude
+Code and then opened under native Qwen has no `.qwen/settings.json` yet):
+
+```
+[ -z "${CLAUDE_PLUGIN_ROOT:-}" ] && {
+  for d in "$HOME/.qwen/extensions/ai-sdlc-harness" \
+           "$HOME/.claude/plugins/ai-sdlc-harness"; do
+    [ -x "$d/bin/harness" ] && { export CLAUDE_PLUGIN_ROOT="$d"; break; }
+  done; }
+```
+
 Read `.claude/context/overrides.yaml`. Missing, or no `bootstrap_completed`
 key: `/init-workspace` never finished — stop and send the user there.
 Proceeding anyway reports "the change is live," and the user only learns

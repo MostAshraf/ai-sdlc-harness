@@ -62,5 +62,58 @@ class PlanContract(unittest.TestCase):
             f"steps/plan-task.md missing required-content marker(s): {missing_from_task}")
 
 
+class AgentToolsPinning(unittest.TestCase):
+    """The three agent files carry a union-spelling `tools:` list so the
+    same frontmatter grants the right tool set on BOTH Claude Code (grants
+    Read/Write/Edit/Bash, ignores the Qwen display names) and Qwen Code
+    (grants ReadFile/WriteFile/Edit/Shell/Grep/Glob, warn-drops the Claude
+    spellings). Verified empirically on Claude Code (V5) and source-verified
+    on Qwen Code v0.20.1 (transformToToolNames). This test pins the union
+    so a future edit can't silently break one platform.
+
+    The reviewer is read-only on BOTH platforms — no write spelling of
+    either dialect appears in its list."""
+
+    def _tools(self, agent_file: str) -> set[str]:
+        text = (ROOT / "agents" / agent_file).read_text(encoding="utf-8")
+        # extract the frontmatter block
+        fm = text.split("---", 2)[1] if text.startswith("---") else ""
+        for line in fm.splitlines():
+            if line.strip().startswith("tools:"):
+                return {t.strip() for t in line.split(":", 1)[1].split(",")
+                        if t.strip()}
+        self.fail(f"no tools: frontmatter in {agent_file}")
+
+    def test_developer_has_both_platform_spellings(self):
+        tools = self._tools("developer.md")
+        # Claude spellings
+        for t in ("Read", "Write", "Edit", "Bash"):
+            self.assertIn(t, tools, f"developer missing Claude spelling {t}")
+        # Qwen display names
+        for t in ("ReadFile", "WriteFile", "Shell"):
+            self.assertIn(t, tools, f"developer missing Qwen spelling {t}")
+
+    def test_planner_has_both_platform_spellings(self):
+        tools = self._tools("planner.md")
+        for t in ("Read", "Write", "Edit", "Bash"):
+            self.assertIn(t, tools, f"planner missing Claude spelling {t}")
+        for t in ("ReadFile", "WriteFile", "Shell"):
+            self.assertIn(t, tools, f"planner missing Qwen spelling {t}")
+
+    def test_reviewer_is_read_only_on_both_platforms(self):
+        tools = self._tools("reviewer.md")
+        # Claude read spellings present
+        for t in ("Read", "Bash"):
+            self.assertIn(t, tools, f"reviewer missing Claude spelling {t}")
+        # Qwen read display names present
+        for t in ("ReadFile", "Shell"):
+            self.assertIn(t, tools, f"reviewer missing Qwen spelling {t}")
+        # NO write spelling of EITHER dialect — read-only contract
+        for write_tool in ("Write", "WriteFile", "Edit"):
+            self.assertNotIn(write_tool, tools,
+                             f"reviewer grants {write_tool} — breaks the "
+                             "read-only contract on one or both platforms")
+
+
 if __name__ == "__main__":
     unittest.main()

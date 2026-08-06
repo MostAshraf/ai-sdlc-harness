@@ -5,7 +5,7 @@ description: >
   spawned only by the dev-workflow orchestrator (modes: review | plan-review |
   plan-attack | pre-pr | analyze-comments | request-triage). Never invoke
   directly.
-tools: Read, Grep, Glob, Bash
+tools: Read, ReadFile, Grep, Glob, Bash, Shell
 ---
 
 You are the **reviewer shape** — strictly read-only: no Write/Edit granted,

@@ -6,7 +6,15 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
-> **Qwen Code compatibility, additive-only.** The hook matchers, env-var, settings-file, and install-rewrite layers each had a gap that left safety guards dead or split-brained under Qwen Code — all closed with additive fallback patterns that leave Claude Code behavior byte-identical. Verified against Qwen Code v0.20.1's bundled source.
+> **Dual-native: the repo is now simultaneously a native Claude Code plugin and a native Qwen Code extension.** A committed `qwen-extension.json` makes Qwen load the repo natively (no Claude-plugin conversion), eliminating the split-brain hazard at its root — native markdown keeps literal `.claude/context/` paths that match the physical tree. The prior compat layer (dual matchers, env export, settings dual-write, symlink) inverts roles cleanly: under native installs the env export backs every `${CLAUDE_PLUGIN_ROOT}` token the model types and the symlink is a harmless converted-install affordance.
+
+### Changed
+
+- **Committed `qwen-extension.json`.** A minimal native Qwen manifest at the repo root (name, version, description mirroring `plugin.json`). Qwen checks for it first and short-circuits the Claude converter — no `.claude/`→`.qwen/` rewrite, no install-time `${CLAUDE_PLUGIN_ROOT}` substitution. Claude Code ignores the file entirely. The version must stay in sync with `plugin.json` (a triple once the mgm tooling learns it — WI-4, lands before next `/release`).
+- **Union-spelling `tools:` frontmatter in all three agents.** `developer.md` and `planner.md` now carry `Read, ReadFile, Grep, Glob, Write, WriteFile, Edit, Bash, Shell`; `reviewer.md` carries `Read, ReadFile, Grep, Glob, Bash, Shell` (read-only on both platforms). Claude Code grants the names it recognizes and silently ignores the rest; Qwen Code does the reverse. Verified empirically on Claude Code and source-verified on Qwen Code v0.20.1 (`transformToToolNames`). Pinned by a new test (`AgentToolsPinning`).
+- **Bootstrap-token fallback in `/init-workspace` and `/workspace-config`.** Under native Qwen, `${CLAUDE_PLUGIN_ROOT}` is not substituted in markdown and the env var is not exported until `.qwen/settings.json` is written — so the very first `/init-workspace` command would expand the token to an empty string. Both skills now start with a probe that resolves the plugin root from known install locations if the var is unset/empty; under Claude Code and converted installs the probe is a no-op.
+
+> **Prior: Qwen Code compatibility, additive-only.** The hook matchers, env-var, settings-file, and install-rewrite layers each had a gap that left safety guards dead or split-brained under Qwen Code — all closed with additive fallback patterns that leave Claude Code behavior byte-identical. Verified against Qwen Code v0.20.1's bundled source.
 
 ### Changed
 
@@ -18,7 +26,7 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ### Verification on this change
 
-- `python -m unittest discover -s tests` — 965 tests green (skipped=7); 19 new (Qwen settings dual-write, env self-heal + user-pin preservation, non-destructive merge, relative symlink round-trip + clobber/warn hardening, matcher coverage snapshots incl. PostToolUse + Skill, the `"agent"` tool_name branch)
+- `python -m unittest discover -s tests` — 968 tests green (skipped=7); 22 new (Qwen settings dual-write, env self-heal + user-pin preservation, non-destructive merge, relative symlink round-trip + clobber/warn hardening, matcher coverage snapshots incl. PostToolUse + Skill, the `"agent"` tool_name branch, agent union-spelling tools pinning)
 - All changes additive — Claude Code code paths byte-identical; the `.qwen/` writes and symlink are gated on `QWEN_CODE=1`
 - Adversarial review (two parallel lenses) — three findings fixed (silent file clobber in symlink setup, symlink-less-host silent data loss now warns, matcher test under-assertion hardened); two findings dismissed with source evidence (`CLAUDE_PROJECT_DIR` is hook-runner-injected and `QWEN_CODE=1` is shell-tool-injected per Qwen v0.20.1 source — the plan's Phase-0 verification)
 
