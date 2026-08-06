@@ -592,7 +592,7 @@ def _blocked_context(p: dict, workspace: Path, runs: list[Path]) -> dict:
     tool_input = p.get("tool_input") or {}
     attempt = (tool_input.get("command")
                or tool_input.get("file_path") or tool_input.get("path") or "")
-    if not attempt and p.get("tool_name") == "Task":
+    if not attempt and p.get("tool_name") in ("Task", "agent"):
         attempt = str(tool_input.get("subagent_type") or "")
     attempt = str(attempt)
     for raw, tag in ([(r, "<run>") for r in runs] + [(workspace, "<workspace>")]):
@@ -1203,7 +1203,19 @@ def guard_write(p: dict) -> None:
             block(reason, cwd, p)
     if shape == "planner":
         path = _resolve_write_path(fp, cwd)
-        artifact_roots = (ws.resolve() / "ai", (ws / ".claude" / "context").resolve())
+        # `.qwen/context` is the Qwen install-rewrite spelling of
+        # `.claude/context` (the installer rewrites `.claude/`→`.qwen/` in
+        # markdown). init-workspace aliases it via a symlink under Qwen,
+        # which `path.resolve()` follows into `.claude/context` — but on
+        # hosts where symlinks fail the model still writes the literal
+        # `.qwen/context/...` path, so accept both prefixes here. The CLI
+        # keeps `.claude/context` as the single physical location either
+        # way; this is confinement acceptance, not a second data tree.
+        artifact_roots = (
+            ws.resolve() / "ai",
+            (ws / ".claude" / "context").resolve(),
+            (ws / ".qwen" / "context").resolve(),
+        )
         # scratch checked via `_is_scratch_write`, not a bare /tmp
         # membership test: the workspace root itself commonly sits under
         # /tmp (Linux `tempfile.mkdtemp()`, CI/containers), and a bare

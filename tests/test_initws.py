@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
@@ -531,6 +532,192 @@ class VerificationGates(M7Harness):
         # and the CLI is still usable afterward
         self.cli("init-section", "--section", "overrides", "--json",
                  json.dumps({"quick_mode": {"loc_threshold": 50}}))
+
+
+class QwenCompatibility(M7Harness):
+    """Qwen Code reads permissions and env from `.qwen/settings.json`
+    (Claude reads `.claude/settings.json`) and its installer rewrites
+    `.claude/`→`.qwen/` in skill markdown. Under `QWEN_CODE=1`,
+    init-workspace mirrors the allowlist + exports CLAUDE_PLUGIN_ROOT into
+    `.qwen/settings.json` and symlinks `.qwen/context`→`../.claude/context`
+    so model writes through the rewritten path land in the single physical
+    tree. Claude Code sessions (no QWEN_CODE) are untouched."""
+
+    def test_write_permissions_mirrors_to_qwen_settings_under_qwen(self):
+        with mock.patch.dict(os.environ, {"QWEN_CODE": "1"}):
+            initws.write_permissions(self.workspace, {"r": str(self.repo)},
+                                     {"r": {"test_cmd": TEST_CMD}})
+        qwen_path = self.workspace / ".qwen" / "settings.json"
+        self.assertTrue(qwen_path.exists())
+        settings = json.loads(qwen_path.read_text(encoding="utf-8"))
+        allow = settings["permissions"]["allow"]
+        # same rules as .claude/settings.json, including the literal token
+        self.assertIn("Bash(${CLAUDE_PLUGIN_ROOT}/bin/harness:*)", allow)
+        self.assertIn(f"Bash({TEST_CMD.split()[0]}:*)", allow)
+        # the env export that makes runtime-generated block-message
+        # `${CLAUDE_PLUGIN_ROOT}/...` invocations runnable under Qwen
+        self.assertIn("CLAUDE_PLUGIN_ROOT", settings["env"])
+
+    def test_write_permissions_skips_qwen_settings_without_qwen_code(self):
+        # Claude Code path is byte-identical: no .qwen/ tree written.
+        # Strip QWEN_CODE from the env — the suite itself may run inside a
+        # Qwen Code session that sets it in the process env.
+        env = {k: v for k, v in os.environ.items() if k != "QWEN_CODE"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            initws.write_permissions(self.workspace, {"r": str(self.repo)},
+                                     {"r": {"test_cmd": TEST_CMD}})
+        self.assertFalse((self.workspace / ".qwen").exists())
+        self.assertTrue((self.workspace / ".claude" / "settings.json").exists())
+
+    def test_qwen_settings_merge_is_non_destructive(self):
+        # a pre-existing .qwen/settings.json (e.g. user env keys) must be
+        # merged, not clobbered — same read-modify-write discipline as the
+        # .claude path.
+        qwen_path = self.workspace / ".qwen" / "settings.json"
+        qwen_path.parent.mkdir(parents=True, exist_ok=True)
+        qwen_path.write_text(json.dumps({
+            "env": {"MY_KEY": "kept"},
+            "permissions": {"allow": ["Bash(echo:*)"]}}), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"QWEN_CODE": "1"}):
+            initws.write_permissions(self.workspace, {"r": str(self.repo)},
+                                     {"r": {"test_cmd": TEST_CMD}})
+        settings = json.loads(qwen_path.read_text(encoding="utf-8"))
+        self.assertEqual(settings["env"]["MY_KEY"], "kept")
+        self.assertIn("Bash(echo:*)", settings["permissions"]["allow"])
+        self.assertIn(f"Bash({TEST_CMD.split()[0]}:*)",
+                      settings["permissions"]["allow"])
+
+    def test_qwen_settings_env_export_preserves_user_pin_pointing_at_real_dir(self):
+        # a user (or prior init) who pinned CLAUDE_PLUGIN_ROOT at a path that
+        # still exists on disk wins — the self-heal only overwrites a
+        # DANGLING value, never a live one. Here the pinned path is the
+        # workspace itself (guaranteed to exist), so it's preserved.
+        qwen_path = self.workspace / ".qwen" / "settings.json"
+        qwen_path.parent.mkdir(parents=True, exist_ok=True)
+        qwen_path.write_text(json.dumps(
+            {"env": {"CLAUDE_PLUGIN_ROOT": str(self.workspace)}}),
+            encoding="utf-8")
+        with mock.patch.dict(os.environ, {"QWEN_CODE": "1"}):
+            initws.write_permissions(self.workspace, {}, {})
+        settings = json.loads(qwen_path.read_text(encoding="utf-8"))
+        self.assertEqual(settings["env"]["CLAUDE_PLUGIN_ROOT"],
+                         str(self.workspace))
+
+    def test_qwen_settings_env_export_self_heals_when_stored_path_dangles(self):
+        # the failure mode Gap 1 exists to prevent: a prior init wrote the
+        # plugin root, the plugin was later reinstalled/moved, and the stored
+        # path no longer exists. The self-heal overwrites it with the current
+        # root so the block-message recovery path stays runnable. Silent on
+        # the happy path (a routine reinstall is expected, not a signal).
+        qwen_path = self.workspace / ".qwen" / "settings.json"
+        qwen_path.parent.mkdir(parents=True, exist_ok=True)
+        stale = "/definitely/not/a/real/path/anymore"
+        qwen_path.write_text(json.dumps(
+            {"env": {"CLAUDE_PLUGIN_ROOT": stale}}), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"QWEN_CODE": "1"}):
+            initws.write_permissions(self.workspace, {}, {})
+        settings = json.loads(qwen_path.read_text(encoding="utf-8"))
+        plugin_root = str(Path(initws.__file__).resolve().parent.parent)
+        self.assertEqual(settings["env"]["CLAUDE_PLUGIN_ROOT"], plugin_root)
+
+    def test_mark_bootstrapped_symlinks_qwen_context_under_qwen(self):
+        # bootstrap the context dir first (write_section creates it)
+        initws.write_section(self.workspace, "provider",
+                             {"provider": {"work_item": "local-markdown",
+                                           "git": "local",
+                                           "stories_dir": "stories"}})
+        with mock.patch.dict(os.environ, {"QWEN_CODE": "1"}):
+            initws.mark_bootstrapped(self.workspace)
+        link = self.workspace / ".qwen" / "context"
+        target = self.workspace / ".claude" / "context"
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.resolve(), target.resolve())
+        # the link target is RELATIVE (../.claude/context), not absolute —
+        # a relative link survives a workspace move/rename where an absolute
+        # one would dangle. readlink returns the stored target verbatim.
+        self.assertEqual(os.readlink(link), os.path.join("..", ".claude", "context"))
+        # a write through the rewritten .qwen/context path lands in the
+        # physical .claude/context tree
+        (link / "witness.txt").write_text("ok", encoding="utf-8")
+        self.assertTrue((target / "witness.txt").exists())
+
+    def test_mark_bootstrapped_no_symlink_without_qwen_code(self):
+        initws.write_section(self.workspace, "provider",
+                             {"provider": {"work_item": "local-markdown",
+                                           "git": "local",
+                                           "stories_dir": "stories"}})
+        env = {k: v for k, v in os.environ.items() if k != "QWEN_CODE"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            initws.mark_bootstrapped(self.workspace)
+        self.assertFalse((self.workspace / ".qwen" / "context").exists())
+
+    def test_link_qwen_context_does_not_clobber_real_file(self):
+        # adversarial-review finding (CONFIRMED): the original `unlink()`
+        # succeeded on a regular file at `.qwen/context`, silently deleting
+        # user data. Only a symlink (a stale/wrong link) is replaced; a real
+        # file or directory the user placed there is left alone.
+        # Consistent-visibility hardening: the occupied branch has the SAME
+        # broken round-trip as a refused symlink (no link → .qwen/context
+        # writes lost), so it warns too — the outcome must not be silent.
+        initws.write_section(self.workspace, "provider",
+                             {"provider": {"work_item": "local-markdown",
+                                           "git": "local",
+                                           "stories_dir": "stories"}})
+        link = self.workspace / ".qwen" / "context"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.write_text("user-owned marker file", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"QWEN_CODE": "1"}), \
+                mock.patch("sys.stderr") as stderr:
+            initws.mark_bootstrapped(self.workspace)
+        # the file survives — not clobbered, not turned into a symlink
+        self.assertFalse(link.is_symlink())
+        self.assertEqual(link.read_text(encoding="utf-8"),
+                         "user-owned marker file")
+        # and the user is told the round-trip is broken (not silent)
+        written = "".join(call.args[0] for call in stderr.write.call_args_list)
+        self.assertIn("exists as a real", written)
+        self.assertIn(".qwen/context", written)
+
+    def test_link_qwen_context_repoints_stale_symlink(self):
+        # a stale/wrong symlink IS replaced — that's the documented
+        # idempotency contract (re-run after the target moved).
+        initws.write_section(self.workspace, "provider",
+                             {"provider": {"work_item": "local-markdown",
+                                           "git": "local",
+                                           "stories_dir": "stories"}})
+        link = self.workspace / ".qwen" / "context"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        elsewhere = self.workspace / "elsewhere"
+        elsewhere.mkdir()
+        link.symlink_to(elsewhere, target_is_directory=True)
+        with mock.patch.dict(os.environ, {"QWEN_CODE": "1"}):
+            initws.mark_bootstrapped(self.workspace)
+        target = self.workspace / ".claude" / "context"
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.resolve(), target.resolve())
+
+    def test_link_qwen_context_warns_when_symlinks_unavailable(self):
+        # adversarial-review finding (MEDIUM, converged): when the host
+        # refuses symlinks, the failure must NOT be silent — without the
+        # symlink the guard_write dual-prefix allows a planner context
+        # write the CLI can never read (silent data loss). A stderr warning
+        # names the requirement. Simulate symlink refusal by patching
+        # symlink_to to raise OSError (mock.patch.object restores it).
+        initws.write_section(self.workspace, "provider",
+                             {"provider": {"work_item": "local-markdown",
+                                           "git": "local",
+                                           "stories_dir": "stories"}})
+        from pathlib import Path
+        with mock.patch.dict(os.environ, {"QWEN_CODE": "1"}), \
+                mock.patch.object(Path, "symlink_to",
+                                  side_effect=OSError("no privilege")), \
+                mock.patch("sys.stderr") as stderr:
+            initws.mark_bootstrapped(self.workspace)
+        written = "".join(call.args[0] for call in stderr.write.call_args_list)
+        self.assertIn("could not symlink .qwen/context", written)
+        # and no symlink exists (creation failed)
+        self.assertFalse(
+            (self.workspace / ".qwen" / "context").is_symlink())
 
 
 class AutoCreateStoriesDir(M7Harness):

@@ -789,6 +789,73 @@ def _write_section_locked(workspace: Path, section: str, path: Path,
 def mark_bootstrapped(workspace: Path) -> None:
     write_section(workspace, "overrides",
                   {"bootstrap_completed": ndjson.now_iso()})
+    if os.environ.get("QWEN_CODE") == "1":
+        _link_qwen_context(workspace)
+
+
+def _link_qwen_context(workspace: Path) -> None:
+    """Qwen's extension installer rewrites `.claude/` → `.qwen/` in every
+    installed `.md`/`.sh` file, so skills and agents under Qwen point the
+    model at `.qwen/context/…` while the CLI and guards read and write the
+    physical `.claude/context/` tree (Python is not rewritten by the
+    installer). Aliasing `.qwen/context` to the real `.claude/context` via
+    a symlink closes that split-brain without relocating state — model
+    reads/writes through the rewritten path land in the single physical
+    location, and Claude Code sessions are untouched. `.claude/context` is
+    created by `write_section` before this runs (mark_bootstrapped is the
+    last init step); the symlink is idempotent and re-points an existing
+    stale/wrong *symlink* rather than failing on it.
+
+    The link target is RELATIVE (`../.claude/context`), not absolute, so a
+    workspace move or rename doesn't dangle it — the absolute form would.
+
+    Adversarial-review hardening: only a symlink (never a regular file or
+    directory the user may have placed at `.qwen/context`) is replaced —
+    `unlink()` on a regular file would silently delete user data. When the
+    host refuses symlinks altogether (unprivileged Windows without Developer
+    Mode) OR a real file/directory occupies the link path, the failure is
+    NOT silent: the dual-prefix acceptance in guard_write keeps the
+    planner's context write unblocked, but without the symlink that write
+    lands in a separate `.qwen/context` tree the CLI never reads — so a
+    visible stderr warning names the requirement in both cases. Full
+    `.qwen/context` round-trip needs the symlink; macOS/Linux always have
+    it, Windows needs Developer Mode or an admin shell."""
+    import sys
+    target = Path("..") / ".claude" / "context"   # relative — survives a workspace move
+    link = workspace / ".qwen" / "context"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if not (workspace / ".claude" / "context").exists():
+        return
+    if link.is_symlink():
+        link.unlink()      # re-point a stale/wrong symlink, never a real file
+    elif link.exists():
+        # A real file/directory the user (or a prior tool) placed here —
+        # leave it (refusing rather than clobbering matches this project's
+        # standing convention for any registry/state write), but warn:
+        # the outcome is the SAME broken round-trip as a refused symlink
+        # (no link → .qwen/context writes lost to the CLI).
+        print(f"warning: .qwen/context exists as a real "
+              f"{'directory' if link.is_dir() else 'file'} (not a symlink) "
+              f"and was left in place; Qwen's installer rewrites skill "
+              f"paths to .qwen/context/, so without the symlink, context "
+              f"writes through that path won't be read by the harness CLI. "
+              f"Remove {link} and re-run /init-workspace to create the "
+              f"symlink.", file=sys.stderr)
+        return
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        # Symlinks unavailable. The guard_write dual-prefix still ALLOWS a
+        # planner context write through `.qwen/context/…`, but with no
+        # symlink that write is functionally lost (the CLI reads only
+        # `.claude/context`). Warn so the user knows the round-trip is
+        # broken on this host rather than discovering it as silent data loss.
+        print("warning: could not symlink .qwen/context -> .claude/context "
+              "(symlinks unavailable on this host). Qwen's installer rewrites "
+              "skill paths to .qwen/context/, so without the symlink, context "
+              "writes through that path won't be read by the harness CLI. "
+              "On Windows, enable Developer Mode or run as admin to create "
+              "symlinks.", file=sys.stderr)
 
 
 def write_permissions(workspace: Path, repos: dict[str, str],
@@ -825,6 +892,46 @@ def write_permissions(workspace: Path, repos: dict[str, str],
                 (lang.get("test_cmd") for lang in language.values()) if cmd)
     allow.update(f"Read({p}/**)" for p in repos.values())
     settings["permissions"]["allow"] = sorted(allow)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    if os.environ.get("QWEN_CODE") == "1":
+        _write_qwen_settings(workspace, plugin_root, sorted(allow))
+    return path
+
+
+def _write_qwen_settings(workspace: Path, plugin_root: Path,
+                         allow: list[str]) -> Path:
+    """Qwen Code reads permissions and env from `<workspace>/.qwen/
+    settings.json` (Claude Code reads `.claude/settings.json`), so the
+    allowlist written above must be mirrored here or background agents hit a
+    permission prompt on every `harness` call under Qwen. The same file
+    also carries the `CLAUDE_PLUGIN_ROOT` env export: Qwen never exports
+    that var itself (it substitutes the token textually in installed
+    markdown and hook commands at install/load time, but not in the
+    runtime-generated block messages guards.py emits), so exporting it via
+    the workspace settings `env` block is what makes a model-recovered
+    `${CLAUDE_PLUGIN_ROOT}/bin/harness ...` block message runnable.
+    `loadEnvironment` writes `env` entries into `process.env` with
+    set-if-unset semantics, so Claude Code's own value, when present,
+    wins (this dual-write only fires under `QWEN_CODE=1`, when the var is
+    guaranteed absent). Read-modify-write with set semantics, matching the
+    `.claude` path's non-destructive merge."""
+    path = workspace / ".qwen" / "settings.json"
+    settings = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    existing_allow = set(settings.setdefault("permissions", {}).get("allow", []))
+    existing_allow.update(allow)
+    settings["permissions"]["allow"] = sorted(existing_allow)
+    env = settings.setdefault("env", {})
+    # Self-heal a stale value: if the previously-stored path no longer
+    # exists on disk (the plugin was reinstalled/moved to a new location),
+    # overwrite it with the current root. A deliberate user pin that still
+    # points at a real directory is preserved; only the dangling case — the
+    # harness's OWN prior write, now orphaned by a reinstall — self-heals.
+    # Silent on the happy path (a routine reinstall is expected behavior,
+    # not a signal worth surfacing).
+    stored = env.get("CLAUDE_PLUGIN_ROOT")
+    if not stored or not Path(stored).is_dir():
+        env["CLAUDE_PLUGIN_ROOT"] = str(plugin_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
     return path
