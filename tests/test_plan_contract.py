@@ -12,6 +12,7 @@ already uses (regex/substring, not parsing); a stronger check would need to
 parse structure, not just grep for markers."""
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 
@@ -108,11 +109,40 @@ class AgentToolsPinning(unittest.TestCase):
         # Qwen read display names present
         for t in ("ReadFile", "Shell"):
             self.assertIn(t, tools, f"reviewer missing Qwen spelling {t}")
-        # NO write spelling of EITHER dialect — read-only contract
-        for write_tool in ("Write", "WriteFile", "Edit"):
+        # NO write spelling of EITHER dialect — read-only contract.
+        # Cover Claude display names, Qwen display names, AND canonical/wire
+        # names (Qwen's transformToToolNames resolves exact-name matches too,
+        # so a lowercase write_file or edit would grant write if it snuck in).
+        for write_tool in ("Write", "WriteFile", "write_file",
+                           "Edit", "edit", "replace",
+                           "NotebookEdit", "notebook_edit"):
             self.assertNotIn(write_tool, tools,
                              f"reviewer grants {write_tool} — breaks the "
                              "read-only contract on one or both platforms")
+
+
+class VersionTripleSync(unittest.TestCase):
+    """qwen-extension.json, plugin.json, and marketplace.json must carry the
+    same version — they're a triple now that the repo is dual-native. The
+    mgm tooling (WI-4) will enforce this at bump-time; this test is cheap
+    defense-in-depth so drift is caught in the harness suite before the
+    next /release, regardless of mgm's state."""
+
+    def test_versions_in_sync(self):
+        pj = json.loads((ROOT / ".claude-plugin" / "plugin.json")
+                        .read_text(encoding="utf-8"))
+        qe = json.loads((ROOT / "qwen-extension.json")
+                        .read_text(encoding="utf-8"))
+        mj = json.loads((ROOT / ".claude-plugin" / "marketplace.json")
+                        .read_text(encoding="utf-8"))
+        versions = {
+            "plugin.json": pj["version"],
+            "qwen-extension.json": qe["version"],
+            "marketplace.json plugins[0]": mj["plugins"][0]["version"],
+        }
+        unique = set(versions.values())
+        self.assertEqual(len(unique), 1,
+                         f"version triple drifted: {versions}")
 
 
 if __name__ == "__main__":

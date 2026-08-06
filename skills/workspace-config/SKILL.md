@@ -21,18 +21,23 @@ skill only *changes* an already-registered repo's path/name/`test_cmd`), and
 
 ## 0 · Confirm the workspace is actually bootstrapped
 
-**Resolve the plugin root first** (same probe as `/init-workspace` — under
-native Qwen Code, `${CLAUDE_PLUGIN_ROOT}` is not exported until
-`.qwen/settings.json` exists, and a workspace bootstrapped under Claude
-Code and then opened under native Qwen has no `.qwen/settings.json` yet):
+**Resolve the plugin root** if not already set (native Qwen first run —
+each Bash call is a fresh subprocess, so the probe prints the path for
+textual substitution). Same resolution logic as `/init-workspace` step 0:
 
 ```
-[ -z "${CLAUDE_PLUGIN_ROOT:-}" ] && {
-  for d in "$HOME/.qwen/extensions/ai-sdlc-harness" \
-           "$HOME/.claude/plugins/ai-sdlc-harness"; do
-    [ -x "$d/bin/harness" ] && { export CLAUDE_PLUGIN_ROOT="$d"; break; }
-  done; }
+R="${CLAUDE_PLUGIN_ROOT:-}"; [ -z "$R" ] && {
+  for p in "$HOME/.qwen/extensions/ai-sdlc-harness/bin/harness" \
+           "$HOME/.qwen/extensions/ai-sdlc-harness/.qwen-extension-install.json"; do
+    [ -e "$p" ] && { case "$p" in *install.json)
+      R=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('source',''))" "$p");;
+      *) R=$(cd "$(dirname "$p")/.." && pwd);; esac
+      [ -x "$R/bin/harness" ] && break; }; done; }
+[ -x "$R/bin/harness" ] || { echo "ERROR: set CLAUDE_PLUGIN_ROOT to the dir with bin/harness" >&2; exit 1; }
+echo "PLUGIN_ROOT=$R"
 ```
+
+**Use the printed path in place of `${CLAUDE_PLUGIN_ROOT}` below.**
 
 Read `.claude/context/overrides.yaml`. Missing, or no `bootstrap_completed`
 key: `/init-workspace` never finished — stop and send the user there.

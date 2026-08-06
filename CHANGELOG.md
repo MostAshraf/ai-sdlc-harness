@@ -26,7 +26,7 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ### Verification on this change
 
-- `python -m unittest discover -s tests` — 968 tests green (skipped=7); 22 new (Qwen settings dual-write, env self-heal + user-pin preservation, non-destructive merge, relative symlink round-trip + clobber/warn hardening, matcher coverage snapshots incl. PostToolUse + Skill, the `"agent"` tool_name branch, agent union-spelling tools pinning)
+- `python -m unittest discover -s tests` — 969 tests green (skipped=7); 23 new (Qwen settings dual-write, env self-heal + user-pin preservation, non-destructive merge, relative symlink round-trip + clobber/warn hardening, matcher coverage snapshots incl. PostToolUse + Skill, the `"agent"` tool_name branch, agent union-spelling tools pinning, version-triple sync)
 - All changes additive — Claude Code code paths byte-identical; the `.qwen/` writes and symlink are gated on `QWEN_CODE=1`
 - Adversarial review (two parallel lenses) — three findings fixed (silent file clobber in symlink setup, symlink-less-host silent data loss now warns, matcher test under-assertion hardened); two findings dismissed with source evidence (`CLAUDE_PROJECT_DIR` is hook-runner-injected and `QWEN_CODE=1` is shell-tool-injected per Qwen v0.20.1 source — the plan's Phase-0 verification)
 

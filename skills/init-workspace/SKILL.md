@@ -16,26 +16,28 @@ time** (`init-section`), never a full-nuke.
 
 ## 0 · Environment bootstrap (do this FIRST)
 
-**Resolve the plugin root first.** Under native Qwen Code installs (no
-Claude-plugin conversion), `${CLAUDE_PLUGIN_ROOT}` is not substituted in
-markdown and the env var is not exported until this skill writes
-`.qwen/settings.json` at step 6 — so the first command must resolve it
-once. Run this probe; if the var is already set (Claude Code, or a
-converted Qwen install where the token was rewritten to an absolute path),
-it's a no-op:
+**Resolve the plugin root.** Under native Qwen Code (no Claude-plugin
+conversion), `${CLAUDE_PLUGIN_ROOT}` is not exported until step 6 writes
+`.qwen/settings.json` — and even then it takes effect next session, not
+this one. Each Bash call is a fresh subprocess (an `export` won't
+persist), so the probe **prints** the resolved path for you to substitute
+textually. If the var is already set (Claude Code, converted install),
+the probe passes it through unchanged:
 
 ```
-[ -z "${CLAUDE_PLUGIN_ROOT:-}" ] && {
-  # native Qwen, first run — find the installed plugin root
-  for d in "$HOME/.qwen/extensions/ai-sdlc-harness" \
-           "$HOME/.claude/plugins/ai-sdlc-harness"; do
-    [ -x "$d/bin/harness" ] && { export CLAUDE_PLUGIN_ROOT="$d"; break; }
-  done; }
-[ -z "${CLAUDE_PLUGIN_ROOT:-}" ] && {
-  echo "ERROR: could not locate the ai-sdlc-harness plugin root." >&2
-  echo "Set CLAUDE_PLUGIN_ROOT to the directory containing bin/harness." >&2
-  exit 1; }
+# Resolve the plugin root and print it (native Qwen first-run fallback)
+R="${CLAUDE_PLUGIN_ROOT:-}"
+[ -z "$R" ] && for d in "$HOME/.qwen/extensions/ai-sdlc-harness/bin/harness" \
+  "$HOME/.qwen/extensions/ai-sdlc-harness/.qwen-extension-install.json"; do
+  [ -e "$d" ] && { case "$d" in *install.json) R=$(python3 -c \
+    "import json,sys;print(json.load(open(sys.argv[1])).get('source',''))" "$d");; \
+    *) R=$(dirname "$(dirname "$d")");; esac; [ -x "$R/bin/harness" ] && break; }; done
+[ -x "$R/bin/harness" ] || { echo "ERROR: set CLAUDE_PLUGIN_ROOT to the dir with bin/harness" >&2; exit 1; }
+echo "PLUGIN_ROOT=$R"
 ```
+
+**Use the printed `PLUGIN_ROOT=<path>` in place of every
+`${CLAUDE_PLUGIN_ROOT}` below** for this skill run.
 
 The harness needs PyYAML; system pythons are often externally managed
 (PEP 668), so the plugin owns a venv that `bin/harness` resolves
