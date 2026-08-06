@@ -31,12 +31,13 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ### Verification on tag tip
 
-- `python -m unittest discover -s tests` — 942 tests green (skipped=7); 33 new
+- `python -m unittest discover -s tests` — 946 tests green (skipped=7); 37 new
 - `verify.py` — ALL PASS 5/5 (hooks.json, test-delta, schema, budget, tests)
-- `drift_check.py` — clean; README test count 942 = 942; CLI verbs all documented
+- `drift_check.py` — clean; README test count 946 = 946; CLI verbs all documented
 - Mutation-tested fifteen ways — every refusal, the resolver's key and its actor check, the open-flag suppression, the worktree guard, and the off-base resolver guard each fail their test with the rest of the suite green
 - Two of those mutations cover ground the pre-review suite could not see at all: `plan.md` step 0a could be **deleted wholesale** with the whole suite still green, and a later version could be **relocated after the planner spawn** — an ordering finding needs an ordering assertion
 - Adversarial review reproduced its two highest findings end to end against real temp repos: the branch-switch that would have squash-merged every task onto the base, and the fork-layout false "already current"
+- CI on the release PR turned up an unrelated latent flake and it is fixed here: `tests/support.py`'s rmtree error handler called `os.chmod` on a path git's background auto-maintenance had just deleted, raising `FileNotFoundError` **from inside the handler for the `FileNotFoundError` it was handling** — failing an otherwise-green run in `tearDown`. Not an OS bug despite surfacing on one macOS lane: from 3.12 `shutil` absorbs that error itself and never calls the handler, so **Python 3.10 is the variable**. Mutation testing also caught that the first fix's tests were vacuous on 3.12+ for exactly that reason
 
 ## [3.4.0] — 2026-08-04
 
