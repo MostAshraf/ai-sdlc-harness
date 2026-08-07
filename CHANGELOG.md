@@ -6,7 +6,17 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
-> **Dual-native: the repo is now simultaneously a native Claude Code plugin and a native Qwen Code extension.** A committed `qwen-extension.json` makes Qwen load the repo natively (no Claude-plugin conversion), eliminating the split-brain hazard at its root — native markdown keeps literal `.claude/context/` paths that match the physical tree. The prior compat layer (dual matchers, env export, settings dual-write, symlink) inverts roles cleanly: under native installs the env export backs every `${CLAUDE_PLUGIN_ROOT}` token the model types and the symlink is a harmless converted-install affordance.
+> **Spawn-identity & capture-integrity.** A field run under Qwen Code spawned `general-purpose` for harness work — one wrong `subagent_type` silently disabled spawn gating, write confinement, and verdict capture simultaneously. The orchestrator, stuck at a cursor it couldn't advance, escalated to attempted evidence forgery. `verdict_bound` caught the forgery, but the entire governance layer was bypassed for the full run. This change blocks the bypass class at its root and gives the orchestrator a sanctioned recovery path. Platform-agnostic; Claude Code behavior identical.
+
+### Changed
+
+- **Harness-headed spawns with wrong agent identity are now blocked.** The spawn guard detects when a prompt carrying `harness-mode:` headers uses a `subagent_type` that doesn't resolve to a harness shape (e.g. `general-purpose`, `Explore`) — a provable mis-typed spawn, not a foreign agent. The block message names all three correct agent identities. `capture_post_spawn` logs a `spawn-shape-unrecognized` event as defense-in-depth for paths where the PreToolUse guard didn't fire. Header-less generic spawns pass untouched.
+- **`run_in_background: false` is now required for harness spawns.** Under Qwen Code, omitting the param defaults to background for top-level spawns — so the old "absent = foreground" premise was platform-dependent. The uniform rule requires explicit `false`, needs no platform detection, and is identical on both platforms.
+- **Shared spawn-identity reference.** `skills/dev-workflow/shared/spawn-identity.md` maps shape words to agent frontmatter names, states the prohibition on generic agents, and reassures that a wrong name is a visible platform error, not a silent bypass. Referenced from `SKILL.md` and `/repo-map-refresh`.
+- **Declared recovery for missing verdict.** `SKILL.md` step 4 and `plan-review.md` now carry an explicit recovery for "cursor refused for missing verdict" — re-spawn the reviewer once with correct identity/foreground/headers. Lists the three forbidden improvisations (writing the ledger directly, synthesizing capture-hook payloads, forcing the cursor) the field run discovered.
+- **`/repo-map-refresh` spawn procedure fixed.** Stale frontmatter name citation (`name: planner` → `name: ai-sdlc-planner`) corrected; now references `shared/spawn-identity.md` and requires explicit `run_in_background: false`.
+
+> **Prior: Dual-native — the repo is now simultaneously a native Claude Code plugin and a native Qwen Code extension.** A committed `qwen-extension.json` makes Qwen load the repo natively (no Claude-plugin conversion), eliminating the split-brain hazard at its root — native markdown keeps literal `.claude/context/` paths that match the physical tree. The prior compat layer (dual matchers, env export, settings dual-write, symlink) inverts roles cleanly: under native installs the env export backs every `${CLAUDE_PLUGIN_ROOT}` token the model types and the symlink is a harmless converted-install affordance.
 
 ### Changed
 
@@ -27,7 +37,7 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ### Verification on this change
 
-- `python -m unittest discover -s tests` — 978 tests green (skipped=7); 32 new (Qwen settings dual-write, env self-heal + user-pin preservation, non-destructive merge, relative symlink round-trip + clobber/warn hardening, matcher coverage snapshots incl. PostToolUse + Skill, the `"agent"` tool_name branch, agent union-spelling tools pinning, version-triple sync, subagent_models notice for resolve-model + init-section)
+- `python -m unittest discover -s tests` — 989 tests green (skipped=7); 43 new (Qwen settings dual-write, env self-heal + user-pin preservation, non-destructive merge, relative symlink round-trip + clobber/warn hardening, matcher coverage snapshots incl. PostToolUse + Skill, the `"agent"` tool_name branch, agent union-spelling tools pinning, version-triple sync, subagent_models notice for resolve-model + init-section)
 - All changes additive — Claude Code code paths byte-identical; the `.qwen/` writes and symlink are gated on `QWEN_CODE=1`
 - Adversarial review (two parallel lenses) — three findings fixed (silent file clobber in symlink setup, symlink-less-host silent data loss now warns, matcher test under-assertion hardened); two findings dismissed with source evidence (`CLAUDE_PROJECT_DIR` is hook-runner-injected and `QWEN_CODE=1` is shell-tool-injected per Qwen v0.20.1 source — the plan's Phase-0 verification)
 

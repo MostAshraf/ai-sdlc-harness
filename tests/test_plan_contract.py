@@ -121,6 +121,47 @@ class AgentToolsPinning(unittest.TestCase):
                              "read-only contract on one or both platforms")
 
 
+class SpawnIdentityContract(unittest.TestCase):
+    """WI-1: each agent's frontmatter `name` must resolve to a known harness
+    shape via the same `shape_of` logic the guards use, and the shared
+    spawn-identity reference must exist and be cited from SKILL.md."""
+
+    KNOWN_SHAPES = {"planner", "developer", "reviewer"}
+
+    def _frontmatter_name(self, agent_file: str) -> str:
+        text = (ROOT / "agents" / agent_file).read_text(encoding="utf-8")
+        fm = text.split("---", 2)[1] if text.startswith("---") else ""
+        for line in fm.splitlines():
+            if line.strip().startswith("name:"):
+                return line.split(":", 1)[1].strip()
+        self.fail(f"no name: frontmatter in {agent_file}")
+
+    def test_each_agent_name_resolves_to_known_shape(self):
+        for agent_file, expected_shape in [
+            ("developer.md", "developer"),
+            ("planner.md", "planner"),
+            ("reviewer.md", "reviewer"),
+        ]:
+            name = self._frontmatter_name(agent_file)
+            # shape_of takes the last :-segment and strips ai-sdlc-
+            shape = name.split(":")[-1].lower().removeprefix("ai-sdlc-")
+            self.assertEqual(shape, expected_shape,
+                             f"{agent_file} name '{name}' resolves to "
+                             f"'{shape}', expected '{expected_shape}'")
+
+    def test_spawn_identity_shared_file_exists(self):
+        self.assertTrue(
+            (ROOT / "skills" / "dev-workflow" / "shared"
+             / "spawn-identity.md").is_file(),
+            "shared/spawn-identity.md must exist (WI-1)")
+
+    def test_skill_md_references_spawn_identity(self):
+        text = (ROOT / "skills" / "dev-workflow" / "SKILL.md"
+                ).read_text(encoding="utf-8")
+        self.assertIn("spawn-identity.md", text,
+                      "SKILL.md must point at shared/spawn-identity.md")
+
+
 class VersionTripleSync(unittest.TestCase):
     """qwen-extension.json, plugin.json, and marketplace.json must carry the
     same version — they're a triple now that the repo is dual-native. The

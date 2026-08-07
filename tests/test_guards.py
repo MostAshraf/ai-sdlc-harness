@@ -1237,7 +1237,8 @@ class TddOrderingGuard(GuardHarness):
 
 def spawn(subagent_type, prompt):
     return {"tool_name": "Agent",
-            "tool_input": {"subagent_type": subagent_type, "prompt": prompt}}
+            "tool_input": {"subagent_type": subagent_type, "prompt": prompt,
+                           "run_in_background": False}}
 
 
 class SpawnGuard(GuardHarness):
@@ -1480,6 +1481,64 @@ class SpawnGuard(GuardHarness):
                              item_id="GOOD-1")
         self.assert_allows("spawn", spawn(
             "developer", f"harness-mode: develop\nharness-run: {good}\ngo"))
+
+
+class SpawnIdentityNearMiss(GuardHarness):
+    """WI-2: a harness-headed spawn (carries harness-mode: header) with a
+    non-harness subagent_type is a provable mis-typed spawn, not a foreign
+    agent. The guard must block it with an actionable message naming the
+    correct agents — instead of silently bypassing gating, write
+    confinement, and verdict capture (the triple-bypass the field run
+    exposed). A header-less generic spawn is genuinely unrelated and
+    passes untouched."""
+
+    def test_generic_agent_with_harness_headers_blocked(self):
+        payload = spawn("general-purpose", "harness-mode: review\ngo")
+        self.assert_blocks("spawn", payload, "does not resolve to a harness shape")
+
+    def test_omitted_subagent_type_with_harness_headers_blocked(self):
+        payload = spawn("", "harness-mode: intake\ngo")
+        payload["tool_input"].pop("subagent_type")
+        self.assert_blocks("spawn", payload, "does not resolve to a harness shape")
+
+    def test_correct_harness_agent_still_allowed(self):
+        # regression: a correct ai-sdlc-reviewer spawn must still pass
+        # (already legal from an always-legal or run-step context)
+        self.assert_allows("spawn", spawn(
+            "planner", "harness-mode: repo-map\ngo"))
+
+    def test_generic_agent_without_harness_headers_allowed(self):
+        # the property that keeps the guard out of unrelated work
+        payload = spawn("general-purpose", "do some research")
+        self.assert_allows("spawn", payload)
+
+    def test_block_message_names_correct_agents(self):
+        payload = spawn("Explore", "harness-mode: review\ngo")
+        code, err = self.run_guard("spawn", payload)
+        self.assertEqual(code, 2)
+        self.assertIn("ai-sdlc-planner", err)
+        self.assertIn("ai-sdlc-developer", err)
+        self.assertIn("ai-sdlc-reviewer", err)
+        self.assertIn("no verdict capture", err)
+
+    def test_harness_spawn_absent_run_in_background_blocked(self):
+        # WI-3: under Qwen Code, omitting run_in_background DEFAULTS to
+        # background for top-level spawns — so the guard must require
+        # explicit false, not just forbid explicit true.
+        payload = spawn("planner", "harness-mode: repo-map\ngo")
+        del payload["tool_input"]["run_in_background"]
+        self.assert_blocks("spawn", payload, "run_in_background: false")
+
+    def test_harness_spawn_explicit_true_still_blocked(self):
+        # regression: explicit true was already blocked; WI-3 keeps it
+        payload = spawn("planner", "harness-mode: repo-map\ngo")
+        payload["tool_input"]["run_in_background"] = True
+        self.assert_blocks("spawn", payload, "FOREGROUND")
+
+    def test_harness_spawn_explicit_false_allowed(self):
+        # regression: explicit false must still pass (repo-map is always-legal)
+        self.assert_allows("spawn", spawn(
+            "planner", "harness-mode: repo-map\ngo"))
 
 
 class SpawnGuardAbortedRun(GuardHarness):

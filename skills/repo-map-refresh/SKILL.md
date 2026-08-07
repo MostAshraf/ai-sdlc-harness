@@ -21,15 +21,11 @@ fork a second copy of it elsewhere.
    header — prose that merely mentions repo-map does not satisfy it; this
    is a declared out-of-run spawn, `pipeline/surfaces.yaml`'s
    `out_of_run_spawns`, legal regardless of whether other runs exist in the
-   workspace) and the repo path. Do not guess the planner's `subagent_type`
-   string: check your currently available subagent types for whichever one
-   corresponds to this plugin's planner (`agents/planner.md`'s frontmatter
-   `name: planner` is the identifying detail to match against) —
-   `hooks/guards.py`'s spawn guard matches on this shape by the LAST
-   `:`-segment of whatever string you pass, and a wrong guess doesn't
-   error, it just silently skips the guard's enforcement (fail-closed
-   spawn gating, planner's write-confinement to `ai/`/`.claude/context/`),
-   which is worse than the guess looking right. The planner can only write
+   workspace) and the repo path. Pass `run_in_background: false` explicitly
+   (the spawn guard requires it). For the correct `subagent_type` and why
+   a wrong identity is now blocked, see
+   `shared/spawn-identity.md` — match the frontmatter `name: ai-sdlc-planner`,
+   never a generic agent. The planner can only write
    under `ai/<run>/` and `.claude/context/` (guard-enforced — never repo
    source), so point it at `.claude/context/repo-map/<name>/`. It follows
    the map content contract

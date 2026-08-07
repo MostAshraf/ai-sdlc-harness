@@ -102,7 +102,13 @@ counter would hit `human_after` on unrelated hiccups):
   panel to re-derive a verdict the engine already holds, and the duplicate
   capture burns a review round). The verb refuses this itself when a verdict
   for the current round exists; if the synthesizer genuinely stalled AFTER
-  that capture, re-run with `--confirm-no-verdict`.
+  that capture, re-run with `--confirm-no-verdict`. If `cursor --to` is
+  refused for a missing verdict (no captured APPROVED/CHANGES_REQUESTED),
+  re-spawn the synthesizer once — correct agent identity
+  (`ai-sdlc-reviewer`), foreground, full headers — and let the hook
+  capture it. Never write `reviews.ndjson` or any ledger directly, never
+  synthesize a capture-hook payload, and never force the cursor. If a
+  second spawn still yields no verdict, stop and report to the user.
 - **A lens** stalled (no status block / no report — an oddly-formatted
   advisory verdict alone is NOT a stall; the engine never reads lens
   verdicts): `${CLAUDE_PLUGIN_ROOT}/bin/harness stall --run <run>
