@@ -78,7 +78,8 @@ notice rather than erroring — expected pre-setup behavior, not a bug to chase.
 
 Every `init-section` write is merged straight into the flat config by its
 top-level keys, so `provider`, `repos`, and `language` payloads must be
-**self-nested** under their own section key:
+**self-nested** under their own section key. If any `init-section` result
+carries a `notice` key, relay its text to the user verbatim:
 
 ```
 ${CLAUDE_PLUGIN_ROOT}/bin/harness init-section --section provider --json \

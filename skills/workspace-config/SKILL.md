@@ -69,6 +69,8 @@ time `/dev-workflow` runs.
 
 `overrides` deep-merges — a call only needs the keys actually changing:
 `init-section --section overrides --json '{"quick_mode": {"loc_max": 50}}'`.
+If the `init-section` result carries a `notice` key, relay its text to the
+user verbatim.
 Exception: a **list**-valued key (`review_policy` is the only shipped one)
 still replaces wholesale — dicts recurse, list items don't — so resend the
 whole list, including entries you're not changing, or one silently vanishes.

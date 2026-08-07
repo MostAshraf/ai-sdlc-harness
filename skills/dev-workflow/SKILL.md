@@ -78,7 +78,9 @@ successful sibling of abort — the final step's file says exactly when).
    default ?? `inherit`, from `subagent_models`). Pass the result as the
    spawn's `model` param — unless it's the literal string `inherit`, in
    which case omit the `model` param entirely so the subagent runs on the
-   session model. Every harness-shape spawn runs FOREGROUND — pass
+   session model. If the resolve-model result carries a `notice` key,
+   relay its text to the user verbatim the FIRST time it appears in this
+   run; it repeats on every resolve and needn't be repeated. Every harness-shape spawn runs FOREGROUND — pass
    `run_in_background: false` explicitly (newer platforms default to
    background, and capture reads the spawn's own tool_response; a
    background spawn returns only a launch stub — verdict lost, stall

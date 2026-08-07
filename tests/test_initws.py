@@ -1216,5 +1216,96 @@ class RepoMapAndStatus(M7Harness):
         self.assertTrue(all(r["cursor"] == "fetch" for r in out["runs"]))
 
 
+class SubagentModelNotice(M7Harness):
+    """WI-7: under QWEN_CODE=1, resolve-model translates non-inherit model
+    overrides to inherit + notice (Qwen's agent tool has no model param),
+    and init-section --section overrides emits a notice when
+    subagent_models contains any non-inherit value. Under Claude Code
+    (no QWEN_CODE) behavior is byte-identical to before."""
+
+    def _write_overrides(self, sm):
+        self.cli("init-section", "--section", "overrides", "--json",
+                 json.dumps({"subagent_models": sm}))
+
+    def test_resolve_model_non_inherit_under_qwen(self):
+        self._write_overrides({"developer": "sonnet"})
+        with mock.patch.dict(os.environ, {"QWEN_CODE": "1"}):
+            out = self.cli("resolve-model", "--shape", "developer",
+                           "--mode", "develop")
+        self.assertEqual(out["model"], "inherit")
+        self.assertEqual(out["configured"], "sonnet")
+        self.assertIn("notice", out)
+        self.assertIn("Qwen Code", out["notice"])
+
+    def test_resolve_model_inherit_under_qwen_no_notice(self):
+        self._write_overrides({"developer": "inherit"})
+        with mock.patch.dict(os.environ, {"QWEN_CODE": "1"}):
+            out = self.cli("resolve-model", "--shape", "developer",
+                           "--mode", "develop")
+        self.assertEqual(out["model"], "inherit")
+        self.assertNotIn("notice", out)
+        self.assertNotIn("configured", out)
+
+    def test_resolve_model_non_inherit_under_claude_passthrough(self):
+        self._write_overrides({"developer": "sonnet"})
+        env = {k: v for k, v in os.environ.items() if k != "QWEN_CODE"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            out = self.cli("resolve-model", "--shape", "developer",
+                           "--mode", "develop")
+        self.assertEqual(out["model"], "sonnet")
+        self.assertNotIn("notice", out)
+
+    def test_init_section_overrides_non_inherit_string_under_qwen(self):
+        with mock.patch.dict(os.environ, {"QWEN_CODE": "1"}):
+            out = self.cli("init-section", "--section", "overrides", "--json",
+                           json.dumps({"subagent_models": {"developer": "sonnet"}}))
+        self.assertTrue(out["ok"])
+        self.assertIn("notice", out)
+
+    def test_init_section_overrides_per_mode_dict_under_qwen(self):
+        with mock.patch.dict(os.environ, {"QWEN_CODE": "1"}):
+            out = self.cli("init-section", "--section", "overrides", "--json",
+                           json.dumps({"subagent_models":
+                                      {"developer": {"default": "inherit", "review": "sonnet"}}}))
+        self.assertTrue(out["ok"])
+        self.assertIn("notice", out)
+
+    def test_init_section_overrides_all_inherit_under_qwen_no_notice(self):
+        with mock.patch.dict(os.environ, {"QWEN_CODE": "1"}):
+            out = self.cli("init-section", "--section", "overrides", "--json",
+                           json.dumps({"subagent_models":
+                                      {"developer": "inherit"}}))
+        self.assertTrue(out["ok"])
+        self.assertNotIn("notice", out)
+
+    def test_init_section_overrides_dict_all_inherit_under_qwen_no_notice(self):
+        # the real config shape: {shape: {default: inherit}} — a per-mode
+        # dict where every value IS inherit. The recursive helper must
+        # see through the nesting; the flat one-level check falsely tripped
+        # (a dict value is never == "inherit").
+        with mock.patch.dict(os.environ, {"QWEN_CODE": "1"}):
+            out = self.cli("init-section", "--section", "overrides", "--json",
+                           json.dumps({"subagent_models":
+                                      {"developer": {"default": "inherit"},
+                                       "reviewer": {"default": "inherit"}}}))
+        self.assertTrue(out["ok"])
+        self.assertNotIn("notice", out)
+
+    def test_init_section_overrides_no_subagent_models_under_qwen(self):
+        with mock.patch.dict(os.environ, {"QWEN_CODE": "1"}):
+            out = self.cli("init-section", "--section", "overrides", "--json",
+                           json.dumps({"quick_mode": {"loc_max": 50}}))
+        self.assertTrue(out["ok"])
+        self.assertNotIn("notice", out)
+
+    def test_init_section_overrides_non_inherit_under_claude_no_notice(self):
+        env = {k: v for k, v in os.environ.items() if k != "QWEN_CODE"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            out = self.cli("init-section", "--section", "overrides", "--json",
+                           json.dumps({"subagent_models": "sonnet"}))
+        self.assertTrue(out["ok"])
+        self.assertNotIn("notice", out)
+
+
 if __name__ == "__main__":
     unittest.main()
