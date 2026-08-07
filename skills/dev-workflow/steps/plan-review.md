@@ -13,7 +13,7 @@ independent evidence attached, not just the planner's word.
    default). Never hand-derive the list from config files.
    For EACH configured
    lens, spawn `reviewer` with `harness-mode: plan-attack` (+
-   `harness-run`, `harness-repo` — NO `harness-task`), naming the lens in
+   `harness-run`, `harness-repo`, `harness-plugin-root` — NO `harness-task`), naming the lens in
    the ask; each follows `steps/plan-attack-task.md` (the lens vocabulary
    and findings format). Batch ALL lens spawns in ONE message (foreground
    — the standard parallelism rule; hook-CHECKED, not just stated: a lens
@@ -37,7 +37,7 @@ independent evidence attached, not just the planner's word.
    persisted (or that lens's stall has been escalated per the stall rule
    below; name any permanently-absent lens in the ask — a silently
    degraded panel is worse than a declared one). Spawn `reviewer` with
-   `harness-mode: plan-review` (+ run/repo headers, NO task) and NAME
+   `harness-mode: plan-review` (+ run/repo/plugin-root headers, NO task) and NAME
    THIS ROUND's exact lens report paths in the ask (zero lenses → say so:
    the synthesizer must never glob the reports directory, where prior
    rounds' files live): it follows `steps/plan-review-task.md` — reads

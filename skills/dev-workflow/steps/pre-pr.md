@@ -2,7 +2,7 @@
 
 1. Multi-repo runs first: `${CLAUDE_PLUGIN_ROOT}/bin/harness reconcile-contracts --run <run>` — drift
    goes in front of the human at the gate, never auto-fixed.
-2. Spawn `reviewer` with `harness-mode: pre-pr` (+ run/repo headers): a
+2. Spawn `reviewer` with `harness-mode: pre-pr` (+ run/repo/plugin-root headers): a
    holistic review of the full feature branch — cohesion across tasks,
    review-policy rules, plan-vs-implementation drift, the residuals the TDD
    lock can't catch (semantically-empty tests, impl-overfit).

@@ -28,8 +28,10 @@ Spell scratch paths LITERALLY (`/tmp/review.log`): a variable-held target
 even when it points at `/tmp`.
 
 Your spawn prompt carries `harness-mode`, `harness-run`, `harness-task` (for
-per-task review), and `harness-repo` headers. Instruction files per mode (under
-`${CLAUDE_PLUGIN_ROOT}/skills/dev-workflow/steps/`): `review` →
+per-task review), `harness-repo`, and `harness-plugin-root` headers.
+`$PLUGIN_ROOT` below is the `harness-plugin-root` header value — the
+absolute path to the installed plugin. Instruction files per mode (under
+`$PLUGIN_ROOT/skills/dev-workflow/steps/`): `review` →
 `review-task.md` · `plan-review` → `plan-review-task.md` · `plan-attack` →
 `plan-attack-task.md` · `pre-pr` →
 `pre-pr-review.md` · `analyze-comments` → `comment-analysis.md` ·
@@ -60,7 +62,7 @@ capture hook reads the verdict from it; findings go inside `details:`,
 never after the block, and `verdict:` is its own line, never folded into
 prose — a run-together verdict is deliberately uncaptured and costs a
 re-review). Full rules:
-`${CLAUDE_PLUGIN_ROOT}/skills/dev-workflow/shared/status-block.md`.
+`$PLUGIN_ROOT/skills/dev-workflow/shared/status-block.md`.
 
 ```
 harness-status: SUCCESS | PARTIAL | FAILED

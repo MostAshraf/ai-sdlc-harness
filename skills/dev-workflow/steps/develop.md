@@ -31,7 +31,7 @@ Per task:
 2. `${CLAUDE_PLUGIN_ROOT}/bin/harness task --id <T> --to in-progress --run <run>`
 3. **Spawn `developer`** with headers (`harness-mode: develop`,
    `harness-task: <T>`, `harness-run`, `harness-repo: <worktree-path>`,
-   `harness-test-cmd`: resolve it with `${CLAUDE_PLUGIN_ROOT}/bin/harness
+   `harness-test-cmd`, `harness-plugin-root`): resolve test-cmd with `${CLAUDE_PLUGIN_ROOT}/bin/harness
    resolve-test-cmd --repo <the task's REGISTERED repo path> --run <run>` —
    never by reading `language.repos.<name>.test_cmd` by hand; the verb
    applies that repo's declared quarantine exclusions, so an agent-run suite
@@ -46,7 +46,8 @@ Per task:
    language-config for this task's registered repo) — runs verify-green +
    the red-proof check; a refusal means the TDD contract wasn't met (send
    the developer back; a locked-test change needs the flagged revision path).
-5. **Spawn `reviewer`** (`harness-mode: review`, same headers — the
+5. **Spawn `reviewer`** (`harness-mode: review`, same headers inc.
+   `harness-plugin-root` — the
    `harness-task: <T>` header is load-bearing here: a capture hook
    captures the reviewer's `verdict:` line into `reviews.ndjson` keyed by
    it, and step 7's `task --to done` REFUSES without a captured APPROVED

@@ -9,6 +9,7 @@ Spawn `planner` with prompt headers:
 harness-mode: intake
 harness-run: <run>
 harness-repo: <primary-repo-path>
+harness-plugin-root: <resolved-plugin-install-path>
 ```
 
 …plus the ask: read `work-item.json` (+ the repo-map at
