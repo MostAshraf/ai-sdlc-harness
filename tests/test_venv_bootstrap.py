@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -42,6 +43,35 @@ def _launcher_command(root: Path) -> str:
     return f'exec "{root}/bin/setup-venv" || {root}/bin/setup-venv'
 
 
+def _path_without_any_python() -> str:
+    """The real PATH with every directory holding a `python`/`python3`
+    executable removed — everything else setup-venv's own internals need
+    (`dirname`, bash's own resolution, coreutils in general) stays
+    resolvable exactly as normal; only the interpreter search comes up
+    genuinely empty. FILTERING the real PATH, rather than isolating a
+    copy or symlink of one tool in a scratch directory, was chosen after
+    both alternatives broke on this host: a copied/symlinked bash or
+    dirname failed to find ITS OWN shared-library dependencies (an
+    MSYS/Windows DLL-search quirk, not a stand-in for how ubuntu-latest/
+    macos-latest's real dynamic linker resolves libraries — but reason
+    enough not to trust the technique further without seeing it pass).
+    An entirely empty PATH was tried first and rejected for a different
+    reason: `dirname` is an external coreutils binary setup-venv's own
+    `HERE=` line depends on, not a shell builtin, so a fully empty PATH
+    fails the script before it ever reaches the python search — a
+    different, unintended failure than the one under test."""
+    keep = []
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if not d:
+            continue
+        p = Path(d)
+        if any((p / name).exists() for name in
+              ("python3", "python3.exe", "python", "python.exe")):
+            continue
+        keep.append(d)
+    return os.pathsep.join(keep)
+
+
 def _install_launcher_pair(root: Path) -> None:
     bin_dir = root / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -54,16 +84,27 @@ def _stub_already_satisfied_venv(root: Path) -> None:
     """A fake `.venv` whose python already answers `import yaml` with
     success — exercises the launcher's fast idempotent path without a
     real venv create + pip install (hermetic, no network, no multi-second
-    cost). The stub must be a REAL executable: batch bytes in a file
-    named python.exe fail CreateProcess, and the launcher then silently
-    takes the FULL bootstrap path — a real venv plus a network pip
-    install hiding inside a "fast path" test (caught in supervision: the
-    fixture's python.exe came back a real PE with pip.exe beside it).
-    support.write_cli_stub builds a faithful PE launcher on Windows and
-    a shebang script on POSIX — the exact seam it exists for."""
+    cost). setup-venv invokes this file DIRECTLY as `"$PY" -c
+    "import yaml"` (the interpreter itself, not code handed to one), so
+    the stub must be a self-executing program that exits 0 regardless of
+    its arguments — not just any file named python(.exe): batch bytes in
+    a file named python.exe fail CreateProcess outright (Windows), and
+    raw Python SOURCE with no shebang gets kernel-ENOEXEC-retried as a
+    sh script on POSIX (`raise SystemExit(0)` is a syntax error there) —
+    both silently escaped into the FULL bootstrap path (a real venv, a
+    network pip install, inside a "fast path" test) rather than failing
+    loud, and both invisible from a Windows dev machine, where only the
+    Windows branch below ever runs locally: CI's Linux/macOS lanes are
+    what caught the POSIX case. A plain shebang script covers POSIX;
+    support.write_cli_stub's faithful PE wrapper covers Windows."""
     venv_bin = root / ".venv" / ("Scripts" if os.name == "nt" else "bin")
     venv_bin.mkdir(parents=True)
-    support.write_cli_stub(venv_bin, "python", "raise SystemExit(0)\n")
+    if os.name == "nt":
+        support.write_cli_stub(venv_bin, "python", "raise SystemExit(0)\n")
+    else:
+        stub = venv_bin / "python"
+        stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
 
 
 class VenvBootstrapLauncherContract(unittest.TestCase):
@@ -144,11 +185,20 @@ class VenvBootstrapDispatchSmoke(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix" and BASH,
                          "bash launch path needs a POSIX bash")
     def test_bash_errors_clearly_when_no_interpreter_found(self):
-        empty_path = tempfile.mkdtemp()
-        self.addCleanup(support.rmtree, empty_path, ignore_errors=True)
-        code, err = self._run([BASH, "-c", _launcher_command(self.root)],
-                              {"PATH": empty_path})
-        self.assertEqual(code, 1)
+        # Invoke bash directly ON THE FILE (`bash script`, not the
+        # dual-clause `exec "script" || ...` launcher command): in this
+        # invocation style bash reads the script's own content, and its
+        # `#!/usr/bin/env bash` line is just a comment needing no `env`/
+        # PATH resolution to launch AT ALL — isolating this test to
+        # exactly what it means to exercise, setup-venv's OWN internal
+        # `command -v python3 || command -v python` fallback correctly
+        # reporting failure, not the outer launcher's shebang
+        # resolution (covered by the fast-path test above and by
+        # HookLauncherContract's equivalents for the hook launchers).
+        script = self.root / "bin" / "setup-venv"
+        code, err = self._run([BASH, str(script)],
+                              {"PATH": _path_without_any_python()})
+        self.assertEqual(code, 1, err)
         self.assertIn("no system python3/python found", err)
 
     @unittest.skipUnless(os.name == "nt", "cmd.exe fallback is Windows-only")
