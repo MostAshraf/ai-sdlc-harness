@@ -30,13 +30,27 @@ class GuardHarness(unittest.TestCase):
     def run_guard(self, name: str, payload: dict,
                   env: dict | None = None) -> tuple[int, str]:
         payload.setdefault("cwd", str(self.workspace))
-        # deterministic env: the suite itself may run inside a Claude Code
-        # session that sets CLAUDE_PROJECT_DIR — strip it so only tests
-        # that inject it exercise the env-first capture path
+        # deterministic env, two axes: the suite itself may run inside a
+        # Claude Code session that sets CLAUDE_PROJECT_DIR — strip it so
+        # only tests that inject it exercise the env-first capture path —
+        # and that exports PYTHONIOENCODING, which would hand the child a
+        # utf-8 stdin no platform-spawned hook is promised (it masked the
+        # stdin-pin mutation entirely: the multibyte capture test passed
+        # against a reverted guards.py). Strip every ambient encoding
+        # override so guards.py's OWN utf-8 stdin pin is what's tested.
         base = {k: v for k, v in os.environ.items()
-                if k != "CLAUDE_PROJECT_DIR"}
+                if k not in ("CLAUDE_PROJECT_DIR", "PYTHONIOENCODING",
+                             "PYTHONUTF8", "PYTHONLEGACYWINDOWSSTDIO")}
+        # ensure_ascii=False: the platform sends hook payloads as RAW
+        # UTF-8 JSON, not \uXXXX-escaped ASCII — an escaped wire format
+        # never exercises the child's stdin DECODING, which made the
+        # multibyte-capture regression test tautological (re-verification
+        # finding: it passed against a guards.py with the utf-8 stdin
+        # pin reverted). encoding="utf-8" below puts the multibyte bytes
+        # on the pipe exactly as Claude/Qwen do.
         proc = subprocess.run([sys.executable, str(GUARDS), name],
-                              input=json.dumps(payload), capture_output=True,
+                              input=json.dumps(payload, ensure_ascii=False),
+                              capture_output=True,
                               text=True, encoding="utf-8", timeout=60,
                               env={**base, **(env or {})})
         return proc.returncode, proc.stderr
@@ -1598,6 +1612,22 @@ class CaptureHooks(GuardHarness):
         self.assertEqual(records[-1]["text"], "APPROVED")
         self.assertEqual(len(records[-1]["hash"]), 64)
 
+    def test_user_prompt_capture_round_trips_multibyte_text(self):
+        # the payload is always UTF-8 JSON, but a Windows pipe defaults to
+        # cp1252+surrogateescape — without main()'s stdin reconfigure, a
+        # prompt like this one either lands garbled (mojibake text + hash)
+        # or is dropped entirely when a lone surrogate hits ndjson's
+        # strict utf-8 encode (adversarial-review finding, CONFIRMED by
+        # probe on the venv interpreter). Byte-identical round-trip is the
+        # contract: this ledger is gate EVIDENCE.
+        prompt = "承認します — の ✔"
+        run = self.make_run()
+        self.present_gate(run)
+        self.assert_allows("user-prompt", {"prompt": prompt})
+        records = ndjson.read_records(run / "human-input.ndjson")
+        self.assertEqual(records[-1]["text"], prompt)
+        self.assertEqual(len(records[-1]["hash"]), 64)
+
     def test_user_prompt_not_captured_without_pending_gate(self):
         # Scoping fix (adversarial-review): a run with no presented,
         # undecided gate accumulates NO raw human text — records outside
@@ -1729,11 +1759,17 @@ class CaptureHooks(GuardHarness):
         guards.py would mint a gate-approval record indistinguishable
         from the human's. The ledgers' sole protection is that only the
         platform fires these entry points."""
-        forge = ("echo '{\"prompt\": \"APPROVED\"}' | python3 "
-                 "${CLAUDE_PLUGIN_ROOT}/hooks/guards.py user-prompt")
-        for agent in (None, "x:developer", "x:reviewer"):
-            payload = bash(forge, agent)
-            self.assert_blocks("bash", payload, "fired by the platform")
+        # every spelling that reaches the dispatcher must be anchored —
+        # the run-guard launcher pair execs guards.py byte-for-byte, so an
+        # unanchored launcher spelling is a clean bypass (adversarial-
+        # review finding on the launcher change, CONFIRMED live)
+        for entry in ("python3 ${CLAUDE_PLUGIN_ROOT}/hooks/guards.py",
+                      "${CLAUDE_PLUGIN_ROOT}/hooks/run-guard",
+                      "${CLAUDE_PLUGIN_ROOT}/hooks/run-guard.cmd"):
+            forge = f"echo '{{\"prompt\": \"APPROVED\"}}' | {entry} user-prompt"
+            for agent in (None, "x:developer", "x:reviewer"):
+                payload = bash(forge, agent)
+                self.assert_blocks("bash", payload, "fired by the platform")
         # the enforcement-only guard verbs can't forge anything — a manual
         # invocation can only ever block; not restricted
         self.assert_allows("bash", bash(
@@ -2855,10 +2891,11 @@ class HookMatcherCoverage(unittest.TestCase):
         named guard verb (bash/write/spawn/read)."""
         for entry in self.hooks["hooks"].get(event, []):
             cmd = entry["hooks"][0]["command"]
-            # command tail: `…guards.py" bash` — match the trailing verb
+            # command tail: `…/run-guard bash` — match the trailing
+            # (clause-2) verb
             if cmd.rstrip().endswith(f" {guard_verb}"):
                 return entry["matcher"].split("|")
-        self.fail(f"no {event} matcher for guards.py {guard_verb}")
+        self.fail(f"no {event} matcher running the {guard_verb} guard")
 
     def test_bash_matcher_covers_qwen_run_shell_command(self):
         segs = self._segments("PreToolUse", "bash")
@@ -2943,6 +2980,9 @@ class HookLauncherContract(unittest.TestCase):
             for entry in entries:
                 for hook in entry["hooks"]:
                     verb = hook["command"].rsplit(" ", 1)[-1]
+                    # a duplicate registration would silently collapse
+                    # into one dict slot and dodge the shape check
+                    assert verb not in cls.commands, f"duplicate {verb}"
                     cls.commands[verb] = hook["command"]
 
     def test_every_guard_command_is_the_dual_clause_shape(self):
@@ -3004,6 +3044,9 @@ class HookLauncherContract(unittest.TestCase):
         self.assertIn("fired by the platform", err)
 
     @unittest.skipUnless(os.name == "nt", "cmd.exe fallback is Windows-only")
+    @unittest.skipIf(re.search(r"[ ()&^%=,;]", str(ROOT)),
+                     "checkout path carries a cmd metacharacter — the "
+                     "documented clause-2 residual, not a code defect")
     def test_cmd_fallback_resolves_the_pathext_sibling_with_exits_intact(self):
         # The EXACT spawn shape Qwen Code uses on Windows outside an MSYS
         # terminal: spawn('cmd.exe', ['/d','/s','/c', cmd], {shell:false})

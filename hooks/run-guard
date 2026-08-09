@@ -22,11 +22,22 @@
 #           falls through, and the UNQUOTED clause 2 resolves this same
 #           extensionless path to run-guard.cmd via PATHEXT. stdin and the
 #           exit code pass through the .cmd untouched.
-# Residual (documented, accepted): clause 2 is unquoted, so under the
-# cmd.exe fallback a plugin root containing SPACES cannot work — no
-# command string can survive libuv's quote-escaping there. Such installs
-# keep the Git-Bash-terminal workaround. bash keeps full space-safety via
-# clause 1's quotes.
+# Residuals (documented, accepted — adversarial-review calibrated):
+#   - clause 2 is unquoted, so under the cmd.exe fallback a plugin root
+#     containing a space OR any cmd-significant character (( ) & ^ % = ,
+#     ;) cannot work — no command string can survive libuv's
+#     quote-escaping there ("&" additionally splits and runs the tail as
+#     its own command). Such installs keep the Git-Bash-terminal
+#     workaround. bash keeps full metachar-safety via clause 1's quotes.
+#   - under the cmd fallback, clause 1's one stderr line ('exec' is not
+#     recognized) precedes EVERY verdict, including the redirect message
+#     on a deny — read past it; the real reason follows.
+#   - a ComSpec pointed at PowerShell (hand-configured) cannot parse
+#     either clause: the hook errors non-2 and the platform treats it as
+#     non-blocking — same posture as the missing-interpreter case.
+#   - the bash clause needs this file EXECUTABLE with an LF shebang
+#     (mode 100755 + .gitattributes enforce that for git-based installs;
+#     a mode-stripping channel degrades non-2, guards silently off).
 #
 # Same interpreter probe as bin/harness: plugin venv first (both layouts —
 # Git Bash on Windows sees Scripts/), then python3 → python (python.org
