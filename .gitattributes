@@ -8,3 +8,5 @@ bin/harness text eol=lf
 bin/harness.cmd text eol=crlf
 hooks/run-guard text eol=lf
 hooks/run-guard.cmd text eol=crlf
+bin/setup-venv text eol=lf
+bin/setup-venv.cmd text eol=crlf
