@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe\"; [ -x \"$PY\" ] || PY=\"$(command -v python3 || command -v python || echo python3)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" bash"
+            "command": "exec \"${CLAUDE_PLUGIN_ROOT}/hooks/run-guard\" bash || ${CLAUDE_PLUGIN_ROOT}/hooks/run-guard bash"
           }
         ]
       },
@@ -15,7 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe\"; [ -x \"$PY\" ] || PY=\"$(command -v python3 || command -v python || echo python3)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" write"
+            "command": "exec \"${CLAUDE_PLUGIN_ROOT}/hooks/run-guard\" write || ${CLAUDE_PLUGIN_ROOT}/hooks/run-guard write"
           }
         ]
       },
@@ -24,7 +24,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe\"; [ -x \"$PY\" ] || PY=\"$(command -v python3 || command -v python || echo python3)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" spawn"
+            "command": "exec \"${CLAUDE_PLUGIN_ROOT}/hooks/run-guard\" spawn || ${CLAUDE_PLUGIN_ROOT}/hooks/run-guard spawn"
           }
         ]
       },
@@ -33,7 +33,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe\"; [ -x \"$PY\" ] || PY=\"$(command -v python3 || command -v python || echo python3)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" skill"
+            "command": "exec \"${CLAUDE_PLUGIN_ROOT}/hooks/run-guard\" skill || ${CLAUDE_PLUGIN_ROOT}/hooks/run-guard skill"
           }
         ]
       },
@@ -42,7 +42,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe\"; [ -x \"$PY\" ] || PY=\"$(command -v python3 || command -v python || echo python3)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" read"
+            "command": "exec \"${CLAUDE_PLUGIN_ROOT}/hooks/run-guard\" read || ${CLAUDE_PLUGIN_ROOT}/hooks/run-guard read"
           }
         ]
       }
@@ -52,7 +52,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe\"; [ -x \"$PY\" ] || PY=\"$(command -v python3 || command -v python || echo python3)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" user-prompt"
+            "command": "exec \"${CLAUDE_PLUGIN_ROOT}/hooks/run-guard\" user-prompt || ${CLAUDE_PLUGIN_ROOT}/hooks/run-guard user-prompt"
           }
         ]
       }
@@ -63,7 +63,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe\"; [ -x \"$PY\" ] || PY=\"$(command -v python3 || command -v python || echo python3)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" post-spawn"
+            "command": "exec \"${CLAUDE_PLUGIN_ROOT}/hooks/run-guard\" post-spawn || ${CLAUDE_PLUGIN_ROOT}/hooks/run-guard post-spawn"
           }
         ]
       }
@@ -73,7 +73,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\"; [ -x \"$PY\" ] || PY=\"${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe\"; [ -x \"$PY\" ] || PY=\"$(command -v python3 || command -v python || echo python3)\"; \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/hooks/guards.py\" subagent-stop"
+            "command": "exec \"${CLAUDE_PLUGIN_ROOT}/hooks/run-guard\" subagent-stop || ${CLAUDE_PLUGIN_ROOT}/hooks/run-guard subagent-stop"
           }
         ]
       }

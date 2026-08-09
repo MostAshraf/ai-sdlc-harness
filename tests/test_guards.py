@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -2907,6 +2908,118 @@ class HookMatcherCoverage(unittest.TestCase):
                 self.assertEqual(entry["matcher"], "Skill")
                 return
         self.fail("no PreToolUse matcher for guards.py skill")
+
+
+class HookLauncherContract(unittest.TestCase):
+    """hooks.json must stay parseable by BOTH shells a platform may pick:
+    Claude Code always fires hook commands under bash (Git Bash on
+    Windows), but Qwen Code on Windows falls back to cmd.exe outside an
+    MSYS-flavored terminal — where the old inline POSIX one-liner was
+    mangled into py-launcher garbage (field report: python.exe [Errno 22]
+    blocking every prompt). The contract is one dual-clause command per
+    guard:
+
+        exec "<root>/hooks/run-guard" <verb> || <root>/hooks/run-guard <verb>
+
+    bash: `exec` REPLACES the shell, so clause 2 is unreachable — a deny
+    (exit 2) can never fall through to a second run against the already-
+    consumed stdin, where the bash/write guards' documented fail-open on
+    an unparseable payload would flip the deny into an allow. cmd.exe:
+    clause 1 dies fast ('exec' is not an internal command), `||` falls
+    through, and the UNQUOTED clause 2 resolves the extensionless path to
+    run-guard.cmd via PATHEXT with stdin and exit code intact."""
+
+    COMMAND_RE = re.compile(
+        r'^exec "\$\{CLAUDE_PLUGIN_ROOT\}/hooks/run-guard" ([a-z-]+)'
+        r' \|\| \$\{CLAUDE_PLUGIN_ROOT\}/hooks/run-guard \1$')
+    FORGE = ("echo '{\"prompt\": \"APPROVED\"}' | python3 "
+             "${CLAUDE_PLUGIN_ROOT}/hooks/guards.py user-prompt")
+
+    @classmethod
+    def setUpClass(cls):
+        hooks = json.loads((ROOT / "hooks" / "hooks.json").read_text())
+        cls.commands = {}
+        for entries in hooks["hooks"].values():
+            for entry in entries:
+                for hook in entry["hooks"]:
+                    verb = hook["command"].rsplit(" ", 1)[-1]
+                    cls.commands[verb] = hook["command"]
+
+    def test_every_guard_command_is_the_dual_clause_shape(self):
+        self.assertEqual(
+            set(self.commands),
+            {"bash", "write", "spawn", "skill", "read",
+             "user-prompt", "post-spawn", "subagent-stop"})
+        for verb, command in self.commands.items():
+            m = self.COMMAND_RE.match(command)
+            self.assertIsNotNone(
+                m, f"{verb} command not dual-clause shell-agnostic: "
+                   f"{command}")
+            self.assertEqual(m.group(1), verb)
+
+    def test_launcher_pair_agrees_on_probe_and_target(self):
+        sh = (ROOT / "hooks" / "run-guard").read_bytes()
+        self.assertTrue(sh.startswith(b"#!/usr/bin/env bash"))
+        self.assertNotIn(b"\r", sh,
+                         "run-guard must stay LF-only: a stock Linux bash "
+                         "rejects a CRLF shebang script")
+        for needle in (b".venv/bin/python", b".venv/Scripts/python.exe",
+                       b"command -v python3", b'exec "$PY" "$HERE/guards.py"'):
+            self.assertIn(needle, sh)
+        bat = (ROOT / "hooks" / "run-guard.cmd").read_bytes()
+        self.assertIn(b"\r\n", bat,
+                      "run-guard.cmd must stay CRLF: cmd.exe parsing has "
+                      "LF-only edge cases")
+        for needle in (rb"%~dp0..\.venv\Scripts\python.exe",
+                       rb'"%~dp0guards.py" %*',
+                       rb"exit /b %ERRORLEVEL%"):
+            self.assertIn(needle, bat)
+
+    def _fire(self, argv, payload, env_extra=None):
+        ws = tempfile.mkdtemp()
+        self.addCleanup(support.rmtree, ws, ignore_errors=True)
+        env = {k: v for k, v in os.environ.items()
+               if k != "CLAUDE_PROJECT_DIR"}
+        proc = subprocess.run(
+            argv, input=json.dumps({**payload, "cwd": ws}),
+            capture_output=True, text=True, encoding="utf-8", timeout=60,
+            env={**env, **(env_extra or {})})
+        return proc.returncode, proc.stderr
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("bash"),
+                         "bash launch path needs a POSIX bash")
+    def test_bash_exec_preserves_verdicts_and_never_reaches_clause_two(self):
+        # env-var expansion of ${CLAUDE_PLUGIN_ROOT} mirrors the platform;
+        # the deny case is the mutation catch: were `exec` dropped, the
+        # deny (exit 2) would trigger clause 2 against exhausted stdin and
+        # the bash guard's fail-open would flip the verdict to 0.
+        env = {"CLAUDE_PLUGIN_ROOT": str(ROOT)}
+        code, err = self._fire(
+            ["bash", "-c", self.commands["user-prompt"]],
+            {"prompt": "hello"}, env)
+        self.assertEqual(code, 0, err)
+        code, err = self._fire(
+            ["bash", "-c", self.commands["bash"]], bash(self.FORGE), env)
+        self.assertEqual(code, 2, "deny must survive the launcher")
+        self.assertIn("fired by the platform", err)
+
+    @unittest.skipUnless(os.name == "nt", "cmd.exe fallback is Windows-only")
+    def test_cmd_fallback_resolves_the_pathext_sibling_with_exits_intact(self):
+        # The EXACT spawn shape Qwen Code uses on Windows outside an MSYS
+        # terminal: spawn('cmd.exe', ['/d','/s','/c', cmd], {shell:false})
+        # with ${CLAUDE_PLUGIN_ROOT} already textually replaced. Python's
+        # list2cmdline quoting == libuv's, so subprocess reproduces the
+        # child command line byte-for-byte.
+        for verb, payload, want in (
+                ("user-prompt", {"prompt": "hello"}, 0),
+                ("bash", bash(self.FORGE), 2)):
+            expanded = self.commands[verb].replace(
+                "${CLAUDE_PLUGIN_ROOT}", str(ROOT))
+            code, err = self._fire(
+                ["cmd.exe", "/d", "/s", "/c", expanded], payload)
+            self.assertEqual(
+                code, want,
+                f"{verb} via cmd.exe fallback: rc={code} stderr={err}")
 
 
 if __name__ == "__main__":

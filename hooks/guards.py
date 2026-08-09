@@ -37,7 +37,8 @@ yaml-free bash/write guards keep blocking); init-workspace verifies the
 dependency up front, and the HMAC chain (RC4) still detects authority-file
 tampering even with guards down — defense in depth, guard = fast-fail,
 chain = guarantee. The same posture covers a missing INTERPRETER: if the
-hook probe chain (hooks.json) finds no runnable python at all — including
+hook launcher pair (hooks/run-guard + run-guard.cmd, registered in
+hooks.json) finds no runnable python at all — including
 the Windows Store alias that answers to `python`/`python3` but only prints
 an install nag — the hook errors non-2 and the platform treats it as
 non-blocking. Accepted: pre-venv, nothing harness-y can execute anyway.
