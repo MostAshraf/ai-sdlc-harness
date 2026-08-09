@@ -1,7 +1,7 @@
 {
   "name": "ai-sdlc-harness",
-  "version": "3.4.1",
-  "description": "Governed multi-agent SDLC pipeline for Claude Code — v3.0, a ground-up rewrite of the v2.x line. Declared-data pipeline, owned entry points, proof-anchored TDD, code-modular providers.",
+  "version": "3.5.0",
+  "description": "Governed multi-agent SDLC pipeline for Claude Code and Qwen Code — v3.0, a ground-up rewrite of the v2.x line. Declared-data pipeline, owned entry points, proof-anchored TDD, code-modular providers.",
   "author": {
     "name": "Mostafa Ashraf"
   },
@@ -16,7 +16,9 @@
     "zoho",
     "language-agnostic",
     "discovery-driven",
-    "dev-workflow"
+    "dev-workflow",
+    "claude-code",
+    "qwen-code"
   ],
   "skills": "./skills/"
 }

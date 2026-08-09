@@ -965,6 +965,17 @@ class WriteGuard(GuardHarness):
         self.assert_blocks("write", self._w(str(self.workspace / "src" / "x.py"), pl),
                            "repo source")
 
+    def test_planner_allows_qwen_context_spelling(self):
+        # Qwen's installer rewrites `.claude/`→`.qwen/` in skill markdown, so
+        # a model following rewritten instructions writes `.qwen/context/…`.
+        # init-workspace symlinks `.qwen/context`→`../.claude/context` under
+        # Qwen (Path.resolve follows it), and guard_write additionally
+        # accepts the literal `.qwen/context` prefix as a fallback for
+        # hosts where symlinks fail. Either way the write must be allowed.
+        pl = "x:planner"
+        self.assert_allows("write", self._w(
+            str(self.workspace / ".qwen" / "context" / "repo-map" / "m.md"), pl))
+
     def test_planner_cannot_write_gate_evidence_into_reports(self):
         """Whole-branch review: SUBAGENT_REGISTER_RE's comment claimed no
         subagent had a path into `<run>/reports/`. True for the reviewer
@@ -1226,7 +1237,8 @@ class TddOrderingGuard(GuardHarness):
 
 def spawn(subagent_type, prompt):
     return {"tool_name": "Agent",
-            "tool_input": {"subagent_type": subagent_type, "prompt": prompt}}
+            "tool_input": {"subagent_type": subagent_type, "prompt": prompt,
+                           "run_in_background": False}}
 
 
 class SpawnGuard(GuardHarness):
@@ -1469,6 +1481,64 @@ class SpawnGuard(GuardHarness):
                              item_id="GOOD-1")
         self.assert_allows("spawn", spawn(
             "developer", f"harness-mode: develop\nharness-run: {good}\ngo"))
+
+
+class SpawnIdentityNearMiss(GuardHarness):
+    """WI-2: a harness-headed spawn (carries harness-mode: header) with a
+    non-harness subagent_type is a provable mis-typed spawn, not a foreign
+    agent. The guard must block it with an actionable message naming the
+    correct agents — instead of silently bypassing gating, write
+    confinement, and verdict capture (the triple-bypass the field run
+    exposed). A header-less generic spawn is genuinely unrelated and
+    passes untouched."""
+
+    def test_generic_agent_with_harness_headers_blocked(self):
+        payload = spawn("general-purpose", "harness-mode: review\ngo")
+        self.assert_blocks("spawn", payload, "does not resolve to a harness shape")
+
+    def test_omitted_subagent_type_with_harness_headers_blocked(self):
+        payload = spawn("", "harness-mode: intake\ngo")
+        payload["tool_input"].pop("subagent_type")
+        self.assert_blocks("spawn", payload, "does not resolve to a harness shape")
+
+    def test_correct_harness_agent_still_allowed(self):
+        # regression: a correct ai-sdlc-reviewer spawn must still pass
+        # (already legal from an always-legal or run-step context)
+        self.assert_allows("spawn", spawn(
+            "planner", "harness-mode: repo-map\ngo"))
+
+    def test_generic_agent_without_harness_headers_allowed(self):
+        # the property that keeps the guard out of unrelated work
+        payload = spawn("general-purpose", "do some research")
+        self.assert_allows("spawn", payload)
+
+    def test_block_message_names_correct_agents(self):
+        payload = spawn("Explore", "harness-mode: review\ngo")
+        code, err = self.run_guard("spawn", payload)
+        self.assertEqual(code, 2)
+        self.assertIn("ai-sdlc-planner", err)
+        self.assertIn("ai-sdlc-developer", err)
+        self.assertIn("ai-sdlc-reviewer", err)
+        self.assertIn("no verdict capture", err)
+
+    def test_harness_spawn_absent_run_in_background_blocked(self):
+        # WI-3: under Qwen Code, omitting run_in_background DEFAULTS to
+        # background for top-level spawns — so the guard must require
+        # explicit false, not just forbid explicit true.
+        payload = spawn("planner", "harness-mode: repo-map\ngo")
+        del payload["tool_input"]["run_in_background"]
+        self.assert_blocks("spawn", payload, "run_in_background: false")
+
+    def test_harness_spawn_explicit_true_still_blocked(self):
+        # regression: explicit true was already blocked; WI-3 keeps it
+        payload = spawn("planner", "harness-mode: repo-map\ngo")
+        payload["tool_input"]["run_in_background"] = True
+        self.assert_blocks("spawn", payload, "FOREGROUND")
+
+    def test_harness_spawn_explicit_false_allowed(self):
+        # regression: explicit false must still pass (repo-map is always-legal)
+        self.assert_allows("spawn", spawn(
+            "planner", "harness-mode: repo-map\ngo"))
 
 
 class SpawnGuardAbortedRun(GuardHarness):
@@ -2644,6 +2714,28 @@ class QwenPayloadShapes(unittest.TestCase):
             "cache_read_input_tokens": 20, "cache_creation_input_tokens": 10})
         self.assertIn("harness-status: SUCCESS", data["text"])
 
+    def test_blocked_context_captures_subagent_type_for_qwen_agent_name(self):
+        # Qwen hook payloads carry the canonical tool name `"agent"` (not
+        # Claude's `"Task"`), so the _blocked_context fallback that
+        # recovers the attempted subagent_type from a spawn block must
+        # recognize both — otherwise a blocked spawn under Qwen logs an
+        # empty attempt and leaves nothing to coach against.
+        bc = self.guards._blocked_context
+        rec = bc({"tool_name": "agent",
+                  "tool_input": {"subagent_type": "x:reviewer",
+                                 "prompt": "harness-mode: review\ngo"}},
+                 self.tmp, [])
+        self.assertEqual(rec["attempt"], "x:reviewer")
+
+    def test_blocked_context_still_captures_claude_task_name(self):
+        # the Claude `"Task"` spelling must keep working byte-identically
+        bc = self.guards._blocked_context
+        rec = bc({"tool_name": "Task",
+                  "tool_input": {"subagent_type": "developer",
+                                 "prompt": "go"}},
+                 self.tmp, [])
+        self.assertEqual(rec["attempt"], "developer")
+
 
 @unittest.skipUnless(os.name == "nt", "Windows-only path shapes")
 class WindowsPathShapes(GuardHarness):
@@ -2741,6 +2833,80 @@ class WindowsPathShapes(GuardHarness):
         payload = bash(r'rm "\\nonexistent-srv-xyz\share\x"', "x:developer")
         payload["cwd"] = str(self.workspace)
         self.assert_blocks("bash", payload, "worktree")
+
+
+class HookMatcherCoverage(unittest.TestCase):
+    """The hook matchers in hooks/hooks.json must fire under BOTH Claude
+    Code (display names: Bash, Write, Edit, Read, Grep, Agent, Task, Skill)
+    and Qwen Code (canonical names in the payload: run_shell_command,
+    write_file, read_file, agent). Qwen's hook matcher builds an alias set
+    per runtime tool and tests each `|`-split matcher segment for EXACT
+    membership — so the canonical name must appear verbatim as a segment.
+    This is a snapshot of the segments that must be present, derived from
+    the alias-set table verified against Qwen Code v0.20.1's source."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.hooks = json.loads((ROOT / "hooks" / "hooks.json").read_text())
+
+    def _segments(self, event, guard_verb):
+        """The `|`-split segments of the matcher whose command runs the
+        named guard verb (bash/write/spawn/read)."""
+        for entry in self.hooks["hooks"].get(event, []):
+            cmd = entry["hooks"][0]["command"]
+            # command tail: `…guards.py" bash` — match the trailing verb
+            if cmd.rstrip().endswith(f" {guard_verb}"):
+                return entry["matcher"].split("|")
+        self.fail(f"no {event} matcher for guards.py {guard_verb}")
+
+    def test_bash_matcher_covers_qwen_run_shell_command(self):
+        segs = self._segments("PreToolUse", "bash")
+        # Claude: "Bash"; Qwen canonical: "run_shell_command"
+        self.assertIn("Bash", segs)
+        self.assertIn("run_shell_command", segs)
+
+    def test_write_matcher_covers_qwen_write_file(self):
+        segs = self._segments("PreToolUse", "write")
+        # Claude names + the Qwen canonical names that must appear as exact
+        # `|`-split segments (Qwen's hook matcher tests membership). Every
+        # real-aliased pair is asserted so a future "simplification" that
+        # drops one segment is caught, not silent.
+        for required in ("Write", "WriteFile", "write_file",
+                         "Edit", "NotebookEdit", "notebook_edit"):
+            self.assertIn(required, segs,
+                          f"write matcher missing {required!r}: {segs}")
+
+    def test_read_matcher_covers_qwen_read_file(self):
+        segs = self._segments("PreToolUse", "read")
+        for required in ("Read", "ReadFile", "read_file", "Grep", "grep_search"):
+            self.assertIn(required, segs,
+                          f"read matcher missing {required!r}: {segs}")
+
+    def test_spawn_matcher_covers_qwen_agent(self):
+        # "Agent|Task" already covers both — Qwen canonicalizes legacy
+        # `task` to `agent`, and `agent` is in the alias set that contains
+        # both "Agent" and "Task". Assert it stays covered.
+        segs = self._segments("PreToolUse", "spawn")
+        self.assertTrue(set(segs) & {"Agent", "Task", "agent"})
+
+    def test_post_spawn_matcher_covers_qwen_agent(self):
+        # PostToolUse (verdict/token capture) uses the same Agent|Task shape
+        # — its Qwen coverage is independently asserted so it can't drift
+        # from the PreToolUse spawn matcher.
+        segs = self._segments("PostToolUse", "post-spawn")
+        self.assertTrue(set(segs) & {"Agent", "Task", "agent"})
+
+    def test_skill_matcher_resolves_under_qwen(self):
+        # `skill`'s alias set is {skill, Skill, SkillTool} — "Skill" is a
+        # member, so the existing matcher fires under Qwen unchanged (no
+        # canonical name needs adding). Assert the matcher stays "Skill"
+        # and isn't accidentally narrowed.
+        for entry in self.hooks["hooks"].get("PreToolUse", []):
+            cmd = entry["hooks"][0]["command"]
+            if cmd.rstrip().endswith(" skill"):
+                self.assertEqual(entry["matcher"], "Skill")
+                return
+        self.fail("no PreToolUse matcher for guards.py skill")
 
 
 if __name__ == "__main__":

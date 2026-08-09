@@ -21,6 +21,24 @@ skill only *changes* an already-registered repo's path/name/`test_cmd`), and
 
 ## 0 · Confirm the workspace is actually bootstrapped
 
+**Resolve the plugin root** if not already set (native Qwen first run —
+each Bash call is a fresh subprocess, so the probe prints the path for
+textual substitution). Same resolution logic as `/init-workspace` step 0:
+
+```
+R="${CLAUDE_PLUGIN_ROOT:-}"; [ -z "$R" ] && {
+  for p in "$HOME/.qwen/extensions/ai-sdlc-harness/bin/harness" \
+           "$HOME/.qwen/extensions/ai-sdlc-harness/.qwen-extension-install.json"; do
+    [ -e "$p" ] && { case "$p" in *install.json)
+      R=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('source',''))" "$p");;
+      *) R=$(cd "$(dirname "$p")/.." && pwd);; esac
+      [ -x "$R/bin/harness" ] && break; }; done; }
+[ -x "$R/bin/harness" ] || { echo "ERROR: set CLAUDE_PLUGIN_ROOT to the dir with bin/harness" >&2; exit 1; }
+echo "PLUGIN_ROOT=$R"
+```
+
+**Use the printed path in place of `${CLAUDE_PLUGIN_ROOT}` below.**
+
 Read `.claude/context/overrides.yaml`. Missing, or no `bootstrap_completed`
 key: `/init-workspace` never finished — stop and send the user there.
 Proceeding anyway reports "the change is live," and the user only learns
@@ -51,6 +69,8 @@ time `/dev-workflow` runs.
 
 `overrides` deep-merges — a call only needs the keys actually changing:
 `init-section --section overrides --json '{"quick_mode": {"loc_max": 50}}'`.
+If the `init-section` result carries a `notice` key, relay its text to the
+user verbatim.
 Exception: a **list**-valued key (`review_policy` is the only shipped one)
 still replaces wholesale — dicts recurse, list items don't — so resend the
 whole list, including entries you're not changing, or one silently vanishes.

@@ -24,7 +24,7 @@ that already exists), so NO red-proof machinery applies.
    it in config (with a reason + date) rather than hand-narrowing the
    command, so the next run inherits the knowledge. Run the resolved command to find diff-coverage gaps against
    the tasks' touched files.
-2. Spawn `developer` with `harness-mode: harden` (+ run/repo/test-cmd
+2. Spawn `developer` with `harness-mode: harden` (+ run/repo/test-cmd/plugin-root
    headers — test-cmd is per repo, resolved with
    `${CLAUDE_PLUGIN_ROOT}/bin/harness resolve-test-cmd --repo <repo> --run
    <run>`, same as `develop`) and the gap list. It follows `steps/harden-task.md`.

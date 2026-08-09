@@ -13,7 +13,7 @@
    - `fresh` → nothing to do (init already generated + stamped it; do NOT
      re-stamp).
    - `missing`/`stale` → regenerate (spawn `planner` with
-     `harness-mode: repo-map`, a declared out-of-run-legal pair) and stamp
+     `harness-mode: repo-map` + plugin-root header, a declared out-of-run-legal pair) and stamp
      via `${CLAUDE_PLUGIN_ROOT}/bin/harness repo-map-stamp` after it
      returns — a plan grounded in a stale map cites patterns that no longer
      exist.
@@ -78,7 +78,7 @@
    not — plan-register refuses out-of-scope tasks either way.
 
 Spawn `planner` with headers (`harness-mode: plan`, `harness-run`,
-`harness-repo`) to produce `<run>/plan.md` — and name the CONFIRMED SCOPE
+`harness-repo`, `harness-plugin-root`) to produce `<run>/plan.md` — and name the CONFIRMED SCOPE
 repos (paths from `show` → `scope.repos`) in the ask: the planner has no
 provider or state access and decomposes only within what the prompt gives
 it (plan-task.md §0 relies on this). It follows `steps/plan-task.md`

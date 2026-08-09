@@ -16,6 +16,29 @@ time** (`init-section`), never a full-nuke.
 
 ## 0 · Environment bootstrap (do this FIRST)
 
+**Resolve the plugin root.** Under native Qwen Code (no Claude-plugin
+conversion), `${CLAUDE_PLUGIN_ROOT}` is not exported until step 6 writes
+`.qwen/settings.json` — and even then it takes effect next session, not
+this one. Each Bash call is a fresh subprocess (an `export` won't
+persist), so the probe **prints** the resolved path for you to substitute
+textually. If the var is already set (Claude Code, converted install),
+the probe passes it through unchanged:
+
+```
+# Resolve the plugin root and print it (native Qwen first-run fallback)
+R="${CLAUDE_PLUGIN_ROOT:-}"
+[ -z "$R" ] && for d in "$HOME/.qwen/extensions/ai-sdlc-harness/bin/harness" \
+  "$HOME/.qwen/extensions/ai-sdlc-harness/.qwen-extension-install.json"; do
+  [ -e "$d" ] && { case "$d" in *install.json) R=$(python3 -c \
+    "import json,sys;print(json.load(open(sys.argv[1])).get('source',''))" "$d");; \
+    *) R=$(dirname "$(dirname "$d")");; esac; [ -x "$R/bin/harness" ] && break; }; done
+[ -x "$R/bin/harness" ] || { echo "ERROR: set CLAUDE_PLUGIN_ROOT to the dir with bin/harness" >&2; exit 1; }
+echo "PLUGIN_ROOT=$R"
+```
+
+**Use the printed `PLUGIN_ROOT=<path>` in place of every
+`${CLAUDE_PLUGIN_ROOT}` below** for this skill run.
+
 The harness needs PyYAML; system pythons are often externally managed
 (PEP 668), so the plugin owns a venv that `bin/harness` resolves
 automatically on every future call:
@@ -55,7 +78,8 @@ notice rather than erroring — expected pre-setup behavior, not a bug to chase.
 
 Every `init-section` write is merged straight into the flat config by its
 top-level keys, so `provider`, `repos`, and `language` payloads must be
-**self-nested** under their own section key:
+**self-nested** under their own section key. If any `init-section` result
+carries a `notice` key, relay its text to the user verbatim:
 
 ```
 ${CLAUDE_PLUGIN_ROOT}/bin/harness init-section --section provider --json \

@@ -32,7 +32,9 @@ The original harness works, but almost all of its accumulated complexity compens
 
 ## Install
 
-This repo *is* a Claude Code plugin marketplace. Inside Claude Code:
+This repo is **dual-native**: a native Claude Code plugin (`.claude-plugin/`) and a native Qwen Code extension (`qwen-extension.json`) in one repository. Install it under either CLI — no conversion step is needed.
+
+### Claude Code
 
 ```
 /plugin marketplace add MostAshraf/ai-sdlc-harness
@@ -46,7 +48,23 @@ claude plugin marketplace add MostAshraf/ai-sdlc-harness
 claude plugin install ai-sdlc-harness@ai-sdlc-harness   # --scope user|project|local
 ```
 
-Then, inside Claude Code:
+### Qwen Code
+
+```
+qwen extensions install MostAshraf/ai-sdlc-harness
+```
+
+For development with a live link to your working copy:
+
+```
+qwen extensions link /path/to/ai-sdlc-harness
+```
+
+Restart Qwen Code so the skills, agents, and hooks load.
+
+### After install
+
+Then, inside Claude Code or Qwen Code:
 
 ```
 /init-workspace
@@ -58,12 +76,30 @@ The interview asks only what it must (provider, repos), *discovers* your toolcha
 
 | Dependency | Why |
 |---|---|
-| **Claude Code** | The CLI that runs this harness. Install from [claude.ai/code](https://claude.ai/code). |
+| **Claude Code** or **Qwen Code** | The CLI that runs this harness. Install Claude Code from [claude.ai/code](https://claude.ai/code) or Qwen Code from [qwen-code](https://github.com/QwenLM/qwen-code). |
 | **Git** | Branch management, per-task worktree isolation, owned commits. |
 | **Python 3.10+** | The entire core is Python. `/init-workspace` creates the plugin's own venv with PyYAML as its first step; until then the guards print a one-line notice and stand down. |
 | **Provider CLI, authed** *(optional)* | `gh auth login` / `glab auth login` / `az login`, if using that provider. MCP providers need their server connected. The `local-markdown` provider needs nothing at all. |
 
 Target repos must be **cloned locally**, clean, and on their default branch when registered — the harness does not clone them. No language prerequisites; toolchains are discovered.
+
+---
+
+## Running under Qwen Code
+
+This repo carries a `qwen-extension.json` at root, making it a **native Qwen Code extension** — no Claude-plugin conversion is needed. Install via `qwen extensions install` or `qwen extensions link` (see [Install](#install) above), then run `/init-workspace` inside a Qwen Code session.
+
+### What happens under Qwen Code
+
+When `/init-workspace` runs under Qwen Code (`QWEN_CODE=1` is set in that session):
+
+- **Permissions are mirrored to `.qwen/settings.json`.** Qwen Code reads its allowlist from `.qwen/settings.json` rather than `.claude/settings.json`; the init step writes both so background agents run unprompted under either CLI. A workspace bootstrapped under Claude Code and later opened under Qwen Code has no `.qwen/settings.json` yet — re-run `/workspace-config` (or the permission-write step) once under Qwen Code to create it.
+- **`CLAUDE_PLUGIN_ROOT` is exported via the `.qwen/settings.json` `env` block** (self-healing on reinstall). Native Qwen does not export this variable or substitute it in markdown, so the init step's bootstrap probe resolves the plugin root on first run and prints it for the model to substitute textually in subsequent commands (each Bash call is a fresh subprocess, so a shell export doesn't persist). The env export written at step 6 takes over from the **next session**. A stale value from a prior install self-heals when the stored path no longer exists on disk; a deliberate user pin pointing at a real directory is preserved.
+- **`.qwen/context` is symlinked to `../.claude/context`** (relative, so a workspace move doesn't dangle it). This is an affordance for the **converted-install** path only: Qwen's Claude-plugin converter rewrites `.claude/` → `.qwen/` in installed markdown, so skills point the model at `.qwen/context/…` while the CLI reads `.claude/context/`. The symlink makes both land in the single physical tree. Under **native** installs, markdown keeps literal `.claude/context/` paths that already match the physical tree, so the symlink is harmless when unused. The write guard additionally accepts the literal `.qwen/context/` prefix as a confined root. **Windows needs Developer Mode or an admin shell to create symlinks**; if creation fails or a real file occupies the path, init prints a visible warning (no silent data loss).
+- **Agents carry a union-spelling `tools:` list.** Each agent's frontmatter carries both Claude names (`Read`, `Write`, `Edit`, `Bash`) and Qwen display names (`ReadFile`, `WriteFile`, `Shell`). Claude Code grants the names it recognizes and silently ignores the rest; Qwen Code does the same in reverse. The reviewer stays read-only on both platforms (no write spelling of either dialect).
+- **`subagent_models` overrides are honored in Claude Code sessions but cannot be applied at spawn under Qwen Code** — its agent tool has no model parameter, so subagents run on the session model. The harness surfaces this at spawn time (via `resolve-model`) and at config time (via `init-section --section overrides`), relaying a notice to the user the first time it fires in each run. The advanced manual escape hatch is a project-level `.qwen/agents/<name>.md` shadow file with a `model:` line — a full copy that replaces the plugin's agent wholesale and must be manually re-synced after plugin upgrades.
+
+**Folder-trust note:** if you enable Qwen Code's `security.folderTrust.enabled` and the workspace is untrusted, Qwen drops workspace settings **entirely** — both the env export and the permission allowlist go inert, surfacing as permission prompts reappearing. Trust enforcement is off by default; trust the workspace (or keep it off) to keep the dual-write live.
 
 ---
 
@@ -409,7 +445,7 @@ python -m venv .venv; .venv\Scripts\pip install pyyaml
 .venv\Scripts\python -m unittest discover -s tests
 ```
 
-The test suite (946 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (989 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 

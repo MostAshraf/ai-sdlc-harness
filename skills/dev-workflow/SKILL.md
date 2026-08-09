@@ -61,27 +61,47 @@ successful sibling of abort — the final step's file says exactly when).
    `steps/gate.md`.
 3. Execute it. Spawning a shape? The prompt MUST carry the structured headers
    (`harness-mode`, `harness-task`, `harness-run`, `harness-repo`,
-   `harness-test-cmd`). Enforcement, precisely: the spawn guard BLOCKS a
+   `harness-test-cmd`, `harness-plugin-root`). **Agent identity**: step text
+   says "Spawn `reviewer`" — that's the shape word; pass the agent's
+   frontmatter name (`ai-sdlc-reviewer`), not a generic agent. See
+   `shared/spawn-identity.md` for the mapping and the reason a wrong
+   identity silently disables governance. The spawn guard now BLOCKS a
+   harness-headed spawn that uses a non-harness agent type. Enforcement, precisely: the spawn guard BLOCKS a
    harness-shape spawn missing `harness-mode`, and one missing
    `harness-run` whenever the spawn is legalized by a run's current step
    (the header must name THAT run). The remaining headers are capture
    conventions — `harness-task` attributes the token ledger and reviewer
    verdicts (a per-task review whose spawn omits it cannot satisfy the
    task's completion guard), `harness-repo`/`harness-test-cmd` scope the
-   subagent's work. Before
+   subagent's work, `harness-plugin-root` passes the resolved plugin
+   install path (agents use it as `$PLUGIN_ROOT` to open instruction files
+   and run `bin/harness` — the token must NOT be `${CLAUDE_PLUGIN_ROOT}`
+   because Qwen's `templateString` scans agent bodies for braced tokens
+   and rejects unknown keys at spawn). Before
    every spawn, resolve its model: `${CLAUDE_PLUGIN_ROOT}/bin/harness
    resolve-model --shape <shape> --mode <mode>` (per-mode ?? per-shape
    default ?? `inherit`, from `subagent_models`). Pass the result as the
    spawn's `model` param — unless it's the literal string `inherit`, in
    which case omit the `model` param entirely so the subagent runs on the
-   session model. Every harness-shape spawn runs FOREGROUND — pass
+   session model. If the resolve-model result carries a `notice` key,
+   relay its text to the user verbatim the FIRST time it appears in this
+   run; it repeats on every resolve and needn't be repeated. Every harness-shape spawn runs FOREGROUND — pass
    `run_in_background: false` explicitly (newer platforms default to
    background, and capture reads the spawn's own tool_response; a
    background spawn returns only a launch stub — verdict lost, stall
-   event fabricated; the guard blocks an explicit `true`). Parallelism =
+   event fabricated; the guard requires an explicit `false`). Parallelism =
    batch multiple foreground spawns in ONE message, never backgrounding.
 4. Advance: `${CLAUDE_PLUGIN_ROOT}/bin/harness cursor --to <next> --run <run>`. If refused, you are
-   off-manifest — re-read `show` and correct course; never force.
+   off-manifest — re-read `show` and correct course; never force. If the
+   refusal is `verdict_bound` (a reviewer verdict was not captured), the
+   **only** sanctioned recovery is to re-spawn the reviewer for that mode
+   — correct agent identity (`ai-sdlc-reviewer`), foreground, full
+   headers — and let the hook capture it. Never write `reviews.ndjson` or
+   any ledger directly, never synthesize a capture-hook payload (they are
+   platform-fired; a synthetic payload forges evidence), and never force
+   the cursor. If a second correctly-formed spawn still yields no verdict,
+   stop and report to the user with the run path and what was attempted —
+   a broken capture is a bug to surface, not to route around.
 
 ## Cross-cutting rules
 
@@ -114,7 +134,7 @@ successful sibling of abort — the final step's file says exactly when).
   *after* the capture); per-task and per-lens keys are never refused — the
   engine reads no verdict for those.
 - **Ad-hoc human requests mid-run:** spawn `reviewer` with
-  `harness-mode: request-triage` (always legal), surface the triage verdict
+  `harness-mode: request-triage` (+ plugin-root header, always legal), surface the triage verdict
   to the user; out-of-scope items are never silently merged.
 - **Publish:** the mirror snapshots the run's audit trail INTO a registered
   **project repo's** feature branch (so the governance record travels with

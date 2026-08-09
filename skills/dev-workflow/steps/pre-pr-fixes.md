@@ -3,7 +3,7 @@
 Task commits are already squashed — fixes need the fixup path (never new
 loose commits, never history edits by hand):
 
-1. Spawn `developer` with `harness-mode: fixup` + the gate's findings.
+1. Spawn `developer` with `harness-mode: fixup` (+ plugin-root header) + the gate's findings.
    It follows `steps/fixup-task.md`.
 2. After its fixup commits land:
    `${CLAUDE_PLUGIN_ROOT}/bin/harness merge-task --repo <repo> --autosquash --base <default-branch>

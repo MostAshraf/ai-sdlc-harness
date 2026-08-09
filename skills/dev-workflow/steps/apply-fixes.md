@@ -4,7 +4,7 @@ Requires the ⟨select-comments⟩ token — a `select` gate (see `analyze-comme
 its decision is a LIST of the comment IDs the human picked, read from
 `state.gates["select-comments"].decision` (`${CLAUDE_PLUGIN_ROOT}/bin/harness show`).
 
-1. Spawn `developer` with `harness-mode: fixup` + the SELECTED comments only
+1. Spawn `developer` with `harness-mode: fixup` (+ plugin-root header) + the SELECTED comments only
    (look up each id's text from `<run>/reports/comments-round-<n>.md`).
    Same rules as `fixup-task.md` (fixup commits, autosquash, locked tests).
 2. `${CLAUDE_PLUGIN_ROOT}/bin/harness merge-task --autosquash

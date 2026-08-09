@@ -12,8 +12,8 @@
         "source": "github",
         "repo": "MostAshraf/ai-sdlc-harness"
       },
-      "version": "3.4.1",
-      "description": "AI-driven SDLC workflow harness for multi-repo development. Provides story refinement, multi-agent development (plan → code → review → test → PR), and automated guardrails via hooks. Supports Azure DevOps, Jira, GitLab, GitHub, Zoho, and local Markdown as work item providers; ADO, GitLab, GitHub, gh-cli, and glab-cli as git providers. Language-agnostic, discovery-driven; supports any language (frontend + backend).",
+      "version": "3.5.0",
+      "description": "AI-driven SDLC workflow harness for multi-repo development. Provides story refinement, multi-agent development (plan → code → review → test → PR), and automated guardrails via hooks. Runs under Claude Code and Qwen Code. Supports Azure DevOps, Jira, GitLab, GitHub, Zoho, and local Markdown as work item providers; ADO, GitLab, GitHub, gh-cli, and glab-cli as git providers. Language-agnostic, discovery-driven; supports any language (frontend + backend).",
       "author": {
         "name": "Mostafa Ashraf"
       },
@@ -32,7 +32,8 @@
         "discovery-driven",
         "dev-workflow",
         "tdd",
-        "code-review-automation"
+        "code-review-automation",
+        "qwen-code"
       ]
     }
   ]

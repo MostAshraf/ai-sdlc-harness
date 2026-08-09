@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -63,6 +64,20 @@ def load_declared(workspace: Path) -> tuple[dict, dict, dict]:
 
 def _emit(payload: dict) -> None:
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def _has_non_inherit_model(sm) -> bool:
+    """True if a `subagent_models` value contains any non-`inherit`
+    override — handles both the string form (``"sonnet"``) and the
+    per-mode dict form (``{"default": "sonnet", "review": "inherit"}``).
+    Any value != "inherit" counts, at any depth in the dict."""
+    if not sm:
+        return False
+    if isinstance(sm, str):
+        return sm != "inherit"
+    if isinstance(sm, dict):
+        return any(_has_non_inherit_model(v) for v in sm.values())
+    return False
 
 
 def _json_source(flag: str, inline: str | None, file_path: Path | None, default):
@@ -567,7 +582,15 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.cmd == "resolve-model":
             model = workflow.resolve_subagent_model(config, args.shape, args.mode)
-            _emit({"ok": True, "model": model})
+            if os.environ.get("QWEN_CODE") == "1" and model != "inherit":
+                _emit({"ok": True, "model": "inherit", "configured": model,
+                       "notice": f"subagent_models configured '{model}' for "
+                       f"{args.shape}, but Qwen Code's agent tool has no "
+                       "model parameter — the override cannot be applied at "
+                       "spawn; the subagent runs on the session model. It "
+                       "will apply in Claude Code sessions of this workspace."})
+            else:
+                _emit({"ok": True, "model": model})
             return 0
 
         if args.cmd == "resolve-lenses":
@@ -674,7 +697,18 @@ def main(argv: list[str] | None = None) -> int:
                        "top-level keys are merged straight into config"})
                 return 1
             path = initws.write_section(args.workspace, args.section, data)
-            _emit({"ok": True, "written": str(path)})
+            result = {"ok": True, "written": str(path)}
+            if (os.environ.get("QWEN_CODE") == "1"
+                    and args.section == "overrides"):
+                sm = data.get("subagent_models")
+                if _has_non_inherit_model(sm):
+                    result["notice"] = (
+                        "subagent_models contains one or more overrides that "
+                        "are stored but inert under Qwen Code (its agent tool "
+                        "has no model parameter — subagents run on the session "
+                        "model). They will apply in Claude Code sessions of "
+                        "this workspace.")
+            _emit(result)
             return 0
 
         if args.cmd == "init-finalize":

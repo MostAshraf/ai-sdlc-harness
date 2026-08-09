@@ -12,6 +12,7 @@ already uses (regex/substring, not parsing); a stronger check would need to
 parse structure, not just grep for markers."""
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 
@@ -60,6 +61,129 @@ class PlanContract(unittest.TestCase):
         self.assertFalse(
             missing_from_task,
             f"steps/plan-task.md missing required-content marker(s): {missing_from_task}")
+
+
+class AgentToolsPinning(unittest.TestCase):
+    """The three agent files carry a union-spelling `tools:` list so the
+    same frontmatter grants the right tool set on BOTH Claude Code (grants
+    Read/Write/Edit/Bash, ignores the Qwen display names) and Qwen Code
+    (grants ReadFile/WriteFile/Edit/Shell/Grep/Glob, warn-drops the Claude
+    spellings). Verified empirically on Claude Code (V5) and source-verified
+    on Qwen Code v0.20.1 (transformToToolNames). This test pins the union
+    so a future edit can't silently break one platform.
+
+    The reviewer is read-only on BOTH platforms — no write spelling of
+    either dialect appears in its list."""
+
+    def _tools(self, agent_file: str) -> set[str]:
+        text = (ROOT / "agents" / agent_file).read_text(encoding="utf-8")
+        # extract the frontmatter block
+        fm = text.split("---", 2)[1] if text.startswith("---") else ""
+        for line in fm.splitlines():
+            if line.strip().startswith("tools:"):
+                return {t.strip() for t in line.split(":", 1)[1].split(",")
+                        if t.strip()}
+        self.fail(f"no tools: frontmatter in {agent_file}")
+
+    def test_developer_has_both_platform_spellings(self):
+        tools = self._tools("developer.md")
+        # Claude spellings
+        for t in ("Read", "Write", "Edit", "Bash"):
+            self.assertIn(t, tools, f"developer missing Claude spelling {t}")
+        # Qwen display names
+        for t in ("ReadFile", "WriteFile", "Shell"):
+            self.assertIn(t, tools, f"developer missing Qwen spelling {t}")
+
+    def test_planner_has_both_platform_spellings(self):
+        tools = self._tools("planner.md")
+        for t in ("Read", "Write", "Edit", "Bash"):
+            self.assertIn(t, tools, f"planner missing Claude spelling {t}")
+        for t in ("ReadFile", "WriteFile", "Shell"):
+            self.assertIn(t, tools, f"planner missing Qwen spelling {t}")
+
+    def test_reviewer_is_read_only_on_both_platforms(self):
+        tools = self._tools("reviewer.md")
+        # Claude read spellings present
+        for t in ("Read", "Bash"):
+            self.assertIn(t, tools, f"reviewer missing Claude spelling {t}")
+        # Qwen read display names present
+        for t in ("ReadFile", "Shell"):
+            self.assertIn(t, tools, f"reviewer missing Qwen spelling {t}")
+        # NO write spelling of EITHER dialect — read-only contract.
+        # Cover Claude display names, Qwen display names, AND canonical/wire
+        # names (Qwen's transformToToolNames resolves exact-name matches too,
+        # so a lowercase write_file or edit would grant write if it snuck in).
+        for write_tool in ("Write", "WriteFile", "write_file",
+                           "Edit", "edit", "replace",
+                           "NotebookEdit", "notebook_edit"):
+            self.assertNotIn(write_tool, tools,
+                             f"reviewer grants {write_tool} — breaks the "
+                             "read-only contract on one or both platforms")
+
+
+class SpawnIdentityContract(unittest.TestCase):
+    """WI-1: each agent's frontmatter `name` must resolve to a known harness
+    shape via the same `shape_of` logic the guards use, and the shared
+    spawn-identity reference must exist and be cited from SKILL.md."""
+
+    KNOWN_SHAPES = {"planner", "developer", "reviewer"}
+
+    def _frontmatter_name(self, agent_file: str) -> str:
+        text = (ROOT / "agents" / agent_file).read_text(encoding="utf-8")
+        fm = text.split("---", 2)[1] if text.startswith("---") else ""
+        for line in fm.splitlines():
+            if line.strip().startswith("name:"):
+                return line.split(":", 1)[1].strip()
+        self.fail(f"no name: frontmatter in {agent_file}")
+
+    def test_each_agent_name_resolves_to_known_shape(self):
+        for agent_file, expected_shape in [
+            ("developer.md", "developer"),
+            ("planner.md", "planner"),
+            ("reviewer.md", "reviewer"),
+        ]:
+            name = self._frontmatter_name(agent_file)
+            # shape_of takes the last :-segment and strips ai-sdlc-
+            shape = name.split(":")[-1].lower().removeprefix("ai-sdlc-")
+            self.assertEqual(shape, expected_shape,
+                             f"{agent_file} name '{name}' resolves to "
+                             f"'{shape}', expected '{expected_shape}'")
+
+    def test_spawn_identity_shared_file_exists(self):
+        self.assertTrue(
+            (ROOT / "skills" / "dev-workflow" / "shared"
+             / "spawn-identity.md").is_file(),
+            "shared/spawn-identity.md must exist (WI-1)")
+
+    def test_skill_md_references_spawn_identity(self):
+        text = (ROOT / "skills" / "dev-workflow" / "SKILL.md"
+                ).read_text(encoding="utf-8")
+        self.assertIn("spawn-identity.md", text,
+                      "SKILL.md must point at shared/spawn-identity.md")
+
+
+class VersionTripleSync(unittest.TestCase):
+    """qwen-extension.json, plugin.json, and marketplace.json must carry the
+    same version — they're a triple now that the repo is dual-native. The
+    mgm tooling (WI-4) will enforce this at bump-time; this test is cheap
+    defense-in-depth so drift is caught in the harness suite before the
+    next /release, regardless of mgm's state."""
+
+    def test_versions_in_sync(self):
+        pj = json.loads((ROOT / ".claude-plugin" / "plugin.json")
+                        .read_text(encoding="utf-8"))
+        qe = json.loads((ROOT / "qwen-extension.json")
+                        .read_text(encoding="utf-8"))
+        mj = json.loads((ROOT / ".claude-plugin" / "marketplace.json")
+                        .read_text(encoding="utf-8"))
+        versions = {
+            "plugin.json": pj["version"],
+            "qwen-extension.json": qe["version"],
+            "marketplace.json plugins[0]": mj["plugins"][0]["version"],
+        }
+        unique = set(versions.values())
+        self.assertEqual(len(unique), 1,
+                         f"version triple drifted: {versions}")
 
 
 if __name__ == "__main__":

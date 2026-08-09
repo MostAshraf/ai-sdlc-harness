@@ -592,7 +592,7 @@ def _blocked_context(p: dict, workspace: Path, runs: list[Path]) -> dict:
     tool_input = p.get("tool_input") or {}
     attempt = (tool_input.get("command")
                or tool_input.get("file_path") or tool_input.get("path") or "")
-    if not attempt and p.get("tool_name") == "Task":
+    if not attempt and p.get("tool_name") in ("Task", "agent"):
         attempt = str(tool_input.get("subagent_type") or "")
     attempt = str(attempt)
     for raw, tag in ([(r, "<run>") for r in runs] + [(workspace, "<workspace>")]):
@@ -1203,7 +1203,19 @@ def guard_write(p: dict) -> None:
             block(reason, cwd, p)
     if shape == "planner":
         path = _resolve_write_path(fp, cwd)
-        artifact_roots = (ws.resolve() / "ai", (ws / ".claude" / "context").resolve())
+        # `.qwen/context` is the Qwen install-rewrite spelling of
+        # `.claude/context` (the installer rewrites `.claude/`→`.qwen/` in
+        # markdown). init-workspace aliases it via a symlink under Qwen,
+        # which `path.resolve()` follows into `.claude/context` — but on
+        # hosts where symlinks fail the model still writes the literal
+        # `.qwen/context/...` path, so accept both prefixes here. The CLI
+        # keeps `.claude/context` as the single physical location either
+        # way; this is confinement acceptance, not a second data tree.
+        artifact_roots = (
+            ws.resolve() / "ai",
+            (ws / ".claude" / "context").resolve(),
+            (ws / ".qwen" / "context").resolve(),
+        )
         # scratch checked via `_is_scratch_write`, not a bare /tmp
         # membership test: the workspace root itself commonly sits under
         # /tmp (Linux `tempfile.mkdtemp()`, CI/containers), and a bare
@@ -1295,8 +1307,38 @@ def guard_spawn(p: dict) -> None:
     ws = _session_workspace(cwd)   # cd-drift-immune (field: session D)
     shape = shape_of(tool_input.get("subagent_type"))
     if shape not in surfaces["shapes"]:
-        return  # not a harness shape — none of our business
-    if tool_input.get("run_in_background") in (True, "true", "True"):
+        # Not a recognized harness shape. If the prompt carries harness
+        # headers, this is a provable mis-typed harness spawn — not a
+        # foreign agent. Block it with an actionable message so the
+        # orchestrator gets the right agent identity, instead of running
+        # the step ungoverned (no gating, no write confinement, no
+        # verdict capture). A header-less generic spawn is genuinely
+        # unrelated work and passes untouched.
+        prompt = tool_input.get("prompt") or ""
+        if MODE_HEADER_RE.search(prompt):
+            block(
+                f"harness-headed spawn used agent type "
+                f"'{tool_input.get('subagent_type', '(omitted)')}' — this is "
+                f"a harness spawn (carries harness-mode: header), but the "
+                f"agent type does not resolve to a harness shape. The three "
+                f"harness agents are: ai-sdlc-planner, ai-sdlc-developer, "
+                f"ai-sdlc-reviewer (your platform may prefix them, e.g. "
+                f"ai-sdlc-harness:ai-sdlc-reviewer). A generic agent "
+                f"(general-purpose, Explore, Task) would run this step "
+                f"with no spawn gating, no write confinement, no "
+                f"verdict capture. See "
+                f"skills/dev-workflow/shared/spawn-identity.md.",
+                cwd, p)
+        return  # genuinely unrelated agent — none of our business
+    # WI-3: require EXPLICIT run_in_background=false — under Qwen Code,
+    # omitting the param DEFAULTS to background for top-level spawns, so
+    # the old premise ("absent = foreground") is platform-dependent and
+    # an omitted param yields the exact failure the guard exists to
+    # prevent. The uniform rule (require explicit false) needs no platform
+    # detection and is identical on both platforms. SKILL.md already
+    # mandates "pass run_in_background: false explicitly".
+    bg = tool_input.get("run_in_background")
+    if bg not in (False, "false", "False"):
         # Backgrounding a reviewer or developer spawn is dangerous: a
         # background spawn's tool_response is only the launch stub — the
         # real reply never passes through ANY hook payload — so the
@@ -1307,12 +1349,13 @@ def guard_spawn(p: dict) -> None:
         # foreground tool_response (capture_post_spawn); background
         # harness spawns break it structurally.
         block(f"harness-shape spawns ('{shape}') must run in the FOREGROUND "
-              "— verdict/status capture reads the spawn's own tool_response, "
-              "and a background spawn returns only a launch stub, so a "
-              "reviewer verdict would be unrecoverable and a spurious stall "
-              "event fabricated. For parallelism, batch multiple foreground "
-              "spawns in ONE message — they run concurrently and each reply "
-              "is captured.", cwd, p)
+              "— pass run_in_background: false explicitly (under Qwen Code, "
+              "omitting it DEFAULTS to background). Verdict/status capture "
+              "reads the spawn's own tool_response, and a background spawn "
+              "returns only a launch stub, so a reviewer verdict would be "
+              "unrecoverable and a spurious stall event fabricated. For "
+              "parallelism, batch multiple foreground spawns in ONE message "
+              "— they run concurrently and each reply is captured.", cwd, p)
     prompt = tool_input.get("prompt") or ""
     m = MODE_HEADER_RE.search(prompt)
     if not m:
@@ -1842,6 +1885,35 @@ def capture_post_spawn(p: dict) -> None:
     shape = shape_of(tool_input.get("subagent_type"))
     surfaces = load_yaml(PLUGIN_ROOT / "pipeline" / "surfaces.yaml")
     if shape not in surfaces["shapes"]:
+        # Defense in depth for guard_spawn's WI-2 block (older guard copy,
+        # PreToolUse disabled, hook ordering). If this near-miss reaches
+        # capture, record what happened instead of returning silently —
+        # the ledger must be able to explain WHY a verdict is missing.
+        prompt = tool_input.get("prompt") or ""
+        if MODE_HEADER_RE.search(prompt):
+            cwd_cap = _session_workspace(Path(p.get("cwd") or "."))
+            runs_cap = live_runs(cwd_cap)
+            # attribute via the harness-run: header (the codebase's own
+            # convention), not runs_cap[0] — in a multi-run workspace the
+            # first-sorted run silently misattributes every other run's
+            # events. Fall back to the single-run case, else stderr.
+            run_cap = (_resolve_run(runs_cap, prompt, cwd_cap)
+                       if runs_cap else None)
+            if run_cap is None and len(runs_cap) == 1:
+                run_cap = runs_cap[0]
+            if run_cap:
+                ndjson.append_record(run_cap / "events.ndjson", {
+                    "kind": "spawn-shape-unrecognized",
+                    "subagent_type": tool_input.get("subagent_type",
+                                                    "(omitted)"),
+                    "mode": (MODE_HEADER_RE.search(prompt)
+                             or [None, None])[1]})
+            elif runs_cap:
+                print(f"ai-sdlc-harness: could not attribute a "
+                      f"spawn-shape-unrecognized event to one of "
+                      f"{len(runs_cap)} live runs (no matching "
+                      f"harness-run: header) — event not recorded.",
+                      file=sys.stderr)
         return  # not a harness shape — none of our business
     cwd = _session_workspace(Path(p.get("cwd") or "."))
     runs = live_runs(cwd)

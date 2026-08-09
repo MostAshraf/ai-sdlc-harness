@@ -6,7 +6,7 @@ new_comments_present` — re-entry after apply-fixes is a declared edge).
 1. Fetch the comments via the git provider:
    `${CLAUDE_PLUGIN_ROOT}/bin/harness fetch-pr-comments --repo <repo> --run <run>`
    (`local` provider returns none — paste them yourself for that case).
-2. Spawn `reviewer` with `harness-mode: analyze-comments` + the comments.
+2. Spawn `reviewer` with `harness-mode: analyze-comments` (+ plugin-root header) + the comments.
    It follows `steps/comment-analysis.md`.
 3. Persist its analysis to `<run>/reports/comments-round-<n>.md`, numbering
    each comment (`[1]`, `[2]`, …), and record the declared artifact:
