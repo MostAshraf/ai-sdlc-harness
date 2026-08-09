@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# POSIX half of the hook launcher pair (run-guard.cmd is the cmd.exe
+# sibling). hooks.json registers every guard as ONE dual-clause command:
+#
+#   exec "${CLAUDE_PLUGIN_ROOT}/hooks/run-guard" <verb> || ${CLAUDE_PLUGIN_ROOT}/hooks/run-guard <verb>
+#
+# because the platform firing the hook picks the shell, and that choice is
+# not ours: Claude Code always uses bash (Git Bash on Windows), but Qwen
+# Code on Windows falls back to cmd.exe unless launched from an
+# MSYS-flavored terminal. The old inline POSIX one-liner died in that
+# fallback — cmd treats `=` as an argument delimiter, so `PY="…"` invoked
+# the Windows `py` launcher with quote-mangled arguments (python.exe
+# [Errno 22] on every prompt, every tool call).
+#
+# How each shell reads the dual clause:
+#   bash  — `exec` REPLACES the shell with this script, so the `||` clause
+#           is unreachable: allow (0), deny (2), and launch failure all
+#           surface directly and clause 2 can never re-read the hook's
+#           already-consumed stdin. Byte-for-byte the old semantics.
+#   cmd   — clause 1 fails fast ('exec' is not recognized — libuv's \"
+#           quote-escaping makes the quoted path unparseable anyway), `||`
+#           falls through, and the UNQUOTED clause 2 resolves this same
+#           extensionless path to run-guard.cmd via PATHEXT. stdin and the
+#           exit code pass through the .cmd untouched.
+# Residuals (documented, accepted — adversarial-review calibrated):
+#   - clause 2 is unquoted, so under the cmd.exe fallback a plugin root
+#     containing a space OR any cmd-significant character (( ) & ^ % = ,
+#     ;) cannot work — no command string can survive libuv's
+#     quote-escaping there ("&" additionally splits and runs the tail as
+#     its own command). Such installs keep the Git-Bash-terminal
+#     workaround. bash keeps full metachar-safety via clause 1's quotes.
+#   - under the cmd fallback, clause 1's one stderr line ('exec' is not
+#     recognized) precedes EVERY verdict, including the redirect message
+#     on a deny — read past it; the real reason follows.
+#   - a ComSpec pointed at PowerShell (hand-configured) cannot parse
+#     either clause: the hook errors non-2 and the platform treats it as
+#     non-blocking — same posture as the missing-interpreter case.
+#   - the bash clause needs this file EXECUTABLE with an LF shebang
+#     (mode 100755 + .gitattributes enforce that for git-based installs;
+#     a mode-stripping channel degrades non-2, guards silently off).
+#
+# Same interpreter probe as bin/harness: plugin venv first (both layouts —
+# Git Bash on Windows sees Scripts/), then python3 → python (python.org
+# Windows installs ship only `python`). No PYTHONPATH needed: guards.py
+# puts the plugin root on sys.path itself.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY="$HERE/../.venv/bin/python"
+[ -x "$PY" ] || PY="$HERE/../.venv/Scripts/python.exe"
+[ -x "$PY" ] || PY="$(command -v python3 || command -v python || echo python3)"
+exec "$PY" "$HERE/guards.py" "$@"

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# POSIX half of the venv-bootstrap launcher pair (setup-venv.cmd is the
+# cmd.exe sibling). init-workspace's SKILL.md step 0 invokes this through
+# ONE dual-clause command, same shape as hooks/run-guard: the shell that
+# ends up interpreting a skill's shell instructions is picked by the
+# platform, not by us — Claude Code's Bash tool always runs bash (Git
+# Bash on Windows), but Qwen Code's run_shell_command tool shares hooks'
+# getShellConfiguration() and falls back to cmd.exe on Windows outside an
+# MSYS-flavored terminal. The inline POSIX probe this replaces
+# (`SYS="$(command -v python3 || command -v python)"`) is unparseable
+# there — cmd treats `=` as an argument delimiter.
+#
+# Idempotent: exits 0 immediately once the plugin venv already has PyYAML
+# importable. Same interpreter probe as bin/harness: plugin venv first
+# (both layouts — Git Bash on Windows sees Scripts/), then system
+# python3 -> python (python.org Windows installs ship only `python`).
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$HERE/.."
+PY="$ROOT/.venv/bin/python"
+[ -x "$PY" ] || PY="$ROOT/.venv/Scripts/python.exe"
+"$PY" -c "import yaml" 2>/dev/null || {
+  SYS="$(command -v python3 || command -v python || true)"
+  [ -n "$SYS" ] || { echo "ERROR: no system python3/python found to create the plugin venv" >&2; exit 1; }
+  "$SYS" -m venv "$ROOT/.venv" &&
+  PY="$ROOT/.venv/bin/python" &&
+  { [ -x "$PY" ] || PY="$ROOT/.venv/Scripts/python.exe"; } &&
+  "$PY" -m pip install --quiet pyyaml
+}

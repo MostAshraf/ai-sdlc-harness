@@ -8,6 +8,7 @@ import json
 import os
 import posixpath
 import re
+import stat
 import subprocess
 from pathlib import Path
 
@@ -786,7 +787,58 @@ def _write_section_locked(workspace: Path, section: str, path: Path,
     return path
 
 
+#: The plugin's own bash launchers (relative to plugin root) that MUST carry
+#: the executable bit for hooks/run-guard's bash `exec` clause — and
+#: bin/harness itself — to run at all. See hooks/run-guard's header for the
+#: full residual: a mode-stripping distribution channel (GitHub "Download
+#: ZIP", a zip-extraction library that drops unix modes, a manual
+#: Windows->POSIX copy) can deliver these non-executable; bash's `exec`
+#: clause then fails 126 with no fallback, the platform reads that non-2
+#: exit as a NON-BLOCKING hook error, and every guard — including the
+#: fail-closed spawn/skill guards — silently stops enforcing.
+_LAUNCHER_FILES = ("hooks/run-guard", "bin/harness")
+
+
+def _restore_launcher_exec_bits(plugin_root: Path | None = None) -> None:
+    """Self-heals the executable bit on this plugin's OWN launchers at every
+    bootstrap — `mark_bootstrapped` is the one call both a fresh `init` and
+    an `init-finalize` re-run funnel through, so this is the one place a
+    stripped bit gets caught for every path in.
+
+    POSIX only: os.chmod's owner/group/other execute bits are meaningless on
+    Windows, where this is a clean no-op (no error, no warning). `plugin_root`
+    defaults to THIS installed plugin's own root — the same
+    `Path(__file__).resolve().parent.parent` resolution `write_permissions`
+    already uses, never a workspace path — but takes a parameter so a test
+    can point it at a disposable fixture copy instead of chmod'ing the real
+    repo.
+
+    A chmod failure (read-only plugin directory, unusual filesystem) must
+    not break bootstrap: warn on stderr naming the file and continue, same
+    voice as the Qwen-symlink warnings below. Never silent — a launcher left
+    non-executable means guards are off, which is the exact finding this
+    self-heal exists to close."""
+    if os.name == "nt":
+        return
+    import sys
+    root = (plugin_root if plugin_root is not None
+            else Path(__file__).resolve().parent.parent)
+    for rel in _LAUNCHER_FILES:
+        path = root / rel
+        try:
+            mode = path.stat().st_mode
+            wanted = mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+            if wanted != mode:
+                os.chmod(path, wanted)
+        except OSError as exc:
+            print(f"warning: could not restore the executable bit on "
+                  f"{path} ({exc}) — a non-executable launcher fails "
+                  "non-blocking and guard hooks silently stop enforcing; "
+                  f"fix by hand: chmod +x {path}", file=sys.stderr)
+
+
 def mark_bootstrapped(workspace: Path) -> None:
+    _restore_launcher_exec_bits()
     write_section(workspace, "overrides",
                   {"bootstrap_completed": ndjson.now_iso()})
     if os.environ.get("QWEN_CODE") == "1":

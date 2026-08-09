@@ -337,7 +337,7 @@ Intake ends by proposing the story's **target repos** with evidence from the map
 
 ## Guardrail Hooks
 
-One Python entry point ([hooks/guards.py](hooks/guards.py)) handles every event, registered in [hooks/hooks.json](hooks/hooks.json). Guards scope themselves to workspaces with a live harness run (resolved from `CLAUDE_PROJECT_DIR` first, so a drifted shell `cwd` can't dodge them) — with one exception: the raw-git block is standing rather than run-scoped, active for the life of any workspace that has completed `/init-workspace` (same `CLAUDE_PROJECT_DIR`-first resolution, checking for the bootstrap marker instead of a live run) regardless of whether a run currently exists. It is still not global — a session that has never run `/init-workspace` sees ordinary git. Two documented residuals: a session rooted directly in a repo registered to a *sibling* workspace, rather than the workspace itself, isn't recognized as belonging to it (nothing today points from a registered repo back to the workspace that owns it); and the bootstrap marker itself (`.claude/context/overrides.yaml`) is an ordinary, non-chain-sealed config file — a direct edit stripping it can silently turn the block back off, a capability the pre-change unconditional block never had. Both accepted deliberately rather than closed in this pass — see `_is_harness_workspace`'s docstring.
+One Python entry point ([hooks/guards.py](hooks/guards.py)) handles every event, registered in [hooks/hooks.json](hooks/hooks.json) through a shell-agnostic launcher pair — guards fire identically whether the host platform runs hook commands under bash (Claude Code everywhere, Qwen Code on POSIX or from a Git-Bash terminal) or under Windows `cmd.exe` (Qwen Code on Windows in any other terminal). Guards scope themselves to workspaces with a live harness run (resolved from `CLAUDE_PROJECT_DIR` first, so a drifted shell `cwd` can't dodge them) — with one exception: the raw-git block is standing rather than run-scoped, active for the life of any workspace that has completed `/init-workspace` (same `CLAUDE_PROJECT_DIR`-first resolution, checking for the bootstrap marker instead of a live run) regardless of whether a run currently exists. It is still not global — a session that has never run `/init-workspace` sees ordinary git. Two documented residuals: a session rooted directly in a repo registered to a *sibling* workspace, rather than the workspace itself, isn't recognized as belonging to it (nothing today points from a registered repo back to the workspace that owns it); and the bootstrap marker itself (`.claude/context/overrides.yaml`) is an ordinary, non-chain-sealed config file — a direct edit stripping it can silently turn the block back off, a capability the pre-change unconditional block never had. Both accepted deliberately rather than closed in this pass — see `_is_harness_workspace`'s docstring.
 
 | Guard | Event · Matcher | What it enforces |
 |---|---|---|
@@ -408,6 +408,7 @@ ai-sdlc-harness/
 │   └── providers/               # code-modular provider adapters
 ├── hooks/
 │   ├── hooks.json               # hook registrations
+│   ├── run-guard · run-guard.cmd   # shell-agnostic launchers (bash + cmd.exe)
 │   └── guards.py                # all guard + capture logic (one entry point)
 ├── agents/                      # the 3 shapes: planner.md, developer.md, reviewer.md
 ├── skills/
@@ -415,7 +416,7 @@ ai-sdlc-harness/
 │   └── init-workspace/ · add-repo/ · migrate-workspace/ · workspace-config/ · workflow-status/ · repo-map-refresh/
 ├── bin/harness                  # wrapper script resolving the plugin venv (+ harness.cmd for Windows)
 ├── tools/                       # meta-tooling: line-budget checker, sandbox workspace generators
-└── tests/                       # 878 stdlib-unittest tests
+└── tests/                       # 1006 stdlib-unittest tests
 ```
 
 Workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside *your* working directory by `/init-workspace` and the pipeline. They never live inside this plugin repo.
@@ -445,7 +446,7 @@ python -m venv .venv; .venv\Scripts\pip install pyyaml
 .venv\Scripts\python -m unittest discover -s tests
 ```
 
-The test suite (989 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (1006 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 

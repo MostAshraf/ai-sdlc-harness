@@ -58,6 +58,31 @@ NOP_CMD = "cmd /c exit 0" if os.name == "nt" else "true"
 # there on exactly this, while the product behaviour was correct).
 NOP_TEST_CMD = "npm test"
 
+_CAN_SYMLINK: bool | None = None
+
+
+def can_symlink() -> bool:
+    """True when this host can create real symlinks. A given everywhere but
+    Windows, where os.symlink needs Developer Mode or admin ([WinError
+    1314]). The production path degrades open with a stderr warning on such
+    hosts (initws' Qwen context link — separately tested via a patched-in
+    refusal), but tests asserting a REAL symlink round-trip can only skip:
+    on a stock Windows dev box the privilege is absent, and a red run that
+    means "host settings", not "code defect", trains people to ignore red.
+    Probed once per process by creating one in a temp dir."""
+    global _CAN_SYMLINK
+    if _CAN_SYMLINK is None:
+        probe_dir = tempfile.mkdtemp()
+        try:
+            os.symlink(probe_dir, os.path.join(probe_dir, "ln"),
+                       target_is_directory=True)
+            _CAN_SYMLINK = True
+        except OSError:
+            _CAN_SYMLINK = False
+        finally:
+            rmtree(probe_dir, ignore_errors=True)
+    return _CAN_SYMLINK
+
 # dir= argument for tempfile.mkdtemp when a fixture must sit inside the
 # guards' scratch root (None = the platform default temp dir, which on
 # Windows is exactly what guards' _tmp_roots() returns there)

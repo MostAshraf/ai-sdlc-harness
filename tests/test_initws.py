@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -620,6 +621,9 @@ class QwenCompatibility(M7Harness):
         plugin_root = str(Path(initws.__file__).resolve().parent.parent)
         self.assertEqual(settings["env"]["CLAUDE_PLUGIN_ROOT"], plugin_root)
 
+    @unittest.skipUnless(support.can_symlink(),
+                         "host cannot create symlinks (Windows: Developer "
+                         "Mode/admin); degrade path tested separately below")
     def test_mark_bootstrapped_symlinks_qwen_context_under_qwen(self):
         # bootstrap the context dir first (write_section creates it)
         initws.write_section(self.workspace, "provider",
@@ -678,6 +682,9 @@ class QwenCompatibility(M7Harness):
         self.assertIn("exists as a real", written)
         self.assertIn(".qwen/context", written)
 
+    @unittest.skipUnless(support.can_symlink(),
+                         "host cannot create symlinks (Windows: Developer "
+                         "Mode/admin); degrade path tested separately below")
     def test_link_qwen_context_repoints_stale_symlink(self):
         # a stale/wrong symlink IS replaced — that's the documented
         # idempotency contract (re-run after the target moved).
@@ -718,6 +725,85 @@ class QwenCompatibility(M7Harness):
         # and no symlink exists (creation failed)
         self.assertFalse(
             (self.workspace / ".qwen" / "context").is_symlink())
+
+
+class LauncherExecBitSelfHeal(unittest.TestCase):
+    """hooks/run-guard's header + guards.py's docstring: a mode-stripping
+    distribution channel (GitHub "Download ZIP", a zip-extraction library
+    that drops unix modes, a manual Windows->POSIX copy) can deliver
+    hooks/run-guard or bin/harness non-executable — bash's `exec` clause
+    then fails 126 with no fallback, the platform reads that non-2 exit as
+    a NON-BLOCKING hook error, and every guard (including the fail-closed
+    spawn/skill guards) silently stops enforcing. `mark_bootstrapped` (the
+    one call both a fresh `init` and an `init-finalize` re-run funnel
+    through) self-heals the bit via `_restore_launcher_exec_bits`, which
+    takes an explicit `plugin_root` so these tests exercise a disposable
+    fixture copy and never chmod the real repo's own launcher files."""
+
+    def _fixture_root(self) -> Path:
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(support.rmtree, root, ignore_errors=True)
+        for rel in initws._LAUNCHER_FILES:
+            f = root / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("#!/usr/bin/env bash\necho stub\n", encoding="utf-8")
+        return root
+
+    @unittest.skipIf(os.name == "nt",
+                     "POSIX executable bit has no Windows meaning — the "
+                     "function is a documented no-op there")
+    def test_restores_stripped_exec_bit(self):
+        root = self._fixture_root()
+        for rel in initws._LAUNCHER_FILES:
+            (root / rel).chmod(0o644)   # strip the bit, as a mode-stripping channel would
+        initws._restore_launcher_exec_bits(plugin_root=root)
+        for rel in initws._LAUNCHER_FILES:
+            mode = (root / rel).stat().st_mode
+            self.assertTrue(mode & stat.S_IXUSR, f"{rel} not user-executable")
+            self.assertTrue(mode & stat.S_IXGRP, f"{rel} not group-executable")
+            self.assertTrue(mode & stat.S_IXOTH, f"{rel} not other-executable")
+
+    def test_already_correct_tree_changes_nothing_and_emits_nothing(self):
+        root = self._fixture_root()
+        if os.name != "nt":
+            for rel in initws._LAUNCHER_FILES:
+                (root / rel).chmod(0o755)
+        before = {rel: (root / rel).stat().st_mode
+                 for rel in initws._LAUNCHER_FILES}
+        with mock.patch("sys.stderr") as stderr:
+            initws._restore_launcher_exec_bits(plugin_root=root)
+        for rel in initws._LAUNCHER_FILES:
+            self.assertEqual((root / rel).stat().st_mode, before[rel])
+        stderr.write.assert_not_called()
+
+    @unittest.skipIf(os.name == "nt",
+                     "chmod is never reached on Windows (early return), so "
+                     "there is no failure path to warn about there")
+    def test_chmod_failure_warns_and_does_not_raise(self):
+        root = self._fixture_root()
+        for rel in initws._LAUNCHER_FILES:
+            (root / rel).chmod(0o644)   # needs a real fix, so chmod is reached
+        with mock.patch("os.chmod", side_effect=OSError("permission denied")), \
+                mock.patch("sys.stderr") as stderr:
+            initws._restore_launcher_exec_bits(plugin_root=root)   # must not raise
+        written = "".join(call.args[0] for call in stderr.write.call_args_list)
+        for rel in initws._LAUNCHER_FILES:
+            self.assertIn(rel, written)
+
+    def test_mark_bootstrapped_calls_the_self_heal(self):
+        """Wiring check: mark_bootstrapped is the one call both a fresh init
+        and an init-finalize re-run funnel through, so the self-heal must
+        run from there, unconditionally, on every call — not just on the
+        interview's happy path."""
+        with mock.patch.object(initws, "_restore_launcher_exec_bits") as heal:
+            workspace = Path(tempfile.mkdtemp())
+            self.addCleanup(support.rmtree, workspace, ignore_errors=True)
+            initws.write_section(workspace, "provider",
+                                 {"provider": {"work_item": "local-markdown",
+                                               "git": "local",
+                                               "stories_dir": "stories"}})
+            initws.mark_bootstrapped(workspace)
+        heal.assert_called_once_with()
 
 
 class AutoCreateStoriesDir(M7Harness):

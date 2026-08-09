@@ -37,7 +37,8 @@ yaml-free bash/write guards keep blocking); init-workspace verifies the
 dependency up front, and the HMAC chain (RC4) still detects authority-file
 tampering even with guards down — defense in depth, guard = fast-fail,
 chain = guarantee. The same posture covers a missing INTERPRETER: if the
-hook probe chain (hooks.json) finds no runnable python at all — including
+hook launcher pair (hooks/run-guard + run-guard.cmd, registered in
+hooks.json) finds no runnable python at all — including
 the Windows Store alias that answers to `python`/`python3` but only prints
 an install nag — the hook errors non-2 and the platform treats it as
 non-blocking. Accepted: pre-venv, nothing harness-y can execute anyway.
@@ -404,9 +405,15 @@ def _reviewer_bash_write_violation(cmd: str, cwd: Path) -> str | None:
 # human-input.ndjson indistinguishable from the human typing it — the
 # ledgers' sole protection is that ONLY the platform fires these). The
 # guard verbs (bash/write/read/spawn/skill) are not listed: invoking them
-# manually can only ever BLOCK.
+# manually can only ever BLOCK. Every SPELLING that reaches the dispatcher
+# must be anchored here, not just guards.py itself: the run-guard launcher
+# pair execs guards.py byte-for-byte, so an unanchored launcher spelling
+# is a clean bypass (adversarial-review finding on the launcher change,
+# CONFIRMED live — `run-guard user-prompt` allowed where
+# `guards.py user-prompt` blocked).
 HOOK_FORGE_RE = re.compile(
-    r"\bguards\.py\b" + _CMD_GAP + r"\b(?:user-prompt|post-spawn|subagent-stop)\b")
+    r"\b(?:guards\.py|run-guard(?:\.cmd)?)\b" + _CMD_GAP +
+    r"\b(?:user-prompt|post-spawn|subagent-stop)\b")
 PLANNER_STAMP_RE = re.compile(
     r"\bharness\b" + _CMD_GAP + r"\brepo-map-stamp\b")
 # Registration verbs are orchestrator-only: the scope is the HUMAN's
@@ -2115,6 +2122,17 @@ def main() -> None:
     # POSIX behavior).
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+    # stdin carries the platform's hook payload, which is ALWAYS UTF-8
+    # JSON — but a Windows pipe defaults to cp1252+surrogateescape, which
+    # decodes multibyte prompts into mojibake carrying lone surrogates:
+    # the capture verbs then either garble the evidence ledger or lose the
+    # record entirely when a surrogate hits ndjson's strict utf-8 encode
+    # (adversarial-review finding on the launcher change, CONFIRMED by
+    # probe). strict errors= is deliberate: genuinely non-UTF-8 bytes
+    # should land in the except below as an unparseable payload, taking
+    # each verb's declared fail-open/fail-closed posture.
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(encoding="utf-8")
     name = sys.argv[1] if len(sys.argv) > 1 else ""
     guard = GUARDS.get(name)
     if guard is None:

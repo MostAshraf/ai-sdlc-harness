@@ -41,23 +41,26 @@ echo "PLUGIN_ROOT=$R"
 
 The harness needs PyYAML; system pythons are often externally managed
 (PEP 668), so the plugin owns a venv that `bin/harness` resolves
-automatically on every future call:
+automatically on every future call. Bootstrap it through ONE dual-clause
+command — same shape as `hooks/run-guard`'s shell-agnostic launcher pair,
+for the same reason: the shell that ends up interpreting this line is
+picked by the platform, not by us. Claude Code's Bash tool always runs
+bash (Git Bash on Windows), but Qwen Code's `run_shell_command` tool
+shares hooks' shell-selection logic and falls back to cmd.exe on Windows
+outside an MSYS-flavored terminal, where a `NAME="$(command …)"`-shaped
+POSIX assignment is unparseable — cmd treats `=` as an argument
+delimiter, the same failure class the hook launchers were fixed for:
 
 ```
-PY="${CLAUDE_PLUGIN_ROOT}/.venv/bin/python"
-[ -x "$PY" ] || PY="${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe"
-"$PY" -c "import yaml" 2>/dev/null || {
-  SYS="$(command -v python3 || command -v python)" &&
-  "$SYS" -m venv "${CLAUDE_PLUGIN_ROOT}/.venv" &&
-  PY="${CLAUDE_PLUGIN_ROOT}/.venv/bin/python" &&
-  { [ -x "$PY" ] || PY="${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe"; } &&
-  "$PY" -m pip install --quiet pyyaml; }
+exec "${CLAUDE_PLUGIN_ROOT}/bin/setup-venv" || ${CLAUDE_PLUGIN_ROOT}/bin/setup-venv
 ```
 
-One snippet for every OS: the Bash tool is Git Bash on Windows, so this
-stays POSIX shell there too — the two `.venv` probes cover the `bin/` (POSIX)
-vs `Scripts/` (Windows) venv layouts, and the `python3 || python` fallback
-covers hosts where only one spelling exists. Until this step runs,
+`exec` replaces bash with the launcher, so the second clause only ever
+runs under cmd.exe (where `exec` fails fast and `||` falls through to the
+unquoted path, PATHEXT-resolved to `setup-venv.cmd`). Both halves probe
+the same two `.venv` layouts (`bin/` POSIX, `Scripts/` Windows) and the
+same `python3` → `python` fallback the old inline snippet used, then exit
+immediately once PyYAML is already importable. Until this step runs,
 `bin/harness` itself still works (it falls back to the same system
 interpreter probe, which is what fails on a PyYAML-less system — that's why
 this step exists), and the spawn/skill guards degrade open with a one-line
