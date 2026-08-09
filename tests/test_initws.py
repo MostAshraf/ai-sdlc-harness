@@ -620,6 +620,9 @@ class QwenCompatibility(M7Harness):
         plugin_root = str(Path(initws.__file__).resolve().parent.parent)
         self.assertEqual(settings["env"]["CLAUDE_PLUGIN_ROOT"], plugin_root)
 
+    @unittest.skipUnless(support.can_symlink(),
+                         "host cannot create symlinks (Windows: Developer "
+                         "Mode/admin); degrade path tested separately below")
     def test_mark_bootstrapped_symlinks_qwen_context_under_qwen(self):
         # bootstrap the context dir first (write_section creates it)
         initws.write_section(self.workspace, "provider",
@@ -678,6 +681,9 @@ class QwenCompatibility(M7Harness):
         self.assertIn("exists as a real", written)
         self.assertIn(".qwen/context", written)
 
+    @unittest.skipUnless(support.can_symlink(),
+                         "host cannot create symlinks (Windows: Developer "
+                         "Mode/admin); degrade path tested separately below")
     def test_link_qwen_context_repoints_stale_symlink(self):
         # a stale/wrong symlink IS replaced — that's the documented
         # idempotency contract (re-run after the target moved).
