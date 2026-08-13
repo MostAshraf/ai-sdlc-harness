@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ai-sdlc-harness — a governed multi-agent SDLC pipeline</title>
+<meta name="description" content="A governed multi-agent SDLC pipeline for Claude Code and Qwen Code. Plan, adversarial review, proven-red TDD, security scan, PR — with tamper-evident evidence at every step.">
+<link rel="canonical" href="https://mostashraf.github.io/ai-sdlc-harness/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="ai-sdlc-harness">
+<meta property="og:description" content="A governed multi-agent SDLC pipeline for Claude Code and Qwen Code. The model gets judgment; code gets the rules.">
+<meta property="og:url" content="https://mostashraf.github.io/ai-sdlc-harness/">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⛓️</text></svg>">
+<style>
+  :root {
+    --bg: #0d0f14;
+    --bg-raised: #14171f;
+    --bg-code: #0a0c11;
+    --line: #242936;
+    --line-soft: #1b1f29;
+    --fg: #e6e9f0;
+    --fg-dim: #99a1b3;
+    --fg-faint: #6b7386;
+    --accent: #d97757;
+    --accent-2: #7c6cf5;
+    --green: #3fb950;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #ffffff;
+      --bg-raised: #f7f8fa;
+      --bg-code: #0d0f14;
+      --line: #e2e5ea;
+      --line-soft: #eceef2;
+      --fg: #14171f;
+      --fg-dim: #545c6b;
+      --fg-faint: #7d8494;
+      --accent: #c2603f;
+      --accent-2: #5b4bd6;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.65 var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+
+  /* hero */
+  header {
+    border-bottom: 1px solid var(--line);
+    background:
+      radial-gradient(900px 380px at 15% -10%, rgba(217,119,87,.14), transparent 65%),
+      radial-gradient(700px 340px at 85% -20%, rgba(124,108,245,.13), transparent 65%);
+  }
+  .hero { padding: 76px 0 56px; }
+  h1 {
+    font: 600 clamp(30px, 6vw, 46px)/1.1 var(--mono);
+    letter-spacing: -.02em;
+    margin: 0 0 14px;
+  }
+  .tagline { font-size: clamp(17px, 2.4vw, 20px); color: var(--fg-dim); margin: 0 0 8px; max-width: 62ch; }
+  .tagline strong { color: var(--fg); font-weight: 600; }
+  .badges { display: flex; flex-wrap: wrap; gap: 7px; margin: 24px 0 30px; }
+  .badges img { height: 20px; display: block; }
+  .cta { display: flex; flex-wrap: wrap; gap: 10px; }
+  .btn {
+    display: inline-block; padding: 10px 18px; border-radius: 7px;
+    font: 500 14.5px/1 var(--sans); text-decoration: none;
+    border: 1px solid var(--line); color: var(--fg); background: var(--bg-raised);
+    transition: border-color .15s, transform .15s;
+  }
+  .btn:hover { border-color: var(--fg-faint); transform: translateY(-1px); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.primary:hover { filter: brightness(1.08); }
+
+  /* sections */
+  section { padding: 56px 0; border-bottom: 1px solid var(--line-soft); }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .11em; color: var(--fg-faint); margin: 0 0 22px; font-weight: 600; }
+  h3 { font-size: 16px; margin: 0 0 6px; font-weight: 600; }
+  p { margin: 0 0 16px; color: var(--fg-dim); }
+  p.lead { color: var(--fg); font-size: 17px; }
+
+  /* pipeline strip */
+  .flow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0 0 20px; }
+  .node {
+    font: 500 12.5px/1 var(--mono); padding: 8px 11px; border-radius: 6px;
+    border: 1px solid var(--line); background: var(--bg-raised); color: var(--fg-dim); white-space: nowrap;
+  }
+  .node.gate { border-color: var(--accent); color: var(--accent); background: rgba(217,119,87,.09); }
+  .node.out { border-color: var(--green); color: var(--green); background: rgba(63,185,80,.09); }
+  .arrow { color: var(--fg-faint); font-size: 12px; }
+  .legend { font-size: 13.5px; color: var(--fg-faint); }
+  .legend b { color: var(--accent); font-weight: 600; }
+
+  /* grid */
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1px; background: var(--line-soft); border: 1px solid var(--line-soft); border-radius: 10px; overflow: hidden; }
+  .cell { background: var(--bg); padding: 22px; }
+  .cell p { margin: 0; font-size: 14.5px; line-height: 1.6; }
+  .cell .k { font: 500 11px/1 var(--mono); color: var(--accent-2); letter-spacing: .06em; text-transform: uppercase; display: block; margin-bottom: 9px; }
+
+  /* code */
+  pre {
+    background: var(--bg-code); border: 1px solid var(--line); border-radius: 8px;
+    padding: 15px 17px; overflow-x: auto; margin: 0 0 12px;
+    font: 13.5px/1.7 var(--mono); color: #e6e9f0;
+  }
+  pre .c { color: #6b7386; }
+  pre .p { color: var(--accent); }
+  .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 22px; }
+  .cols h3 { font: 600 14px/1 var(--sans); color: var(--fg-dim); margin-bottom: 11px; }
+
+  /* providers */
+  .chips { display: flex; flex-wrap: wrap; gap: 7px; }
+  .chip { font: 500 12.5px/1 var(--mono); padding: 7px 11px; border: 1px solid var(--line); border-radius: 20px; color: var(--fg-dim); }
+
+  footer { padding: 40px 0 60px; font-size: 14px; color: var(--fg-faint); display: flex; flex-wrap: wrap; gap: 18px; justify-content: space-between; }
+  footer a { color: var(--fg-dim); text-decoration: none; }
+  footer a:hover { color: var(--accent); }
+  footer nav { display: flex; flex-wrap: wrap; gap: 18px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap hero">
+    <h1>ai-sdlc-harness</h1>
+    <p class="tagline">A <strong>governed multi-agent SDLC pipeline</strong> for Claude Code and Qwen Code. It drives a real engineering workflow — plan, adversarial plan review, proven-red TDD, security scan, PR, comment rounds — across one repo or many.</p>
+    <p class="tagline">The model gets judgment. Code gets the rules.</p>
+
+    <div class="badges">
+      <a href="https://github.com/MostAshraf/ai-sdlc-harness/actions/workflows/ci.yml"><img src="https://github.com/MostAshraf/ai-sdlc-harness/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status"></a>
+      <a href="https://github.com/MostAshraf/ai-sdlc-harness/releases/latest"><img src="https://img.shields.io/github/v/release/MostAshraf/ai-sdlc-harness?label=release&color=2ea44f" alt="Latest release"></a>
+      <a href="https://github.com/MostAshraf/ai-sdlc-harness/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License"></a>
+      <img src="https://img.shields.io/badge/Claude_Code-plugin-d97757" alt="Claude Code plugin">
+      <img src="https://img.shields.io/badge/Qwen_Code-extension-615ced" alt="Qwen Code extension">
+    </div>
+
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/MostAshraf/ai-sdlc-harness#install">Install</a>
+      <a class="btn" href="https://github.com/MostAshraf/ai-sdlc-harness">Source on GitHub</a>
+      <a class="btn" href="https://github.com/MostAshraf/ai-sdlc-harness/blob/main/CHANGELOG.md">Changelog</a>
+    </div>
+  </div>
+</header>
+
+<main>
+
+<section class="wrap">
+  <h2>The problem it solves</h2>
+  <p class="lead">Agentic coding tools will happily tell you a test passed, a review approved, and a plan was followed. The interesting question is what happens when that is not true.</p>
+  <p>This harness moves every mechanical rule out of prose the model is asked to obey and into code that simply runs. Pipeline shape is declared data read by both the orchestrator <em>and</em> the enforcement layer, so there is no second copy to drift. Workflow state is HMAC-chain-sealed and the evidence ledgers are append-only — an out-of-band edit surfaces as a refusal, not a surprise. Your reply at a human gate is captured verbatim by a hook and parsed by deterministic code, so the model cannot approve on your behalf.</p>
+</section>
+
+<section class="wrap">
+  <h2>Full mode, end to end</h2>
+  <div class="flow">
+    <span class="node">fetch + classify</span><span class="arrow">→</span>
+    <span class="node">intake</span><span class="arrow">→</span>
+    <span class="node">plan</span><span class="arrow">→</span>
+    <span class="node">adversarial panel</span><span class="arrow">→</span>
+    <span class="node gate">approve-plan</span><span class="arrow">→</span>
+    <span class="node">proven-red TDD</span><span class="arrow">→</span>
+    <span class="node gate">approve-impl</span><span class="arrow">→</span>
+    <span class="node">harden</span><span class="arrow">→</span>
+    <span class="node">security scan</span><span class="arrow">→</span>
+    <span class="node">pre-PR review</span><span class="arrow">→</span>
+    <span class="node gate">approve-pre-pr</span><span class="arrow">→</span>
+    <span class="node out">create PR</span><span class="arrow">→</span>
+    <span class="node out">reconcile + metrics</span>
+  </div>
+  <p class="legend"><b>Orange</b> steps are human gates. Everything between them runs hands-off. <strong>Lean mode</strong> keeps identical rigor but gates by exception — one stop, right before the PR. <strong>Quick mode</strong> handles trivial changes, and mechanically escalates itself back to full if the real diff turns out to be anything but.</p>
+</section>
+
+<section class="wrap">
+  <h2>What is actually enforced</h2>
+  <div class="grid">
+    <div class="cell">
+      <span class="k">Proof-anchored TDD</span>
+      <p>Writes to non-test paths are hook-refused until the test has been <em>observed</em> failing. The proof is sealed and the test set blob-SHA-locked, so a quietly weakened assertion refuses the completion transition.</p>
+    </div>
+    <div class="cell">
+      <span class="k">Verdicts, not paraphrases</span>
+      <p>A task cannot reach <span style="font-family:var(--mono)">done</span> without a hook-captured <span style="font-family:var(--mono)">APPROVED</span> in the ledger. The orchestrator cannot summarize a review into an approval.</p>
+    </div>
+    <div class="cell">
+      <span class="k">Owned git</span>
+      <p>Raw history-mutating git verbs are blocked inside a bootstrapped workspace. Every mutation goes through an entry point that validates, executes, and ledgers in one place.</p>
+    </div>
+    <div class="cell">
+      <span class="k">Fail-closed spawning</span>
+      <p>Only the subagent set the manifest declares for the current cursor position may be spawned — shape and mode header both checked, fail-closed even on ambiguity.</p>
+    </div>
+    <div class="cell">
+      <span class="k">Scoped planning</span>
+      <p>You confirm the target repos before a plan exists. Task registration then refuses anything outside that scope; widening mid-plan comes back through you.</p>
+    </div>
+    <div class="cell">
+      <span class="k">An audit trail that travels</span>
+      <p>Every deviation, token, verdict, and decision is ledgered and mirrored onto the feature branch at gate crossings — minus your raw replies, which never leave the workspace.</p>
+    </div>
+  </div>
+</section>
+
+<section class="wrap">
+  <h2>Install</h2>
+  <div class="cols">
+    <div>
+      <h3>Claude Code</h3>
+      <pre><span class="p">/plugin</span> marketplace add MostAshraf/ai-sdlc-harness
+<span class="p">/plugin</span> install ai-sdlc-harness@ai-sdlc-harness</pre>
+    </div>
+    <div>
+      <h3>Qwen Code</h3>
+      <pre>qwen extensions install MostAshraf/ai-sdlc-harness</pre>
+    </div>
+  </div>
+  <p>One repository, natively both — a Claude Code plugin and a Qwen Code extension, no conversion step. Restart the CLI so skills and hooks load, then:</p>
+  <pre><span class="p">/init-workspace</span>   <span class="c"># one-time interview: provider, repos, discovered toolchain</span>
+<span class="p">/dev-workflow</span> <span class="c">&lt;work-item-id&gt;</span></pre>
+  <p>Needs Git and Python 3.10+. No language prerequisites — toolchains are discovered, and the setup step builds its own venv without touching system Python.</p>
+</section>
+
+<section class="wrap">
+  <h2>Work-item providers</h2>
+  <div class="chips">
+    <span class="chip">local-markdown</span>
+    <span class="chip">github</span>
+    <span class="chip">gitlab</span>
+    <span class="chip">ado</span>
+    <span class="chip">ado-mcp</span>
+    <span class="chip">jira</span>
+    <span class="chip">zoho</span>
+  </div>
+  <p style="margin-top:16px">Code modules behind one interface, each held to a shared contract test. <span style="font-family:var(--mono);font-size:13.5px">local-markdown</span> needs nothing at all — work items are just files.</p>
+</section>
+
+</main>
+
+<footer class="wrap">
+  <span>MIT licensed · built by <a href="https://github.com/MostAshraf">Mostafa Ashraf</a></span>
+  <nav>
+    <a href="https://github.com/MostAshraf/ai-sdlc-harness">GitHub</a>
+    <a href="https://github.com/MostAshraf/ai-sdlc-harness#faq">FAQ</a>
+    <a href="https://github.com/MostAshraf/ai-sdlc-harness/blob/main/CONTRIBUTING.md">Contributing</a>
+    <a href="https://github.com/MostAshraf/ai-sdlc-harness/issues">Issues</a>
+  </nav>
+</footer>
+
+</body>
+</html>

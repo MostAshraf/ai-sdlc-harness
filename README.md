@@ -1,8 +1,13 @@
-# ai-sdlc-harness · v3.0
+# ai-sdlc-harness
 
+[![CI](https://github.com/MostAshraf/ai-sdlc-harness/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MostAshraf/ai-sdlc-harness/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/MostAshraf/ai-sdlc-harness?label=release&color=2ea44f)](https://github.com/MostAshraf/ai-sdlc-harness/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Claude Code](https://img.shields.io/badge/Claude_Code-plugin-d97757)](#claude-code)
+[![Qwen Code](https://img.shields.io/badge/Qwen_Code-extension-615ced)](#qwen-code)
 [![Available on CodeGuilds](https://img.shields.io/badge/Available_on-CodeGuilds-6366f1)](https://codeguilds.dev/packages/ai-sdlc-harness)
 
-**A governed multi-agent SDLC pipeline for Claude Code** — a ground-up rewrite of [ai-sdlc-harness](https://github.com/MostAshraf/ai-sdlc-harness). Drives a real engineering workflow — fetch → scope-confirmed plan → independent plan review → proven-red TDD → review → security → PR → comment rounds → reconcile → metrics — across one or many repos. No application code lives here: only the pipeline manifest, the Python core that enforces it, and the agents, skills, and hooks that run it.
+**A governed multi-agent SDLC pipeline for Claude Code and Qwen Code** — a ground-up rewrite of [ai-sdlc-harness](https://github.com/MostAshraf/ai-sdlc-harness). Drives a real engineering workflow — fetch → scope-confirmed plan → independent plan review → proven-red TDD → review → security → PR → comment rounds → reconcile → metrics — across one or many repos. No application code lives here: only the pipeline manifest, the Python core that enforces it, and the agents, skills, and hooks that run it.
 
 | Command | Purpose |
 |---|---|

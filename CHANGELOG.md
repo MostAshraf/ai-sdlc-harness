@@ -6,6 +6,28 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
+- Project presence, no behavior change to the pipeline itself. The README
+  title no longer carries a hand-maintained version (it read `v3.0` four
+  releases after 3.0), and the tagline now names **Qwen Code** alongside
+  Claude Code — the dual-native support has shipped since 3.5.0 but the
+  first line a visitor reads still said Claude Code only. Added a badge row
+  whose release badge reads the latest tag, so it cannot go stale the way
+  the title did.
+- Added the GitHub community set: `CONTRIBUTING.md` (the three enforcing
+  checks, the Windows lane, the fail-open/fail-closed convention),
+  `CODE_OF_CONDUCT.md`, `SECURITY.md` (scoped to what this project's
+  security surface actually is — evidence integrity and the guard layer —
+  with the deliberately accepted limits listed so they are not re-reported),
+  issue forms for bug/feature, and a PR template whose checklist is the
+  three checks plus a blast-radius section for declared data and guards.
+- Added a landing page under `docs/` for GitHub Pages.
+- CI now also runs on push to `main`, not only on pull requests. A squash
+  merge is one push, so this is one extra matrix run per release rather than
+  the every-branch double-billing the workflow comment rejects — and it is
+  what lets the README's CI badge describe `main` at all, since
+  `pull_request` runs attach to the PR head branch and never to the default
+  branch.
+
 ## [3.5.1] — 2026-08-09
 
 > **v3.5.0 shipped Qwen Code support; running it on Windows outside a Git-Bash terminal broke it completely, the same day.** Every guard hook — and, it turned out, the `/init-workspace` venv bootstrap that hits the identical code path — was built on a POSIX shell one-liner that Qwen's Windows fallback shell (`cmd.exe`) cannot parse, so every prompt and tool call died on a hook error before reaching the model. This release closes that gap with a shell-agnostic launcher pattern, then hardens it: an adversarial review of the fix itself found and closed a way the new launchers could be forged into minting fake gate evidence, a Windows encoding bug that could garble or drop a captured prompt, and a silent failure mode if a launcher's executable bit gets stripped in transit.

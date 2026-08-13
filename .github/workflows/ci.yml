@@ -6,9 +6,9 @@
 # layer grew nt-scoped path handling — see CHANGELOG [3.0.3].
 name: ci
 
-# PR-only, deliberately. A bare `push:` (every push, every branch) ran the
-# whole matrix a SECOND time for any push to a branch with an open PR —
-# 6 jobs billed as 12, both reporting the same tree.
+# PRs plus `main` only, deliberately narrow. A bare `push:` (every push,
+# every branch) ran the whole matrix a SECOND time for any push to a branch
+# with an open PR — 6 jobs billed as 12, both reporting the same tree.
 #
 # No `types:` filter: the default (opened + synchronize + reopened) is
 # load-bearing, not incidental. `synchronize` is what re-tests commits
@@ -19,6 +19,14 @@ name: ci
 on:
   pull_request:
 
+  # `main` itself, post-merge. Releases squash-merge, so this is ONE push per
+  # release — one extra matrix run, not the every-branch double-billing above.
+  # It is also the only way the README's CI badge can describe `main`:
+  # pull_request runs attach to the PR head branch, never to the default
+  # branch, so a PR-only workflow renders a permanent "no status" badge.
+  push:
+    branches: [main]
+
 jobs:
   test:
     strategy:
@@ -28,8 +36,8 @@ jobs:
         python: ["3.10", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - name: Install runtime deps

@@ -1,0 +1,53 @@
+name: Feature request
+description: Propose a capability, provider, mode, or guard
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Most changes here touch declared data ([pipeline/manifest.yaml](../../pipeline/manifest.yaml), [pipeline/surfaces.yaml](../../pipeline/surfaces.yaml)) as well as code, so agreeing on the shape before the diff exists saves real work. See [CONTRIBUTING.md](../../CONTRIBUTING.md).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you unable to do today? Describe the situation, not the solution you have in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you'd like instead
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of the harness
+      options:
+        - Work-item provider (Jira, ADO, GitHub, GitLab, Zoho, local-markdown, new one)
+        - Pipeline mode (full / lean / quick / new one)
+        - Pipeline step or gate
+        - Guardrail hook
+        - The `harness` CLI
+        - Agent shape (planner / developer / reviewer)
+        - Workspace setup or config
+        - Docs
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Including "configure it per workspace instead" or "do it outside the harness" — knowing what you ruled out is useful.
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Would you be up for implementing it?
+      options:
+        - label: I'd be willing to open a PR for this

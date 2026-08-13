@@ -1,0 +1,97 @@
+name: Bug report
+description: Something in the harness behaves differently than documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. The fields below are the ones that actually shorten a diagnosis — CLI, OS, and the exit code usually narrow it to a single guard or verb.
+
+        **Do not paste secrets.** `.claude/context/.harness-key` and the contents of `human-input.ndjson` never need to leave your machine.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. /init-workspace with provider `local-markdown`
+        2. /dev-workflow US-42
+        3. At the plan gate, replied `APPROVED`
+        4. ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: cli
+    attributes:
+      label: Which CLI
+      options:
+        - Claude Code
+        - Qwen Code (native extension)
+        - Qwen Code (converted Claude plugin)
+        - Both
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Linux
+        - macOS
+        - Windows (Git Bash terminal)
+        - Windows (PowerShell / cmd.exe terminal)
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Harness version
+      description: From `.claude-plugin/plugin.json`, or the release you installed.
+      placeholder: "3.5.1"
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12.4"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: exit-code
+    attributes:
+      label: Exit code, if a `harness` verb refused
+      description: "0 ok · 1 refused · 2 usage error · 3 integrity violation"
+      options:
+        - "Not applicable"
+        - "1 — refused"
+        - "2 — usage error"
+        - "3 — integrity violation"
+        - "Other / crash"
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Relevant output
+      description: |
+        The error text, and where useful the tail of `ai/<run>/events.ndjson` — it records every deviation, block, and stall. Also useful: `/workflow-status` output.
+      render: text
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Non-default config, an unusual install path, a workspace migrated from v2.x, and so on.
