@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: FAQ — resume, abort, exit code 3, mode selection
+    url: https://github.com/MostAshraf/ai-sdlc-harness#faq
+    about: Most "is this broken?" questions are answered here first.
+  - name: Running under Qwen Code
+    url: https://github.com/MostAshraf/ai-sdlc-harness#running-under-qwen-code
+    about: Permissions mirroring, CLAUDE_PLUGIN_ROOT, folder trust, subagent models.
+  - name: Report a security vulnerability
+    url: https://github.com/MostAshraf/ai-sdlc-harness/security/advisories/new
+    about: Report privately. Please do not open a public issue.
