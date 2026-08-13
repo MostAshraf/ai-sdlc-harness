@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Most changes here touch declared data ([pipeline/manifest.yaml](../../pipeline/manifest.yaml), [pipeline/surfaces.yaml](../../pipeline/surfaces.yaml)) as well as code, so agreeing on the shape before the diff exists saves real work. See [CONTRIBUTING.md](../../CONTRIBUTING.md).
+        Most changes here touch declared data ([pipeline/manifest.yaml](https://github.com/MostAshraf/ai-sdlc-harness/blob/main/pipeline/manifest.yaml), [pipeline/surfaces.yaml](https://github.com/MostAshraf/ai-sdlc-harness/blob/main/pipeline/surfaces.yaml)) as well as code, so agreeing on the shape before the diff exists saves real work. See [CONTRIBUTING.md](https://github.com/MostAshraf/ai-sdlc-harness/blob/main/CONTRIBUTING.md).
 
   - type: textarea
     id: problem
