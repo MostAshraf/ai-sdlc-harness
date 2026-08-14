@@ -27,6 +27,17 @@ All notable changes to `ai-sdlc-harness` are documented here.
   what lets the README's CI badge describe `main` at all, since
   `pull_request` runs attach to the PR head branch and never to the default
   branch.
+- .NET/C# projects can now follow the test-first path at all. The default
+  test-path conventions covered Python, JavaScript and the Maven layout, but
+  nothing a C# project uses — so a .NET task's very first test write was
+  refused as "not a test path", and the only way forward was turning the
+  ordering gate off. `*Test.cs`, `*Tests.cs`, and every file inside a
+  `*.Tests` project now count as tests. That last entry is deliberately
+  broader than the per-file Java conventions beside it: .NET keeps its tests
+  in a sibling `Foo.Tests` project whose fixtures and `Usings.cs` are part of
+  the test surface, and it opens pre-red write access to that directory only.
+  Workspace discovery still has no marker for `.sln`/`.csproj`, so a .NET
+  repo's test command is still set by hand during `/init-workspace`.
 
 ## [3.5.1] — 2026-08-09
 

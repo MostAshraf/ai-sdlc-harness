@@ -91,7 +91,14 @@ tags: {}
 #   surface the test-first ordering guard allows BEFORE a task's red-proof is
 #   sealed — so the defaults must cover the mainstream layouts (field report:
 #   the Python/JS-only defaults would have stranded a Maven developer at the
-#   first `src/test/**` write).
+#   first `src/test/**` write; the same gap stranded .NET, whose tests are
+#   neither under a `tests/` root nor named like any glob here).
+#   `**/*.Tests/**` is a PROJECT-directory glob, unlike every per-file entry
+#   beside it: .NET puts tests in their own `Foo.Tests` project, and its
+#   non-`*Tests.cs` members (fixtures, builders, `Usings.cs`) are part of the
+#   test surface. Broader than the Java globs on purpose — a test project
+#   holds only test code — and it costs pre-red write access to that
+#   directory, nothing outside it.
 # test_closure: existing files SHA-locked WITH the tests (fixtures/config —
 # the RC4 widening: weakening a shared fixture must not evade the lock).
 # pre_red_paths: additionally writable before the red-proof is sealed — build
@@ -101,7 +108,8 @@ tags: {}
 language:
   test_paths: ["tests/**", "**/test_*.py", "**/*_test.*", "**/*.test.*",
                "**/*.spec.*", "src/test/**", "**/*Test.java", "**/*Tests.java",
-               "**/__tests__/**"]
+               "**/__tests__/**", "**/*Test.cs", "**/*Tests.cs",
+               "**/*.Tests/**"]
   test_closure: ["**/conftest.py", "pytest.ini", "tests/**", "src/test/**"]
   pre_red_paths: ["**/pom.xml", "**/build.gradle", "**/build.gradle.kts",
                   "**/settings.gradle", "**/settings.gradle.kts",

@@ -1215,6 +1215,43 @@ class TddOrderingGuard(GuardHarness):
         self.assert_allows(
             "bash", bash(f'cd "{wt_sh}" && rm -rf target && mvn -q test', dev))
 
+    def test_dotnet_test_surface_writable_pre_red(self):
+        """The Maven field report's exact shape, one stack over: a .NET repo
+        keeps its tests in a sibling `Foo.Tests` PROJECT — no `tests/` root,
+        no name any pre-existing glob matched — so the first test write was
+        refused as 'not a test path' with no way forward but disabling the
+        gate."""
+        run, wt = self._tdd_run()
+        dev = "x:developer"
+        for ok in ("src/Calc.Tests/CalculatorTests.cs",   # **/*Tests.cs
+                   "src/Calc.Tests/AdderTest.cs",         # **/*Test.cs (singular)
+                   # root-level, past NO directory: the `**/`-prefix trap
+                   # test_contracts.test_root_level_test_file_still_excluded
+                   # exists for — _match's anchored retry is what catches it
+                   "CalculatorTests.cs",
+                   # a test project's non-`*Tests.cs` members are test surface
+                   # too, and only `**/*.Tests/**` reaches them
+                   "src/Calc.Tests/Fixtures/OrderBuilder.cs",
+                   "src/Calc.Tests/Usings.cs"):
+            self.assert_allows("write", self._w(str(wt / ok), dev))
+
+    def test_dotnet_production_still_blocked_pre_red(self):
+        """The widening's mutation case. `**/*.Tests/**` is the one directory
+        glob in test_paths; if it leaked past the `.Tests/` component it
+        would unlock production writes for every .NET repo — the gate would
+        report green while enforcing nothing."""
+        run, wt = self._tdd_run()
+        dev = "x:developer"
+        for blocked in ("src/Calc.API/Calculator.cs",
+                        # near-misses on the directory glob: `.Tests` must be
+                        # a whole path component, not a name PREFIX
+                        "src/Calc.TestSupport/Helper.cs",
+                        "src/Calc.Tests.Shared/Helper.cs",
+                        # ...and `Tests` alone is not `*Tests.cs`
+                        "src/Calc.API/TestsController.cs"):
+            self.assert_blocks("write", self._w(str(wt / blocked), dev),
+                               "red-proof")
+
     def test_unlocks_once_red_proof_sealed(self):
         run, wt = self._tdd_run()
         (run / ".redproof").mkdir()
