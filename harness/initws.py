@@ -71,7 +71,121 @@ def _coverage_proposal(marker: str, marker_dir: Path,
 # Directories that hold generated/vendored content, never a hand-authored
 # subproject worth proposing as its own monorepo logical-repo (a Nuxt/Nitro
 # `.output/server/package.json`, a `dist`/`build`/`target` bundle, ...).
-EXCLUDED_DIRS = {".venv", "node_modules", ".output", "dist", "build", "target"}
+# `bin`/`obj` are .NET's pair, carrying the same risk `build` already
+# accepted — a repo whose hand-authored sources live in a directory of that
+# name is skipped. Worth it: a built solution puts hundreds of files under
+# each one, at every project, and the walk lists every directory it enters.
+EXCLUDED_DIRS = {".venv", "node_modules", ".output", "dist", "build", "target",
+                 "bin", "obj"}
+
+# .NET is matched by EXTENSION, not by filename — a solution/project file
+# carries the project's own name, so there is no fixed string for MARKERS to
+# key on. Kept a separate table for a second reason: its hits must NOT be
+# one-per-matching-file the way MARKERS' are (see _dotnet_roots).
+DOTNET_SOLUTION_SUFFIXES = (".sln", ".slnx")   # .slnx: the .NET 9 XML format
+DOTNET_PROJECT_SUFFIX = ".csproj"
+DOTNET_TEST_CMD = "dotnet test"
+_TRACKED_SUFFIXES = frozenset((*DOTNET_SOLUTION_SUFFIXES,
+                               DOTNET_PROJECT_SUFFIX))
+
+
+def _dotnet_roots(by_suffix: dict[str, list[Path]]) -> list[Path]:
+    """Which directories are .NET logical repos.
+
+    A solution file WINS outright: it names the projects it builds, and one
+    `dotnet test` there covers all of them. Proposing per `.csproj` instead
+    would turn an ordinary five-project solution into five logical repos,
+    each with its own `dotnet test` — a monorepo_split the user then has to
+    undo by hand. Cost of the rule, accepted for predictability: a `.csproj`
+    outside any solution's subtree is swallowed when a solution exists
+    elsewhere in the repo.
+
+    Nested solutions collapse to the outermost — a root `All.sln` beside
+    `tools/Tools.sln` is one buildable unit, and proposing both would nest
+    one logical repo inside another.
+
+    With no solution anywhere, sibling projects still collapse, to their
+    common ancestor, for the same no-fan-out reason. That ancestor often
+    holds no project file itself, and `dotnet test` cannot answer such a
+    directory — so the root is still proposed (it IS the repo boundary) but
+    _dotnet_command returns no `test_cmd` for it. An earlier revision left a
+    bare `dotnet test` there on the theory that the interview's probe would
+    catch it; adversarial review measured that it does not — see
+    _dotnet_command for why that failure is silent until verify-red.
+    Deliberately still no guess at which project is the test project.
+
+    NOTE (accepted limit, not a bug): discover()'s `depth` cut applies to
+    this walk, so a solution deeper than `depth` is not seen at all, and in
+    a deep layout the coverage evidence under it may be out of reach while
+    the root itself is found. `src/Services/<Area>/<Project>/` exceeds the
+    default 3.
+    """
+    solutions = sorted({f.parent for suffix in DOTNET_SOLUTION_SUFFIXES
+                        for f in by_suffix.get(suffix, [])})
+    if solutions:
+        return [d for d in solutions
+                if not any(other in d.parents for other in solutions)]
+    projects = sorted({f.parent for f in
+                       by_suffix.get(DOTNET_PROJECT_SUFFIX, [])})
+    if not projects:
+        return []
+    return [Path(os.path.commonpath([str(p) for p in projects]))]
+
+
+def _dotnet_command(root: Path, by_suffix: dict[str, list[Path]]) -> str | None:
+    """The `dotnet test` invocation for `root`, or None when no single one
+    covers it.
+
+    `dotnet test` resolves a project or solution IN ITS OWN DIRECTORY, never
+    recursively, and refuses two ways: MSB1003 when the directory holds
+    none, MSB1011 when it holds several. Both exit 1 with `dotnet` itself
+    resolvable — which verify()'s invocability gate reports as PASS, since
+    it deliberately can't fail a legitimately-red suite on its exit code.
+
+    So a bare `dotnet test` proposed for a directory that cannot answer it
+    survives init entirely, and only detonates later: verify-red accepts ANY
+    non-zero exit, so it seals a red-proof over a BUILD error with no test
+    ever having run, and verify-green — which needs exit 0 — can then never
+    be reached. The task wedges. Naming the file removes the ambiguity case
+    (`App.sln` beside `App.slnx` is exactly the state a .NET 9 migration
+    passes through), and returning None removes the other: the interview
+    asks for a command instead of confirming one that cannot work.
+    """
+    def named(paths: list[Path]) -> list[str]:
+        return sorted(f.name for f in paths if f.parent == root)
+
+    here = named([f for suffix in DOTNET_SOLUTION_SUFFIXES
+                  for f in by_suffix.get(suffix, [])])
+    if not here:
+        here = named(by_suffix.get(DOTNET_PROJECT_SUFFIX, []))
+    if len(here) != 1:
+        return None
+    target = here[0]
+    if " " in target:
+        target = f'"{target}"'
+    return f"{DOTNET_TEST_CMD} {target}"
+
+
+def _dotnet_coverage(root: Path, projects: list[Path]) -> bool:
+    """Whether repo EVIDENCE justifies a coverage proposal for `root`, the
+    same bar node and java are held to: the `coverlet.collector` package is
+    what makes `--collect:"XPlat Code Coverage"` work at all, so without it
+    the flag just produces an empty report. `coverlet.msbuild` is a
+    DIFFERENT integration driven by `/p:CollectCoverage=true` —
+    deliberately not detected here rather than answered with the wrong flag.
+
+    Confined to `root`'s own subtree, so in a multi-solution repo one
+    solution's coverlet reference can't justify a proposal for another."""
+    for path in projects:
+        if not path.is_relative_to(root):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "coverlet.collector" in text.lower():
+            return True
+    return False
 
 # tool binary -> project-local wrapper script: prefer the wrapper when the
 # marker's directory has one, since a bare global command only works if
@@ -108,6 +222,12 @@ def discover(repo: Path, depth: int = 3, branch: str | None = None) -> dict:
     # `depth`; found markers land in MARKERS order, sorted per marker,
     # exactly as the rglob version emitted them.
     by_marker: dict[str, list[Path]] = {}
+    # Extension-keyed hits ride the SAME walk (full file paths — _dotnet_
+    # coverage has to read the project files, not just locate them). Only
+    # the suffixes actually in the table are bucketed: keying every
+    # extension would grow a dict entry per .py/.js/.png in the repo for
+    # nothing.
+    by_suffix: dict[str, list[Path]] = {}
     for dirpath, dirnames, filenames in os.walk(repo):
         rel = Path(dirpath).relative_to(repo)
         rel_parts = rel.parts
@@ -118,6 +238,9 @@ def discover(repo: Path, depth: int = 3, branch: str | None = None) -> dict:
                            if d not in EXCLUDED_DIRS and not d.startswith(".")]
         for name in filenames:
             by_marker.setdefault(name, []).append(Path(dirpath))
+            suffix = os.path.splitext(name)[1].lower()
+            if suffix in _TRACKED_SUFFIXES:
+                by_suffix.setdefault(suffix, []).append(Path(dirpath) / name)
     hits = []
     for marker, lang, test_cmd, coverage_cmd in MARKERS:
         for marker_dir in sorted(by_marker.get(marker, [])):
@@ -128,6 +251,22 @@ def discover(repo: Path, depth: int = 3, branch: str | None = None) -> dict:
             if cov:
                 hit["coverage_cmd"] = _wrapper_test_cmd(marker_dir, cov)
             hits.append(hit)
+    # Appended after the MARKERS block, not interleaved: .NET resolves its
+    # roots across the whole walk at once, so it has no place in a
+    # per-marker loop. No _wrapper_test_cmd — `dotnet` has no project-local
+    # wrapper the way maven has mvnw.
+    for root in _dotnet_roots(by_suffix):
+        hit = {"language": "dotnet", "root": str(root.relative_to(repo))}
+        # `test_cmd` is OMITTED, not guessed, when no single project or
+        # solution answers this root (_dotnet_command). Coverage hangs off
+        # the same resolved target: proposing a coverage command for a test
+        # command we couldn't name would be the same guess one level up.
+        cmd = _dotnet_command(root, by_suffix)
+        if cmd:
+            hit["test_cmd"] = cmd
+            if _dotnet_coverage(root, by_suffix.get(DOTNET_PROJECT_SUFFIX, [])):
+                hit["coverage_cmd"] = f'{cmd} --collect:"XPlat Code Coverage"'
+        hits.append(hit)
     roots = {h["root"] for h in hits}
     return {"proposals": hits,
             "monorepo_split": sorted(roots) if len(roots) > 1 else None,

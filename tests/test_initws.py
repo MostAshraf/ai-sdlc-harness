@@ -186,6 +186,192 @@ class Discovery(M7Harness):
         java = next(p for p in out["proposals"] if p["language"] == "java")
         self.assertEqual(java["test_cmd"], "mvn -q test")
 
+    def _discover_dotnet(self, files: dict):
+        """Write a .NET-shaped tree, commit it, and return the discover
+        payload. Values are file CONTENT; a `.csproj` needs real text
+        because coverage detection reads it."""
+        for rel, body in files.items():
+            path = self.repo / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+        gitops.run_git(self.repo, "add", "-A")
+        gitops.run_git(self.repo, "commit", "-m", "dotnet")
+        out = self.cli("discover", "--repo", str(self.repo))
+        return out, [p for p in out["proposals"] if p["language"] == "dotnet"]
+
+    CSPROJ = "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>\n"
+
+    def test_dotnet_solution_is_one_repo_not_one_per_project(self):
+        """THE reason .NET can't reuse the per-file MARKERS path: an
+        ordinary solution has a `.csproj` per project, so matching those
+        would propose five logical repos — each with its own `dotnet test`
+        — for one buildable unit, leaving the user to undo the split."""
+        out, dotnet = self._discover_dotnet({
+            "App.sln": "Microsoft Visual Studio Solution File\n",
+            "src/App.API/App.API.csproj": self.CSPROJ,
+            "src/App.Core/App.Core.csproj": self.CSPROJ,
+            "tests/App.Tests/App.Tests.csproj": self.CSPROJ})
+        self.assertEqual(len(dotnet), 1)
+        self.assertEqual(dotnet[0]["root"], ".")
+        # names the solution: a bare `dotnet test` is ambiguous the moment a
+        # second solution file appears beside it
+        self.assertEqual(dotnet[0]["test_cmd"], "dotnet test App.sln")
+        self.assertIsNone(out["monorepo_split"])
+
+    def test_dotnet_nested_solutions_collapse_to_outermost(self):
+        """A root solution beside a nested one is still one buildable unit;
+        proposing both would nest one logical repo inside another."""
+        out, dotnet = self._discover_dotnet({
+            "All.sln": "solution\n",
+            "tools/Tools.sln": "solution\n",
+            "tools/Gen/Gen.csproj": self.CSPROJ})
+        self.assertEqual([p["root"] for p in dotnet], ["."])
+
+    def test_dotnet_without_solution_collapses_to_common_ancestor(self):
+        """No solution file (SDK-style repos sometimes skip it): sibling
+        projects must still collapse rather than fan out. The ancestor holds
+        no project file itself, so it gets a root but NO test_cmd — see
+        test_dotnet_ambiguous_root_gets_no_test_cmd_guess for why guessing
+        one there wedges the task rather than failing at init."""
+        out, dotnet = self._discover_dotnet({
+            "src/App.API/App.API.csproj": self.CSPROJ,
+            "src/App.Tests/App.Tests.csproj": self.CSPROJ})
+        self.assertEqual(len(dotnet), 1)
+        self.assertEqual(Path(dotnet[0]["root"]).as_posix(), "src")
+        self.assertNotIn("test_cmd", dotnet[0])
+
+    def test_dotnet_slnx_recognised_as_a_solution(self):
+        """.NET 9's XML solution format — a repo that has migrated to it
+        must not fall through to the no-solution csproj path."""
+        out, dotnet = self._discover_dotnet({
+            "App.slnx": "<Solution />\n",
+            "src/App.API/App.API.csproj": self.CSPROJ})
+        self.assertEqual([p["root"] for p in dotnet], ["."])
+
+    COVERLET = ("<Project><ItemGroup><PackageReference "
+                "Include=\"coverlet.collector\" Version=\"6.0.0\" />"
+                "</ItemGroup></Project>\n")
+
+    def test_dotnet_without_coverlet_proposes_no_coverage(self):
+        """Same bar as the jacoco and vitest rules: propose a coverage
+        command only where the repo proves it works. Kept a separate test
+        from the positive case — sharing one repo across both halves left
+        `App.sln` on disk for the second, so it re-ran the solution path
+        while reading as the no-solution one (adversarial review)."""
+        out, dotnet = self._discover_dotnet({
+            "App.sln": "solution\n",
+            "tests/App.Tests/App.Tests.csproj": self.CSPROJ})
+        self.assertNotIn("coverage_cmd", dotnet[0])
+
+    def test_dotnet_coverlet_is_detection_not_guessing(self):
+        out, dotnet = self._discover_dotnet({
+            "App.sln": "solution\n",
+            "tests/App.Tests/App.Tests.csproj": self.COVERLET})
+        self.assertEqual(dotnet[0]["coverage_cmd"],
+                         'dotnet test App.sln --collect:"XPlat Code Coverage"')
+
+    def test_dotnet_coverage_evidence_confined_to_its_own_root(self):
+        """The rejecting direction of _dotnet_coverage's subtree filter,
+        which nothing else exercises: one solution's coverlet reference must
+        not justify a coverage proposal for a DIFFERENT solution."""
+        out, dotnet = self._discover_dotnet({
+            "backend/B.sln": "solution\n",
+            "backend/src/B/B.csproj": self.CSPROJ,
+            "tools/T.sln": "solution\n",
+            "tools/Gen/Gen.csproj": self.COVERLET})
+        by_root = {p["root"]: p for p in dotnet}
+        self.assertEqual(set(by_root), {"backend", "tools"})
+        self.assertNotIn("coverage_cmd", by_root["backend"])
+        self.assertIn("coverage_cmd", by_root["tools"])
+
+    def test_dotnet_csproj_outside_any_solution_is_swallowed(self):
+        """The precedence rule's ACCEPTED COST, pinned. Adversarial review
+        mutated _dotnet_roots to also return project dirs outside every
+        solution subtree and all other tests stayed green — the losing half
+        of the rule was unpinned. `standalone/` is deliberately invisible,
+        and its coverlet evidence deliberately discarded."""
+        out, dotnet = self._discover_dotnet({
+            "backend/B.sln": "solution\n",
+            "backend/src/B/B.csproj": self.CSPROJ,
+            "standalone/Tool/Tool.csproj": self.COVERLET})
+        self.assertEqual([p["root"] for p in dotnet], ["backend"])
+        self.assertNotIn("coverage_cmd", dotnet[0])
+
+    def test_dotnet_ambiguous_root_gets_no_test_cmd_guess(self):
+        """`dotnet test` resolves a project/solution in its OWN directory
+        and refuses when there are none (MSB1003) or several (MSB1011) —
+        both exit 1 with `dotnet` on PATH, which init-verify's invocability
+        gate reports as PASS. A guessed command therefore survives init and
+        detonates at verify-red, which accepts any non-zero exit and seals a
+        red-proof over a BUILD error that verify-green can never clear.
+        Omit the key instead (adversarial review, both lenses)."""
+        # no solution: the common ancestor holds no project file itself
+        out, dotnet = self._discover_dotnet({
+            "src/App/App.csproj": self.CSPROJ,
+            "tests/App.Tests/App.Tests.csproj": self.CSPROJ})
+        self.assertEqual(dotnet[0]["root"], ".")
+        self.assertNotIn("test_cmd", dotnet[0])
+        self.assertNotIn("coverage_cmd", dotnet[0])
+
+    def test_dotnet_sln_beside_slnx_is_ambiguous_not_guessed(self):
+        """The .NET 9 migration state this round added `.slnx` for: two
+        solution files in one directory is MSB1011, not a free choice."""
+        out, dotnet = self._discover_dotnet({
+            "App.sln": "solution\n", "App.slnx": "<Solution />\n",
+            "src/App/App.csproj": self.CSPROJ})
+        self.assertEqual(dotnet[0]["root"], ".")
+        self.assertNotIn("test_cmd", dotnet[0])
+
+    def test_dotnet_target_with_spaces_is_quoted(self):
+        """The proposal is run through a shell (`shell=True` in
+        gitops._run_tests), so an unquoted `dotnet test My App.sln` would
+        split into two arguments and fail as MSB1011/MSB1003 — the exact
+        class _dotnet_command exists to prevent."""
+        out, dotnet = self._discover_dotnet({"My App.sln": "solution\n",
+                                             "src/App/App.csproj": self.CSPROJ})
+        self.assertEqual(dotnet[0]["test_cmd"], 'dotnet test "My App.sln"')
+
+    def test_dotnet_single_project_repo_names_its_csproj(self):
+        """No solution but one project in the root: nameable, so it gets a
+        command — naming the file is what removes the MSB1011 class."""
+        out, dotnet = self._discover_dotnet({"App.Tests.csproj": self.CSPROJ})
+        self.assertEqual(dotnet[0]["test_cmd"], "dotnet test App.Tests.csproj")
+
+    def test_dotnet_msbuild_coverlet_gets_no_proposal(self):
+        """`coverlet.msbuild` drives coverage through
+        `/p:CollectCoverage=true`, NOT `--collect:"XPlat Code Coverage"` —
+        the collector's absence must mean no proposal, not the wrong flag
+        (the empty-report failure mode is silent)."""
+        out, dotnet = self._discover_dotnet({
+            "tests/App.Tests/App.Tests.csproj":
+                "<Project><ItemGroup><PackageReference "
+                "Include=\"coverlet.msbuild\" Version=\"6.0.0\" />"
+                "</ItemGroup></Project>\n"})
+        self.assertNotIn("coverage_cmd", dotnet[0])
+
+    def test_dotnet_build_output_excluded_from_discovery(self):
+        """`bin`/`obj` hold copies and generated project files; counting
+        them would invent roots that are not hand-authored subprojects."""
+        out, dotnet = self._discover_dotnet({
+            "App.sln": "solution\n",
+            "src/App.API/App.API.csproj": self.CSPROJ,
+            "src/App.API/bin/Release/App.API.csproj": self.CSPROJ,
+            "src/App.API/obj/Stale.sln": "solution\n"})
+        self.assertEqual([p["root"] for p in dotnet], ["."])
+
+    def test_dotnet_alongside_node_proposes_monorepo_split(self):
+        """The field shape this round exists for: a .NET backend beside a
+        Node frontend used to discover as frontend-only, so the backend
+        silently got no test command and the pipeline never ran its tests."""
+        out, dotnet = self._discover_dotnet({
+            "backend/App.sln": "solution\n",
+            "backend/src/App.API/App.API.csproj": self.CSPROJ,
+            "frontend/package.json": "{}"})
+        self.assertEqual(out["monorepo_split"], ["backend", "frontend"])
+        self.assertEqual([p["root"] for p in dotnet], ["backend"])
+        self.assertEqual({p["language"] for p in out["proposals"]},
+                         {"dotnet", "node"})
+
     def test_switches_to_default_branch_and_reflects_its_state(self):
         """A repo left on a non-default branch must be scanned on the
         DEFAULT branch's state, not whatever branch it was left on."""

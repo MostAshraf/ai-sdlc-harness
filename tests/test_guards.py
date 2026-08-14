@@ -1215,6 +1215,112 @@ class TddOrderingGuard(GuardHarness):
         self.assert_allows(
             "bash", bash(f'cd "{wt_sh}" && rm -rf target && mvn -q test', dev))
 
+    def test_dotnet_test_surface_writable_pre_red(self):
+        """The Maven field report's exact shape, one stack over: a .NET repo
+        keeps its tests in a sibling `Foo.Tests` PROJECT — no `tests/` root,
+        no name any pre-existing glob matched — so the first test write was
+        refused as 'not a test path' with no way forward but disabling the
+        gate."""
+        run, wt = self._tdd_run()
+        dev = "x:developer"
+        for ok in ("src/Calc.Tests/CalculatorTests.cs",   # **/*Tests.cs
+                   "src/Calc.Tests/AdderTest.cs",         # **/*Test.cs (singular)
+                   # root-level, past NO directory: the `**/`-prefix trap
+                   # test_contracts.test_root_level_test_file_still_excluded
+                   # exists for — _match's anchored retry is what catches it
+                   "CalculatorTests.cs",
+                   # a test project's non-`*Tests.cs` members are test surface
+                   # too, and only `**/*.Tests/**` reaches them
+                   "src/Calc.Tests/Fixtures/OrderBuilder.cs",
+                   "src/Calc.Tests/Usings.cs"):
+            self.assert_allows("write", self._w(str(wt / ok), dev))
+
+    def test_dotnet_production_still_blocked_pre_red(self):
+        """The widening's mutation case. `**/*.Tests/**` is the one directory
+        glob in test_paths; if it leaked past the `.Tests/` component it
+        would unlock production writes for every .NET repo — the gate would
+        report green while enforcing nothing."""
+        run, wt = self._tdd_run()
+        dev = "x:developer"
+        for blocked in ("src/Calc.API/Calculator.cs",
+                        # near-misses on the directory glob: `.Tests` must be
+                        # a whole path component, not a name PREFIX
+                        "src/Calc.TestSupport/Helper.cs",
+                        "src/Calc.Tests.Shared/Helper.cs",
+                        # ...and `Tests` alone is not `*Tests.cs`
+                        "src/Calc.API/TestsController.cs"):
+            self.assert_blocks("write", self._w(str(wt / blocked), dev),
+                               "red-proof")
+
+    def test_dotnet_build_manifests_are_writable_but_never_locked(self):
+        """Adversarial-review regression, and the one this guard's own
+        assertions CANNOT catch: `test_paths` is also the SHA-lock set
+        (gitops._test_set), so the first spelling of the .NET entry,
+        `**/*.Tests/**`, pulled the test project's own `.csproj` under the
+        red lock — the very file `**/*.csproj` sits in `pre_red_paths` to
+        keep editable AFTER red. A routine post-red ProjectReference edit
+        then failed verify-green with no revise path. Writability never
+        regressed (the guard unions all three lists, so it allowed the file
+        either way) — only lockability did, which is why this asserts on
+        classification rather than on an allow/block verdict."""
+        from harness.cli import load_declared
+        from harness.gitops import matches_any
+        lang = load_declared(self.workspace)[2]["language"]
+        for manifest in ("src/Calc.Tests/Calc.Tests.csproj", "App.sln",
+                         "App.slnx", "Directory.Packages.props"):
+            self.assertFalse(matches_any(manifest, lang["test_paths"]),
+                             f"{manifest} must stay out of the red lock set")
+            self.assertTrue(matches_any(manifest, lang["pre_red_paths"]),
+                            f"{manifest} must stay writable before red")
+        # build output the red run itself rewrites — locking it made
+        # verify-green refuse unconditionally, with --revise reproducing it
+        for output in ("src/Calc.Tests/bin/Debug/net8.0/Calc.Tests.dll",
+                       "src/Calc.Tests/TestResults/r/coverage.cobertura.xml",
+                       "src/Calc.Tests/README.md"):
+            self.assertFalse(matches_any(output, lang["test_paths"]),
+                             f"{output} is not test source")
+        # ...while the project's actual source stays classified as tests,
+        # including the flat member `**/*.Tests/**/*.cs` would have dropped
+        for source in ("src/Calc.Tests/Usings.cs",
+                       "src/Calc.Tests/Fixtures/OrderBuilder.cs"):
+            self.assertTrue(matches_any(source, lang["test_paths"]), source)
+        # a test project's non-.cs assets keep their pre-red WRITE surface
+        # through pre_red_paths — the half the `.cs` tail gives up
+        for asset in ("src/Calc.Tests/Data/sample.json",
+                      "src/Calc.Tests/coverage.runsettings",
+                      "src/Calc.Tests/Properties/launchSettings.json"):
+            self.assertFalse(matches_any(asset, lang["test_paths"]), asset)
+            self.assertTrue(matches_any(asset, lang["pre_red_paths"]), asset)
+
+    def test_dotnet_test_globs_agree_under_git_pathspec_too(self):
+        """`test_paths` is read by TWO matchers with opposite `*` semantics:
+        fnmatch (gitops._match), where `*` crosses `/`, and GIT, where
+        reconcile_contracts turns each entry into `:(exclude,glob)` and `*`
+        does NOT cross `/`. A single `**/*.Tests/*.cs` satisfies the first
+        and silently fails the second — nested test files stay IN scope, so
+        a contract signature living only there is reported CLEAN instead of
+        drift. Adversarial review found this; the paired glob closes it, and
+        this test fails if either half is dropped."""
+        repo = self.workspace / "gitglob"
+        (repo / "src" / "Calc.Tests" / "Unit").mkdir(parents=True)
+        (repo / "src" / "App").mkdir(parents=True)
+        for rel in ("src/Calc.Tests/Usings.cs",             # flat test source
+                    "src/Calc.Tests/Unit/Helper.cs",        # nested test source
+                    "src/Calc.Tests/Calc.Tests.csproj",     # not test source
+                    "src/App/Prod.cs"):                     # production
+            (repo / rel).write_text("x\n", encoding="utf-8")
+        for argv in (["git", "init"], ["git", "add", "-A"]):
+            subprocess.run(argv, cwd=repo, capture_output=True, check=True)
+        globs = load_declared(self.workspace)[2]["language"]["test_paths"]
+        out = subprocess.run(
+            ["git", "ls-files", "--", *(f":(exclude,glob){g}" for g in globs)],
+            cwd=repo, capture_output=True, text=True, encoding="utf-8")
+        survivors = set(out.stdout.split())
+        self.assertNotIn("src/Calc.Tests/Unit/Helper.cs", survivors)
+        self.assertNotIn("src/Calc.Tests/Usings.cs", survivors)
+        self.assertEqual(survivors, {"src/App/Prod.cs",
+                                     "src/Calc.Tests/Calc.Tests.csproj"})
+
     def test_unlocks_once_red_proof_sealed(self):
         run, wt = self._tdd_run()
         (run / ".redproof").mkdir()
