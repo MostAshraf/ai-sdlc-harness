@@ -93,27 +93,63 @@ tags: {}
 #   the Python/JS-only defaults would have stranded a Maven developer at the
 #   first `src/test/**` write; the same gap stranded .NET, whose tests are
 #   neither under a `tests/` root nor named like any glob here).
-#   `**/*.Tests/**` is a PROJECT-directory glob, unlike every per-file entry
-#   beside it: .NET puts tests in their own `Foo.Tests` project, and its
-#   non-`*Tests.cs` members (fixtures, builders, `Usings.cs`) are part of the
-#   test surface. Broader than the Java globs on purpose — a test project
-#   holds only test code — and it costs pre-red write access to that
-#   directory, nothing outside it.
+#   The .NET pair `**/*.Tests/*.cs` + `**/*.Tests/**/*.cs` is the one
+#   PROJECT-directory entry: tests live in their own `Foo.Tests` project and
+#   its non-`*Tests.cs` members (fixtures, builders, `Usings.cs`) are test
+#   surface too. Both halves of the pair are load-bearing — TWO matchers read
+#   this list with OPPOSITE `*` semantics (adversarial review found each gap
+#   by breaking the other spelling):
+#     - gitops._match (fnmatch): `*` CROSSES `/`, so `*.Tests/*.cs` alone
+#       already reaches nested files, but `*.Tests/**/*.cs` alone would drop
+#       the flat `Usings.cs` — it needs a directory in between.
+#     - workflow.reconcile_contracts feeds these to GIT as
+#       `:(exclude,glob)`, where `*` does NOT cross `/`. There
+#       `*.Tests/*.cs` alone excludes only flat files, so a contract
+#       signature living in a nested test file was reported CLEAN.
+#   The `*.cs` tail (rather than a bare `**/`) is equally deliberate:
+#   test_paths is also the SHA-LOCK set (gitops._test_set), and a directory
+#   glob locked the test project's own `.csproj` — the very file
+#   `**/*.csproj` sits in pre_red_paths to keep editable after red, wedging
+#   a routine post-red ProjectReference edit — plus `bin`/`obj`/`TestResults`
+#   output the red run itself rewrites. Writability for a test project's
+#   NON-`.cs` assets (xUnit `[Theory]` json, `.runsettings`, `.fs`) is
+#   restored through pre_red_paths below, which widens writes without
+#   locking. Residual, accepted: any `.cs` under a test project, including
+#   generated `obj/` sources, is still lock-eligible; `.gitignore` covers it.
 # test_closure: existing files SHA-locked WITH the tests (fixtures/config —
 # the RC4 widening: weakening a shared fixture must not evade the lock).
 # pre_red_paths: additionally writable before the red-proof is sealed — build
 #   manifests a failing test's new dependency lands in. Deliberately NOT
 #   test_closure: closure files are SHA-locked at red, and a post-red
 #   implementation-dependency edit to pom.xml must stay legal.
+#   .NET needs more than its `.csproj` here, and the two that look optional
+#   are not (adversarial review, run against the real guard):
+#     - `Directory.Packages.props` — under Central Package Management, the
+#       modern default, the test csproj carries `<PackageReference>` with NO
+#       version and the version lives only here. Blocking it stops the
+#       developer one file past where the test_paths entry let them in.
+#     - `*.sln`/`*.slnx` — a NEW test project is invisible to
+#       `dotnet test <solution>` until the solution references it, so
+#       verify-red reports "test suite PASSES — not red" and points at the
+#       test rather than the solution file.
+#     - `**/*.Tests/**` — the whole test project, writable but NOT locked.
+#       This is the half test_paths' `.cs` tail gives up: a test project's
+#       `[Theory]` data json, `.runsettings`, `xunit.runner.json` and `.fs`
+#       sources are written test-first like any test, and belong on the
+#       write surface even though they must stay out of the lock set.
 language:
   test_paths: ["tests/**", "**/test_*.py", "**/*_test.*", "**/*.test.*",
                "**/*.spec.*", "src/test/**", "**/*Test.java", "**/*Tests.java",
                "**/__tests__/**", "**/*Test.cs", "**/*Tests.cs",
-               "**/*.Tests/**"]
+               "**/*.Tests/*.cs", "**/*.Tests/**/*.cs"]
   test_closure: ["**/conftest.py", "pytest.ini", "tests/**", "src/test/**"]
   pre_red_paths: ["**/pom.xml", "**/build.gradle", "**/build.gradle.kts",
                   "**/settings.gradle", "**/settings.gradle.kts",
-                  "**/package.json", "**/*.csproj", "pyproject.toml",
+                  "**/package.json", "**/*.csproj", "**/*.sln", "**/*.slnx",
+                  "**/Directory.Packages.props", "**/Directory.Build.props",
+                  "**/Directory.Build.targets", "**/*.Tests/**",
+                  "**/NuGet.config", "**/nuget.config", "**/NuGet.Config",
+                  "pyproject.toml",
                   "setup.py", "setup.cfg", "requirements*.txt", "go.mod",
                   "go.sum", "Cargo.toml", "Gemfile", "composer.json"]
 # Per-repo entries live under `language.repos.<name>` (test_cmd, coverage_cmd,

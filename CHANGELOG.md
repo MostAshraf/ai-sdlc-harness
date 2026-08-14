@@ -31,13 +31,40 @@ All notable changes to `ai-sdlc-harness` are documented here.
   test-path conventions covered Python, JavaScript and the Maven layout, but
   nothing a C# project uses — so a .NET task's very first test write was
   refused as "not a test path", and the only way forward was turning the
-  ordering gate off. `*Test.cs`, `*Tests.cs`, and every file inside a
-  `*.Tests` project now count as tests. That last entry is deliberately
-  broader than the per-file Java conventions beside it: .NET keeps its tests
-  in a sibling `Foo.Tests` project whose fixtures and `Usings.cs` are part of
-  the test surface, and it opens pre-red write access to that directory only.
-  Workspace discovery still has no marker for `.sln`/`.csproj`, so a .NET
-  repo's test command is still set by hand during `/init-workspace`.
+  ordering gate off. `*Test.cs`, `*Tests.cs`, and the `.cs` sources anywhere
+  inside a `*.Tests` project now count as tests — .NET keeps its tests in a
+  sibling `Foo.Tests` project whose fixtures, builders and `Usings.cs` are
+  part of the test surface, not just the files named like a test. A test
+  project's non-source assets (`[Theory]` data, `.runsettings`) stay
+  writable before the red-proof without joining the locked set, so editing
+  one later in the task can't wedge it.
+  .NET's build manifests join the set that stays writable before the
+  red-proof seals, alongside the `.csproj` — `Directory.Packages.props`
+  (under Central Package Management, the modern default, a test package's
+  version lives only there) and the solution file (a new test project is
+  invisible to `dotnet test` until the solution references it, which
+  otherwise surfaced as the confusing "test suite PASSES — not red").
+- `/init-workspace` now discovers .NET repos. A solution file marks the
+  repo, and once one exists every project defers to it rather than each
+  becoming its own logical repo — including a project in an unrelated
+  subtree, which is folded in rather than proposed separately. Where there
+  is no solution at all, sibling projects collapse to their common ancestor
+  instead of fanning out. A
+  .NET backend beside a Node frontend is now proposed as the two logical
+  repos it is, where previously only the frontend was detected and the
+  backend silently got no test command. Proposed commands name their
+  solution or project file rather than relying on `dotnet test` picking one,
+  and where no single command can cover a root, **none is proposed and the
+  interview asks** — a command that cannot locate its project still passes
+  the invocability check at setup, then fails much later and much less
+  legibly. Coverage is proposed only where a project references
+  `coverlet.collector`, never guessed. Discovery also stops descending into
+  `bin` and `obj` — this applies to every language, not only .NET, so a repo
+  whose hand-written sources live in a directory of either name is no longer
+  discovered (the same trade already made for `build`, `dist` and `target`).
+  A layout nested deeper than three directories is still out of reach for
+  discovery, which for .NET means an `src/Services/<Area>/<Project>/` tree
+  is not proposed and must be configured by hand.
 
 ## [3.5.1] — 2026-08-09
 

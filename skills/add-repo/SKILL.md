@@ -40,6 +40,11 @@ defaults-to-confirm, not facts:
 - Confirm `test_cmd` by actually running it — don't accept the proposal
   unconfirmed, and never collapse this repo's own command onto another
   registered repo's.
+- A proposal may carry **no `test_cmd`**: no single command covers that
+  root (a .NET root with no solution file, or two side by side). Ask the
+  user; never synthesise one. `init-verify` gates on invocability only, so
+  a command that cannot even locate its project still reports `pass`, and
+  the first `verify-red` then seals a red-proof over a build error.
 - A `monorepo_split` proposal means this "one repo" is actually several
   logical repos sharing one `.git` at the physical root. **This isn't yet
   representable as separate registered repos** — `init-verify`'s

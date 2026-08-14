@@ -129,7 +129,12 @@ at its physical root.
 names used in `--section repos` (a sub-key, not a sibling of the global
 `test_paths`/`test_closure` settings, so a repo name can never collide with
 those) — confirm each repo's own `test_cmd` by running it, never collapse
-differing repos onto one command. **`coverage_cmd` gets the same
+differing repos onto one command. **A proposal may carry no `test_cmd`** —
+no single command covers that root (a .NET root with no solution file, or
+two side by side). Ask the user; never synthesise one. Nothing catches a bad
+guess later: `init-verify` gates on invocability only, so a command that
+cannot even locate its project still reports `pass`, and the first
+`verify-red` then seals a red-proof over a build error. **`coverage_cmd` gets the same
 treatment**: discover proposes one only on repo evidence (a `coverage`
 script, jest/vitest+provider, jacoco in the pom) — confirm it by running
 it. No proposal → ask the user for one (the harden step consumes it and
