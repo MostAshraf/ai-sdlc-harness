@@ -6,65 +6,35 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
-- Project presence, no behavior change to the pipeline itself. The README
-  title no longer carries a hand-maintained version (it read `v3.0` four
-  releases after 3.0), and the tagline now names **Qwen Code** alongside
-  Claude Code — the dual-native support has shipped since 3.5.0 but the
-  first line a visitor reads still said Claude Code only. Added a badge row
-  whose release badge reads the latest tag, so it cannot go stale the way
-  the title did.
-- Added the GitHub community set: `CONTRIBUTING.md` (the three enforcing
-  checks, the Windows lane, the fail-open/fail-closed convention),
-  `CODE_OF_CONDUCT.md`, `SECURITY.md` (scoped to what this project's
-  security surface actually is — evidence integrity and the guard layer —
-  with the deliberately accepted limits listed so they are not re-reported),
-  issue forms for bug/feature, and a PR template whose checklist is the
-  three checks plus a blast-radius section for declared data and guards.
-- Added a landing page under `docs/` for GitHub Pages.
-- CI now also runs on push to `main`, not only on pull requests. A squash
-  merge is one push, so this is one extra matrix run per release rather than
-  the every-branch double-billing the workflow comment rejects — and it is
-  what lets the README's CI badge describe `main` at all, since
-  `pull_request` runs attach to the PR head branch and never to the default
-  branch.
-- .NET/C# projects can now follow the test-first path at all. The default
-  test-path conventions covered Python, JavaScript and the Maven layout, but
-  nothing a C# project uses — so a .NET task's very first test write was
-  refused as "not a test path", and the only way forward was turning the
-  ordering gate off. `*Test.cs`, `*Tests.cs`, and the `.cs` sources anywhere
-  inside a `*.Tests` project now count as tests — .NET keeps its tests in a
-  sibling `Foo.Tests` project whose fixtures, builders and `Usings.cs` are
-  part of the test surface, not just the files named like a test. A test
-  project's non-source assets (`[Theory]` data, `.runsettings`) stay
-  writable before the red-proof without joining the locked set, so editing
-  one later in the task can't wedge it.
-  .NET's build manifests join the set that stays writable before the
-  red-proof seals, alongside the `.csproj` — `Directory.Packages.props`
-  (under Central Package Management, the modern default, a test package's
-  version lives only there) and the solution file (a new test project is
-  invisible to `dotnet test` until the solution references it, which
-  otherwise surfaced as the confusing "test suite PASSES — not red").
-- `/init-workspace` now discovers .NET repos. A solution file marks the
-  repo, and once one exists every project defers to it rather than each
-  becoming its own logical repo — including a project in an unrelated
-  subtree, which is folded in rather than proposed separately. Where there
-  is no solution at all, sibling projects collapse to their common ancestor
-  instead of fanning out. A
-  .NET backend beside a Node frontend is now proposed as the two logical
-  repos it is, where previously only the frontend was detected and the
-  backend silently got no test command. Proposed commands name their
-  solution or project file rather than relying on `dotnet test` picking one,
-  and where no single command can cover a root, **none is proposed and the
-  interview asks** — a command that cannot locate its project still passes
-  the invocability check at setup, then fails much later and much less
-  legibly. Coverage is proposed only where a project references
-  `coverlet.collector`, never guessed. Discovery also stops descending into
-  `bin` and `obj` — this applies to every language, not only .NET, so a repo
-  whose hand-written sources live in a directory of either name is no longer
-  discovered (the same trade already made for `build`, `dist` and `target`).
-  A layout nested deeper than three directories is still out of reach for
-  discovery, which for .NET means an `src/Services/<Area>/<Project>/` tree
-  is not proposed and must be configured by hand.
+## [3.5.2] — 2026-08-14
+
+> **.NET and C# projects could not use this harness at all, and nothing said so.** The test-path defaults covered Python, JavaScript and the Maven layout, so a C# task's very first test write was refused as "not a test path" with no way forward but disabling the ordering gate — and discovery, which matches project files by exact name, saw nothing in a repo whose project files are named after the project. A .NET backend beside a Node frontend registered as frontend-only, and its tests silently never ran. This release closes both halves, then hardens them: an adversarial review of the fix found that the obvious spelling of the new test-path rule also SHA-locked the files it was supposed to keep editable, and that the narrower spelling which fixed that opened a silent false-negative in the pre-PR contract gate.
+
+### Release highlights
+
+| Theme | What changed |
+|---|---|
+| **.NET/C# tests are recognised as tests** | `*Test.cs`, `*Tests.cs`, and the `.cs` sources anywhere inside a `*.Tests` project now count as the test set — .NET keeps its tests in a sibling `Foo.Tests` project whose fixtures, builders and `Usings.cs` are test surface too, not only the files named like a test. A test project's non-source assets (`[Theory]` data, `.runsettings`, `xunit.runner.json`) stay writable before the red-proof without joining the locked set, so touching one later in a task cannot wedge it. |
+| **.NET build manifests stay writable before red** | The README has always promised that build manifests for test dependencies stay writable pre-red; for .NET only the `.csproj` did. `Directory.Packages.props` now does too — under Central Package Management, the modern default, a test package's version lives only there — along with `Directory.Build.props`/`.targets`, `nuget.config`, and the solution file, since a new test project is invisible to `dotnet test <solution>` until referenced, which surfaced as the confusing "test suite PASSES — not red". |
+| **`/init-workspace` discovers .NET repos** | A solution file marks the repo, and once one exists every project defers to it rather than each becoming its own logical repo — otherwise an ordinary five-project solution proposed five logical repos the user had to merge back by hand. With no solution at all, sibling projects collapse to their common ancestor instead of fanning out. A .NET backend beside a Node frontend is now proposed as the two logical repos it is. |
+| **Proposed commands name their target, or aren't proposed** | `dotnet test` resolves a project or solution in its own directory only, and refuses both when there is none and when there are several — each time with an exit code that setup's invocability check reads as success. A guessed command therefore survived setup and failed much later and far less legibly. Commands now name their solution or project file, and where no single command covers a root, none is proposed and the interview asks. Coverage is proposed only where a project references `coverlet.collector`, never guessed. |
+| **Project presence** | The README title no longer carries a hand-maintained version (it read `v3.0` four releases on), the tagline names **Qwen Code** alongside Claude Code, and a badge row reads the latest tag so it cannot go stale the same way. Adds the GitHub community set — `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md` scoped to this project's real surface with its accepted limits listed, issue forms, and a PR template — plus a GitHub Pages landing page. |
+| **CI describes `main`** | CI now also runs on push to `main`, not only on pull requests. A squash merge is one push, so this is one extra matrix run per release rather than every-branch double-billing — and it is what lets the README's CI badge describe the default branch at all, since `pull_request` runs attach to the PR head branch. |
+
+### Upgrade notes
+
+- **A patch number carrying feature work.** This is `.2` on 3.5, but it adds .NET/C# support rather than only fixing things. Nothing is breaking; the note is here so the version number does not undersell what moved.
+- **Two shipped defaults widened, and workspaces that never overrode them pick the new values up on update** — `language.test_paths` and `language.pre_red_paths`. Both only ADD patterns; nothing that matched before stops matching, so a Python, JS, Go, Rust or Maven workspace sees no behaviour change unless it happens to contain `.cs` files or .NET build manifests.
+- **`bin` and `obj` are now skipped by workspace discovery, for every language, not only .NET.** This is the one change that can affect a non-.NET repo: if your hand-written sources live in a directory named `bin` or `obj`, `/init-workspace`, `/add-repo` and `/repo-map-refresh` will no longer look inside it. Same trade already made for `build`, `dist` and `target`. Registered workspaces are unaffected until you re-run discovery.
+- **Known residual** — workspace discovery still walks only three directories deep, so a layout like `src/Services/<Area>/<Project>/` is not proposed and must be configured by hand. For a .NET repo with a solution at the root but projects deeper than that, the root is found while its coverage evidence is not, so no `coverage_cmd` is proposed.
+- **Known residual** — a proposed `dotnet test` target containing a space is quoted; one containing other shell metacharacters (`&`, `;`, `$`) is not.
+- **Known residual** — for a monorepo SUBTREE root, a proposed command is relative to the subtree while registration happens at the physical root. .NET's failure in that case exits 1, which slips the same invocability check that catches an equivalent Node failure's 127. Pre-existing shape, surfaced by this release's testing rather than introduced by it.
+
+### Verification on tag tip
+
+- `python -m harness.schema` — declared data valid
+- `python tools/budget_check.py` — line budget green
+- `python -m unittest discover -s tests` — 1025 tests green (skipped=12); 19 new this cycle
 
 ## [3.5.1] — 2026-08-09
 
