@@ -113,18 +113,18 @@ note this only catches a *nonexistent* guess; a repo with no `origin` and
 a stray local branch that happens to be named `main` cannot be told apart
 from a genuine one, so confirm the branch name with the user for any repo
 without a resolvable `origin/HEAD`.
-**Known risk:** re-running this against a repo that already has an active
-`/dev-workflow` run in progress can switch that run's feature-branch
-checkout back to default — avoid re-running discovery for a repo with
-in-flight work. Present the proposals (language, `test_cmd`, default
-branch) as defaults-to-confirm. A `monorepo_split` proposal means this "one
-repo" is actually several logical repos sharing one `.git` at the physical
-root — **this isn't yet representable as separate registered repos**
-(`init-verify`'s `repo:<name>` check requires a `.git` directly under the
-registered path, which no subtree has, so registering subtrees separately
-leaves every one of them permanently failing verification with no
-available fix). Tell the user this is a known gap; register the repo once,
-at its physical root.
+**Known risk:** re-running this against a repo with an active `/dev-workflow`
+run switches that run's feature-branch checkout back to default — and the
+switch flips the whole checkout, so avoid discovery on ANY path inside a
+checkout with in-flight work, not just the exact registered path. Present the proposals (language, `test_cmd`, default
+branch) as defaults-to-confirm. A `monorepo_split` proposal means this "one repo" is several
+logical repos sharing one `.git` — **register each proposed root as its own repo**: path
+`<checkout>/<root>` (checkout-relative; `.` = the checkout), name `<repo>-<root>`, and confirm
+each `test_cmd` FROM that subtree — commands run with the registered path as cwd. `init-verify`
+passes any path inside a git work tree, naming the enclosing checkout: a pass, not a warning.
+What the shared `.git` costs: tasks still isolate (worktrees cut from the physical checkout,
+staging subtree-bounded, direct-branch fallback refused), but outside them both repos ride one
+branch, and a parent root holds its child — only review keeps a parent's task out of it.
 **Language-config is per repo**, under `language.repos`, keyed by the same
 names used in `--section repos` (a sub-key, not a sibling of the global
 `test_paths`/`test_closure` settings, so a repo name can never collide with

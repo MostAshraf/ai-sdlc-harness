@@ -12,7 +12,9 @@ import unittest
 from pathlib import Path
 
 from harness import gitops, ndjson, state as state_mod
-from tests.test_gitops import FAILING_TEST, TEST_CMD, make_repo
+from harness.providers import git_providers
+from tests.test_gitops import (FAILING_TEST, TEST_CMD, make_monorepo,
+                               make_repo)
 from tests import support
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -2999,6 +3001,207 @@ class ManualPrRecord(BreadthHarness):
         out = self.cli("create-pr", "--repo", str(self.repo), "--url",
                        "https://git.example.com/grp/proj", run=run, expect=1)
         self.assertIn("ending in", out["error"])
+
+
+class SharedBranchPr(BreadthHarness):
+    """create-pr is one PR per PHYSICAL BRANCH, not per registered repo.
+
+    Two logical repos that are subtrees of ONE checkout share one `.git`,
+    therefore one HEAD: preflight cuts the deterministic feature branch for
+    the first and the second ADOPTS it, so `rev-parse --abbrev-ref HEAD`
+    answers the same string in both. The pre-fix create-pr derived its head
+    from exactly that rev-parse and called the provider once per repo — two
+    calls, identical head/base, identical remote. The second is a validation
+    error the gitlab adapter refuses to swallow by design ("MR already open")
+    and `gh pr create` behaves the same, so the run dead-ended at create-pr
+    with no remedy but `--manual-url` for a PR that already exists.
+    """
+
+    def _shared_checkout_run(self, story_id, date, repos):
+        """Register `repos` (name -> path, every one of them inside ONE
+        checkout), fetch, and preflight each for real — so the branch
+        adoption under test is the production one, not a fixture — then park
+        the cursor at create-pr. Returns the run and the one branch they all
+        share."""
+        self.story(story_id, "Spans both stacks")
+        args = []
+        for name, path in repos.items():
+            args += ["--repo", f"{name}={path}", "--test-cmd", f"{name}={TEST_CMD}"]
+        self.cli("init", "--stories-dir", str(self.stories), *args)
+        run = Path(self.cli("fetch", "--id", story_id, "--date", date)["run"])
+        self._at(run, "preflight")
+        cut = [self.cli("preflight", "--repo", str(p), run=run)["branch"]
+               for p in repos.values()]
+        # The precondition the whole finding rests on — assert it rather than
+        # assume it, so a future preflight change that stopped sharing the
+        # branch fails HERE with a readable message instead of making the
+        # create-pr assertions below quietly vacuous.
+        self.assertEqual(len(set(cut)), 1, cut)
+        for path in repos.values():
+            # one `.git`, one HEAD — the exact string create-pr derives its
+            # head from, read from every registered directory
+            self.assertEqual(
+                gitops.run_git(path, "rev-parse", "--abbrev-ref", "HEAD"),
+                cut[0])
+        self._at(run, "create-pr")
+        return run, cut[0]
+
+    def _mono_run(self, story_id, date):
+        """A registered pair in ONE checkout — root as `backend` (the .NET
+        `.sln`-at-the-physical-root case) and `frontend/` as its own logical
+        repo."""
+        mono = make_monorepo(self.workspace)
+        frontend = mono / "frontend"
+        run, branch = self._shared_checkout_run(
+            story_id, date, {"backend": mono, "frontend": frontend})
+        return run, mono, frontend, branch
+
+    def _at(self, run, step):
+        # Same cursor shortcut ManualPrRecord uses: these tests exercise
+        # create-pr's provider-call arithmetic, not the gate walk.
+        st = state_mod.load(run, self.workspace)
+        st["cursor"]["current_step"] = step
+        state_mod.save(run, self.workspace, st)
+
+    def _kinds(self, run):
+        return [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+
+    def test_subtree_repos_sharing_a_branch_make_one_provider_call(self):
+        run, mono, frontend, branch = self._mono_run("W-91", "2026-02-20")
+        pr_a = self.cli("create-pr", "--repo", str(mono), run=run)
+        pr_b = self.cli("create-pr", "--repo", str(frontend), run=run)
+        # Exactly ONE provider call. The `local` adapter's URL embeds the
+        # repo path it was called with (`file://<repo>#<branch>`), so this is
+        # a direct read of WHICH call produced the record rather than an
+        # inference: a second call from `frontend` could only ever have
+        # produced a `…/frontend#…` URL.
+        self.assertEqual(pr_b["url"], pr_a["url"])
+        self.assertEqual(pr_a["url"], f"file://{mono}#{branch}")
+        self.assertEqual(self._kinds(run).count("pr-created"), 1)
+        self.assertEqual(self._kinds(run).count("pr-shared"), 1)
+        # ...and the derived entry is honest about who made it.
+        self.assertEqual(pr_b["via"], "backend")
+        self.assertNotIn("via", pr_a)
+        state = self.cli("show", run=run)["state"]
+        prs = state["artifacts"]["pr"]
+        self.assertEqual(set(prs), {"backend", "frontend"})   # both names resolve
+        self.assertEqual(prs["frontend"]["url"], prs["backend"]["url"])
+        # The extra key must not break the repo-name-keyed consumer: cli's
+        # fetch-pr-comments looks the entry up by name and hands the WHOLE
+        # dict to the adapter. `local` is records-only, so an empty list here
+        # is the adapter having accepted the derived entry.
+        self.assertEqual(
+            self.cli("fetch-pr-comments", "--repo", str(frontend),
+                     run=run)["comments"], [])
+
+    def test_a_manual_record_is_shared_by_the_sibling_subtree_repo(self):
+        """Manual-then-normal is the ordering that matters: a provider that
+        could not create the first repo's PR cannot create the second's
+        either, so the sibling must reuse the hand-recorded entry rather than
+        walk into the failure the escape hatch exists to route around. The
+        manual entry carries no `branch` key (its shape is id/url/title/
+        manual), so the match falls back to preflight's `branches` record."""
+        run, mono, frontend, _ = self._mono_run("W-92", "2026-02-21")
+        url = "https://git.example.com/grp/proj/-/merge_requests/12"
+        self.cli("create-pr", "--repo", str(mono), "--url", url, run=run)
+        pr_b = self.cli("create-pr", "--repo", str(frontend), run=run)
+        self.assertEqual(pr_b["url"], url)
+        self.assertTrue(pr_b["manual"])          # copied verbatim, still honest
+        self.assertEqual(pr_b["via"], "backend")
+        # the comment loop's id derivation is untouched by the extra key
+        self.assertEqual(git_providers._pr_number(pr_b["url"]), "12")
+        kinds = self._kinds(run)
+        self.assertNotIn("pr-created", kinds)    # the provider was never called
+        self.assertEqual(kinds.count("pr-recorded-manually"), 1)
+        self.assertEqual(kinds.count("pr-shared"), 1)
+
+    def test_manual_url_wins_over_the_shared_record(self):
+        """The reverse ordering. `--url` is an explicit human act naming one
+        specific URL for one specific repo; a mechanical "you meant the
+        sibling's PR" would overrule it at the one moment the provider is
+        already known to be misbehaving."""
+        run, mono, frontend, _ = self._mono_run("W-93", "2026-02-22")
+        self.cli("create-pr", "--repo", str(mono), run=run)
+        url = "https://git.example.com/grp/proj/-/merge_requests/13"
+        pr_b = self.cli("create-pr", "--repo", str(frontend), "--url", url,
+                        run=run)
+        self.assertEqual(pr_b["url"], url)
+        self.assertNotIn("via", pr_b)
+        kinds = self._kinds(run)
+        self.assertEqual(kinds.count("pr-recorded-manually"), 1)
+        self.assertNotIn("pr-shared", kinds)
+
+    def test_separate_checkouts_still_get_one_provider_call_each(self):
+        """The no-regression fence. Feature branch names are DETERMINISTIC
+        per work item, so two repos in genuinely separate checkouts are on
+        the same branch NAME as a matter of course — which is why the reuse
+        test is `shares_toplevel` (which checkout does this path resolve
+        into?) and not a path-prefix or name comparison. Collapsing these two
+        would be the silent loss of a real PR."""
+        repo_b = make_repo(self.workspace, "repo-b")
+        self.story("W-94", "two checkouts")
+        self.init(extra_repos=f"repo-b={repo_b}",
+                  extra_test_cmd=f"repo-b={TEST_CMD}")
+        run = Path(self.cli("fetch", "--id", "W-94", "--date", "2026-02-23")["run"])
+        self._at(run, "preflight")
+        branch_a = self.cli("preflight", "--repo", str(self.repo), run=run)["branch"]
+        branch_b = self.cli("preflight", "--repo", str(repo_b), run=run)["branch"]
+        self.assertEqual(branch_b, branch_a)     # same name, distinct checkouts
+        self._at(run, "create-pr")
+        pr_a = self.cli("create-pr", "--repo", str(self.repo), run=run)
+        pr_b = self.cli("create-pr", "--repo", str(repo_b), run=run)
+        self.assertNotEqual(pr_a["url"], pr_b["url"])
+        self.assertNotIn("via", pr_b)
+        kinds = self._kinds(run)
+        self.assertEqual(kinds.count("pr-created"), 2)
+        self.assertNotIn("pr-shared", kinds)
+
+    def test_via_names_the_originating_repo_not_the_copy_it_matched(self):
+        """THREE registrations in one checkout — the case where the entry the
+        scan matches can itself be a copy. `shares_toplevel` returns names
+        SORTED, so `beta`'s scan reaches `alpha`'s derived record before
+        `zeta`'s real one; a `via` read off the matched entry would name a
+        repo that never called the provider either, and the reader would have
+        to walk the chain to find the one that did. Names are chosen so the
+        originator sorts LAST: with `zeta` first alphabetically the bug is
+        unreachable and the test would pass either way."""
+        mono = make_monorepo(self.workspace)
+        repos = {"zeta": mono, "alpha": mono / "backend",
+                 "beta": mono / "frontend"}
+        run, _ = self._shared_checkout_run("W-95", "2026-02-24", repos)
+        origin = self.cli("create-pr", "--repo", str(mono), run=run)
+        for name in ("alpha", "beta"):
+            pr = self.cli("create-pr", "--repo", str(repos[name]), run=run)
+            self.assertEqual(pr["url"], origin["url"])
+            self.assertEqual(pr["via"], "zeta")   # the provider call, one hop
+        kinds = self._kinds(run)
+        self.assertEqual(kinds.count("pr-created"), 1)
+        self.assertEqual(kinds.count("pr-shared"), 2)
+        # the ledger's `via` and its prose agree with the artifact's
+        shared = [e for e in ndjson.read_records(run / "events.ndjson")
+                  if e["kind"] == "pr-shared"]
+        self.assertEqual({e["via"] for e in shared}, {"zeta"})
+        self.assertTrue(all("shares zeta's PR" in e["reason"] for e in shared))
+
+    def test_a_repeat_call_for_the_originator_is_not_a_share_of_itself(self):
+        """Repeat create-pr for the ORIGINATING repo matches its own record
+        copied under a sibling's name (re-verification finding, reachable:
+        set_artifact overwrites freely and the cursor stays at create-pr
+        for the whole fan-out). Reusing that copy would write `via: zeta`
+        on zeta itself — a `pr-shared` ledger row asserting zeta did not
+        open the PR it opened. The reuse must skip self and fall through
+        to the provider; the same-repo duplicate call is the pre-existing,
+        loud residual, and the audit rows stay true."""
+        mono = make_monorepo(self.workspace)
+        repos = {"zeta": mono, "alpha": mono / "backend",
+                 "beta": mono / "frontend"}
+        run, _ = self._shared_checkout_run("W-96", "2026-02-25", repos)
+        self.cli("create-pr", "--repo", str(mono), run=run)
+        self.cli("create-pr", "--repo", str(repos["alpha"]), run=run)
+        repeat = self.cli("create-pr", "--repo", str(mono), run=run)
+        self.assertNotIn("via", repeat)
+        kinds = self._kinds(run)
+        self.assertEqual(kinds.count("pr-shared"), 1)   # alpha's only
 
 
 class PublishMirrorPush(BreadthHarness):

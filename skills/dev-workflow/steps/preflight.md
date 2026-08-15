@@ -76,10 +76,11 @@ so a mid-run change leaves the repos on differently-named branches (workable
 — every artifact is per-repo keyed — but it costs the cross-repo name
 correlation a reviewer uses). Then it creates the branch and records the
 `branches` artifact. It also pins
-`.harness-key` into the repo's `.git/info/exclude` (shared with its task
-worktrees), so a stray integrity key can never be swept into git history
-by the commit verbs' `git add -A`; the commit verbs refuse-and-unstage as
-backstop. Then:
+`.harness-key` into the enclosing checkout's `.git/info/exclude` (resolved
+via git, so one file serves every logical repo and task worktree of that
+checkout), so a stray integrity key can never be swept into git history
+by the commit verbs' `git add -A -- .`; the commit verbs refuse-and-unstage
+as backstop. Then:
 
 ```
 ${CLAUDE_PLUGIN_ROOT}/bin/harness cursor --to develop --run <run>

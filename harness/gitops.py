@@ -59,7 +59,159 @@ def head_sha(repo: Path) -> str:
     return run_git(repo, "rev-parse", "HEAD")
 
 
+# ------------------------------------------------- subtree logical repos
+#
+# A registered repo path is not necessarily a physical checkout root. A
+# LOGICAL repo may be any SUBTREE of one — `<checkout>/frontend` alongside
+# `<checkout>` itself — which is exactly the shape `initws.discover()`'s
+# `monorepo_split` proposes and the real .NET case demands (the `.sln` at the
+# physical root is one logical repo, `frontend/` is another, one `.git`
+# between them). `repos.yaml` stays `name -> path`; the subtree path IS the
+# registered path, so every exact-path resolver (repo_name, resolve_test_cmd,
+# quarantine) keeps working untouched.
+#
+# What that costs this module is PATH RELATIVITY, because git's own answers
+# are not uniformly relative to the directory you asked from:
+#   - `diff --name-only/--numstat` and `status --porcelain` are TOPLEVEL-
+#     relative no matter the cwd — so a subtree repo's file list arrives
+#     carrying a `frontend/` prefix that no consumer expects (test_paths
+#     globs, blob-SHA locks and gate scopes all read these as repo-relative).
+#     `--relative` is git's own fix and does BOTH halves at once: it drops
+#     entries outside the cwd's subtree and re-roots the rest. Probe-verified
+#     on git 2.55 for --name-only, --numstat and --cached, and a no-op at a
+#     toplevel (empty prefix) — so root repos are byte-identical.
+#   - `ls-files` (with or without --others) is already CWD-relative AND
+#     cwd-scoped, so it needs nothing.
+# Anything added later that has no `--relative` (status, notably) must
+# translate through `subtree_prefix` by hand; that is what the pair below is
+# for, and why they live here rather than inlined at one call site.
+
+
+def toplevel(repo: Path) -> Path:
+    """The PHYSICAL checkout `repo` lives in — `repo` itself for a root
+    registration, the enclosing checkout for a subtree one."""
+    return Path(run_git(repo, "rev-parse", "--show-toplevel"))
+
+
+def subtree_prefix(repo: Path) -> str:
+    """`repo`'s position INSIDE its physical checkout — `''` for a root
+    registration, `'frontend'` for a subtree one. Trailing slash stripped
+    (git emits `frontend/`) so callers compose it explicitly."""
+    return run_git(repo, "rev-parse", "--show-prefix").strip("/")
+
+
+def work_tree_root(path) -> Path | None:
+    """The checkout `path` belongs to, or None when it is not inside a git
+    work tree at all. The registration probe: `(path/".git").exists()` is
+    true for a checkout ROOT only, which is precisely the assumption subtree
+    logical repos break. Never raises — a missing directory, a bare repo, or
+    no `git` on PATH are all "not a work tree", and a verify-time check must
+    report that, not traceback."""
+    try:
+        out = run_git(Path(str(path)), "rev-parse", "--show-toplevel",
+                      check=False)
+    except OSError:                    # no git binary — unanswerable, not fatal
+        return None
+    return Path(out) if out else None
+
+
+def has_tracked_files(path) -> bool:
+    """Does `path` hold anything git actually TRACKS? `work_tree_root` only
+    answers "inside a work tree", which an UNTRACKED or .gitignored
+    directory satisfies exactly as well as a real subtree — probed on git
+    2.55: `git -C <checkout>/generated rev-parse --show-toplevel` answers
+    `<checkout>` for a `generated/` that `.gitignore` excludes. A
+    registration there verifies clean and then breaks at the first task,
+    because `git worktree add` materializes only what the BRANCH carries:
+    the new worktree appears WITHOUT that directory, `_run_tests(cwd=...)`
+    raises on the missing path, and the CLI's resume probe
+    (`Path(recorded["path"]).is_dir()`) stays false forever. `ls-files` is
+    cwd-scoped and index-backed, so a non-empty answer is precisely "a
+    checkout of this branch brings this directory with it".
+
+    Never raises — same contract as `work_tree_root`, since both exist to
+    answer a verify-time question about a path that may not be there."""
+    try:
+        return bool(run_git(Path(str(path)), "ls-files", check=False))
+    except OSError:                    # no git binary — unanswerable, not fatal
+        return False
+
+
+def _dirt_subject(repo, top) -> str:
+    """Who a "N uncommitted change(s)" refusal is ABOUT. Both refusals
+    (`ensure_default_branch`, `update_base`) probe `changed_files(
+    toplevel(repo))` deliberately — `checkout` and `merge --ff-only`
+    rewrite the whole physical tree — and the paths that come back are
+    therefore TOPLEVEL-relative. Naming `repo` as the subject while listing
+    those paths sent the user to clean a file in a directory that doesn't
+    contain it (reproduced: `...\\ws\\mono\\frontend has 1 uncommitted
+    change(s) (.gitignore)` for a `.gitignore` living at `...\\ws\\mono`).
+    Subject and paths now name the same tree, and the subject states the
+    relationship so "why is it complaining about a sibling's file" is
+    answered in the refusal rather than left to the reader.
+
+    A root registration IS its own toplevel, so its message is the exact
+    string it has always been."""
+    try:
+        same = Path(str(top)).resolve() == Path(str(repo)).resolve()
+    except OSError:                    # unresolvable — say more, never less
+        same = str(top) == str(repo)
+    if same:
+        return str(repo)
+    return f"{top} (the physical checkout holding the registered repo {repo})"
+
+
+def shares_toplevel(config_repos: dict, repo) -> list[str]:
+    """Names of OTHER registered repos resolving into the same physical
+    checkout as `repo` — the parent/child overlap a monorepo split creates
+    deliberately (root `.sln` repo + `frontend/` repo, one `.git`).
+
+    Context is the DIRECT-BRANCH FALLBACK, the documented escape when
+    `worktree_add` fails twice: that fallback cuts the task branch in the
+    MAIN checkout, and a checkout switch flips the WHOLE physical tree — so
+    where the toplevel is shared it yanks the sibling logical repo's files
+    out from under whatever task is running there. Per-task worktrees are
+    immune (each is its own tree); the fallback is the one path that isn't.
+
+    This list NAMES colliders; it does not decide the refusal, and must not
+    be made to (adversarial-review finding, reproduced): the hazard is a
+    property of the physical checkout, not of the registry, so with only
+    `frontend` registered this returns `[]` while cutting a task branch in
+    the shared checkout still flips `backend/`, `infra/`, and any
+    uncommitted human work sitting beside them. `worktree_add` refuses on
+    subtree-ness itself and uses this only to say WHO ELSE it knows about.
+
+    Never raises: an unreadable or non-git registration is simply not a
+    collision, and message enrichment must not be able to replace the real
+    worktree failure with a lookup error."""
+    mine = work_tree_root(repo)
+    if mine is None:
+        return []
+    try:
+        here = Path(str(repo)).resolve()
+        mine = mine.resolve()
+    except OSError:
+        return []
+    out = []
+    for name, path in (config_repos or {}).items():
+        try:
+            if Path(str(path)).resolve() == here:
+                continue               # the same registration, not a collision
+            other = work_tree_root(path)
+            if other is not None and other.resolve() == mine:
+                out.append(name)
+        except OSError:
+            continue
+    return sorted(out)
+
+
 def blob_sha(repo: Path, path: str) -> str:
+    # `hash-object` addresses the WORKING TREE relative to cwd (`git -C repo`),
+    # not the index, so a subtree-relative path already resolves against the
+    # logical repo — no `:<prefix><path>` index rewriting needed here. The
+    # locked-set paths reaching this come from `changed_files`/`ls-files`,
+    # both subtree-relative by the rules above, so the SHA lock names the
+    # blob the developer is actually editing.
     return run_git(repo, "hash-object", "--", path)
 
 
@@ -67,7 +219,9 @@ def changed_files(repo: Path) -> list[str]:
     # `diff --name-only` + `ls-files --others`: clean one-path-per-line output,
     # no status columns to mis-parse (porcelain parsing is exactly the kind of
     # fragile reverse-engineering this module exists to avoid).
-    tracked = run_git(repo, "diff", "--name-only", "HEAD")
+    # `--relative` scopes the diff half to the registered subtree and re-roots
+    # it (see the relativity note above); the `ls-files` half already is.
+    tracked = run_git(repo, "diff", "--name-only", "--relative", "HEAD")
     untracked = run_git(repo, "ls-files", "--others", "--exclude-standard")
     return [p for p in (tracked + "\n" + untracked).splitlines() if p.strip()]
 
@@ -127,7 +281,12 @@ def _refuse_swept_secrets(repo: Path) -> None:
             if p.rsplit("/", 1)[-1] in _SECRET_BASENAMES]
     if not hits:
         return
-    run_git(repo, "reset", "--", *hits, check=False)
+    # Deliberately NOT `--relative` above: the whole index is what `git
+    # commit` will write, so a key staged outside the registered subtree
+    # still has to be caught. That leaves `hits` TOPLEVEL-relative, which a
+    # `reset` issued from a subtree cwd would mis-target — so the unstage is
+    # issued from the toplevel, where those paths mean what they say.
+    run_git(toplevel(repo), "reset", "--", *hits, check=False)
     raise SecretSweepError(
         f"refusing to commit a harness integrity key: {', '.join(hits)} was "
         "about to enter git history (now unstaged). The live key lives at "
@@ -152,7 +311,13 @@ def commit_class(repo: Path, config: dict, cls: str, **params) -> str:
     template = (config["naming"]["commit"] or {}).get(cls)
     if not template:
         raise GitError(f"no declared commit class '{cls}'")
-    run_git(repo, "add", "-A")
+    # `-- .` bounds the sweep to the REGISTERED path. Identical to a bare
+    # `add -A` for a root repo (`.` is the whole tree there); for a subtree
+    # logical repo it is the guarantee that a `frontend` task can never
+    # stage — let alone commit — an edit someone left in `backend/`, which
+    # shares the same `.git` and would otherwise ride along silently under a
+    # frontend task's message.
+    run_git(repo, "add", "-A", "--", ".")
     _refuse_swept_secrets(repo)
     if not run_git(repo, "diff", "--cached", "--name-only"):
         raise GitError("nothing to commit")
@@ -162,7 +327,7 @@ def commit_class(repo: Path, config: dict, cls: str, **params) -> str:
 
 def commit_fixup(repo: Path, target_sha: str) -> str:
     """`harness commit --fixup-of` — post-squash fix commits (coverage B10)."""
-    run_git(repo, "add", "-A")
+    run_git(repo, "add", "-A", "--", ".")   # subtree-scoped, see commit_class
     _refuse_swept_secrets(repo)
     if not run_git(repo, "diff", "--cached", "--name-only"):
         raise GitError("nothing to commit")
@@ -291,7 +456,14 @@ def publish_mirror(repo: Path, run_dir: Path, config: dict, run_name: str) -> st
     staged = run_git(repo, "diff", "--cached", "--name-only").splitlines()
     if not staged:
         return head_sha(repo)  # nothing new — mirror already current
-    offenders = [p for p in staged if not p.startswith("ai/")]
+    # Toplevel-relative on purpose (no `--relative`): exclusivity is a claim
+    # about the whole commit, so a staged path OUTSIDE the registered subtree
+    # must be reported, not filtered away. The expected prefix therefore has
+    # to carry the subtree too — `frontend/ai/<run>` for a logical repo
+    # registered at `frontend`, plain `ai/<run>` at a checkout root.
+    prefix = subtree_prefix(repo)
+    wanted = f"{prefix}/ai/" if prefix else "ai/"
+    offenders = [p for p in staged if not p.startswith(wanted)]
     if offenders:
         raise GitError(f"mirror commit would not be path-exclusive: {offenders}")
     message = render(config["naming"]["commit"]["mirror"], run=run_name)
@@ -423,11 +595,19 @@ def update_base(repo: Path, branch: str | None = None) -> dict:
             "commits. Run update-base from that worktree, or detach/switch it "
             "first; never moved out from under a checkout.")
     if checked_out:
-        dirty = changed_files(repo)
+        # Toplevel-scoped for the same reason ensure_default_branch is: the
+        # `merge --ff-only` below rewrites the whole physical tree, so a
+        # sibling logical repo's uncommitted work is just as much at risk as
+        # this one's. The SUBJECT follows the scope (`_dirt_subject`) —
+        # toplevel-relative paths under a subtree-repo heading named a
+        # directory that does not contain them.
+        top = toplevel(repo)
+        dirty = changed_files(top)
         if dirty:
             shown = ", ".join(dirty[:5]) + ("..." if len(dirty) > 5 else "")
             raise GitError(
-                f"{repo} has {len(dirty)} uncommitted change(s) ({shown}) on "
+                f"{_dirt_subject(repo, top)} has {len(dirty)} uncommitted "
+                f"change(s) ({shown}) on "
                 f"'{target}' itself — a fast-forward would rewrite them; "
                 "commit or stash them yourself first, never auto-discarded. "
                 "(Uncommitted work on ANY OTHER branch is fine: this verb "
@@ -788,11 +968,28 @@ def ensure_default_branch(repo: Path, branch: str | None = None) -> dict:
         raise GitError(
             f"{repo} has a {in_progress} in progress — finish or abort it "
             "yourself before continuing; never auto-resolved")
-    dirty = changed_files(repo)
+    # Probed at the PHYSICAL TOPLEVEL, not at the registered subtree —
+    # decided and documented here because the two are no longer the same
+    # thing. `changed_files(repo)` now honestly reports only the logical
+    # repo's own dirt, but the thing this function is about to do is
+    # `git checkout`, which flips the ENTIRE shared checkout: uncommitted
+    # work in a sibling logical repo (`backend/` while this is `frontend`)
+    # would be carried onto the target branch or clobbered outright. So the
+    # subtree scoping that protects `add -A` must NOT reach the safety
+    # question, and the paths stay toplevel-relative so the refusal says
+    # where the dirt actually is rather than hiding it as "somewhere else".
+    # (`_in_progress_operation` is already whole-checkout — it reads git-dir
+    # markers — which is the same answer for the same reason.)
+    # The SUBJECT is scoped to match (`_dirt_subject`): listing toplevel-
+    # relative paths under a `<checkout>/frontend` heading told the user to
+    # go clean a file in a directory that does not contain it.
+    top = toplevel(repo)
+    dirty = changed_files(top)
     if dirty:
         shown = ", ".join(dirty[:5]) + ("..." if len(dirty) > 5 else "")
         raise GitError(
-            f"{repo} has {len(dirty)} uncommitted change(s) ({shown}) — "
+            f"{_dirt_subject(repo, top)} has {len(dirty)} uncommitted "
+            f"change(s) ({shown}) — "
             "resolve, commit, or stash them yourself before continuing; "
             "never auto-discarded")
     behind = base_branch_behind(repo, target)
@@ -806,36 +1003,134 @@ def ensure_default_branch(repo: Path, branch: str | None = None) -> dict:
 
 # ------------------------------------------------------------- worktrees
 
-def worktree_add(repo: Path, task_id: str, base_branch: str) -> dict:
+def worktree_add(repo: Path, task_id: str, base_branch: str,
+                 config_repos: dict | None = None) -> dict:
     """Per-task worktree with uid8 collision-avoidance (M5 charter). One retry
-    with a fresh uid; a second failure raises so the orchestrator can offer
-    the documented direct-branch fallback explicitly."""
+    with a fresh uid; a second failure raises, and the message says whether
+    the documented direct-branch fallback is even available here — it is not
+    for a subtree registration, whose checkout the fallback would flip
+    wholesale (see the refusal at the bottom).
+
+    Created from — and placed beside — the PHYSICAL toplevel, never beside
+    the registered path. For a subtree logical repo `repo.parent` is INSIDE
+    the checkout, so the old placement dropped the new worktree into the very
+    tree it was branching from: a nested checkout sitting in `<repo>/..`,
+    which the parent's own `git add`/status then have to reckon with. The
+    returned `path` still points at the LOGICAL repo (`<worktree>/<prefix>`)
+    because that is the directory the task's developer works in, and `root`
+    carries the worktree root that `worktree_remove` needs. A root
+    registration has an empty prefix, so `root == path` and both the layout
+    and the naming are exactly what they were.
+
+    The returned `path` is VERIFIED to exist before it is returned — see
+    the refusal below; a path this function hands back is a directory the
+    task can actually be run in.
+
+    `config_repos` (the `repos.yaml` map) is message-only: it lets the
+    failure path name the known direct-branch colliders — see
+    `shares_toplevel`."""
     import uuid
+    prefix = subtree_prefix(repo)
+    # A root registration keeps `repo` VERBATIM rather than re-deriving it
+    # through rev-parse: git's canonical spelling can differ from the
+    # registered one (macOS `/var` -> `/private/var`), and silently relocating
+    # every existing deployment's worktrees is not a subtree feature.
+    top = toplevel(repo) if prefix else Path(repo)
     last_err = None
     for _ in range(2):
         uid = uuid.uuid4().hex[:8]
         branch = f"task/{task_id}-{uid}"
-        path = repo.parent / f"{repo.name}-wt-{task_id}-{uid}"
+        root = top.parent / f"{top.name}-wt-{task_id}-{uid}"
         try:
-            run_git(repo, "worktree", "add", "-b", branch, str(path), base_branch)
-            return {"path": str(path), "branch": branch}
+            run_git(top, "worktree", "add", "-b", branch, str(root), base_branch)
         except GitError as exc:
             last_err = exc
+            continue
+        path = root / prefix if prefix else root
+        if path.is_dir():
+            return {"path": str(path), "root": str(root), "branch": branch}
+        # `git worktree add` SUCCEEDS while materializing only what
+        # `base_branch` tracks, so a subtree that does not exist on that
+        # base leaves a perfectly healthy worktree with no `<prefix>` in it
+        # (reproduced against a base predating the subtree's first commit:
+        # returned `...-wt-T1-<uid>\frontend`, exists on disk False, verb
+        # reported ok). Returning that path hands the developer a
+        # `harness-repo` header pointing at nothing, `_run_tests(cwd=...)`
+        # raises, and — worse — the CLI's resume gate
+        # (`Path(recorded["path"]).is_dir()`) stays false forever, so every
+        # retry adds ANOTHER worktree and ANOTHER `task/<id>-<uid>` branch
+        # while `worktree_remove` only ever sees the newest record. Refuse
+        # here, and take the tree we just made with us: the leak this lane
+        # is documented never to produce must not start with our own call.
+        run_git(top, "worktree", "remove", "--force", str(root), check=False)
+        run_git(top, "branch", "-D", branch, check=False)
+        run_git(top, "worktree", "prune", check=False)
+        # The cleanup above is check=False best-effort (a locked file — AV
+        # scanner, open handle — can defeat `worktree remove` on Windows,
+        # and then `branch -D` fails on the still-checked-out branch), so
+        # the message must not state the removal as fact it didn't verify.
+        cleaned = ("removed again, no branch left behind"
+                   if not root.exists() else
+                   f"cleanup attempted but {root} is still on disk — "
+                   "remove it and its task branch by hand")
+        raise GitError(
+            f"worktree for task {task_id} was created from '{base_branch}' "
+            f"but the registered subtree '{prefix}' does not exist on that "
+            "branch — nothing under it is tracked there, so the worktree "
+            f"came up without it ({cleaned}). "
+            f"Commit {repo} onto '{base_branch}' (or pass a base that "
+            "carries it) and retry; never worked around silently.")
+    # The direct-branch fallback cuts the task branch in the MAIN checkout,
+    # and a checkout switch flips the WHOLE physical tree. Refused for ANY
+    # subtree registration, not only where a sibling happens to be
+    # registered too (adversarial-review finding, reproduced with only
+    # `frontend` registered): `shares_toplevel` answers about the REGISTRY,
+    # the hazard is about the CHECKOUT, so an empty list offered a fallback
+    # that would still have flipped `backend/`, `infra/` and any uncommitted
+    # human work in them. The list survives as the naming of KNOWN
+    # colliders — a refusal that can say who else is in there is worth more
+    # than one that can't. A root registration with no sharers is untouched:
+    # same offer, same wording as before subtrees existed.
+    shared = shares_toplevel(config_repos or {}, repo)
+    if prefix or shared:
+        colliders = (f" (also registered into it: {', '.join(shared)})"
+                     if shared else "")
+        fallback = (
+            "the direct-branch fallback is NOT available here: this "
+            f"registration shares the physical checkout {top}{colliders}, so "
+            "cutting the task branch there would switch every other file in "
+            "that checkout too — sibling logical repos and unregistered "
+            "uncommitted work alike. Fix the repo state instead; never "
+            "proceed silently")
+    else:
+        fallback = (
+            "offer the direct-branch fallback (task branch in the main "
+            "checkout, worktree: null) or fix the repo state; never proceed "
+            "silently")
     raise GitError(
         f"worktree creation failed twice for task {task_id} ({last_err}) — "
-        "offer the direct-branch fallback (task branch in the main checkout, "
-        "worktree: null) or fix the repo state; never proceed silently")
+        f"{fallback}")
 
 
 def worktree_remove(repo: Path, worktree: dict) -> None:
-    run_git(repo, "worktree", "remove", "--force", worktree["path"], check=False)
+    # `git worktree remove` takes the worktree ROOT; `path` is the logical
+    # repo inside it, which for a subtree registration is a subdirectory git
+    # rejects outright ("is not a working tree"). `.get`, not `[...]`: run
+    # state written before subtree support carries only the old
+    # `{path, branch}` shape, and a resumed run must still be able to sweep.
+    run_git(repo, "worktree", "remove", "--force",
+            worktree.get("root") or worktree["path"], check=False)
     run_git(repo, "branch", "-D", worktree["branch"], check=False)
     run_git(repo, "worktree", "prune", check=False)
 
 
 def diff_paths(repo: Path, base: str) -> list[str]:
-    """All paths the branch touches vs base (committed) plus working changes."""
-    committed = run_git(repo, "diff", "--name-only", f"{base}...HEAD")
+    """All paths the branch touches vs base (committed) plus working changes.
+    `--relative` keeps the committed half inside the registered subtree, the
+    same scope `changed_files` gives the working half — the contract/quick
+    gates that consume this compare against repo-relative declarations."""
+    committed = run_git(repo, "diff", "--name-only", "--relative",
+                        f"{base}...HEAD")
     return sorted({*committed.splitlines(), *changed_files(repo)} - {""})
 
 
@@ -844,9 +1139,14 @@ def diff_line_count(repo: Path, base: str) -> int:
     scope `diff_paths` covers — quick_recheck's `quick_mode.loc_max` check
     (design.md piece 1: the size dimension of "quick", not just the
     disqualify-pattern dimension). Binary files show `-` for both counts in
-    `--numstat`; skipped, not counted as a giant integer."""
-    committed = run_git(repo, "diff", "--numstat", f"{base}...HEAD")
-    working = run_git(repo, "diff", "--numstat")
+    `--numstat`; skipped, not counted as a giant integer.
+
+    `--relative` on both halves, so a subtree logical repo's "is this change
+    small enough for quick mode" answer counts ITS lines — not a sibling
+    logical repo's churn, which it neither owns nor can review."""
+    committed = run_git(repo, "diff", "--numstat", "--relative",
+                        f"{base}...HEAD")
+    working = run_git(repo, "diff", "--numstat", "--relative")
     total = 0
     for line in (committed + "\n" + working).splitlines():
         if not line.strip():

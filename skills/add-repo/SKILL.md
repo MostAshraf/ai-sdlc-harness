@@ -32,7 +32,10 @@ told apart from a genuine one, so confirm rather than assume.
 registered, with a `/dev-workflow` run in progress against it, can switch
 that run's feature-branch checkout back to default — if there's any chance
 the path is already registered, check first rather than running `discover`
-on it.
+on it. The same hazard reaches a path that is merely **inside** a checkout
+some other registered repo already covers (the monorepo shape below): the
+branch switch flips the whole shared tree, so check for an in-flight run on
+every logical repo sharing that checkout, not only on this exact path.
 
 Present the proposals (language, `test_cmd`, default branch) as
 defaults-to-confirm, not facts:
@@ -46,12 +49,26 @@ defaults-to-confirm, not facts:
   a command that cannot even locate its project still reports `pass`, and
   the first `verify-red` then seals a red-proof over a build error.
 - A `monorepo_split` proposal means this "one repo" is actually several
-  logical repos sharing one `.git` at the physical root. **This isn't yet
-  representable as separate registered repos** — `init-verify`'s
-  `repo:<name>` check requires a `.git` directly under the registered path,
-  which no subtree has, so registering subtrees separately leaves every one
-  of them permanently failing verification with no available fix. Tell the
-  user this is a known gap; register the repo once, at its physical root.
+  logical repos sharing one `.git` at the physical root. **Register each
+  proposed root as its own logical repo** — one `/add-repo` pass per root
+  (this run registers one; tell the user the rest each need their own run),
+  not one registration at the checkout. `monorepo_split` lists the `root` of
+  every proposal, checkout-relative in the platform's own separators
+  (backslashed on Windows), `.` meaning the checkout itself; the path to
+  register is `<checkout>/<root>` (plain
+  `<checkout>` for `.`). Suggest `<repo>-<root>` names (`xtream-backend` for
+  the `.` root holding the solution, `xtream-frontend` for `frontend/`) and
+  let the user overrule the names, not the shape. `init-verify` passes any
+  path inside a git work tree, root or subtree, and says `<path> (subtree of
+  <checkout>)` when they differ — confirmation, not a warning. Confirm each
+  root's `test_cmd` **from that subtree** (`cd <checkout>/frontend` first):
+  proposed commands are subtree-relative and the harness runs them with the
+  registered path as cwd. Say plainly what the user gets: per-task worktrees
+  still isolate (built from the physical checkout, task works in
+  `<worktree>/<subtree>`, staging bounded to the subtree), but outside
+  worktrees both logical repos sit on the SAME branch — `preflight` cuts it
+  in the shared checkout — and a parent root legally contains its child, so
+  only review catches a parent task editing the child's files.
 
 ## 3 · Register
 
@@ -68,6 +85,14 @@ aliases) on:
 - `--path` already registered under a different name — surface this
   verbatim; the repo is very likely already set up, so confirm with the
   user rather than retrying with a new name.
+
+`--path` may be a **subtree** of a checkout another registered repo already
+covers — that's the monorepo shape above, and it is not a collision: the
+duplicate-path refusal compares resolved paths exactly, so `<checkout>` and
+`<checkout>/frontend` are two distinct registrations while the identical
+path twice is still refused. Pass the subtree path verbatim and register the
+subtree's own `--test-cmd` with it; nothing downstream rewrites the path back
+to the physical checkout root.
 
 `--test-cmd` is optional — omitting it registers the repo but leaves
 `init-verify`'s `test_cmd:<name>` check failing until a command is set via

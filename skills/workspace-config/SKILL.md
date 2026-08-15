@@ -63,7 +63,9 @@ time `/dev-workflow` runs.
   {"exclude_template": "--exclude {test}", "tests": [{"test": "t/a.spec.ts",
   "reason": "fails on main", "since": "2026-07-22"}]}}}}}` — `language` is a
   full REPLACE (§2): re-send every repo's existing keys.
-- `repos` — repointing or renaming an *existing* entry's path.
+- `repos` — repointing or renaming an *existing* entry's path. A path may be
+  a checkout root **or** a subtree of one (`<checkout>/frontend`) — that's
+  how a monorepo's logical repos are registered, one entry per root.
 
 ## 2 · Read the current section before writing it
 
@@ -89,7 +91,13 @@ one needs a direct edit to `overrides.yaml`; say so rather than improvising.
 ## 3 · Confirm a `test_cmd` change by running it, and mind two risks
 
 Confirm any `test_cmd` change by actually running it in that repo — same
-rule `/add-repo`/`/init-workspace` follow, never accept it unconfirmed.
+rule `/add-repo`/`/init-workspace` follow, never accept it unconfirmed. Run
+it **at the registered path**, which may be a subtree of a checkout: test
+commands run with the registered path as their cwd, so a command
+confirmed from the enclosing checkout root proves nothing about that logical
+repo. Repointing an entry between a checkout root and a subtree of it is a
+legal `repos` write (`init-verify` accepts either), but it moves the command's
+cwd — re-confirm that repo's `test_cmd` in the same pass.
 
 **Known risks**: (1) `init-section --section repos` has none of `/add-repo`'s
 collision checks — a duplicate name (case-insensitive: collides on-disk on
@@ -104,8 +112,12 @@ run mid-flight can start failing with a confusing "no test command" error.
 
 ## 4 · Re-verify if the section could affect verify or permissions
 
-`init-verify` covers `provider`, `repos` (≥1 registered, each a real git
-checkout), and `language` (`test_cmd` runnability) — **not** `overrides`.
+`init-verify` covers `provider`, `repos` (≥1 registered, each path inside a
+git work tree — a checkout root *or* any subtree of one, which is how a
+monorepo's logical repos register), and `language` (`test_cmd` runnability)
+— **not** `overrides`. A `repo:<name>` detail reading `<path> (subtree of
+<checkout>)` is a pass stating where the git tree actually is, not a
+failure.
 
 - `provider` only: re-run `init-verify`, fix any failure.
 - `repos` (a path) or `language` (a `test_cmd` binary): re-run `init-verify`,
