@@ -12,7 +12,7 @@ from pathlib import Path
 
 from harness import gitops, state as state_mod, workflow
 from harness.cli import load_declared
-from tests.test_gitops import make_repo
+from tests.test_gitops import make_monorepo, make_repo
 from tests import support
 
 
@@ -279,6 +279,161 @@ class HttpRouteReconciliation(_ContractHarness):
                     '[Route("users/{id:int}/items")]\n')
         self._write(self.repo_b, "client.cs", '$"users/{uid}/items"\n')
         self.assertEqual(self._verdict(), "clean")
+
+
+class SubtreeContractSurface(_ContractHarness):
+    """A registered repo is not necessarily a checkout ROOT any more: one
+    logical repo may sit at `<checkout>` while another sits at
+    `<checkout>/frontend`, one `.git` between them (gitops' SubtreeLogicalRepos
+    covers the same shape from the git side).
+
+    `git grep`'s exclusion pathspecs are CWD-RELATIVE, so the parent
+    registration's `:(exclude,glob)ai/**` and `:(exclude,glob)tests/**`
+    anchor at the checkout root and never reach into the sibling — while its
+    `-- .` search scope does. The sharp case is the sibling's PUBLISHED
+    MIRROR: publish_mirror drops the run's own state.yaml, contract
+    declarations verbatim, into `<repo>/ai/<run>/`, so the parent was
+    matching the sibling's copy of the DECLARATION and calling it `present`.
+    A false CLEAN at ⟨approve-pre-pr⟩ — the direction this checker is not
+    allowed to fail in, and in lean mode the single guaranteed human stop."""
+
+    FRAG = "def api_v2(payload)"
+
+    def setUp(self):
+        super().setUp()
+        self.mono = make_monorepo(self.workspace)
+        self.frontend = self.mono / "frontend"
+
+    def _mono_repos(self):
+        return {"mono": str(self.mono), "frontend": str(self.frontend)}
+
+    def _verdict(self):
+        return workflow.reconcile_contracts(self.workspace, self.run,
+                                            self.config, self._mono_repos())
+
+    def _declare(self, repo_name):
+        self._register([{"id": "C1", "repos": [repo_name],
+                         "signature": self.FRAG}])
+
+    # ------------------------------------------ the parent registration
+
+    def test_sibling_mirror_of_the_declaration_does_not_satisfy_the_parent(self):
+        """The reproduced case. Byte-for-byte what publish_mirror writes into
+        the frontend registration — and it is the contract's own text, so a
+        parent that can see it always reports `present`, for every contract,
+        forever. Excluded at the parent's own `ai/**` since session D; the
+        sibling's copy needs the nested-registration subtraction."""
+        self._declare("mono")
+        self._write(self.mono, f"frontend/ai/{self.run.name}/state.yaml",
+                    f"contracts:\n- id: C1\n  signature: {self.FRAG}\n")
+        self.assertEqual(self._verdict(), "drift")
+
+    def test_sibling_test_file_does_not_satisfy_the_parent(self):
+        """The other half of the same cwd-relativity: `tests/**` anchors at
+        the parent's cwd, so `frontend/tests/` was un-excluded — resurrecting
+        verbatim the "a mention in a test counts as an implementation" bug
+        test_match_only_in_test_path_is_excluded_as_false_positive pins for
+        the single-checkout shape. Deliberately NOT named `test_*.py`: that
+        basename is caught by the `**/test_*.py` glob at any depth, which
+        would hide the anchoring defect this test exists to catch."""
+        self._declare("mono")
+        self._write(self.mono, "frontend/tests/api_helper.py",
+                    f"# {self.FRAG} mentioned here, not implemented\n")
+        self.assertEqual(self._verdict(), "drift")
+
+    def test_sibling_source_does_not_satisfy_the_parent(self):
+        """Same false clean, no mirror and no test path involved: a
+        separately-registered logical repo's source is not this repo's
+        contract surface — `frontend` implementing the signature satisfies
+        `frontend`'s row in the report, never `mono`'s."""
+        self._declare("mono")
+        self._write(self.mono, "frontend/impl.py", f"{self.FRAG}: pass\n")
+        self.assertEqual(self._verdict(), "drift")
+
+    def test_parents_own_source_still_counts(self):
+        """The positive control for all three: the subtraction removes the
+        nested registration, not the parent's own tree."""
+        self._declare("mono")
+        self._write(self.mono, "impl.py", f"{self.FRAG}: pass\n")
+        self.assertEqual(self._verdict(), "clean")
+
+    # --------------------------------------- the subtree registration
+
+    def test_subtree_registration_is_unaffected(self):
+        """Nothing changes for the child: its cwd-relative excludes already
+        sit exactly under its cwd-scoped `.`, so its own tests/ and mirror
+        were always excluded and its own source always visible. Pinned so a
+        later "fix" that prefixes the globs cannot silently break it."""
+        self._declare("frontend")
+        self._write(self.mono, "frontend/tests/api_helper.py",
+                    f"# {self.FRAG} mentioned here, not implemented\n")
+        self._write(self.mono, f"frontend/ai/{self.run.name}/state.yaml",
+                    f"contracts:\n- id: C1\n  signature: {self.FRAG}\n")
+        self.assertEqual(self._verdict(), "drift")
+        self._write(self.mono, "frontend/impl.py", f"{self.FRAG}: pass\n")
+        self.assertEqual(self._verdict(), "clean")
+
+    def test_parent_source_does_not_satisfy_the_subtree(self):
+        # the mirror image, already true before this change (`-- .` is
+        # cwd-scoped) — asserted so the pair is symmetric on the record
+        self._declare("frontend")
+        self._write(self.mono, "impl.py", f"{self.FRAG}: pass\n")
+        self.assertEqual(self._verdict(), "drift")
+
+
+class ContractExcludePathspecs(_ContractHarness):
+    """The pathspec list itself, asserted literally — the regression fence
+    around "a root registration's behaviour is UNCHANGED"."""
+
+    def setUp(self):
+        super().setUp()
+        self.mono = make_monorepo(self.workspace)
+        self.frontend = self.mono / "frontend"
+        self.globs = self.config["language"]["test_paths"]
+        self.base = ([f":(exclude,glob){g}" for g in self.globs]
+                     + [":(exclude,glob)ai/**"])
+
+    def _mono_repos(self):
+        return {"mono": str(self.mono), "frontend": str(self.frontend)}
+
+    def test_separate_checkouts_are_byte_identical_to_before(self):
+        # the shape every deployment before subtree registrations had, and
+        # still the common one: two registered repos, neither inside the
+        # other, so the nested-registration subtraction contributes nothing
+        self.assertEqual(
+            workflow._contract_excludes(self.repo_a, self.globs, self._repos()),
+            self.base)
+
+    def test_subtree_registration_is_byte_identical_too(self):
+        # a child registration's excludes are cwd-relative under a cwd-scoped
+        # `.`; prefixing them (`frontend/tests/**` issued FROM `frontend`)
+        # would apply the prefix twice and match nothing — probed on git
+        # 2.55.0.windows.3
+        self.assertEqual(
+            workflow._contract_excludes(self.frontend, self.globs,
+                                        self._mono_repos()),
+            self.base)
+
+    def test_parent_registration_subtracts_the_nested_one(self):
+        self.assertEqual(
+            workflow._contract_excludes(self.mono, self.globs,
+                                        self._mono_repos()),
+            self.base + [":(exclude,glob)frontend/**"])
+
+    def test_nested_registrations_skips_self_and_outsiders(self):
+        # `.` is the dangerous one: `:(exclude,glob)./**` empties the search
+        # scope outright (probed), so a second spelling of the repo's own
+        # registration must never survive the filter. Deep nesting is kept —
+        # redundant beside `frontend`, but the subtraction is not required to
+        # know that a registration list has no overlaps.
+        repos = {"mono": str(self.mono),
+                 "mono-again": str(self.mono) + "/.",
+                 "frontend": str(self.frontend),
+                 "admin": str(self.frontend / "admin"),
+                 "outside": str(self.repo_a)}
+        self.assertEqual(workflow._nested_registrations(self.mono, repos),
+                         ["frontend", "frontend/admin"])
+        self.assertEqual(workflow._nested_registrations(self.repo_a, repos), [])
 
 
 class HttpRouteRegexUnit(unittest.TestCase):

@@ -904,6 +904,57 @@ class WriteGuard(GuardHarness):
         self.assert_blocks("write", self._w(str(code / "gamma" / "x.py"), dev),
                            "worktree")
 
+    def test_subtree_repo_worktree_write_allowed(self):
+        # A logical repo registered as a SUBTREE of a physical checkout —
+        # initws.discover's monorepo split, where `Code/mono` is the one
+        # checkout and `frontend/` is a logical repo of its own. gitops.
+        # worktree_add names and places the per-task worktree after the
+        # PHYSICAL TOPLEVEL (`Code/mono-wt-<task>-<uid>`), which is neither
+        # inside the registered path nor a `frontend-wt-` sibling under
+        # `Code/mono` — so every developer write into its OWN worktree was
+        # blocked. It passed only when the enclosing root repo happened to be
+        # registered too; here it deliberately is NOT, which is the whole
+        # point (that coincidence was luck, not correctness).
+        dev = "x:developer"
+        mono = self.workspace / "Code" / "mono"
+        (mono / ".git").mkdir(parents=True)   # the marker the toplevel walk
+        (mono / "frontend").mkdir()           # stats for — no git needed
+        self._register_repo(mono / "frontend")
+        wt = self.workspace / "Code" / "mono-wt-T1-ab12cd34"
+        self.assert_allows("write",
+                           self._w(str(wt / "frontend" / "src" / "a.ts"), dev))
+        # the registered subtree itself keeps working...
+        self.assert_allows("write",
+                           self._w(str(mono / "frontend" / "src" / "a.ts"), dev))
+        # ...while the checkout's OTHER subtree — a sibling logical repo
+        # nobody registered — stays outside the confinement
+        self.assert_blocks("write",
+                           self._w(str(mono / "backend" / "Prog.cs"), dev),
+                           "worktree")
+        # and a stranger repo's worktree is not this developer's business
+        # either: the `-wt-` name has to be the TOPLEVEL's, not just any
+        self.assert_blocks("write", self._w(str(
+            self.workspace / "Code" / "stranger-wt-T1-ab12cd34" / "src" / "a.ts"),
+            dev), "worktree")
+
+    def test_root_repo_worktree_naming_never_widens_to_ancestors(self):
+        # Mutation guard on the toplevel walk. A root registration carries
+        # its own `.git`, so the walk must stop THERE and keep accepting
+        # exactly `backend-wt-*`. Accepting a `-wt-` sibling for every
+        # ancestor directory instead — the cheaper spelling of the same fix —
+        # would additionally hand a developer `<ws>/Code-wt-*`, a widening of
+        # the ordinary shape that this guard's fail-closed bias forbids.
+        dev = "x:developer"
+        repo = self.workspace / "Code" / "backend"
+        (repo / ".git").mkdir(parents=True)
+        self._register_repo(repo)
+        self.assert_allows("write", self._w(str(
+            self.workspace / "Code" / "backend-wt-T1-ab12cd34" / "src" / "x.py"),
+            dev))
+        self.assert_blocks("write", self._w(str(
+            self.workspace / "Code-wt-T1-ab12cd34" / "src" / "x.py"), dev),
+            "worktree")
+
     def test_developer_write_fails_open_without_registered_repos(self):
         # no repos.yaml -> bounds undeterminable -> fail open (never strand
         # a developer on a defense-in-depth guard); authority files stay
@@ -1141,6 +1192,203 @@ class WriteGuard(GuardHarness):
             "--run ai/2026-01-01-X", "x:reviewer"))
 
 
+class WorktreeScopeGuard(GuardHarness):
+    """Subtree-scope confinement (adversarial-review, HIGH, reproduced
+    end-to-end with real git): a subtree logical repo's task worktree is cut
+    from the PHYSICAL checkout, so the worktree carries the whole monorepo
+    while the task owns one directory of it. Everything downstream is
+    subtree-scoped — `changed_files`/`diff_paths` are `--relative`, so the
+    gates and the reviewer see only the task's own files; `commit_class`
+    stages `add -A -- .` from the subtree; `merge-task` squashes what was
+    committed; develop.md step 7 force-removes the worktree. An edit dropped
+    outside the subtree therefore vanished on a GREEN run with no error, no
+    warning and no event. This guard refuses it instead.
+
+    Every fixture here leaves `test_intents` unset so the ordering gate is
+    exempt and only the scope gate can speak — the two are adjacent on the
+    same hot path and would otherwise be indistinguishable by verdict."""
+
+    def _w(self, fp, agent=None):
+        p = {"tool_name": "Write", "tool_input": {"file_path": fp}}
+        if agent:
+            p["agent_type"] = agent
+            p["agent_id"] = "a-1"
+        return p
+
+    def _register_repo(self, repo: Path):
+        ctx = self.workspace / ".claude" / "context"
+        ctx.mkdir(parents=True, exist_ok=True)
+        (ctx / "repos.yaml").write_text(f"repos:\n  r: {repo}\n")
+
+    def _subtree_run(self, prefix="frontend"):
+        """ONE physical checkout `Code/mono` whose `<prefix>` subtree is the
+        registered logical repo, plus the worktree `worktree_add` cuts for it:
+        named after the TOPLEVEL, with the logical repo inside it, and both
+        recorded (`{path, root, branch}`). `<wt>/package.json` and
+        `<wt>/backend/` are the monorepo remainder that rides along in the
+        worktree and belongs to no-one here."""
+        mono = self.workspace / "Code" / "mono"
+        (mono / ".git").mkdir(parents=True)   # the marker the toplevel walk
+        (mono / prefix).mkdir(parents=True)   # stats for — no git needed
+        self._register_repo(mono / prefix)
+        run = self.make_run()
+        root = self.workspace / "Code" / "mono-wt-T1-ab12cd34"
+        (root / prefix).mkdir(parents=True)
+        (root / "backend").mkdir()
+        st = state_mod.load(run, self.workspace)
+        st["tasks"][0]["worktree"] = {"path": str(root / prefix),
+                                      "root": str(root),
+                                      "branch": "task/T1-ab12cd34"}
+        state_mod.save(run, self.workspace, st)
+        return run, root
+
+    def _root_run(self):
+        """The ordinary shape, for the byte-identical proof: a ROOT
+        registration, whose `worktree_add` prefix is empty — so `path ==
+        root` and the logical repo IS the whole worktree."""
+        repo = self.workspace / "Code" / "backend"
+        (repo / ".git").mkdir(parents=True)
+        self._register_repo(repo)
+        run = self.make_run()
+        wt = self.workspace / "Code" / "backend-wt-T1-ab12cd34"
+        wt.mkdir()
+        st = state_mod.load(run, self.workspace)
+        st["tasks"][0]["worktree"] = {"path": str(wt), "root": str(wt),
+                                      "branch": "task/T1-ab12cd34"}
+        state_mod.save(run, self.workspace, st)
+        return run, wt
+
+    def test_write_outside_the_task_subtree_is_blocked(self):
+        # THE mutation test. The exact failure shape the review reproduced:
+        # a frontend task needs a dependency, so the developer edits
+        # `<wt>/frontend/app.ts` AND the workspace-root `<wt>/package.json`.
+        # Before this gate BOTH were allowed — `_developer_write_ok` waved
+        # the whole worktree through — and only the first one existed by the
+        # time the PR was open. The sibling logical repo's directory in the
+        # same worktree is the same bug wearing a different path.
+        run, root = self._subtree_run()
+        for lost in (root / "package.json", root / "backend" / "app.py",
+                     root / "pnpm-workspace.yaml"):
+            self.assert_blocks("write", self._w(str(lost), "x:developer"),
+                               "SILENTLY LOST")
+
+    def test_write_inside_the_task_subtree_is_allowed(self):
+        # The other half of the same worktree, and the reason this cannot
+        # just refuse the worktree wholesale: the task's own files are here.
+        run, root = self._subtree_run()
+        self.assert_allows("write", self._w(
+            str(root / "frontend" / "src" / "app.ts"), "x:developer"))
+        self.assert_allows("write", self._w(
+            str(root / "frontend" / "package.json"), "x:developer"))
+
+    def test_bash_write_outside_the_task_subtree_is_blocked(self):
+        # Both surfaces or neither: closing Write/Edit alone leaves
+        # `sed -i <wt>/package.json` as a one-line walk around the whole
+        # confinement, which is the very shape of the finding. Quoted target
+        # so the nt sweep sees the drive-lettered absolute (`_ABS_TOKEN_RE`).
+        run, root = self._subtree_run()
+        manifest, sibling = root / "package.json", root / "backend"
+        self.assert_blocks("bash", bash(
+            f'sed -i s/a/b/ "{manifest}"', "x:developer"), "SILENTLY LOST")
+        self.assert_blocks("bash", bash(
+            f'rm -rf "{sibling}"', "x:developer"), "SILENTLY LOST")
+
+    def test_bash_cd_into_the_worktree_root_is_not_a_write(self):
+        # False-block guard on the ancestor tolerance. A destructive verb
+        # anywhere in a command makes the bash sweep treat EVERY absolute
+        # token as a target — including the `cd <worktree>` / `git -C
+        # <worktree>` argument that a clean-and-build naturally carries. The
+        # worktree root and the directories above a nested prefix are
+        # ancestors of the logical repo, never files, so they are tolerated;
+        # this is the same case, one directory out, that the ordering gate's
+        # `rel == "."` branch has always had to absorb.
+        run, root = self._subtree_run()
+        dist = root / "frontend" / "dist"
+        self.assert_allows("bash", bash(
+            f'cd "{root}" && rm -rf "{dist}"', "x:developer"))
+
+    def _nested_prefix_run(self):
+        mono = self.workspace / "Deep" / "mono"
+        (mono / ".git").mkdir(parents=True)
+        (mono / "apps" / "web").mkdir(parents=True)
+        self._register_repo(mono / "apps" / "web")
+        run = self.make_run(run_name="2026-01-02-G-2", item_id="G-2")
+        root = self.workspace / "Deep" / "mono-wt-T1-99887766"
+        (root / "apps" / "web").mkdir(parents=True)
+        st = state_mod.load(run, self.workspace)
+        st["tasks"][0]["worktree"] = {"path": str(root / "apps" / "web"),
+                                      "root": str(root),
+                                      "branch": "task/T1-99887766"}
+        state_mod.save(run, self.workspace, st)
+        return run, root
+
+    def test_nested_prefix_confines_to_the_full_prefix(self):
+        # `apps/web`, not just `apps`: the confinement is the recorded
+        # logical path, so a sibling app in the same worktree is out.
+        run, root = self._nested_prefix_run()
+        self.assert_allows("write", self._w(
+            str(root / "apps" / "web" / "src" / "a.ts"), "x:developer"))
+        self.assert_blocks("write", self._w(
+            str(root / "apps" / "api" / "src" / "a.ts"), "x:developer"),
+            "SILENTLY LOST")
+        # ...while `<wt>/apps` itself — an intermediate directory of the
+        # prefix, and pure `cd` noise on the bash sweep — is tolerated by the
+        # same ancestor rule the worktree root gets
+        apps = root / "apps"
+        self.assert_allows("bash", bash(
+            f'cd "{apps}" && rm -rf build', "x:developer"))
+
+    def test_root_registration_worktree_is_unchanged(self):
+        # The compatibility proof, and the one behaviour this change was not
+        # allowed to move: a ROOT registration's prefix is empty, so the
+        # logical repo IS the worktree root and NOTHING inside the worktree
+        # can be out of scope — including the paths that are the whole bug
+        # for a subtree task. Run state is recorded here, so the gate is
+        # fully live and still says nothing.
+        run, wt = self._root_run()
+        for p in (wt / "package.json", wt / "backend" / "app.py",
+                  wt / "src" / "main" / "App.java"):
+            self.assert_allows("write", self._w(str(p), "x:developer"))
+        target = wt / "target"
+        self.assert_allows("bash", bash(
+            f'rm -rf "{target}"', "x:developer"))
+
+    def test_unreadable_run_state_falls_back_to_allowing_the_worktree(self):
+        # The fail-open this gate is deliberately built with. Reading run
+        # state means chain-verifying it, and a developer must never be
+        # stranded inside its own worktree because a sibling run's state is
+        # corrupt — so an unreadable state degrades to TODAY's behaviour (the
+        # whole worktree allowed), never to a block. The write is still
+        # confined by `_developer_write_ok`; only the finer line goes quiet.
+        run, root = self._subtree_run()
+        sf = run / "state.yaml"
+        sf.write_text(sf.read_text(encoding="utf-8") + "# tampered\n")
+        self.assert_allows("write", self._w(
+            str(root / "package.json"), "x:developer"))
+
+    def test_unrecorded_worktree_falls_back_to_allowing_the_worktree(self):
+        # Same posture for the other two indeterminates: the direct-branch
+        # fallback records `worktree: null`, and an aborted run's stale
+        # worktree dir must not enforce anything after the sweep. Neither
+        # resolves a logical root, so neither may refuse a write.
+        run, root = self._subtree_run()
+        st = state_mod.load(run, self.workspace)
+        st["tasks"][0]["worktree"] = None
+        state_mod.save(run, self.workspace, st)
+        self.assert_allows("write", self._w(
+            str(root / "package.json"), "x:developer"))
+
+    def test_stranger_worktree_is_still_blocked_outright(self):
+        # Unchanged and load-bearing: the scope gate narrows a worktree the
+        # developer is already entitled to. A `-wt-` directory named after a
+        # repo nobody registered never reaches it — `_developer_write_ok`
+        # refuses it first, with its own message.
+        run, root = self._subtree_run()
+        self.assert_blocks("write", self._w(str(
+            self.workspace / "Code" / "stranger-wt-T1-ab12cd34" / "a.ts"),
+            "x:developer"), "worktree")
+
+
 class TddOrderingGuard(GuardHarness):
     """Test-first ordering (field report: 2 of 8 declared test-intents had
     zero test code while their production signatures were already changed —
@@ -1176,6 +1424,91 @@ class TddOrderingGuard(GuardHarness):
             st["tasks"][0]["test_intents"] = list(intents)
         state_mod.save(run, self.workspace, st)
         return run, wt
+
+    def _subtree_tdd_run(self, intents=("test_calc_adds",)):
+        """The subtree shape: ONE physical checkout `Code/mono`, its
+        `frontend/` subtree registered as the logical repo, and the worktree
+        gitops.worktree_add now cuts — named after the TOPLEVEL, with the
+        logical repo at `<root>/frontend` inside it and both recorded
+        (`{path, root, branch}`)."""
+        mono = self.workspace / "Code" / "mono"
+        (mono / ".git").mkdir(parents=True)
+        (mono / "frontend").mkdir()
+        self._register_repo(mono / "frontend")
+        run = self.make_run()
+        root = self.workspace / "Code" / "mono-wt-T1-ab12cd34"
+        (root / "frontend").mkdir(parents=True)
+        st = state_mod.load(run, self.workspace)
+        st["tasks"][0]["worktree"] = {"path": str(root / "frontend"),
+                                      "root": str(root),
+                                      "branch": "task/T1-ab12cd34"}
+        st["tasks"][0]["test_intents"] = list(intents)
+        state_mod.save(run, self.workspace, st)
+        return run, root
+
+    def test_subtree_task_ordering_gate_fires(self):
+        # THE silent fail-open. `_find_worktree_task` compared the
+        # name-derived worktree root against `worktree["path"]`, which under
+        # the subtree contract is the LOGICAL repo `<root>/frontend`: the
+        # equality never held, no task was ever found, and the ordering gate
+        # enforced nothing for every subtree task — while reporting nothing,
+        # because "no task here" is its legitimate fail-open verdict for a
+        # direct-branch fallback. Blocking here is the proof it's dead.
+        run, root = self._subtree_tdd_run()
+        self.assert_blocks("write", self._w(
+            str(root / "frontend" / "src" / "App.ts"), "x:developer"),
+            "red-proof")
+
+    def test_subtree_rel_path_is_logical_repo_relative(self):
+        # `language.test_paths` globs are repo-relative by construction
+        # (`tests/**`), so the rel handed to them must be computed against
+        # the LOGICAL repo inside the worktree, not the worktree root — else
+        # every subtree task's test writes arrive as `frontend/tests/...`,
+        # match nothing, and the gate refuses the very files it exists to
+        # demand. `tests/helpers/fixture.py` is the discriminating probe: it
+        # matches `tests/**` subtree-relative and matches NOTHING with the
+        # prefix on. (A `tests/test_x.py` probe would pass either way —
+        # `**/test_*.py` catches the prefixed spelling too — and prove
+        # nothing.)
+        run, root = self._subtree_tdd_run()
+        fe = root / "frontend"
+        self.assert_allows("write", self._w(
+            str(fe / "tests" / "helpers" / "fixture.py"), "x:developer"))
+        # the same basename on the production side still blocks, so the
+        # allowance above is glob matching and not the gate falling open
+        self.assert_blocks("write", self._w(
+            str(fe / "src" / "helpers" / "fixture.py"), "x:developer"),
+            "red-proof")
+
+    def test_subtree_write_outside_the_logical_repo_never_reaches_this_gate(self):
+        # A sibling logical repo's directory inside the SAME physical
+        # worktree. This gate cannot compute a rel for it and falls open —
+        # which is correct and is no longer the verdict, because the
+        # subtree-scope confinement (WorktreeScopeGuard) refuses the write
+        # one step earlier. The ordering question is a claim about THIS
+        # task's repo; "that file is not yours at all" is the answer the
+        # developer needs, and it is the one it gets. The ValueError branch
+        # in `_tdd_block_reason` survives as a backstop for the ancestor
+        # paths that gate deliberately tolerates, not for real writes.
+        run, root = self._subtree_tdd_run()
+        self.assert_blocks("write", self._w(
+            str(root / "backend" / "Prog.cs"), "x:developer"),
+            "SILENTLY LOST")
+
+    def test_old_shape_worktree_record_still_matched(self):
+        # Run state written BEFORE the subtree contract carries
+        # `{path, branch}` only — no `root` — and there `path` IS the
+        # worktree root. A resumed run must keep enforcing the ordering, so
+        # the lookup falls back to `path` instead of demanding `root`.
+        run, wt = self._tdd_run()
+        st = state_mod.load(run, self.workspace)
+        self.assertNotIn("root", st["tasks"][0]["worktree"])
+        self.assert_blocks("write",
+                           self._w(str(wt / "src" / "main" / "App.java"),
+                                   "x:developer"), "red-proof")
+        self.assert_allows("write",
+                           self._w(str(wt / "tests" / "helpers" / "fixture.py"),
+                                   "x:developer"))
 
     def test_production_write_blocked_before_red_proof(self):
         run, wt = self._tdd_run()

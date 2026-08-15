@@ -25,9 +25,21 @@ unverified. No task declaring `env_requires` → nothing probed, exit 0.
 Per task:
 
 1. **Worktree:** `${CLAUDE_PLUGIN_ROOT}/bin/harness worktree-add --repo <repo> --task-id <T>
-   --base <feature-branch> --run <run>` — records `{path, branch}` in state;
-   idempotent on resume. If it fails twice it names the direct-branch
-   fallback — offer that choice to the user, never improvise.
+   --base <feature-branch> --run <run>` — records `{path, root, branch}` in
+   state; idempotent on resume. For a repo registered as a **subtree** of a
+   shared checkout, `root` is the worktree itself and `path` is the logical
+   repo inside it (`<worktree>/<subtree>`) — `path` is what the developer
+   and every later `--repo <worktree>` argument take, never `root` (that one
+   exists so the sweep in step 7 can remove the worktree at all). Root
+   registrations are unchanged: the two are the same directory. If worktree
+   creation fails twice, read what the failure actually says before
+   answering: it either names the direct-branch fallback (offer that choice
+   to the user, never improvise) **or REFUSES it, naming the shared
+   physical checkout (and any other repos registered into it)** — a task
+   branch cut in the main checkout switches every file there, registered
+   or not. On the refusal
+   there is no choice to offer: surface the message verbatim, stop the lane,
+   and let the user fix the repo state.
 2. `${CLAUDE_PLUGIN_ROOT}/bin/harness task --id <T> --to in-progress --run <run>`
 3. **Spawn `developer`** with headers (`harness-mode: develop`,
    `harness-task: <T>`, `harness-run`, `harness-repo: <worktree-path>`,

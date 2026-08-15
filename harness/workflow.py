@@ -1379,34 +1379,62 @@ def _http_route_regex(frag: str) -> str | None:
                    for i, p in enumerate(parts))
 
 
-def reconcile_contracts(workspace: Path, run: Path, config: dict,
-                        repos: dict[str, str]) -> str:
-    """Cross-repo contract check (M5 charter / coverage B6): every declared
-    signature (or, for a multi-fragment signature, every fragment) must
-    appear in every repo the contract names — either its flat `repos` list
-    or, when declared directionally, `producer` + `consumers`. Test paths
-    (the same `language.test_paths` convention verify-red reads) are
-    excluded to cut false positives from a signature merely mentioned in a
-    test — known residual: a repo whose ONLY correct representation of a
-    signature is a consumer-driven contract test would false-negative here;
-    accepted trade-off, same class as RC4's shared-fixture residual. Drift
-    is REPORTED for the human at ⟨approve-pre-pr⟩ — never auto-fixed.
-    Fragments are validated grep-able at declaration (`_validate_contract`
-    rejects prose — validation-walk F3), closing the common false-positive
-    cheaply. For `type: http` contracts only, a fragment carrying a
-    `{param}` token matches route-STRUCTURALLY (each param elides to one
-    path segment — `_http_route_regex`; field 459226: producer `{id}` vs
-    consumer `userId` false-drifted a byte-identical route); every other
-    fragment is an exact literal match. True semantic/AST comparison
-    remains a documented future upgrade, not attempted here: it would need
-    structured fragments (the symbol + its kind, not a free string) plus a
-    per-language matcher — stdlib `ast` for Python, a parser or heuristic
-    for JS, tree-sitter for universal coverage — which trades the
-    language-agnostic, near-zero-dependency stance `git grep` was chosen
-    for; hence deferred (the http-param elision is the cheap, targeted
-    slice of it that keeps that stance)."""
-    st = state_mod.load(run, workspace)
-    test_globs = config.get("language", {}).get("test_paths", ["tests/**"])
+def _nested_registrations(repo: Path, repos: dict[str, str]) -> list[str]:
+    """Slash-separated paths, relative to `repo`, of every OTHER registered
+    repo that lives strictly INSIDE it — `['frontend']` for a repo
+    registered at a checkout root whose `frontend/` subtree is a second
+    logical repo, `[]` in the single-repo-per-checkout shape that was the
+    only shape before subtree registrations existed.
+
+    Containment is decided on PATHS alone, deliberately NOT through
+    `gitops.shares_toplevel`: that helper answers the neighbouring question
+    ("same physical checkout?") by shelling out to git and returns `[]` on
+    any failure — no git binary, unreadable path, bare repo. Here that
+    failure mode would silently drop an exclusion and restore the exact
+    false CLEAN this function exists to prevent, so the lookup must be one
+    that cannot fail that way. Where a nested registration turns out to be
+    its own checkout, the extra pathspec is a harmless no-op (probed on git
+    2.55.0.windows.3: an exclude naming a path git does not track is not an
+    error, exit unchanged)."""
+    try:
+        here = Path(repo).resolve()
+    except OSError:
+        return []
+    out = set()
+    for path in (repos or {}).values():
+        try:
+            rel = Path(str(path)).resolve().relative_to(here)
+        except (OSError, ValueError):
+            continue            # unresolvable, or simply not inside `repo`
+        posix = rel.as_posix()
+        if posix in (".", ""):
+            # `repo`'s own registration (or a second spelling of it), never
+            # something nested — and emitting it would be catastrophic
+            # rather than merely wrong: probed, `:(exclude,glob)./**`
+            # empties the search scope entirely, turning every contract
+            # MISSING.
+            continue
+        out.add(posix)
+    return sorted(out)
+
+
+def _contract_excludes(repo: Path, test_globs: list[str],
+                       repos: dict[str, str]) -> list[str]:
+    """The `git grep` exclusion pathspecs for ONE repo's contract search.
+
+    Every pathspec here is CWD-RELATIVE by construction — git resolves a
+    pathspec without `:(top)` magic against the directory it was invoked
+    from (`run_git`'s `git -C repo`), so these compose with the `-- .`
+    search scope instead of fighting it. Probed on git 2.55.0.windows.3 in
+    a real monorepo: a `frontend/tests/**` exclude issued FROM `frontend`
+    matches nothing at all (the cwd prefix is applied on top of the one
+    already written), which is why nothing here carries a subtree prefix,
+    and why a SUBTREE registration needs no adjustment whatsoever — its
+    cwd-relative excludes already sit exactly under its cwd-scoped `.`,
+    and its `.` already cannot see a sibling that is not beneath it.
+    `:(top,exclude,glob)<prefix>/<glob>` was the other candidate and works
+    identically from either cwd; it buys nothing over the cwd-relative form
+    and would have to re-derive the prefix per repo, so it is not used."""
     # `glob` pathspec magic, not plain `:(exclude)`: git's non-glob pathspec
     # interpretation of a `**/`-prefixed pattern only matches past at least
     # one real directory, silently failing to exclude a root-level file —
@@ -1426,6 +1454,79 @@ def reconcile_contracts(workspace: Path, run: Path, config: dict,
     # contract coverage there — same harness-owns-ai/ convention as
     # publish_mirror.
     excludes.append(":(exclude,glob)ai/**")
+    # ...and subtract every OTHER registered repo nested inside this one.
+    # A registered repo is no longer necessarily a checkout root: with one
+    # logical repo registered at `<checkout>` and a second at
+    # `<checkout>/frontend`, the root registration's `-- .` legitimately
+    # spans that second repo's files while the two excludes above — anchored
+    # at the cwd, i.e. the checkout root — do not reach into it. Probed (git
+    # 2.55.0.windows.3, real monorepo): from the toplevel,
+    # `:(exclude,glob)ai/**` + `:(exclude,glob)tests/**` still FIND
+    # `frontend/ai/<run>/state.yaml` and `frontend/tests/t.py` (exit 0);
+    # the same greps issued from `frontend` do not (exit 1). The mirror is
+    # the sharp edge: publish_mirror writes the run's own state.yaml —
+    # every contract declaration verbatim — into `<repo>/ai/<run>/`, so the
+    # parent repo was matching the SIBLING's copy of the declaration and
+    # reporting `present` for something it never implemented. That is a
+    # false CLEAN, the one direction this checker may never fail in (see
+    # the asymmetry note in the grep loop below), landing at the
+    # ⟨approve-pre-pr⟩ stop that lean mode makes the single guaranteed
+    # human gate. The same cwd-relativity un-excluded `frontend/tests/**`,
+    # resurrecting verbatim the "fragments matching their own declaration"
+    # bug the ai/** exclusion above was added to kill.
+    #
+    # The WHOLE nested subtree goes, not just its ai/** and test paths: a
+    # separately-registered logical repo's source is not this repo's
+    # contract surface either — `frontend` implementing the signature
+    # satisfies `frontend`'s own row in the report, never the parent's, and
+    # leaving it visible is the identical false-clean class. Trade-off
+    # (accepted, and deliberately the safe direction): a contract naming
+    # only the parent whose code genuinely lives inside a registered child
+    # now reports DRIFT — visible, one line for the human to dismiss, and a
+    # true statement that the contract names the wrong repo — where before
+    # it passed silently.
+    excludes.extend(f":(exclude,glob){rel}/**"
+                    for rel in _nested_registrations(repo, repos))
+    return excludes
+
+
+def reconcile_contracts(workspace: Path, run: Path, config: dict,
+                        repos: dict[str, str]) -> str:
+    """Cross-repo contract check (M5 charter / coverage B6): every declared
+    signature (or, for a multi-fragment signature, every fragment) must
+    appear in every repo the contract names — either its flat `repos` list
+    or, when declared directionally, `producer` + `consumers`. Test paths
+    (the same `language.test_paths` convention verify-red reads) are
+    excluded to cut false positives from a signature merely mentioned in a
+    test — known residual: a repo whose ONLY correct representation of a
+    signature is a consumer-driven contract test would false-negative here;
+    accepted trade-off, same class as RC4's shared-fixture residual. The
+    searched surface is the registered path's own subtree minus the run
+    mirror and minus any OTHER registered repo nested inside it — see
+    `_contract_excludes`, which is where subtree registrations stopped that
+    from being the same thing as "the whole checkout". Drift is REPORTED
+    for the human at ⟨approve-pre-pr⟩ — never auto-fixed.
+    Fragments are validated grep-able at declaration (`_validate_contract`
+    rejects prose — validation-walk F3), closing the common false-positive
+    cheaply. For `type: http` contracts only, a fragment carrying a
+    `{param}` token matches route-STRUCTURALLY (each param elides to one
+    path segment — `_http_route_regex`; field 459226: producer `{id}` vs
+    consumer `userId` false-drifted a byte-identical route); every other
+    fragment is an exact literal match. True semantic/AST comparison
+    remains a documented future upgrade, not attempted here: it would need
+    structured fragments (the symbol + its kind, not a free string) plus a
+    per-language matcher — stdlib `ast` for Python, a parser or heuristic
+    for JS, tree-sitter for universal coverage — which trades the
+    language-agnostic, near-zero-dependency stance `git grep` was chosen
+    for; hence deferred (the http-param elision is the cheap, targeted
+    slice of it that keeps that stance)."""
+    st = state_mod.load(run, workspace)
+    test_globs = config.get("language", {}).get("test_paths", ["tests/**"])
+    # Per REPO, not once for the run: the exclusion set now depends on where
+    # the repo sits in its physical checkout (`_contract_excludes`), and the
+    # same repo recurs across contracts — so memoise on the registered path
+    # rather than rebuilding it per fragment.
+    excludes_by_repo: dict[str, list[str]] = {}
     lines, drift = ["# Cross-repo contracts\n"], False
     for c in st.get("contracts", []):
         fragments = c["signature"] if isinstance(c["signature"], list) else [c["signature"]]
@@ -1444,6 +1545,10 @@ def reconcile_contracts(workspace: Path, run: Path, config: dict,
         is_http = c.get("type") == "http"
         for repo_name in repo_names:
             repo = Path(repos.get(repo_name, repo_name))
+            if str(repo) not in excludes_by_repo:
+                excludes_by_repo[str(repo)] = _contract_excludes(
+                    repo, test_globs, repos)
+            excludes = excludes_by_repo[str(repo)]
             missing = []
             for frag in fragments:
                 # http fragments carrying a {param} token match
@@ -1479,14 +1584,99 @@ def reconcile_contracts(workspace: Path, run: Path, config: dict,
     return verdict
 
 
+def _shared_pr_record(st: dict, config: dict, repo: Path,
+                      branch: str, name: str) -> tuple[str, dict] | None:
+    """`(ORIGINATING repo name, the `pr` entry to copy)` when this run ALREADY
+    opened a PR for the very same physical branch under a different registered
+    name — None otherwise, which is every single-checkout-per-repo run.
+
+    Subtree logical repos make one physical checkout hold several registered
+    repos (`backend` = `<checkout>`, `frontend` = `<checkout>/frontend`,
+    gitops' subtree note). One checkout is one `.git`, therefore ONE HEAD:
+    preflight cuts the deterministic feature branch for the first of them and
+    the second ADOPTS that same branch (the `_branch_exists` arm at the
+    bottom of `preflight`), so `rev-parse --abbrev-ref HEAD` answers the
+    identical string in both directories. Calling the provider twice with
+    that head/base pair against the identical remote is not two PRs, it is
+    one PR and one validation error: the gitlab adapter refuses to swallow
+    that class by design (`git_providers._GITLAB_PROJECT_RESOLUTION` — "a
+    validation error (branch missing, MR already open, no permission) must
+    surface as itself"), and `gh pr create` behaves the same. The run then
+    dead-ends at create-pr with no remedy but `--manual-url` for a PR that
+    already exists; and had it somehow succeeded, `pr-comments` would fetch
+    and triage the same thread twice.
+
+    Containment is decided by `gitops.shares_toplevel`, NOT by a path-prefix
+    test, and the branch equality below is why. The feature branch name is
+    DETERMINISTIC per work item (`_render_feature_branch`), so two repos in
+    genuinely separate checkouts are on the same branch NAME as a matter of
+    course — the name proves nothing on its own, and a path test that
+    answered "nested, therefore same repo" for an independently-checked-out
+    `<checkout>/vendor/thing` would collapse two real PRs into one silently.
+    `shares_toplevel` asks git which checkout each registration resolves
+    into and gets that case right. Its documented failure mode — it shells
+    out and returns `[]` on any failure — is acceptable HERE and only here:
+    a false `[]` costs a second provider call, i.e. exactly the status quo
+    bug, LOUD and at the same step, never a silently wrong shared record.
+    It is also nearly unreachable at this call site, because `create_pr` has
+    already run `rev-parse` through `run_git` on this very repo to get
+    `branch` before asking — a missing git binary or unreadable registration
+    would have raised there first."""
+    prs = (st.get("artifacts") or {}).get("pr") or {}
+    if not prs:
+        return None
+    branches = (st.get("artifacts") or {}).get("branches") or {}
+    for other in gitops.shares_toplevel(config.get("repos") or {}, repo):
+        entry = prs.get(other)
+        if not entry:
+            continue
+        # A provider-created entry carries the head branch it was opened for.
+        # A `--manual-url` one does NOT (its shape is id/url/title/manual), so
+        # fall back to what preflight recorded for that repo — the branch
+        # `push` pushed and therefore the one the human opened by hand
+        # against. Without this fallback the manual-then-normal ordering would
+        # miss the match and make the duplicate call anyway, which is the one
+        # sequence where the provider is already known to be unreliable.
+        recorded = entry.get("branch") or (branches.get(other) or {}).get("branch")
+        if recorded and recorded == branch:
+            # The ORIGIN, not whichever entry the scan happened to land on.
+            # From the THIRD registration in one checkout the matched entry
+            # can itself be a copy — `shares_toplevel` returns names sorted,
+            # so a sharer sorting ahead of the originator is found first —
+            # and `via` is specified as the repo whose call actually reached
+            # the provider, i.e. one hop to the real call from every copy
+            # rather than a chain the reader has to walk. `entry["via"]` is
+            # already an origin by this same rule, so the resolution is one
+            # level deep and can never recurse.
+            origin = entry.get("via") or other
+            if origin == name:
+                # A REPEAT create-pr for the originator matches its own
+                # record copied under a sibling's name (re-verification
+                # finding: reachable — set_artifact overwrites freely and
+                # the cursor stays at create-pr for the whole fan-out).
+                # Reusing it would write `via: <self>` and a `pr-shared`
+                # ledger row asserting this repo did not open the PR it
+                # opened. Skip: the fall-through provider call's
+                # duplicate error is the same-repo re-invocation's
+                # pre-existing, loud behavior, and audit rows stay true.
+                continue
+            return origin, entry
+    return None
+
+
 def create_pr(workspace: Path, run: Path, config: dict, manifest: dict,
               repo: Path, manual_url: str | None = None) -> dict:
     """Create the PR via the configured git provider. M5 ships `local`
     (a records-only provider so the pipeline completes without a forge);
-    real forges arrive in M6 through the same seam. One PR per repo in
-    multi-repo runs (create-pr.md) — the `pr` artifact is keyed by the
-    repo's registered name, same shape as `branches`, so a second repo's
-    call never overwrites the first's record.
+    real forges arrive in M6 through the same seam. One PR per PHYSICAL
+    BRANCH (create-pr.md) — the `pr` artifact is keyed by the repo's
+    registered name, same shape as `branches`, so a second repo's call never
+    overwrites the first's record; but where two registered repos are
+    subtrees of ONE checkout they share one branch and therefore one PR, and
+    the second repo's call records the first's PR under its own name instead
+    of calling the provider again (`_shared_pr_record`). Every consumer keyed
+    by repo name — cli's `fetch-pr-comments` lookup, the `pr-comments` group
+    — still resolves, off one provider call and one comment thread.
 
     `manual_url` is the provider-outage escape hatch (field: a reverse
     proxy in front of a self-hosted GitLab 404'd every path-encoded
@@ -1494,11 +1684,21 @@ def create_pr(workspace: Path, run: Path, config: dict, manifest: dict,
     pushes and numeric-ID reads worked fine — the human created the MR by
     hand, and the run still needs its artifact). Recording stays an owned
     entry point: same lock, ensure_live, per-repo keying — plus a distinct
-    event kind so the audit trail shows no provider call was made."""
+    event kind so the audit trail shows no provider call was made. It also
+    WINS over the shared-branch reuse: the human is naming one specific URL
+    for one specific repo, and a mechanical "you meant the sibling's PR"
+    would overrule an explicit human act at the one moment the provider is
+    already known to be misbehaving (passing the sibling's own URL is then
+    the way to say "same PR", and lands the identical record). The reverse
+    ordering — manual for repo A, then a plain create for repo B on the same
+    physical branch — DOES reuse A's record, which is the ordering that
+    matters: the provider that could not create A's PR cannot create B's
+    either."""
     from . import initws
     from .providers.git_providers import create_pr as git_create_pr
     from .transitions import ensure_live
     name = initws.repo_name(config, repo) or str(repo)
+    shared_from = None
     with state_mod.locked(run):
         st = state_mod.load(run, workspace)
         ensure_live(st, "create-pr")
@@ -1537,15 +1737,52 @@ def create_pr(workspace: Path, run: Path, config: dict, manifest: dict,
                 raise gitops.GitError(
                     f"no recorded base branch for repo '{name}' in this run — "
                     "run `harness preflight --repo <path>` for it first")
-            pr = git_create_pr(config, repo=repo, branch=branch, base=base,
-                               title=title, work_item_id=st["work_item"]["id"],
-                               summary=st["work_item"]["title"])
+            # Idempotency ACROSS repos, mirroring preflight's `existing =
+            # branches.get(name); if existing: return existing` — the same
+            # "this run already did this piece of work, adopt it" shape, one
+            # key wider because the unit here is the physical branch, not the
+            # registered name. Deliberately AFTER the fail-closed base check
+            # above so both paths keep the same precondition: a repo that was
+            # never preflighted under this run gets the preflight refusal, not
+            # a silently-invented `pr` entry for a scope it was never in.
+            # Inside the lock, unlike preflight's prior-work probe: that one
+            # is `ls-remote` and reaches the NETWORK, this one is local
+            # `rev-parse --show-toplevel` per registration and it replaces a
+            # provider CLI call already made under this same lock.
+            shared = _shared_pr_record(st, config, repo, branch, name)
+            if shared:
+                shared_from, entry = shared
+                # `via` names the repo whose call actually reached the
+                # provider, so the artifact never claims two PRs were opened
+                # where one was. An EXTRA key only — every consumer of a `pr`
+                # entry reads named keys (`git_providers._pr_number` off
+                # `pr["url"]`, the fetch adapters off `pr["url"]` alone, cli's
+                # fetch-pr-comments off the repo-name key) and none enumerates
+                # or schema-checks the entry's shape, so the copy stays a
+                # drop-in for the originating record everywhere downstream.
+                pr = {**entry, "via": shared_from}
+            else:
+                pr = git_create_pr(config, repo=repo, branch=branch, base=base,
+                                   title=title,
+                                   work_item_id=st["work_item"]["id"],
+                                   summary=st["work_item"]["title"])
         prs = dict((st.get("artifacts") or {}).get("pr") or {})
         prs[name] = pr
         set_artifact(st, manifest, "pr", prs)
         state_mod.save(run, workspace, st)
     ndjson.append_record(run / "events.ndjson", {
-        "kind": "pr-recorded-manually" if manual_url else "pr-created",
+        # A DISTINCT kind, not `pr-created` with a reason: the ledger's whole
+        # job here is that a reader counting `pr-created` rows counts provider
+        # calls, and a shared record is not one. Deliberately NOT added to
+        # FLAGGED_EVENT_KINDS — sharing is the designed, correct outcome for a
+        # monorepo's subtree repos, so flagging it would park a permanent
+        # "a human should look" row on every such run for nothing happening,
+        # the over-reporting failure mode that block warns about. When the
+        # origin was itself a manual record its own `pr-recorded-manually` is
+        # already on the gauge; re-flagging the copy would double-count one
+        # fact.
+        "kind": ("pr-recorded-manually" if manual_url
+                 else "pr-shared" if shared_from else "pr-created"),
         "title": title, "repo": name, "actor": "create-pr",
         # `reason` on the flagged variant, for the same rendering rule the
         # four kinds this change added were just given it for: `_detail`
@@ -1553,10 +1790,18 @@ def create_pr(workspace: Path, run: Path, config: dict, manifest: dict,
         # showing a timestamp and a kind and nothing more. Predates this
         # change; caught by the same re-verification sweep and one line to
         # close, which makes the "all eight carry it" claim true of the
-        # whole gauge rather than just the new half.
+        # whole gauge rather than just the new half. `pr-shared` carries one
+        # too — it never reaches `_detail` (unflagged by design, above), but
+        # the raw ledger is read by hand far more often than metrics.md is,
+        # and one self-explaining line beats a kind the reader has to look up.
         **({"url": manual_url,
             "reason": f"{name}: PR recorded by hand — {manual_url}"}
-           if manual_url else {})})
+           if manual_url else
+           {"url": pr.get("url"), "via": shared_from,
+            "reason": f"{name} shares {shared_from}'s PR — one physical "
+                      "checkout, one branch, so no second provider call "
+                      "was made"}
+           if shared_from else {})})
     return pr
 
 

@@ -2018,5 +2018,449 @@ class CliEndToEnd(GitopsHarness):
         self.assertEqual(code, 0, out)
 
 
+def make_monorepo(base: Path, name: str = "mono") -> Path:
+    """ONE physical checkout holding TWO logical repos: `frontend/` and
+    `backend/`, `.git` at the root. The shape `discover()`'s
+    `monorepo_split` proposes, and the shape the .NET case forces (a `.sln`
+    at the physical root registered as one logical repo, `frontend/` as
+    another) — so `repos.yaml` maps two names into one checkout and every
+    path-producing git call has to know which half it is answering for."""
+    repo = base / name
+    for area in ("frontend", "backend"):
+        (repo / area / "tests").mkdir(parents=True)
+    gitops.run_git(base, "init", "-b", "main", name)
+    gitops.run_git(repo, "config", "user.email", "t@t")
+    gitops.run_git(repo, "config", "user.name", "t")
+    for area in ("frontend", "backend"):
+        (repo / area / "tests" / "__init__.py").write_text("")
+        (repo / area / "app.py").write_text("def val():\n    return 1\n")
+    (repo / "README.md").write_text("mono\n")
+    gitops.run_git(repo, "add", "-A")
+    gitops.run_git(repo, "commit", "-m", "init")
+    return repo
+
+
+class SubtreeLogicalRepos(unittest.TestCase):
+    """A logical repo registered by a SUBTREE of a physical checkout.
+
+    `repos.yaml` still maps name -> path; the subtree path IS the registered
+    path, so the exact-path resolvers are untouched. What changes is that
+    `repo` and `git rev-parse --show-toplevel` are no longer the same
+    directory — and git's own answers are not uniformly relative to either
+    one. Every test here pins one half of that: the prefix is stripped, and
+    the sibling logical repo's paths are filtered out."""
+
+    def setUp(self):
+        self.workspace = Path(tempfile.mkdtemp())
+        self.mono = make_monorepo(self.workspace)
+        self.frontend = self.mono / "frontend"
+        self.backend = self.mono / "backend"
+        _, _, self.config = load_declared(self.workspace)
+
+    def tearDown(self):
+        support.rmtree(self.workspace)
+
+    def _dirty_both(self):
+        (self.frontend / "app.py").write_text("def val():\n    return 2\n")
+        (self.backend / "app.py").write_text("def val():\n    return 3\n")
+        (self.frontend / "new.py").write_text("f\n")
+        (self.backend / "new.py").write_text("b\n")
+
+    # ------------------------------------------------- the canonical pair
+
+    def test_toplevel_and_prefix_locate_the_registration(self):
+        self.assertEqual(gitops.toplevel(self.frontend).resolve(),
+                         self.mono.resolve())
+        self.assertEqual(gitops.subtree_prefix(self.frontend), "frontend")
+        # a root registration is its own toplevel with an EMPTY prefix —
+        # the property every "byte-identical for root repos" claim rests on
+        self.assertEqual(gitops.toplevel(self.mono).resolve(),
+                         self.mono.resolve())
+        self.assertEqual(gitops.subtree_prefix(self.mono), "")
+
+    def test_work_tree_root_accepts_a_subtree_and_answers_none_off_tree(self):
+        self.assertEqual(gitops.work_tree_root(self.frontend).resolve(),
+                         self.mono.resolve())
+        outside = self.workspace / "plain"
+        outside.mkdir()
+        self.assertIsNone(gitops.work_tree_root(outside))
+        self.assertIsNone(gitops.work_tree_root(self.workspace / "missing"))
+
+    def test_has_tracked_files_separates_a_real_subtree_from_an_ignored_one(self):
+        """`work_tree_root` says "inside a work tree", which an IGNORED
+        directory satisfies just as well — and `git worktree add` will not
+        materialize one, so a registration there is un-runnable. This is the
+        second half of the question the repo gate has to ask."""
+        (self.mono / ".gitignore").write_text("generated/\n")
+        (self.mono / "generated").mkdir()
+        (self.mono / "generated" / "app.py").write_text("g\n")
+        gitops.run_git(self.mono, "add", "-A")
+        gitops.run_git(self.mono, "commit", "-m", "ignore generated")
+        # both are inside the same work tree...
+        self.assertEqual(gitops.work_tree_root(self.mono / "generated").resolve(),
+                         self.mono.resolve())
+        # ...only one of them is in the index
+        self.assertTrue(gitops.has_tracked_files(self.frontend))
+        self.assertFalse(gitops.has_tracked_files(self.mono / "generated"))
+        self.assertFalse(gitops.has_tracked_files(self.workspace / "missing"))
+
+    # ------------------------------------------------------ path relativity
+
+    def test_changed_files_strips_the_prefix_and_drops_the_sibling(self):
+        self._dirty_both()
+        self.assertEqual(sorted(gitops.changed_files(self.frontend)),
+                         ["app.py", "new.py"])
+        # the same physical dirt, asked at the root: unfiltered, unstripped
+        self.assertEqual(sorted(gitops.changed_files(self.mono)),
+                         ["backend/app.py", "backend/new.py",
+                          "frontend/app.py", "frontend/new.py"])
+
+    def test_diff_paths_strips_the_prefix_and_drops_the_sibling(self):
+        gitops.run_git(self.mono, "checkout", "-b", "task/T1")
+        (self.frontend / "app.py").write_text("def val():\n    return 2\n")
+        (self.backend / "app.py").write_text("def val():\n    return 3\n")
+        gitops.run_git(self.mono, "add", "-A")
+        gitops.run_git(self.mono, "commit", "-m", "both")
+        (self.frontend / "later.py").write_text("l\n")   # working-tree half
+        (self.backend / "later.py").write_text("l\n")
+        self.assertEqual(gitops.diff_paths(self.frontend, "main"),
+                         ["app.py", "later.py"])
+        self.assertEqual(gitops.diff_paths(self.backend, "main"),
+                         ["app.py", "later.py"])
+
+    def test_diff_line_count_counts_only_the_registered_subtree(self):
+        gitops.run_git(self.mono, "checkout", "-b", "task/T1")
+        (self.backend / "app.py").write_text("x\n" * 40)
+        gitops.run_git(self.mono, "add", "-A")
+        gitops.run_git(self.mono, "commit", "-m", "backend churn")
+        (self.frontend / "app.py").write_text("def val():\n    return 2\n")
+        # frontend touched 1 line + 1 line; backend's 40+ must not inflate
+        # the quick-mode size gate for a repo that does not own them
+        self.assertEqual(gitops.diff_line_count(self.frontend, "main"), 2)
+        self.assertGreater(gitops.diff_line_count(self.backend, "main"), 40)
+
+    def test_blob_sha_and_test_set_lock_the_subtree_file(self):
+        (self.frontend / "tests" / "test_app.py").write_text("def test_val(): pass\n")
+        (self.backend / "tests" / "test_app.py").write_text("def test_val(): pass\n")
+        tests, closure = gitops._test_set(self.frontend, self.config, None)
+        # subtree-relative keys, and the sibling's identically-named test is
+        # not in the locked set at all
+        self.assertEqual(sorted(tests), ["tests/test_app.py"])
+        self.assertEqual(
+            tests["tests/test_app.py"],
+            gitops.run_git(self.mono, "hash-object", "--",
+                           "frontend/tests/test_app.py"))
+        self.assertTrue(all(not c.startswith("backend") for c in closure), closure)
+        self.assertIn("tests/__init__.py", closure)
+
+    # ---------------------------------------------------------- staging scope
+
+    def test_commit_cannot_stage_or_commit_a_sibling_subtree(self):
+        """The mutation test for `add -A -- .`: one `.git`, two logical
+        repos, so an unrelated edit left in `backend/` used to be swept into
+        a `frontend` task's commit under that task's message."""
+        self._dirty_both()
+        gitops.commit_class(self.frontend, self.config, "working",
+                            task="T1", summary="frontend only")
+        committed = gitops.run_git(self.mono, "diff-tree", "--no-commit-id",
+                                   "--name-only", "-r", "HEAD").splitlines()
+        self.assertEqual(sorted(committed),
+                         ["frontend/app.py", "frontend/new.py"])
+        # and the backend edits are still sitting in the working tree,
+        # unstaged — surfaced to their own repo, not silently absorbed
+        self.assertEqual(sorted(gitops.changed_files(self.backend)),
+                         ["app.py", "new.py"])
+
+    def test_commit_fixup_is_subtree_scoped_too(self):
+        (self.frontend / "app.py").write_text("def val():\n    return 2\n")
+        target = gitops.commit_class(self.frontend, self.config, "working",
+                                     task="T1", summary="first")
+        (self.frontend / "app.py").write_text("def val():\n    return 4\n")
+        (self.backend / "app.py").write_text("def val():\n    return 5\n")
+        gitops.commit_fixup(self.frontend, target)
+        committed = gitops.run_git(self.mono, "diff-tree", "--no-commit-id",
+                                   "--name-only", "-r", "HEAD").splitlines()
+        self.assertEqual(committed, ["frontend/app.py"])
+
+    def test_mirror_stays_path_exclusive_from_a_subtree_repo(self):
+        run = self.workspace / "ai" / "2026-01-01-SUB-1"
+        (run / "reports").mkdir(parents=True)
+        (run / "reports" / "r.md").write_text("report\n")
+        gitops.publish_mirror(self.frontend, run, self.config, run.name)
+        committed = gitops.run_git(self.mono, "diff-tree", "--no-commit-id",
+                                   "--name-only", "-r", "HEAD").splitlines()
+        # exclusivity is judged against `<prefix>/ai/<run>`: the mirror lands
+        # inside the LOGICAL repo, so the staged paths carry the prefix and a
+        # bare `ai/` expectation would have called every one of them an
+        # offender
+        self.assertTrue(committed)
+        self.assertTrue(all(p.startswith(f"frontend/ai/{run.name}/")
+                            for p in committed), committed)
+
+    # -------------------------------------------------------------- worktrees
+
+    def test_worktree_lands_beside_the_toplevel_and_returns_the_subtree(self):
+        wt = gitops.worktree_add(self.frontend, "T1", "main")
+        root, path = Path(wt["root"]), Path(wt["path"])
+        self.addCleanup(gitops.worktree_remove, self.frontend, wt)
+        # beside the PHYSICAL checkout, named after it — not beside
+        # `<checkout>/frontend`, which would nest a whole second checkout
+        # inside the tree it was cut from
+        self.assertEqual(root.parent.resolve(), self.mono.parent.resolve())
+        self.assertTrue(root.name.startswith(f"{self.mono.name}-wt-T1-"))
+        self.assertNotIn(self.mono.resolve(), root.resolve().parents)
+        # the task works in the LOGICAL repo inside that worktree
+        self.assertEqual(path, root / "frontend")
+        self.assertTrue((path / "app.py").is_file())
+        self.assertEqual(gitops.subtree_prefix(path), "frontend")
+
+    def test_worktree_remove_cleans_up_a_subtree_worktree(self):
+        wt = gitops.worktree_add(self.frontend, "T1", "main")
+        root = Path(wt["root"])
+        self.assertTrue(root.is_dir())
+        gitops.worktree_remove(self.frontend, wt)
+        # `git worktree remove` takes the ROOT — handed `path` (the subtree)
+        # it refuses with "is not a working tree" and the tree leaks
+        self.assertFalse(root.exists())
+        self.assertNotIn("task/", gitops.run_git(self.mono, "branch", "--list"))
+
+    def test_root_registration_worktree_layout_is_unchanged(self):
+        wt = gitops.worktree_add(self.mono, "T2", "main")
+        self.addCleanup(gitops.worktree_remove, self.mono, wt)
+        self.assertEqual(wt["path"], wt["root"])      # empty prefix
+        self.assertEqual(Path(wt["path"]).parent.resolve(),
+                         self.workspace.resolve())
+        self.assertTrue(Path(wt["path"]).name.startswith("mono-wt-T2-"))
+
+    def test_worktree_remove_tolerates_the_pre_subtree_dict_shape(self):
+        """Run state written before this change records only
+        `{path, branch}`; a resumed/reconciled run must still sweep."""
+        wt = gitops.worktree_add(self.mono, "T3", "main")
+        legacy = {"path": wt["path"], "branch": wt["branch"]}
+        gitops.worktree_remove(self.mono, legacy)
+        self.assertFalse(Path(wt["path"]).exists())
+
+    # ------------------------------- the returned path has to actually exist
+
+    def _base_without_frontend(self) -> str:
+        """A base branch that predates the subtree — the ordinary case for a
+        long-lived `main` and a newly split-out logical repo, and equally
+        what an ignored/untracked subtree looks like to `worktree add`."""
+        gitops.run_git(self.mono, "checkout", "-q", "-b", "old", "main")
+        gitops.run_git(self.mono, "rm", "-r", "-q", "frontend")
+        gitops.run_git(self.mono, "commit", "-m", "no frontend on this base")
+        gitops.run_git(self.mono, "checkout", "-q", "main")
+        return "old"
+
+    def test_worktree_add_refuses_a_base_that_lacks_the_subtree(self):
+        """`git worktree add` SUCCEEDS on such a base and simply does not
+        materialize the subtree, so the pre-fix verb returned ok with a
+        `path` that was never on disk: the developer's `harness-repo` header
+        pointed at nothing and `_run_tests(cwd=...)` raised."""
+        base = self._base_without_frontend()
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.worktree_add(self.frontend, "T1", base)
+        msg = str(ctx.exception)
+        self.assertIn("does not exist on that branch", msg)
+        self.assertIn(base, msg)
+
+    def test_the_refused_worktree_is_not_left_behind(self):
+        """cli.py's resume gate is `Path(recorded["path"]).is_dir()` — false
+        forever for a subtree that never materialized — so a returned-but-
+        missing path made every retry cut ANOTHER worktree and ANOTHER
+        `task/<id>-<uid>` branch, with `worktree_remove` only ever seeing the
+        newest record. The refusal takes its own tree with it."""
+        base = self._base_without_frontend()
+        with self.assertRaises(gitops.GitError):
+            gitops.worktree_add(self.frontend, "T1", base)
+        self.assertEqual(
+            gitops.run_git(self.mono, "worktree", "list").count("\n"), 0)
+        self.assertNotIn("task/", gitops.run_git(self.mono, "branch", "--list"))
+        self.assertEqual(
+            [p.name for p in self.workspace.iterdir()
+             if p.name.startswith("mono-wt-")], [])
+
+    def test_a_materialized_subtree_worktree_still_returns_its_path(self):
+        """The no-regression half: the check only refuses the missing case."""
+        self._base_without_frontend()                 # the branch merely exists
+        wt = gitops.worktree_add(self.frontend, "T1", "main")
+        self.addCleanup(gitops.worktree_remove, self.frontend, wt)
+        self.assertTrue(Path(wt["path"]).is_dir())
+        self.assertTrue((Path(wt["path"]) / "app.py").is_file())
+
+    def test_root_registration_path_check_is_a_no_op(self):
+        """A root registration's `path` IS the worktree root, which `git
+        worktree add` always creates — the verification can never fire, and
+        the verb's result shape is unchanged."""
+        wt = gitops.worktree_add(self.mono, "T4", "main")
+        self.addCleanup(gitops.worktree_remove, self.mono, wt)
+        self.assertEqual(sorted(wt), ["branch", "path", "root"])
+        self.assertTrue(Path(wt["path"]).is_dir())
+
+    # ------------------------------------------ shared-checkout collisions
+
+    def test_shares_toplevel_names_only_the_sibling_logical_repos(self):
+        other = make_repo(self.workspace, "solo")
+        repos = {"frontend": str(self.frontend), "backend": str(self.backend),
+                 "mono": str(self.mono), "solo": str(other)}
+        self.assertEqual(gitops.shares_toplevel(repos, self.frontend),
+                         ["backend", "mono"])
+        self.assertEqual(gitops.shares_toplevel(repos, other), [])
+        # a dangling registration is not a collision, and must not raise
+        self.assertEqual(
+            gitops.shares_toplevel({"ghost": str(self.workspace / "gone")},
+                                   other), [])
+
+    def test_worktree_failure_refuses_the_direct_branch_fallback_on_a_share(self):
+        repos = {"frontend": str(self.frontend), "mono": str(self.mono)}
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.worktree_add(self.frontend, "T1", "no-such-base", repos)
+        msg = str(ctx.exception)
+        self.assertIn("direct-branch fallback is NOT available", msg)
+        self.assertIn("mono", msg)
+
+    def test_worktree_failure_refuses_the_fallback_for_an_UNREGISTERED_share(self):
+        """The hazard is the physical CHECKOUT, not the registry. With only
+        `frontend` registered, `shares_toplevel` is empty — and the pre-fix
+        message therefore OFFERED the direct-branch fallback, which cuts the
+        task branch in the checkout that also holds `backend/` and whatever
+        uncommitted human work sits beside it."""
+        self.assertEqual(
+            gitops.shares_toplevel({"frontend": str(self.frontend)},
+                                   self.frontend), [])
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.worktree_add(self.frontend, "T1", "no-such-base",
+                                {"frontend": str(self.frontend)})
+        msg = str(ctx.exception)
+        self.assertIn("direct-branch fallback is NOT available", msg)
+        self.assertNotIn("offer the direct-branch fallback", msg)
+        self.assertIn(self.mono.name, msg)          # names the shared checkout
+        self.assertNotIn("also registered into it", msg)   # nothing to name
+
+    def test_worktree_failure_still_offers_the_fallback_without_a_share(self):
+        solo = make_repo(self.workspace, "solo")
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.worktree_add(solo, "T1", "no-such-base",
+                                {"solo": str(solo)})
+        self.assertIn("offer the direct-branch fallback", str(ctx.exception))
+
+    def test_a_root_registration_that_shares_a_checkout_still_refuses(self):
+        """The parent half of a split (`mono` registered at the checkout
+        root, `frontend` under it) has an EMPTY prefix but the same hazard:
+        a task branch cut there switches `frontend/` too."""
+        repos = {"frontend": str(self.frontend), "mono": str(self.mono)}
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.worktree_add(self.mono, "T1", "no-such-base", repos)
+        msg = str(ctx.exception)
+        self.assertIn("direct-branch fallback is NOT available", msg)
+        self.assertIn("also registered into it: frontend", msg)
+
+    # --------------------------------------------------- shared-checkout dirt
+
+    def test_ensure_default_branch_refuses_on_out_of_subtree_dirt(self):
+        """`changed_files` is subtree-scoped now, but `git checkout` still
+        flips the WHOLE physical tree — so the safety question is asked at
+        the toplevel, and the refusal names where the dirt actually is."""
+        (self.backend / "app.py").write_text("def val():\n    return 9\n")
+        self.assertEqual(gitops.changed_files(self.frontend), [])   # not ITS dirt
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.ensure_default_branch(self.frontend, "main")
+        msg = str(ctx.exception)
+        self.assertIn("uncommitted", msg)
+        self.assertIn("backend/app.py", msg)
+
+    def test_the_dirt_refusal_names_the_tree_the_dirt_is_actually_in(self):
+        """Subject and paths have to name the SAME directory. They didn't:
+        the paths are toplevel-relative (deliberately — see above) while the
+        subject stayed the registered path, so the refusal read
+        `...\\mono\\frontend has 1 uncommitted change(s) (.gitignore)` for a
+        `.gitignore` that lives at `...\\mono` and cannot be found, let
+        alone cleaned, where the message points."""
+        (self.mono / ".gitignore").write_text("*.tmp\n")
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.ensure_default_branch(self.frontend, "main")
+        msg = str(ctx.exception)
+        self.assertIn(".gitignore", msg)
+        subject = Path(msg.split(" has ")[0].split(" (")[0])
+        self.assertEqual(subject.resolve(), self.mono.resolve())
+        # and the relationship is stated, so "why is it talking about a
+        # directory I didn't register" is answered in the refusal itself
+        self.assertIn(
+            f"the physical checkout holding the registered repo {self.frontend}",
+            msg)
+
+    def test_update_base_dirt_refusal_names_the_shared_checkout_too(self):
+        """The twin refusal, same widening, same fix — it refuses before any
+        remote is contacted, so no upstream fixture is needed."""
+        (self.mono / ".gitignore").write_text("*.tmp\n")
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.update_base(self.frontend, "main")
+        msg = str(ctx.exception)
+        self.assertIn(".gitignore", msg)
+        self.assertIn("on 'main' itself", msg)
+        subject = Path(msg.split(" has ")[0].split(" (")[0])
+        self.assertEqual(subject.resolve(), self.mono.resolve())
+
+    def test_root_registration_dirt_messages_are_byte_identical(self):
+        """No-regression, stated as the literal strings: a single-repo
+        registration is its own toplevel, so neither refusal may gain a
+        single character."""
+        (self.mono / "README.md").write_text("dirty\n")
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.ensure_default_branch(self.mono, "main")
+        self.assertEqual(
+            str(ctx.exception),
+            f"{self.mono} has 1 uncommitted change(s) (README.md) — resolve, "
+            "commit, or stash them yourself before continuing; never "
+            "auto-discarded")
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.update_base(self.mono, "main")
+        self.assertEqual(
+            str(ctx.exception),
+            f"{self.mono} has 1 uncommitted change(s) (README.md) on 'main' "
+            "itself — a fast-forward would rewrite them; commit or stash them "
+            "yourself first, never auto-discarded. (Uncommitted work on ANY "
+            "OTHER branch is fine: this verb moves the base ref without "
+            "touching your working tree.)")
+
+    def test_ensure_default_branch_still_passes_on_a_clean_shared_checkout(self):
+        gitops.run_git(self.mono, "checkout", "-b", "side")
+        out = gitops.ensure_default_branch(self.frontend, "main")
+        self.assertTrue(out["switched"])
+        self.assertEqual(out["branch"], "main")
+
+    def test_cli_worktree_lane_round_trips_the_root_through_state(self):
+        """`root` has to survive state.yaml, or the sweep at task-done hands
+        `git worktree remove` the subtree path and leaks the whole tree."""
+        chain.load_or_create_key(self.workspace)
+        run = self.workspace / "ai" / "2026-01-01-SUB-1"
+        state_mod.bootstrap(
+            run, self.workspace,
+            work_item={"id": "SUB-1", "title": "t", "provider_ref": ""},
+            mode="full", change_type="fix",
+            tasks=[{"id": "T1", "repo": str(self.frontend)}], entry_step="fetch")
+
+        def cli(*args):
+            proc = subprocess.run(
+                [sys.executable, "-m", "harness", "--workspace",
+                 str(self.workspace), "--run", str(run), *args],
+                cwd=Path(__file__).resolve().parent.parent, capture_output=True,
+                text=True, encoding="utf-8", timeout=120)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return json.loads(proc.stdout)
+
+        wt = cli("worktree-add", "--repo", str(self.frontend),
+                 "--task-id", "T1", "--base", "main")
+        root, path = Path(wt["root"]), Path(wt["path"])
+        self.assertEqual(path, root / "frontend")
+        self.assertTrue((path / "app.py").is_file())
+        resumed = cli("worktree-add", "--repo", str(self.frontend),
+                      "--task-id", "T1", "--base", "main")
+        self.assertTrue(resumed["resumed"])
+        self.assertEqual(resumed["root"], wt["root"])
+        cli("worktree-remove", "--repo", str(self.frontend), "--task-id", "T1")
+        self.assertFalse(root.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

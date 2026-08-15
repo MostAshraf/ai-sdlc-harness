@@ -670,7 +670,9 @@ def verify(config: dict, workspace: Path | None = None) -> list[dict]:
     refusal or were hand-edited past it (re-review finding: write-time
     enforcement alone left old/edited configs reporting ok:true while still
     carrying the exact `git add -A` authority-file leak the refusal
-    exists to stop)."""
+    exists to stop) — and, since the repo gate now accepts a SUBTREE of a
+    checkout, the wider containment form of the same hazard: a registration
+    whose physical checkout HOLDS the workspace."""
     checks: list[dict] = []
 
     def add(name, ok, detail, remediation=""):
@@ -735,6 +737,7 @@ def verify(config: dict, workspace: Path | None = None) -> list[dict]:
 
     ws_root = workspace.resolve() if workspace is not None else None
     for name, path in repos.items():
+        top = gitops.work_tree_root(path)
         if ws_root is not None and Path(str(path)).resolve() == ws_root:
             add(f"repo:{name}", "fail", str(path),
                 "the workspace root itself must not be a registered repo — "
@@ -742,9 +745,73 @@ def verify(config: dict, workspace: Path | None = None) -> list[dict]:
                 "authority files (incl. human-input.ndjson) into project "
                 "history; register the actual project checkout instead")
             continue
-        is_repo = (Path(path) / ".git").exists()
-        add(f"repo:{name}", "pass" if is_repo else "fail", str(path),
-            "path must be a git checkout")
+        # CONTAINMENT, not just equality — the gate below now passes any
+        # path inside a work tree, so the workspace no longer has to BE the
+        # registration to be inside its blast radius; it only has to sit
+        # somewhere in the same physical checkout (`<checkout>/ws` alongside
+        # `<checkout>/code/myapp`). Reproduced end to end: that registration
+        # verified `pass`, then preflight's `ensure_default_branch` probed
+        # dirt at the TOPLEVEL — which now contains the live run's own
+        # `ws/ai/<run>/**` — and refused permanently, naming the harness's
+        # own state files as the thing to go clean. Committing them to make
+        # the refusal go away is worse: the `git checkout <default>` that
+        # follows swaps the workspace's chain-sealed `state.yaml` and
+        # `.claude/context/**` out from under the running run, which past a
+        # reseal is unrecoverable. Pre-subtree this registration hard-FAILED
+        # the repo gate, so none of it was reachable; the gate widening is
+        # what makes it reachable, and this is where it gets closed.
+        if (ws_root is not None and top is not None
+                and ws_root.is_relative_to(top.resolve())):
+            add(f"repo:{name}", "fail", f"{path} (subtree of {top})",
+                f"the harness workspace ({ws_root}) lives INSIDE this "
+                f"registration's git checkout ({top}) — every branch-safety "
+                "probe this repo drives runs at that checkout, so the run's "
+                "own ai/** files read as uncommitted project changes, and a "
+                "branch switch there would swap the workspace's sealed "
+                "state.yaml and .claude/context/** mid-run; move the "
+                "workspace outside that checkout, or register a project "
+                "checkout that does not contain it")
+            continue
+        # Inside a work TREE, not "has a .git of its own": a logical repo may
+        # be registered by a SUBTREE of a physical checkout (`<checkout>/
+        # frontend` — exactly what discover()'s monorepo_split proposes, and
+        # what a .NET solution at the root plus a frontend app under it
+        # requires). The old `.git`-exists gate could only ever pass a
+        # checkout root, so it failed every split this workspace can now
+        # represent. When the two differ the detail NAMES the physical
+        # checkout: "registered here, but the git tree is over there" is the
+        # fact a human reads this report to learn, and stating only the
+        # registered path would quietly hide the shared-checkout relationship
+        # that `add -A` scoping and the direct-branch refusal both hinge on.
+        detail = str(path)
+        if top is not None and top.resolve() != Path(str(path)).resolve():
+            detail = f"{path} (subtree of {top})"
+            # "inside a work tree" is also true of an UNTRACKED or ignored
+            # directory (probed, git 2.55: `git -C <checkout>/generated
+            # rev-parse --show-toplevel` answers `<checkout>` for a
+            # gitignored `generated/`). Such a registration would verify
+            # clean and then be un-runnable: `git worktree add` materializes
+            # only what the branch tracks, so the task worktree comes up
+            # without that directory at all — see gitops.has_tracked_files.
+            # Caught HERE, where the fix is one commit or one config edit,
+            # rather than mid-run where it is a wedged task. Root
+            # registrations skip the probe entirely: an empty index is a
+            # legitimate freshly-init'd checkout, and failing it would break
+            # a registration shape that has always been supported.
+            if not gitops.has_tracked_files(path):
+                add(f"repo:{name}", "fail", detail,
+                    f"nothing under this path is tracked by {top} — it is "
+                    "inside the checkout but not in its index (untracked, "
+                    ".gitignored, or spelled with a case the index doesn't "
+                    "use), so a per-task `git worktree add` would produce a "
+                    "worktree with no such directory in it and every task "
+                    "command would run in a missing cwd; commit the subtree "
+                    "to the checkout (or register the tracked spelling of "
+                    "its path)")
+                continue
+        add(f"repo:{name}", "pass" if top is not None else "fail", detail,
+            "path must be inside a git checkout (its root, or any subtree "
+            "of one — a subtree registers as its own logical repo)")
 
     for name, path in repos.items():
         # Quarantine shape checked HERE, where fixing config is cheap

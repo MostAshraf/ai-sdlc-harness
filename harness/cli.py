@@ -890,7 +890,11 @@ def main(argv: list[str] | None = None) -> int:
                 if recorded and Path(recorded["path"]).is_dir():
                     _emit({"ok": True, "resumed": True, **recorded})
                     return 0
-                wt = gitops.worktree_add(args.repo, args.task_id, args.base)
+                # the registered map rides along so a twice-failed worktree
+                # can say whether the direct-branch fallback is even legal
+                # here (gitops.shares_toplevel)
+                wt = gitops.worktree_add(args.repo, args.task_id, args.base,
+                                         config.get("repos") or {})
                 task["worktree"] = wt
                 state_mod.save(args.run, args.workspace, st)
             _emit({"ok": True, "resumed": False, **wt})

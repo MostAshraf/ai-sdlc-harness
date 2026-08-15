@@ -17,7 +17,15 @@ ${CLAUDE_PLUGIN_ROOT}/bin/harness create-pr --repo <repo> --run <run>
 Creates the PR via the configured git provider (title from the declared
 `pr_title` template; base branch is the one `preflight` resolved and
 recorded for this repo — never a hardcoded guess), records the `pr`
-artifact (keyed by repo name — one PR per repo in multi-repo runs).
+artifact (keyed by repo name — **one PR per physical branch**).
+
+Run it **once per preflighted repo**, in any order. Repos sharing one
+checkout (subtree logical repos) share one branch and therefore one PR: the
+first call opens it, later calls record that same PR under their own name
+(`via: <the repo that opened it>`, a `pr-shared` event, no second provider
+call). Every repo name still resolves to a PR, and to the same comment
+thread — so `pr-comments` triages that one thread whichever name it is run
+under.
 
 **Provider outage escape hatch:** if the provider CLI cannot create the
 PR (infrastructure fault — e.g. a proxy 404ing path-encoded project
@@ -25,8 +33,9 @@ lookups) but the branch is pushed, the human creates the PR by hand and
 you record it with `--url <its-url>` on the same command (the URL must
 end in the PR/MR number — the comment loop derives the id from it).
 Recording stays owned: same artifact, same locking, plus a
-`pr-recorded-manually` audit event. Never hand-edit state.yaml, never
-skip recording.
+`pr-recorded-manually` audit event. `--url` overrides the shared-branch
+reuse above — pass the sibling's own URL to point a second repo at one
+hand-made PR. Never hand-edit state.yaml, never skip recording.
 
 Then publish the mirror **once per preflighted repo** (SKILL.md's Publish
 rule) so the final run snapshot lands in each PR's branch — `--push` is

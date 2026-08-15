@@ -36,6 +36,8 @@ from pathlib import Path
 
 import yaml
 
+from . import gitops
+
 # v2.x provider spellings -> v3.0 module names. v2.x named transports
 # (`glab-cli`) where v3.0 names forges/trackers; unknown spelling -> None,
 # and the interview asks rather than this module guessing.
@@ -322,10 +324,14 @@ def _extract_repos(text: str, notes: list, workspace: Path) -> dict:
                          "register a separate project checkout")
             continue
         repos[name] = str(path)
-        if not (path / ".git").exists():
-            notes.append(f"repo '{name}': {path} is not a git "
-                         "checkout on this machine — re-point it at the "
-                         "confirm step or init-verify will fail")
+        # Same probe init-verify uses, for the same reason: a v2.1 repo row
+        # may point at a SUBTREE of a checkout (v3 registers those as logical
+        # repos), and a `.git`-exists test would have warned about a
+        # perfectly valid registration the confirm step then can't "fix".
+        if gitops.work_tree_root(path) is None:
+            notes.append(f"repo '{name}': {path} is not a git checkout "
+                         "(nor inside one) on this machine — re-point it at "
+                         "the confirm step or init-verify will fail")
     return repos
 
 

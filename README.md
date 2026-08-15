@@ -86,7 +86,7 @@ The interview asks only what it must (provider, repos), *discovers* your toolcha
 | **Python 3.10+** | The entire core is Python. `/init-workspace` creates the plugin's own venv with PyYAML as its first step; until then the guards print a one-line notice and stand down. |
 | **Provider CLI, authed** *(optional)* | `gh auth login` / `glab auth login` / `az login`, if using that provider. MCP providers need their server connected. The `local-markdown` provider needs nothing at all. |
 
-Target repos must be **cloned locally**, clean, and on their default branch when registered — the harness does not clone them. No language prerequisites; toolchains are discovered.
+Target repos must be **cloned locally**, clean, and on their default branch when registered — the harness does not clone them. A registered repo does not have to be a whole checkout: any subtree of one can be registered as a repo in its own right, which is how a monorepo's stacks are set up (see [Multi-repo runs](#multi-repo-runs)). No language prerequisites; toolchains are discovered.
 
 ---
 
@@ -330,6 +330,8 @@ Skipping the plan step means skipping the step that decides **which repo** the w
 
 ### Multi-repo runs
 
+A repo here is a *logical* repo, not necessarily a whole checkout. A monorepo whose stacks want different test commands — a .NET solution at the root, a Node app under `frontend/` — registers each as its own repo (`<checkout>` and `<checkout>/frontend`), with its own test/coverage commands, its own repo map, and its own task lanes; setup proposes exactly that split when it discovers one. Commands run in the registered subtree, per-task worktrees are built from the physical checkout so tasks still never share a working tree, and a commit stages only its own subtree. Two caveats worth knowing up front: outside task worktrees the logical repos share the checkout's branch (a branch cut flips the whole tree), and a parent repo's tree genuinely contains its children, so keeping a parent's task out of a child's files is a review concern rather than a mechanical one.
+
 A work item spanning repos gets per-repo task lanes; cross-repo API contracts are declared in the plan and mechanically re-checked at reconcile time (`reconcile-contracts` greps each declared fragment across the other repos' sources, excluding test paths and the committed `ai/**` mirrors; `{param}` tokens in `http` route fragments match any one path segment, so each repo may name a route parameter its own way without false drift). Sync points fail closed: the cursor cannot leave `develop` while any task in any lane is non-terminal.
 
 ### The repo map
@@ -421,7 +423,7 @@ ai-sdlc-harness/
 │   └── init-workspace/ · add-repo/ · migrate-workspace/ · workspace-config/ · workflow-status/ · repo-map-refresh/
 ├── bin/harness                  # wrapper script resolving the plugin venv (+ harness.cmd for Windows)
 ├── tools/                       # meta-tooling: line-budget checker, sandbox workspace generators
-└── tests/                       # 1025 stdlib-unittest tests
+└── tests/                       # 1092 stdlib-unittest tests
 ```
 
 Workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside *your* working directory by `/init-workspace` and the pipeline. They never live inside this plugin repo.
@@ -451,7 +453,7 @@ python -m venv .venv; .venv\Scripts\pip install pyyaml
 .venv\Scripts\python -m unittest discover -s tests
 ```
 
-The test suite (1025 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (1092 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 

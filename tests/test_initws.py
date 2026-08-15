@@ -17,7 +17,7 @@ from unittest import mock
 import yaml
 
 from harness import gitops, initws
-from tests.test_gitops import TEST_CMD, make_repo
+from tests.test_gitops import TEST_CMD, make_monorepo, make_repo
 from tests import support
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -719,6 +719,176 @@ class VerificationGates(M7Harness):
         # and the CLI is still usable afterward
         self.cli("init-section", "--section", "overrides", "--json",
                  json.dumps({"quick_mode": {"loc_threshold": 50}}))
+
+
+class SubtreeRepoRegistration(M7Harness):
+    """init-verify's repo gate probes membership of a git WORK TREE, not
+    `(path/".git").exists()`. The old test could only ever pass a checkout
+    ROOT — which is exactly the registration `discover()`'s `monorepo_split`
+    cannot produce, so every split it proposed verified as a failure."""
+
+    def test_verify_passes_a_subtree_and_names_the_physical_checkout(self):
+        mono = make_monorepo(self.workspace)
+        stories = self.workspace / "stories"
+        stories.mkdir()
+        # parent AND child registered together — the legal, required overlap
+        # (a .NET `.sln` at the root plus a frontend app under it)
+        self.cli("init", "--stories-dir", str(stories),
+                 "--repo", f"front={mono / 'frontend'}",
+                 "--repo", f"mono={mono}",
+                 "--test-cmd", f"front={support.NOP_CMD}",
+                 "--test-cmd", f"mono={support.NOP_CMD}")
+        out = self.cli("init-verify")
+        checks = {c["check"]: c for c in out["checks"]}
+        self.assertEqual(checks["repo:front"]["status"], "pass")
+        # the report is honest about the shared checkout: the registered path
+        # is not where `.git` is, and that relationship is what the direct-
+        # branch refusal and `add -A` scoping both hinge on
+        self.assertIn("subtree of", checks["repo:front"]["detail"])
+        self.assertIn(str(mono), checks["repo:front"]["detail"])
+        self.assertEqual(checks["repo:mono"]["status"], "pass")
+        self.assertNotIn("subtree of", checks["repo:mono"]["detail"])
+        self.assertTrue(out["ok"])
+
+    def test_a_discovered_monorepo_split_is_registrable_end_to_end(self):
+        """The point of the change: `discover()` already PROPOSES subtree
+        roots, and until now none of them could be registered — the repo
+        gate rejected every one. Proposal -> repos.yaml -> init-verify, with
+        each logical repo carrying its own test_cmd."""
+        mono = make_monorepo(self.workspace)
+        (mono / "frontend" / "package.json").write_text('{"name": "f"}\n')
+        (mono / "backend" / "pyproject.toml").write_text("[project]\nname='b'\n")
+        gitops.run_git(mono, "add", "-A")
+        gitops.run_git(mono, "commit", "-m", "markers")
+        out = self.cli("discover", "--repo", str(mono))
+        self.assertEqual(out["monorepo_split"], ["backend", "frontend"])
+        stories = self.workspace / "stories"
+        stories.mkdir()
+        self.cli("init", "--stories-dir", str(stories),
+                 *[a for root in out["monorepo_split"]
+                   for a in ("--repo", f"{root}={mono / root}")],
+                 *[a for root in out["monorepo_split"]
+                   for a in ("--test-cmd", f"{root}={support.NOP_CMD}")])
+        verified = self.cli("init-verify")
+        statuses = {c["check"]: c["status"] for c in verified["checks"]}
+        self.assertEqual(statuses["repo:frontend"], "pass")
+        self.assertEqual(statuses["repo:backend"], "pass")
+        self.assertEqual(statuses["test_cmd:frontend"], "pass")
+        self.assertTrue(verified["ok"])
+
+    def test_verify_still_fails_a_path_outside_any_checkout(self):
+        plain = self.workspace / "plain"
+        plain.mkdir()
+        stories = self.workspace / "stories"
+        stories.mkdir()
+        self.cli("init", "--stories-dir", str(stories),
+                 "--repo", f"repo={plain}", "--test-cmd", f"repo={support.NOP_CMD}")
+        out = self.cli("init-verify", expect=1)
+        check = next(c for c in out["checks"] if c["check"] == "repo:repo")
+        self.assertEqual(check["status"], "fail")
+        self.assertIn("git checkout", check["remediation"])
+
+    # ------------------------- the checkout must not swallow the workspace
+
+    def _cli_in(self, workspace: Path, *args, expect=0):
+        """`M7Harness.cli` pins --workspace to the fixture root; the
+        containment hazard needs a workspace NESTED inside a checkout, which
+        that root can never be."""
+        proc = subprocess.run(
+            [str(HARNESS_BIN), "--workspace", str(workspace), *args],
+            cwd=workspace, capture_output=True, text=True, encoding="utf-8",
+            timeout=300)
+        payload = json.loads(proc.stdout) if proc.stdout.strip() else {}
+        self.assertEqual(proc.returncode, expect,
+                         f"{args} -> {payload} {proc.stderr}")
+        return payload
+
+    def test_verify_refuses_a_checkout_that_contains_the_workspace(self):
+        """The exact-equality refusal above catches "the workspace IS the
+        repo". The gate's new qualifying condition is CONTAINMENT, so the
+        hazard widened with it: workspace at `<checkout>/ws`, registration at
+        `<checkout>/code/myapp`, one `.git` over both. Pre-fix that verified
+        `pass` — and then preflight's `ensure_default_branch` probed dirt at
+        the toplevel, which now contains the live run's own `ws/ai/<run>/**`,
+        and refused permanently naming the harness's own state files.
+        Committing them to clear it is worse: the `git checkout <default>`
+        that follows swaps the workspace's sealed state.yaml and
+        `.claude/context/**` out from under the run."""
+        outer = self.workspace / "outer"
+        (outer / "code" / "myapp").mkdir(parents=True)
+        gitops.run_git(self.workspace, "init", "-b", "main", "outer")
+        gitops.run_git(outer, "config", "user.email", "t@t")
+        gitops.run_git(outer, "config", "user.name", "t")
+        (outer / "code" / "myapp" / "app.py").write_text("x\n")
+        gitops.run_git(outer, "add", "-A")
+        gitops.run_git(outer, "commit", "-m", "init")
+        ws = outer / "ws"
+        stories = ws / "stories"
+        stories.mkdir(parents=True)
+        self._cli_in(ws, "init", "--stories-dir", str(stories),
+                     "--repo", f"myapp={outer / 'code' / 'myapp'}",
+                     "--test-cmd", f"myapp={support.NOP_CMD}")
+        out = self._cli_in(ws, "init-verify", expect=1)
+        check = next(c for c in out["checks"] if c["check"] == "repo:myapp")
+        self.assertEqual(check["status"], "fail")
+        self.assertIn("lives INSIDE", check["remediation"])
+        self.assertIn("state.yaml", check["remediation"])
+        self.assertFalse(out["ok"])
+
+    def test_a_subtree_beside_an_outside_workspace_is_still_fine(self):
+        """No-regression for the containment check: the ordinary subtree
+        registration — workspace somewhere else entirely — is untouched."""
+        mono = make_monorepo(self.workspace / "elsewhere")
+        stories = self.workspace / "stories"
+        stories.mkdir()
+        self.cli("init", "--stories-dir", str(stories),
+                 "--repo", f"front={mono / 'frontend'}",
+                 "--test-cmd", f"front={support.NOP_CMD}")
+        checks = {c["check"]: c for c in self.cli("init-verify")["checks"]}
+        self.assertEqual(checks["repo:front"]["status"], "pass")
+
+    # ------------------------------ a subtree git can actually materialize
+
+    def test_verify_refuses_an_untracked_subtree_registration(self):
+        """Membership of a work tree is also true of an IGNORED directory,
+        so a registration git can never materialize verified clean: the
+        per-task `git worktree add` brings only what the branch tracks, the
+        returned repo path does not exist, and every task command runs in a
+        missing cwd."""
+        mono = make_monorepo(self.workspace)
+        (mono / ".gitignore").write_text("generated/\n")
+        (mono / "generated").mkdir()
+        (mono / "generated" / "app.py").write_text("g\n")
+        gitops.run_git(mono, "add", "-A")
+        gitops.run_git(mono, "commit", "-m", "ignore generated")
+        stories = self.workspace / "stories"
+        stories.mkdir()
+        self.cli("init", "--stories-dir", str(stories),
+                 "--repo", f"gen={mono / 'generated'}",
+                 "--test-cmd", f"gen={support.NOP_CMD}")
+        out = self.cli("init-verify", expect=1)
+        check = next(c for c in out["checks"] if c["check"] == "repo:gen")
+        self.assertEqual(check["status"], "fail")
+        self.assertIn("not in its index", check["remediation"])
+        self.assertIn("worktree", check["remediation"])
+        # the detail still names the checkout — the reader needs to know
+        # WHICH index the path is missing from
+        self.assertIn("subtree of", check["detail"])
+
+    def test_an_empty_root_registration_still_passes(self):
+        """No-regression for the tracked-subtree probe: a freshly-init'd
+        checkout with an empty index is a legitimate root registration and
+        must not be caught by a check aimed at subtrees."""
+        fresh = self.workspace / "fresh"
+        fresh.mkdir()
+        gitops.run_git(self.workspace, "init", "-b", "main", "fresh")
+        stories = self.workspace / "stories"
+        stories.mkdir()
+        self.cli("init", "--stories-dir", str(stories),
+                 "--repo", f"fresh={fresh}", "--test-cmd", f"fresh={support.NOP_CMD}")
+        checks = {c["check"]: c for c in self.cli("init-verify")["checks"]}
+        self.assertEqual(checks["repo:fresh"]["status"], "pass")
+        self.assertEqual(checks["repo:fresh"]["detail"], str(fresh))
 
 
 class QwenCompatibility(M7Harness):
