@@ -3371,6 +3371,70 @@ class DeferFollowThrough(BreadthHarness):
         self.assertGreaterEqual(flagged, 1)   # the real pending is still owed
 
 
+class BackgroundSpawnGauge(unittest.TestCase):
+    """`spawn-pending` / `spawn-captured`: the two-hook handoff for a
+    BACKGROUND spawn (PostToolUse sees only a launch stub; the reply lands at
+    SubagentStop). A pending with no capture means that stop never came — the
+    subagent crashed, or the session ended under it — and NOTHING was recorded
+    for that spawn, so the gauge must surface it until it pairs off."""
+
+    def test_a_dangling_pending_is_outstanding_until_its_capture(self):
+        from harness.workflow import (FLAGGED_EVENT_KINDS, outstanding_flagged,
+                                      run_health)
+        self.assertIn("spawn-pending", FLAGGED_EVENT_KINDS)
+        events = [{"kind": "spawn-pending", "agent_id": "a-1", "task": "T1",
+                   "actor": "reviewer", "mode": "review"}]
+        self.assertEqual(len(outstanding_flagged(events)), 1)
+        # …and while it is OUTSTANDING it degrades run health, exactly like
+        # its twin kind `background-spawn-uncaptured`: both describe a spawn
+        # whose verdict, status block and token row were never recorded, and
+        # which of the two a run gets is decided by the platform's stub
+        # schema, not by how the run went (adversarial review on this change)
+        verdict, counts = run_health(events)
+        self.assertEqual(verdict, "DEGRADED")
+        self.assertEqual(counts["spawn-pending"], 1)
+        events.append({"kind": "spawn-captured", "agent_id": "a-1",
+                       "task": "T1", "actor": "capture", "shape": "reviewer",
+                       "mode": "review"})
+        self.assertEqual(outstanding_flagged(events), [])
+        # …and PAIRED it degrades nothing: the evidence arrived late, exactly
+        # as designed, so unlike a stall there is no history to remember
+        self.assertEqual(run_health(events), ("HEALTHY", {}))
+
+    def test_one_capture_clears_only_its_own_agent(self):
+        # keyed by agent id rather than superseding the whole set: the plan
+        # panel batches every lens spawn in ONE message by mandate, so several
+        # pendings are open at once and the first lens to finish must not
+        # clear its siblings — the under-count a repo-only base key produced
+        from harness.workflow import outstanding_flagged, run_health
+        events = [{"kind": "spawn-pending", "agent_id": "a-1"},
+                  {"kind": "spawn-pending", "agent_id": "a-2"},
+                  {"kind": "spawn-captured", "agent_id": "a-1",
+                   "actor": "capture"}]
+        self.assertEqual([e["agent_id"] for e in outstanding_flagged(events)],
+                         ["a-2"])
+        # health counts the SAME survivors — one gauge, one rule
+        self.assertEqual(run_health(events), ("DEGRADED", {"spawn-pending": 1}))
+
+    def test_a_forged_capture_cannot_clear_a_pending(self):
+        """The resolver is actor-checked like its four siblings. The first
+        draft argued the agent_id alone was a narrow enough bound; executed,
+        it is not — the id is published in plain text in the very ledger
+        `log-event` appends to, so a hand-written record reads it off the
+        pending and clears a real outstanding flag."""
+        from harness.workflow import outstanding_flagged, run_health
+        events = [{"kind": "spawn-pending", "agent_id": "a-1", "task": "T1"},
+                  # what `harness log-event --json '{…}'` produces: right
+                  # kind, right id, no capture-owned actor
+                  {"kind": "spawn-captured", "agent_id": "a-1"},
+                  # …and the pre-fix spelling, where `actor` carried the
+                  # spawn SHAPE — a value any caller can read off the pending
+                  {"kind": "spawn-captured", "agent_id": "a-1",
+                   "actor": "reviewer"}]
+        self.assertEqual(len(outstanding_flagged(events)), 1)
+        self.assertEqual(run_health(events)[0], "DEGRADED")
+
+
 class RunHealth(BreadthHarness):
     """The process-health verdict (field 459226 rec: a run 'completed
     green' over 11 flagged events and 2 stalls, visible only via manual

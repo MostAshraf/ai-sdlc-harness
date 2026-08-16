@@ -6,6 +6,32 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
+- Reviewer verdicts from background subagents are no longer lost. Newer
+  Claude Code versions run subagents in the background by default, where the
+  pipeline's capture saw only a launch stub: the verdict was unrecoverable
+  and a spurious "stalled agent" event was fabricated in its place. Capture
+  now records a pending marker when a spawn is backgrounded and completes it
+  when that agent actually finishes — the verdict, status block, and token
+  cost all land under the same task attribution, and a background agent that
+  dies without ever finishing surfaces as an outstanding flag on the
+  dashboard (and degrades run health) instead of vanishing. Background
+  spawns of the pipeline's own agents remain **blocked** for now: the block
+  message no longer claims the verdict would be lost, but lifting it is the
+  next release's orchestration change, not this one. Qwen Code's background
+  format has not been measured and is not yet covered.
+- Requesting the stalled-agent procedure while a background review is still
+  pending is now refused — re-spawning over a live reviewer produced two
+  verdicts for one round, and the stale one could win. The run dashboard
+  (`harness show`) now lists outstanding flagged events, so "still running"
+  is visible exactly where the stall/wait decision is made; an explicit
+  override remains available.
+- Evidence-forgery hardening, from an adversarial review of this change:
+  the record that clears a pending spawn is now capture-owned and checked by
+  every reader (a hand-written ledger event could previously silence the
+  "background spawn awaiting capture" flag), and the guard that blocks
+  hand-piped synthetic payloads into the capture hooks now catches the
+  line-continuation spelling that already evaded it for other verbs.
+
 ## [3.6.0] — 2026-08-15
 > **A monorepo's second stack could be discovered, described, and then not registered — and its test suite silently never ran again.** Setup has proposed a `monorepo_split` for as long as it has proposed anything: one checkout, a .NET solution at its root, a Node app under `frontend/`, two logical repos sharing one `.git`. Nothing downstream could accept that answer. Verification asked whether the registered path had a `.git` directly under it — true only of a checkout root — so registering the two roots separately left both permanently failing the gate with no available fix, and the setup skills said the only thing that then worked: register the repo once, at its physical root. One stack got a test command; the other's suite dropped out of every pipeline that ever ran there, with no gate anywhere reporting the loss. A registered repo may now be **any subtree of a git checkout**, so the split registers as the several logical repos it always was. An adversarial review of the change then hardened it: the review found (and this release closes) a write path where an edit outside the task's subtree was silently destroyed on a green run, a contract check that could report clean against a sibling repo's files, a PR step that hard-failed for the second repo of a shared checkout, and four verification gaps where setup accepted a registration the pipeline could never run.
 

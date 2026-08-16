@@ -650,6 +650,29 @@ class ShowNextSteps(Harness):
         reloaded = state_mod.load(run, self.workspace)
         self.assertEqual(reloaded["artifacts"]["plan-review.outcome"], "pending")
 
+    def test_outstanding_flagged_summary_is_reported_per_kind(self):
+        """The wait-vs-stall decision is made at exactly the moment the
+        orchestrator re-reads `show`, and `show` reported no flagged events
+        at all — so the one record that answers it (`spawn-pending`: that
+        subagent is still running) was invisible without reading ndjson by
+        hand. Same shared filter as `status`/metrics, so the numbers can
+        never disagree; resolved items pair off and drop out."""
+        run, _ = self._plan_review_run()
+        self.assertEqual(self._show(run)["outstanding_flagged"], {})
+        for rec in ({"kind": "spawn-pending", "agent_id": "a-1",
+                     "task": "step:plan-review:contradictions"},
+                    {"kind": "spawn-pending", "agent_id": "a-2",
+                     "task": "step:plan-review:coverage"},
+                    {"kind": "hook-blocked", "actor": "reviewer"}):
+            ndjson.append_record(run / "events.ndjson", rec)
+        self.assertEqual(self._show(run)["outstanding_flagged"],
+                         {"spawn-pending": 2, "hook-blocked": 1})
+        ndjson.append_record(run / "events.ndjson",
+                             {"kind": "spawn-captured", "agent_id": "a-1",
+                              "actor": "capture"})
+        self.assertEqual(self._show(run)["outstanding_flagged"],
+                         {"spawn-pending": 1, "hook-blocked": 1})
+
     def test_no_verdict_yields_empty_next_steps(self):
         # fail-closed exactly like the engine: no in-window verdict -> no
         # legal exit, and nothing to refresh off the `pending` cache
@@ -1363,6 +1386,77 @@ class StallVerdictGuard(Harness):
         self._guard("T1")
         self.assertEqual(
             transitions.record_stall(self.st, self.config, "T1"), "reinvoke")
+
+    def _pending(self, key, agent_id="a-1"):
+        ndjson.append_record(self.run / "events.ndjson",
+                             {"kind": "spawn-pending", "task": key,
+                              "actor": "reviewer", "agent_id": agent_id})
+
+    def test_an_open_pending_refuses_the_stall(self):
+        """A background spawn between launch and completion leaves the
+        ledgers looking exactly like a stall — no verdict, no status block —
+        and `spawn-pending` is the record that says otherwise. The stall
+        layer was the one layer never taught to read it: executed, `stall`
+        returned `reinvoke` over a live background reviewer, both copies
+        finished, and latest-wins handed the run the STALE APPROVED.
+
+        Checked for a PER-TASK key too (that is the proven case): the
+        verdict-ledger half below never runs for one, but "the agent is
+        still running" is true of any spawn."""
+        self._pending("T1")
+        before = json.dumps(self.st, sort_keys=True, default=str)
+        with self.assertRaises(transitions.TransitionError) as ctx:
+            self._guard("T1")
+        msg = str(ctx.exception)
+        self.assertIn("still RUNNING", msg)
+        self.assertIn("SubagentStop", msg)
+        self.assertIn("--confirm-no-verdict", msg)
+        # refuses BEFORE record_stall, so no counter moved (same contract as
+        # the verdict half)
+        self.assertEqual(json.dumps(self.st, sort_keys=True, default=str),
+                         before)
+        # …and a pending under a DIFFERENT key is that key's business, not
+        # this one's — the guard only refuses what it can attribute
+        self._guard(self.KEY)
+
+    def test_a_captured_spawn_stops_refusing(self):
+        # the pending pairs off by agent id the moment SubagentStop captures
+        # its reply, and the stall procedure is available again immediately
+        self._pending("T1")
+        with self.assertRaises(transitions.TransitionError):
+            self._guard("T1")
+        ndjson.append_record(self.run / "events.ndjson",
+                             {"kind": "spawn-captured", "agent_id": "a-1",
+                              "actor": "capture", "shape": "reviewer"})
+        self._guard("T1")
+        self.assertEqual(
+            transitions.record_stall(self.st, self.config, "T1"), "reinvoke")
+
+    def test_a_forged_capture_cannot_unblock_the_stall(self):
+        # the resolver is actor-checked in BOTH readers (gauge and guard):
+        # here the forgery direction is unblocking a refusal, and the
+        # agent_id is published in the very ledger `log-event` appends to
+        self._pending("T1")
+        ndjson.append_record(self.run / "events.ndjson",
+                             {"kind": "spawn-captured", "agent_id": "a-1"})
+        with self.assertRaises(transitions.TransitionError):
+            self._guard("T1")
+
+    def test_the_pending_refusal_is_overridable(self):
+        # for the spawn that genuinely died (session ended, CLI crashed) the
+        # existing escape hatch still records the stall — and still leaves
+        # the visible override marker
+        state_mod.save(self.run, self.workspace, self.st)
+        self._pending(self.KEY)
+        blocked = self._cli("stall")
+        self.assertFalse(blocked["ok"])
+        self.assertIn("still RUNNING", blocked["error"])
+        forced = self._cli("stall", "--confirm-no-verdict")
+        self.assertTrue(forced["ok"], forced)
+        self.assertEqual(forced["action"], "reinvoke")
+        override = next(e for e in ndjson.read_records(self.run / "events.ndjson")
+                        if e["kind"] == "stall-verdict-override")
+        self.assertIn("still RUNNING", override["reason"])
 
     def test_step_without_verdict_bound_is_unaffected(self):
         support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")

@@ -1301,8 +1301,32 @@ def main(argv: list[str] | None = None) -> int:
                 after = probe.get("artifacts") or {}
                 derived = {k: v for k, v in after.items()
                            if before.get(k) != v}
+            # A fourth ledger-fresh field, same motive as the three above —
+            # something true on disk that state.yaml alone cannot show. The
+            # orchestrator is told to re-read `show` whenever it is unsure
+            # what to do next, and "wait for a background spawn vs. call
+            # `stall`" is decided at exactly that moment — yet `show`
+            # reported no flagged events at all, so the one record that
+            # answers it (`spawn-pending`) was invisible unless the
+            # orchestrator went reading ndjson by hand. `status` has carried
+            # a flagged COUNT for runs; per-KIND is what makes the reading
+            # actionable here. Same shared filter, so the number can never
+            # disagree with `status` or with metrics' "## Flagged events".
+            #
+            # Enrichment, never a failure mode: an unreadable/absent ledger
+            # degrades to {} exactly like the probe above — `show` is the
+            # tool reached for when a run is wedged.
+            outstanding: dict[str, int] = {}
+            try:
+                for e in workflow.outstanding_flagged(
+                        ndjson.read_records(args.run / "events.ndjson")):
+                    kind = e.get("kind")
+                    outstanding[kind] = outstanding.get(kind, 0) + 1
+            except Exception:                                 # noqa: BLE001
+                outstanding = {}
             _emit({"ok": True, "state": st, "next_steps": next_steps,
-                   "derived": derived, "probe_error": probe_error})
+                   "derived": derived, "probe_error": probe_error,
+                   "outstanding_flagged": outstanding})
             return 0
 
         # Expensive verify-green test run happens OUTSIDE the lock (RC4);

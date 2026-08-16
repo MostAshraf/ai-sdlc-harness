@@ -87,9 +87,10 @@ successful sibling of abort — the final step's file says exactly when).
    relay its text to the user verbatim the FIRST time it appears in this
    run; it repeats on every resolve and needn't be repeated. Every harness-shape spawn runs FOREGROUND — pass
    `run_in_background: false` explicitly (newer platforms default to
-   background, and capture reads the spawn's own tool_response; a
-   background spawn returns only a launch stub — verdict lost, stall
-   event fabricated; the guard requires an explicit `false`). Parallelism =
+   background; a background spawn returns only a launch stub, and while
+   capture now defers that spawn's verdict to its SubagentStop, the
+   wait-vs-stall orchestration around it has not landed — the guard
+   requires an explicit `false`). Parallelism =
    batch multiple foreground spawns in ONE message, never backgrounding.
 4. Advance: `${CLAUDE_PLUGIN_ROOT}/bin/harness cursor --to <next> --run <run>`. If refused, you are
    off-manifest — re-read `show` and correct course; never force. If the
@@ -128,7 +129,9 @@ successful sibling of abort — the final step's file says exactly when).
   Check the TAIL of `<run>/events.ndjson` before calling `stall`:
   `status-block-malformed` → the verdict was captured despite the loose
   block — proceed on the ledger, never stall; `missing-status-block` →
-  genuine stall, procedure above. For a task-less **step** key, `stall`
+  genuine stall, procedure above; an unresolved `spawn-pending` (also in
+  `show`'s `outstanding_flagged`) → that subagent is still running in the
+  background, WAIT for its SubagentStop; never stall. For a task-less **step** key, `stall`
   refuses outright when that step's ledger already holds a verdict for the
   current round (`--confirm-no-verdict` overrides, for a spawn that stalled
   *after* the capture); per-task and per-lens keys are never refused — the

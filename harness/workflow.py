@@ -41,7 +41,7 @@ FLAGGED_EVENT_KINDS = (
     "pr-recorded-manually", "secret-sweep-blocked", "gate-skipped",
     "deferral-pending", "panel-serialized",
     # field: dual-run comparison, and everything added to this block since.
-    # Ten kinds now, in three resolution classes —
+    # Eleven kinds now, in three resolution classes —
     # each stated explicitly, because getting this wrong is what makes the
     # flagged-events gauge either over- or under-report (see
     # outstanding_flagged below).
@@ -105,12 +105,27 @@ FLAGGED_EVENT_KINDS = (
     # rejected one class above (adversarial-review, both lenses
     # independently). Not HEALTH_DEGRADING either: no evidence was lost and
     # the run's own machinery is intact — only the external tracker is behind.
-    "write-back-failed")
-# None of the ten are HEALTH_DEGRADING (below): each means "a human should
-# look", not "this run's machinery degraded / evidence was lost". The closest
-# call is `remote-branch-unverified` — evidence genuinely not obtained — but
-# preflight continuing without it is the declared, safe behaviour (a
-# connectivity blip must not brick a run), not a degraded one.
+    "write-back-failed",
+    # Class (c), RESOLVABLE — paired off BY AGENT ID by `spawn-captured`.
+    # Claude Code 2.1.232 backgrounds subagent spawns by default, and a
+    # background spawn's PostToolUse carries only a launch stub: the reply,
+    # its verdict and its status block all arrive later, at SubagentStop.
+    # `spawn-pending` is the handoff record between those two hooks (one-shot
+    # subprocesses sharing no state but this ledger), so a pending that never
+    # got its `spawn-captured` means the stop never came — the subagent
+    # crashed, or the session ended under it — and NOTHING was recorded for
+    # that spawn: no verdict, no stall event, no token row. A silent hole in
+    # the evidence, unresolvable by the harness itself (only a fresh spawn
+    # fixes it), which is exactly what this gauge exists to put in front of a
+    # human. The ONE kind here that is conditionally HEALTH_DEGRADING: see
+    # run_health below — outstanding degrades, paired never does.
+    "spawn-pending")
+# Ten of the eleven are never HEALTH_DEGRADING (below): each means "a human
+# should look", not "this run's machinery degraded / evidence was lost". The
+# closest call is `remote-branch-unverified` — evidence genuinely not obtained
+# — but preflight continuing without it is the declared, safe behaviour (a
+# connectivity blip must not brick a run), not a degraded one. The eleventh,
+# `spawn-pending`, is the exception and run_health states its rule.
 
 
 def _base_key(e: dict) -> tuple:
@@ -151,13 +166,15 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
 
     `base-branch-stale` pairs off the same way but keyed BY REPO — see the
     branch below for why a whole-set supersede would under-count a multi-repo
-    run."""
+    run. `spawn-pending` is keyed the same way by AGENT ID, for the same
+    reason: several background spawns run at once."""
     flagged = [e for e in events if e.get("kind") in FLAGGED_EVENT_KINDS]
     open_pending: list[dict] = []
     open_plan: list[dict] = []
     open_env: list[dict] = []
     open_wb: list[dict] = []
     open_base: dict[tuple, list[dict]] = {}
+    open_spawn: dict[str, list[dict]] = {}
     resolved: set[int] = set()
     for e in events:
         kind = e.get("kind")
@@ -232,6 +249,30 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
             # writes the actor still clears — stated so the check is not read
             # as more than it is.
             resolved.update(id(x) for x in open_base.pop(_base_key(e), []))
+        elif kind == "spawn-pending":
+            open_spawn.setdefault(e.get("agent_id"), []).append(e)
+        elif kind == "spawn-captured" and e.get("actor") == "capture":
+            # Keyed by AGENT ID, like base-branch-stale's per-repo keying and
+            # for the same reason: several background spawns are in flight at
+            # once by design (plan-review.md mandates batching every lens
+            # spawn in ONE message), so a whole-set supersede would clear
+            # every sibling's pending the moment the first lens finished —
+            # the silent under-count the per-key pairing exists to prevent.
+            #
+            # actor-checked, exactly like its four siblings above. The first
+            # draft argued the agent_id was discriminator enough — "a stray
+            # record would have to name the exact platform-issued id of an
+            # OPEN pending, a strictly narrower bound". Adversarial review
+            # executed that bound and it is not narrow at all: the id is
+            # published in plain text in the very ledger `log-event` appends
+            # to, so `harness log-event --json
+            # '{"kind":"spawn-captured","agent_id":"a-1"}'` read the id off
+            # the pending and cleared it. `actor: "capture"` is the
+            # capture-owned value that was missing (the record now carries
+            # the spawn shape under `shape` instead) — the same bound the
+            # siblings have, no more: a caller that writes the actor still
+            # clears.
+            resolved.update(id(x) for x in open_spawn.pop(e.get("agent_id"), []))
         elif kind in ("risk-without-tests", "tests-without-production",
                       "contract-fragment-weak"):
             open_plan.append(e)
@@ -261,6 +302,9 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
 # and `hook-blocked` (content findings / guards doing their job), and
 # `panel-serialized` (an efficiency miss — wall-clock wasted, nothing
 # lost or stalled).
+# Deliberately NOT here: `spawn-pending`, whose degradation is CONDITIONAL
+# on being unpaired and so cannot be decided from the kind alone — the rule
+# lives in run_health, which has the whole event list to pair against.
 HEALTH_DEGRADING_KINDS = (
     "missing-status-block", "verdict-uncaptured",
     "background-spawn-uncaptured")
@@ -286,12 +330,34 @@ def run_health(events: list[dict], stalls: int = 0) -> tuple[str, dict[str, int]
     `metrics_report` — the same anti-drift rule as FLAGGED_EVENT_KINDS
     above. Unlike outstanding_flagged, health is HISTORY, not a live
     gauge: a stall the run later recovered from still degraded it, so
-    nothing pairs off."""
+    nothing pairs off.
+
+    ONE documented exception: an OUTSTANDING `spawn-pending`. Its twin kind
+    `background-spawn-uncaptured` is already HEALTH_DEGRADING and describes
+    the IDENTICAL outcome — a spawn whose verdict, status block and token
+    row were never recorded — so which of the two a run ends up with is
+    decided by the platform's stub schema, not by how well the run went.
+    Leaving one degrading and the other not made health depend on that
+    coin-flip. Resolved in favour of degrading only while UNPAIRED (the
+    history-vs-gauge tension cuts the other way here): a pending that got
+    its `spawn-captured` lost NOTHING — the evidence arrived late, exactly
+    as designed — so unlike a stall there is no degradation in the history
+    to remember (adversarial review on this change).
+    """
     counts: dict[str, int] = {}
     for e in events:
         k = e.get("kind")
         if k in HEALTH_DEGRADING_KINDS:
             counts[k] = counts.get(k, 0) + 1
+    # Through outstanding_flagged, not a local re-implementation: the
+    # per-agent-id pairing (and its actor check) must mean the SAME thing on
+    # the gauge and on the health verdict, or a run reads DEGRADED on one
+    # surface and HEALTHY on the other — the drift FLAGGED_EVENT_KINDS is
+    # shared to prevent.
+    open_spawn = sum(1 for e in outstanding_flagged(events)
+                     if e.get("kind") == "spawn-pending")
+    if open_spawn:
+        counts["spawn-pending"] = open_spawn
     return ("DEGRADED" if counts or stalls else "HEALTHY", counts)
 
 

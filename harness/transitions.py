@@ -660,6 +660,40 @@ def _stall_round_anchor(state: dict, run: Path, stall_key: str,
     return max(marks, default="")
 
 
+def _open_spawn_pending(run: Path, stall_key: str) -> dict | None:
+    """The `spawn-pending` for THIS stall key that no `spawn-captured` has
+    closed yet, or None.
+
+    Keyed the way `_stall_round_anchor` keys its own event scan — the
+    record's `task` against the stall key — so the guard only ever refuses a
+    stall it can positively attribute to a spawn in flight; a pending under
+    a different key (or none) is left to that key's own stall.
+
+    The pairing repeats `workflow.outstanding_flagged`'s rule rather than
+    importing it: that is the run-wide GAUGE (every open pending, no key),
+    while this is a per-key question, and `harness.workflow` imports the
+    engine, not the other way round. The `actor == "capture"` check is the
+    part that must not drift — without it a hand-written `log-event` could
+    UNBLOCK a stall by faking the capture, which is the forgery direction
+    that matters here.
+
+    Reads leniently and returns None on an unreadable ledger: this guard
+    SUPPRESSES an action, so it fails OPEN for the same reason the verdict
+    check below does — a ledger that cannot be read cannot prove a spawn is
+    live, and bricking the stalled-agent procedure is the worse failure."""
+    try:
+        events = ndjson.read_records(run / "events.ndjson")
+    except OSError:
+        return None
+    closed = {e.get("agent_id") for e in events
+              if e.get("kind") == "spawn-captured"
+              and e.get("actor") == "capture"}
+    return next((e for e in events
+                 if e.get("kind") == "spawn-pending"
+                 and e.get("task") == stall_key
+                 and e.get("agent_id") not in closed), None)
+
+
 def guard_stall_verdict(state: dict, manifest: dict, run: Path,
                         stall_key: str) -> None:
     """Refuse a stall the run's own verdict ledger already answers.
@@ -677,7 +711,32 @@ def guard_stall_verdict(state: dict, manifest: dict, run: Path,
     anti-manipulation note) and the exhaustion latch depends on that, so
     neither may be softened to compensate. Only steps declaring
     `verdict_bound` have a verdict to check; everything else (every per-task
-    spawn) passes straight through."""
+    spawn) passes straight through.
+
+    …EXCEPT for a spawn that has not finished yet. A background spawn's
+    reply reaches no hook until its SubagentStop, so between launch and
+    completion the run's ledgers look exactly like a stall: no verdict, no
+    status block, nothing. `spawn-pending` is the record that says
+    otherwise, and the stall layer was the one layer never taught to read
+    it — adversarial review executed the consequence: `stall` returned
+    `reinvoke` over a live background reviewer, the reinvoked copy and the
+    original both finished, and latest-wins on reviews.ndjson handed the
+    run the STALE APPROVED. Checked before the `step:` filter because the
+    proven case is a per-task review key, and "the agent is still running"
+    is true of any spawn, verdict_bound or not."""
+    open_pending = _open_spawn_pending(run, stall_key)
+    if open_pending is not None:
+        raise TransitionError(
+            f"'{stall_key}': a spawn for this key is still RUNNING in the "
+            f"background (spawn-pending, agent {open_pending.get('agent_id')})"
+            " — its reply reaches no hook until it finishes, so the empty "
+            "ledger is not a stall, it is a spawn in flight. WAIT for that "
+            "agent's SubagentStop: verdict and status-block capture happen "
+            "there, and the pending clears itself (spawn-captured). "
+            "Reinvoking now runs a second agent against the same worktree "
+            "and latest-wins can hand the run the STALE verdict. If that "
+            "agent genuinely died (its session ended, the CLI crashed), "
+            "re-run with --confirm-no-verdict.")
     if not stall_key.startswith("step:"):
         return  # per-task spawn: no verdict ledger governs it
     step = stall_key[len("step:"):]
