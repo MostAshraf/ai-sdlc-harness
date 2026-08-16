@@ -69,7 +69,25 @@ class LedgerCorruption(ValueError):
 
 
 def read_records(path: Path, strict: bool = False) -> list[dict]:
-    """Read all records.
+    """Read all records (see `read_records_counting` for the parse rules —
+    this is the same read with the skipped-line count dropped)."""
+    return read_records_counting(path, strict)[0]
+
+
+def read_records_counting(path: Path,
+                          strict: bool = False) -> tuple[list[dict], int]:
+    """Read all records, plus HOW MANY non-blank lines failed to parse.
+
+    The count exists because a lenient read is silent by construction, and
+    for one class of consumer that silence is a disabled guard rather than a
+    missing row: the three readers of the `spawn-pending` pairing
+    (`guards._live_spawn_for`, `transitions.open_spawn_pendings`,
+    `capture_subagent_stop`'s abandonment resolver) all decide "no spawn is
+    in flight" from ABSENCE, so a torn pending line silently turns the
+    one-live-spawn refusal, the stall refusal and the late-reply drop into
+    no-ops (adversarial review). They keep reading leniently — failing
+    closed on a torn line would brick the wedged-run path those guards exist
+    to protect — but they now SAY the ledger was partly unreadable.
 
     `strict=False` (default): skip unparseable lines. A crash-torn fragment
     is a known benign shape (append_record isolates it on its own line), and
@@ -92,8 +110,9 @@ def read_records(path: Path, strict: bool = False) -> list[dict]:
     record containing one, common in pasted text, split into two fragments
     and vanished whole)."""
     if not path.exists():
-        return []
+        return [], 0
     records: list[dict] = []
+    skipped = 0
     for line in path.read_bytes().decode("utf-8", errors="replace").split("\n"):
         if not line.strip():
             continue
@@ -105,5 +124,6 @@ def read_records(path: Path, strict: bool = False) -> list[dict]:
                     f"{path}: unparseable ledger line — refusing to derive a "
                     "decision from a ledger with a corrupt record (fail "
                     "closed; re-submit to heal it)")
+            skipped += 1
             continue  # torn/corrupt line — isolated, tolerated
-    return records
+    return records, skipped

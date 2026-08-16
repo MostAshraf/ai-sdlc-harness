@@ -14,17 +14,43 @@ All notable changes to `ai-sdlc-harness` are documented here.
   when that agent actually finishes — the verdict, status block, and token
   cost all land under the same task attribution, and a background agent that
   dies without ever finishing surfaces as an outstanding flag on the
-  dashboard (and degrades run health) instead of vanishing. Background
-  spawns of the pipeline's own agents remain **blocked** for now: the block
-  message no longer claims the verdict would be lost, but lifting it is the
-  next release's orchestration change, not this one. Qwen Code's background
-  format has not been measured and is not yet covered.
+  dashboard (and degrades run health) instead of vanishing.
+- Background spawns of the pipeline's own agents are **no longer blocked
+  under Claude Code**. The old rule required an explicit
+  `run_in_background: false` on every spawn — impossible on the newer Agent
+  tool, which has no such parameter, so the guard blocked the entire
+  pipeline there. Capture now handles both ends of a background spawn, so
+  the rule applies only under Qwen Code, whose background format has not
+  been measured (an unrecognised launch stub there would fabricate the
+  stalled-agent event this work exists to prevent). The pipeline
+  instructions changed to match: pass `false` where the tool has the
+  parameter; where it does not, wait for the agent's completion
+  notification and read the verdict from the ledger, never from reply text.
+- **One live spawn per (task, mode).** With backgrounding allowed, a second
+  agent could be launched to answer a question the first was still
+  answering — both finish, and the newest verdict wins, which may be the
+  stale one. The spawn guard now refuses that, naming the agent still in
+  flight and the two ways out: wait for it, or — if it genuinely died —
+  record the stall with `--confirm-no-verdict`, which now also abandons the
+  pending, freeing the key for a fresh spawn. Spawns for a different task or
+  mode are untouched, so parallel work stays parallel — as are spawns
+  batched into a single message (they all clear the guard before any of them
+  reports, which is what keeps a batched review panel legal) and the panel's
+  own adversarial lenses, which are exempt outright: no engine-read verdict
+  rides on a lens, so two of them cost tokens, never a wrong verdict. A reply that arrives
+  after abandonment is reported and dropped rather than entering the ledger
+  behind the replacement round's back; the abandoned spawn stops counting on
+  the dashboard, where the override itself is already recorded.
 - Requesting the stalled-agent procedure while a background review is still
   pending is now refused — re-spawning over a live reviewer produced two
   verdicts for one round, and the stale one could win. The run dashboard
   (`harness show`) now lists outstanding flagged events, so "still running"
   is visible exactly where the stall/wait decision is made; an explicit
-  override remains available.
+  override remains available. This now covers task-less spawns
+  (plan-review, pre-pr, a plan panel's lenses) too: their pending and their
+  stall key are spelled differently, and used to miss each other — so the
+  plan-review synthesizer, the case the refusal was written for, could be
+  running in the background and still be told to re-spawn.
 - Evidence-forgery hardening, from an adversarial review of this change:
   the record that clears a pending spawn is now capture-owned and checked by
   every reader (a hand-written ledger event could previously silence the

@@ -4,6 +4,7 @@ completes with contract reconciliation surfaced; worktree lifecycle."""
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -77,7 +78,7 @@ class BreadthHarness(unittest.TestCase):
             t["status"] = "done"
         state_mod.save(run, self.workspace, st)
 
-    def tdd_task(self, run, task_id, worktree: Path):
+    def tdd_task(self, run, task_id, worktree: Path, review=None):
         self.cli("task", "--id", task_id, "--to", "in-progress", run=run)
         (worktree / "tests" / "test_x.py").write_text(FAILING_TEST)
         self.cli("verify-red", "--repo", str(worktree), "--task", task_id,
@@ -87,7 +88,7 @@ class BreadthHarness(unittest.TestCase):
                  "--summary", "implement val", run=run)
         self.cli("task", "--id", task_id, "--to", "in-review",
                  "--repo", str(worktree), "--test-cmd", TEST_CMD, run=run)
-        self.review_approve(run, task_id)
+        (review or self.review_approve)(run, task_id)
 
     def review_approve(self, run, task_id, verdict="APPROVED"):
         """Simulate the SubagentStop hook's reviewer-verdict capture — the
@@ -97,6 +98,67 @@ class BreadthHarness(unittest.TestCase):
         ndjson.append_record(run / "reviews.ndjson",
                              {"task": task_id, "mode": "review",
                               "verdict": verdict})
+
+    def hook(self, name, payload) -> str:
+        """Fire a real capture hook exactly as the platform does: the
+        one-shot guards.py subprocess, JSON payload on stdin. Returns stderr.
+
+        CLAUDE_PROJECT_DIR and QWEN_CODE are stripped for the same reason
+        tests/test_guards.py strips them — the suite may itself be running
+        inside one of those sessions, and both change which branch the hook
+        takes."""
+        payload.setdefault("cwd", str(self.workspace))
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("CLAUDE_PROJECT_DIR", "QWEN_CODE")}
+        proc = subprocess.run(
+            [sys.executable, str(ROOT / "hooks" / "guards.py"), name],
+            input=json.dumps(payload), capture_output=True, text=True,
+            encoding="utf-8", timeout=60, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stderr
+
+    def review_via_background_spawn(self, run, task_id, verdict="APPROVED"):
+        """The reviewer round trip a BACKGROUND spawn actually produces, with
+        no ledger written by this test at all: PostToolUse sees only the
+        launch stub (-> `spawn-pending`), the agent's reply arrives later at
+        SubagentStop (-> reviews.ndjson + `spawn-captured`). Drop-in
+        replacement for `review_approve`'s hand-written row, so a pipeline
+        walk can prove the orchestration path end-to-end now that WI-3 no
+        longer forces every spawn into the foreground."""
+        agent_id = f"bg-{task_id}"
+        prompt = (f"harness-mode: review\nharness-task: {task_id}\n"
+                  f"harness-run: {run}\nreview the task diff")
+        self.hook("post-spawn", {
+            "tool_name": "Agent",
+            "tool_input": {"subagent_type": "ai-sdlc-reviewer",
+                           "prompt": prompt},
+            # the MEASURED 2.1.232 launch stub: no reply, no
+            # run_in_background echoed back into tool_input
+            "tool_response": {"isAsync": True, "status": "async_launched",
+                              "agentId": agent_id,
+                              "outputFile": f"/tmp/{agent_id}.json"}})
+        pending = [e for e in ndjson.read_records(run / "events.ndjson")
+                   if e["kind"] == "spawn-pending"]
+        self.assertEqual(pending[-1]["agent_id"], agent_id)
+        rows = (ndjson.read_records(run / "reviews.ndjson")
+                if (run / "reviews.ndjson").exists() else [])
+        self.assertFalse([r for r in rows if r.get("task") == task_id],
+                         "nothing may be captured from a launch stub")
+        transcript = self.workspace / f"{agent_id}.jsonl"
+        transcript.write_text("\n".join(json.dumps(l) for l in [
+            {"type": "user", "message": {"content": [
+                {"type": "text", "text": prompt}]}},
+            {"type": "assistant", "message": {
+                "model": "claude-opus-4-8",
+                "usage": {"input_tokens": 12, "output_tokens": 4},
+                "content": [{"type": "text",
+                             "text": f"harness-status: SUCCESS\n"
+                                     f"harness-task: {task_id}\n"
+                                     f"verdict: {verdict}\n"
+                                     f"outcome: reviewed"}]}}]))
+        self.hook("subagent-stop", {"agent_type": "ai-sdlc-reviewer",
+                                    "agent_id": agent_id,
+                                    "agent_transcript_path": str(transcript)})
 
     def scope(self, run, *repos):
         """Record the user-confirmed target-repo scope (intake's job in
@@ -152,10 +214,26 @@ class FullWalk(BreadthHarness):
         self.assertTrue(resumed["resumed"])           # idempotent resume
         self.assertEqual(resumed["path"], wt["path"])
 
-        self.tdd_task(run, "T1", worktree)
+        # …and the review completes the way a BACKGROUND spawn completes —
+        # launch stub at PostToolUse, reply at SubagentStop — with both real
+        # hooks fired and no ledger row written by this test. WI-3 used to
+        # force every harness spawn into the foreground; with it lifted on
+        # Claude Code this is the shape the pipeline actually produces, so
+        # the walk exercises it end to end.
+        self.tdd_task(run, "T1", worktree,
+                      review=self.review_via_background_spawn)
+        captured = ndjson.read_records(run / "reviews.ndjson")[-1]
+        self.assertEqual((captured["task"], captured["mode"],
+                          captured["verdict"]), ("T1", "review", "APPROVED"))
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertEqual([k for k in kinds if k.startswith("spawn-")],
+                         ["spawn-pending", "spawn-captured"])
+        self.assertNotIn("missing-status-block", kinds)
         gitops.run_git(self.repo, "checkout", branch)
         self.cli("merge-task", "--repo", str(self.repo), "--task-id", "T1",
                  "--task-branch", wt["branch"], "--summary", "fix crash", run=run)
+        # refused unless the reviewer's APPROVED is on the ledger — here that
+        # row exists only because the two capture hooks put it there
         self.cli("task", "--id", "T1", "--to", "done", run=run)
         self.cli("worktree-remove", "--repo", str(self.repo), "--task-id", "T1",
                  run=run)
@@ -3415,6 +3493,48 @@ class BackgroundSpawnGauge(unittest.TestCase):
                          ["a-2"])
         # health counts the SAME survivors — one gauge, one rule
         self.assertEqual(run_health(events), ("DEGRADED", {"spawn-pending": 1}))
+
+    def test_an_abandoned_pending_pairs_off_and_does_not_degrade(self):
+        """The second resolver: a stall override (`--confirm-no-verdict`)
+        declares a spawn dead and writes `spawn-abandoned`. The pending stops
+        being outstanding — the run has given up on that spawn and replaced
+        it, so a permanently red gauge would be reporting a decision, not a
+        problem — and health does not degrade twice for one incident: the
+        override's own `stall-verdict-override` (flagged) and the stall
+        counters it bumped are the record."""
+        from harness.workflow import outstanding_flagged, run_health
+        events = [{"kind": "spawn-pending", "agent_id": "a-1", "task": "T1",
+                   "actor": "reviewer", "mode": "review"}]
+        self.assertEqual(len(outstanding_flagged(events)), 1)
+        self.assertEqual(run_health(events)[0], "DEGRADED")
+        events.append({"kind": "spawn-abandoned", "agent_id": "a-1",
+                       "task": "T1", "mode": "review", "actor": "stall",
+                       "reason": "declared dead"})
+        self.assertEqual(outstanding_flagged(events), [])
+        self.assertEqual(run_health(events), ("HEALTHY", {}))
+
+    def test_abandoning_one_leaves_its_siblings_outstanding(self):
+        # keyed by agent id like its `spawn-captured` twin: a batched panel
+        # has several pendings open at once, and retiring the one that died
+        # must not silently clear the ones still running
+        from harness.workflow import outstanding_flagged, run_health
+        events = [{"kind": "spawn-pending", "agent_id": "a-1"},
+                  {"kind": "spawn-pending", "agent_id": "a-2"},
+                  {"kind": "spawn-abandoned", "agent_id": "a-1",
+                   "actor": "stall"}]
+        self.assertEqual([e["agent_id"] for e in outstanding_flagged(events)],
+                         ["a-2"])
+        self.assertEqual(run_health(events), ("DEGRADED", {"spawn-pending": 1}))
+
+    def test_a_forged_abandonment_cannot_clear_a_pending(self):
+        # same actor bound as every other resolver on this gauge
+        from harness.workflow import outstanding_flagged, run_health
+        events = [{"kind": "spawn-pending", "agent_id": "a-1", "task": "T1"},
+                  {"kind": "spawn-abandoned", "agent_id": "a-1"},
+                  {"kind": "spawn-abandoned", "agent_id": "a-1",
+                   "actor": "capture"}]
+        self.assertEqual(len(outstanding_flagged(events)), 1)
+        self.assertEqual(run_health(events)[0], "DEGRADED")
 
     def test_a_forged_capture_cannot_clear_a_pending(self):
         """The resolver is actor-checked like its four siblings. The first

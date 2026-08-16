@@ -1625,6 +1625,58 @@ def _flag_serialized_panel(run: Path) -> None:
             pass
 
 
+def _live_spawn_for(run: Path, task: str | None, mode: str) -> dict | None:
+    """The OPEN `spawn-pending` for this exact (task, mode) — a spawn of the
+    same shape of work that launched and has not reported back — or None.
+
+    Open = a pending whose agent_id carries neither a `spawn-captured`
+    (actor "capture": its SubagentStop arrived and the reply was captured)
+    nor a `spawn-abandoned` (actor "stall": a stall override declared that
+    round dead). Both resolvers are actor-checked, exactly as
+    `workflow.outstanding_flagged` and `transitions._open_spawn_pending`
+    check them — this is the third reader of the same pairing and a
+    hand-written `log-event` must not be able to unblock a spawn here while
+    being inert in the other two.
+
+    Keyed on (task, mode) EQUALITY and nothing else — never on a stall key.
+    Neither the stall layer's `step:<step>[:<lens>]` spelling nor the
+    mode-bound matching `transitions.stall_key_spawn_modes` derives from it
+    reaches this predicate: a task-less spawn's pending carries task=None and
+    this is asked about task=None too, both sides parsing the same absent
+    header. Same for `capture_subagent_stop`, which pairs on agent_id — so
+    narrowing the stall-key predicate changed neither of them.
+
+    Reads the ledger BEST-EFFORT: an unreadable events.ndjson allows the
+    spawn. This predicate exists to refuse, and guard_spawn's fail-closed
+    posture is about spawn LEGALITY (the manifest), not about a serialization
+    check that would otherwise turn an I/O error into "no agent may run" —
+    the same reasoning `_flag_serialized_panel` states for its own ledger
+    read. Lenient PARSING has the same shape and a quieter failure: a torn
+    `spawn-pending` line is simply skipped, and this predicate reads absence
+    as "nothing in flight" — i.e. one corrupt line silently disables the
+    refusal. Not fixable by failing closed (that would block every spawn in
+    a run whose ledger a crash tore), so it is made VISIBLE instead: the
+    skipped-line count goes to stderr (adversarial review)."""
+    try:
+        events, skipped = ndjson.read_records_counting(run / "events.ndjson")
+    except OSError:
+        return None
+    if skipped:
+        print(f"ai-sdlc-harness: {run / 'events.ndjson'} has {skipped} "
+              "unparseable line(s) — a torn `spawn-pending` line is invisible "
+              "here, so a second spawn for a key whose agent is still in "
+              "flight may be allowed through.", file=sys.stderr)
+    closed = {e.get("agent_id") for e in events
+              if (e.get("kind") == "spawn-captured"
+                  and e.get("actor") == "capture")
+              or (e.get("kind") == "spawn-abandoned"
+                  and e.get("actor") == "stall")}
+    return next((e for e in events
+                 if e.get("kind") == "spawn-pending"
+                 and e.get("task") == task and e.get("mode") == mode
+                 and e.get("agent_id") not in closed), None)
+
+
 def guard_spawn(p: dict) -> None:
     surfaces = load_yaml(PLUGIN_ROOT / "pipeline" / "surfaces.yaml")
     manifest = load_yaml(PLUGIN_ROOT / "pipeline" / "manifest.yaml")
@@ -1656,44 +1708,69 @@ def guard_spawn(p: dict) -> None:
                 f"skills/dev-workflow/shared/spawn-identity.md.",
                 cwd, p)
         return  # genuinely unrelated agent — none of our business
-    # WI-3: require EXPLICIT run_in_background=false — under Qwen Code,
-    # omitting the param DEFAULTS to background for top-level spawns, so
-    # the old premise ("absent = foreground") is platform-dependent and
-    # an omitted param yields the exact failure the guard exists to
-    # prevent. The uniform rule (require explicit false) needs no platform
-    # detection and is identical on both platforms. SKILL.md already
-    # mandates "pass run_in_background: false explicitly".
-    bg = tool_input.get("run_in_background")
-    if bg not in (False, "false", "False"):
-        # Still blocked THIS round, but no longer because the verdict would
-        # be unrecoverable: capture_post_spawn now records a `spawn-pending`
-        # off the launch stub and capture_subagent_stop completes it from
-        # the agent's own SubagentStop, so a background reply CAN be
-        # captured (adversarial review on that change: the old "verdict
-        # unrecoverable" claim is now false and saying it would misdescribe
-        # the machinery a reader is standing in). What has NOT landed is the
-        # orchestration flip — SKILL.md still mandates foreground, the
-        # stall/wait procedure is only just learning to read pendings, and
-        # nothing yet coordinates a reinvoke against a still-live background
-        # original in the same worktree. The block stays until that flip
-        # lands; the capture path exists for the spawns the platform
-        # backgrounds ANYWAY, behind this guard's back.
-        block(f"harness-shape spawns ('{shape}') must run in the FOREGROUND "
-              "— pass run_in_background: false explicitly (under Qwen Code, "
-              "omitting it DEFAULTS to background). Background capture "
-              "machinery now exists (the launch stub is recorded as "
-              "`spawn-pending` and completed at the agent's SubagentStop), "
-              "but the orchestration around it — wait-vs-stall, reinvoke "
-              "safety in a shared worktree — has not landed, so deliberate "
-              "backgrounding stays blocked. For parallelism, batch multiple "
-              "foreground spawns in ONE message — they run concurrently and "
-              "each reply is captured.", cwd, p)
+    # WI-3, RESCOPED TO QWEN CODE. The rule's original premise is dead and
+    # says so here rather than quietly: "require explicit false — a uniform
+    # rule that needs no platform detection and is identical on both
+    # platforms". It was uniform because the two platforms failed the same
+    # way. They no longer do. On Claude Code the async stub shape is
+    # MEASURED (2.1.232: {isAsync, status: async_launched, agentId, …}),
+    # capture_post_spawn recognises it, and capture_subagent_stop completes
+    # it — a background reply is captured end to end, so the rule now
+    # forbids the platform's own default for no benefit and, on the newer
+    # Agent schema that dropped the parameter entirely, blocks EVERY
+    # harness spawn (the whole pipeline) over a param the caller cannot
+    # pass. Under Qwen Code the same stub is UNMEASURED: an unrecognised
+    # stub falls to _capture_reply, whose necessarily-absent status block
+    # fabricates a missing-status-block stall for a live agent — the exact
+    # bug round 1 killed on Claude — so there the rule stays verbatim.
+    #
+    # STATED RISK, accepted and documented: this trusts QWEN_CODE to reach
+    # hook subprocesses. The harness already relies on that env var
+    # elsewhere (initws mirrors settings/agents into `.qwen/` on it,
+    # resolve-model relays its no-model-param notice on it), and Qwen v0.20.1
+    # injects it into shell-tool environments. If it ever fails to propagate
+    # into a HOOK's environment specifically, this block silently vanishes
+    # and Qwen backgrounding is allowed unguarded — a wrong-way failure
+    # (silent permit, not a false refusal). Truthy-presence rather than the
+    # `== "1"` those other sites use, deliberately: any spelling the CLI
+    # might ship keeps the protective block on, and a stray value can only
+    # ever over-refuse, which the caller can see and fix.
+    #
+    # The OTHER side of that trade, equally accepted: because Qwen keeps the
+    # rule verbatim, Qwen inherits the failure the rescope removed from
+    # Claude Code — if Qwen ever adopts the newer Agent schema that drops
+    # `run_in_background` entirely, every harness spawn there hard-fails on a
+    # parameter the caller cannot pass, i.e. the whole pipeline blocks with
+    # no in-band workaround. Held anyway until Qwen's launch-stub shape is
+    # MEASURED: a fabricated stalled-agent event for a live agent (the
+    # unmeasured-stub failure) corrupts the evidence ledger and races a
+    # re-spawn against the original, where this one refuses loudly and
+    # visibly. Measuring that stub is what retires this branch.
+    if os.environ.get("QWEN_CODE"):
+        bg = tool_input.get("run_in_background")
+        if bg not in (False, "false", "False"):
+            block(f"harness-shape spawns ('{shape}') must run in the "
+                  "FOREGROUND under Qwen Code — pass run_in_background: "
+                  "false explicitly (omitting it DEFAULTS to background for "
+                  "top-level spawns). Background capture exists, but it is "
+                  "built on Claude Code's MEASURED launch-stub shape; Qwen's "
+                  "is unmeasured, and an unrecognised stub reaching verdict "
+                  "capture fabricates a stalled-agent event for an agent "
+                  "that is still running. For parallelism, batch multiple "
+                  "foreground spawns in ONE message — they run concurrently "
+                  "and each reply is captured.", cwd, p)
     prompt = tool_input.get("prompt") or ""
     m = MODE_HEADER_RE.search(prompt)
     if not m:
         block(f"harness-shape spawn ('{shape}') requires the structured "
               "`harness-mode: <mode>` header in the spawn prompt (RC4).", cwd, p)
     mode = m.group(1)
+    # The other half of the serialization key below. Absent for a task-less
+    # spawn (plan-review, pre-pr, …) and None on BOTH sides then — the
+    # pending record capture_post_spawn writes carries the same parse of the
+    # same header, so a task-less spawn serializes against its own task-less
+    # twin and against nothing else.
+    task = (TASK_HEADER_RE.search(prompt) or [None, None])[1]
     pair = {"shape": shape, "mode": mode}
     if pair in (manifest.get("always_legal_spawns") or []):
         return
@@ -1735,6 +1812,84 @@ def guard_spawn(p: dict) -> None:
                 step_would_match = True  # legal step, but unattributable
                 continue
             if run.resolve() == header_run:
+                # ONE LIVE SPAWN PER (task, mode). The failure this closes
+                # was executed in round 1's review: round N's background
+                # reviewer was still running when round N+1's was spawned,
+                # both finished, and latest-wins on reviews.ndjson crowned
+                # the STALE verdict — the same race guard_stall_verdict
+                # refuses a stall for, arriving through the other door.
+                # Backgrounding is now legal on Claude Code (WI-3 above), so
+                # "the previous one is still in flight" stopped being a
+                # corner and became the default shape.
+                #
+                # Keyed on (task, mode) and NOTHING coarser, deliberately: a
+                # DIFFERENT task or a DIFFERENT mode is unrelated work, and
+                # cross-task parallelism — several tasks' developers or
+                # reviewers in flight at once — stays legal, which is the
+                # whole point of backgrounding. Only a second agent
+                # answering the SAME question is refused.
+                #
+                # plan-attack is EXEMPT, and that is the one exemption
+                # (`always_legal_spawns` returned far above, deliberately
+                # unserialized for the same reason: a cross-cutting
+                # request-triage answers no run-owned question, so a second
+                # one competes with nothing). The refusal is a HARD BLOCK
+                # built on the batched-panel premise — every lens clears
+                # PreToolUse before any lens's PostToolUse writes a pending —
+                # which `_flag_serialized_panel` labels in its own docstring
+                # "field-consistent, not provable" and deliberately does NOT
+                # block on; and a lens stub returns in milliseconds, so the
+                # margin the premise needs is unmeasurably thin. Two tiers of
+                # confidence, one rule: the OBSERVER may run on a premise it
+                # cannot prove, the BLOCKER may not. If the premise fails,
+                # this refuses lenses 2..N of every panel and the only escape
+                # (`--confirm-no-verdict` on the panel's key) retires the
+                # whole panel including lens 1's real work — and the
+                # single-lens stall recovery plan-review.md documents was
+                # blocked outright, since a re-spawned lens necessarily
+                # arrives while its siblings are in flight. Safe to exempt
+                # because NO engine-read verdict rides on a lens (the same
+                # justification transitions' docstring gives: verdict_bound
+                # filters on mode plan-review, so lens verdicts can neither
+                # move the window nor burn the round budget) — two lenses
+                # answering one question cost tokens, not a wrong verdict.
+                # The non-blocking `panel-serialized` flag below remains the
+                # detector for a serially-issued panel.
+                live = (None if mode == "plan-attack"
+                        else _live_spawn_for(run, task, mode))
+                if live is not None:
+                    if task:
+                        # plural, deliberately: a task key holds one pending
+                        # PER MODE, and the CLI abandons every open one on
+                        # the key — a singular here promised a narrower
+                        # override than the one it prescribed
+                        # (adversarial re-verification, executed: two
+                        # pendings, one command, two abandonments).
+                        exits = (f"run `harness stall --confirm-no-verdict "
+                                 f"--task {task}`, which abandons EVERY "
+                                 f"open pending on task {task} (all modes) "
+                                 "and frees this key")
+                    else:
+                        exits = ("run `harness stall --confirm-no-verdict` "
+                                 "(no --task: the key is `step:<this run's "
+                                 "current step>`), which abandons EVERY open "
+                                 "pending on that key — every task-less spawn "
+                                 "in flight whose mode this step declares, "
+                                 "siblings included — and frees it")
+                    block(
+                        f"a ({shape}, {mode}) spawn for this key is ALREADY "
+                        f"in flight — agent {live.get('agent_id')} launched "
+                        "in the background and has not reported back "
+                        "(`spawn-pending`, still open in this run's "
+                        "events.ndjson). Two agents answering the same "
+                        "question is how a STALE verdict wins: both write "
+                        "reviews.ndjson and the engine reads the latest. "
+                        "Two exits, no third: WAIT for that agent's "
+                        "completion notification (its verdict/status capture "
+                        "happens there and clears the pending), or — if it "
+                        f"genuinely died — {exits}. A spawn "
+                        "for a DIFFERENT task or mode is unaffected.",
+                        cwd, p)
                 if mode == "plan-attack":
                     _flag_serialized_panel(run)
                 return
@@ -2155,20 +2310,62 @@ def capture_subagent_stop(p: dict) -> None:
     # own ledger) is accepted deliberately.
     agent_id = p.get("agent_id")
     try:
-        prior = ndjson.read_records(run / "events.ndjson")
+        prior, skipped = ndjson.read_records_counting(run / "events.ndjson")
     except OSError:
-        prior = []
+        prior, skipped = [], 0
+    if skipped:
+        # Same silence, third reader (adversarial review): a torn
+        # `spawn-pending` line makes this stop look like a foreground one and
+        # its verdict is never captured, while a torn `spawn-abandoned` line
+        # lets an abandoned round's late reply into the ledger after all.
+        # Lenient by design — failing closed here would drop verdicts a
+        # readable ledger would have captured — so the ledger's damage is
+        # reported instead of inferred from a missing row later.
+        print(f"ai-sdlc-harness: {run / 'events.ndjson'} has {skipped} "
+              "unparseable line(s) — a torn `spawn-pending` / "
+              "`spawn-abandoned` line is invisible to this capture, so a "
+              "background reply may be dropped (or an abandoned round's "
+              "reply captured) on this stop.", file=sys.stderr)
     # actor-checked like the gauge's resolver and the stall guard's — all
-    # three readers of this record test the same capture-owned value, or a
+    # four readers of this record test the same capture-owned value, or a
     # forged `spawn-captured` would SUPPRESS a real capture here (verdict
-    # lost silently) while being inert in the other two.
+    # lost silently) while being inert in the others.
     _captured_ids = {e.get("agent_id") for e in prior
                      if e.get("kind") == "spawn-captured"
                      and e.get("actor") == "capture"}
+    # The second resolver: a stall override (`--confirm-no-verdict`) declared
+    # this spawn dead and abandoned its pending. A stop arriving afterwards
+    # is the slow-not-dead agent, and its verdict must NOT enter the ledger —
+    # the round it belonged to was closed out by the override, another agent
+    # may already be answering the same question, and latest-wins would hand
+    # the run whichever finished last. That is exactly the stale-verdict race
+    # guard_spawn's one-live-spawn rule closes on the launch side; letting a
+    # late reply through here would reopen it on the completion side.
+    # actor-checked ("stall") for the same reason its sibling is: the record
+    # SUPPRESSES a capture, so a forged one would silently cost a verdict.
+    _abandoned_ids = {e.get("agent_id") for e in prior
+                      if e.get("kind") == "spawn-abandoned"
+                      and e.get("actor") == "stall"}
     open_pendings = [e for e in prior if e.get("kind") == "spawn-pending"
-                     and e.get("agent_id") not in _captured_ids]
+                     and e.get("agent_id") not in _captured_ids
+                     and e.get("agent_id") not in _abandoned_ids]
     pending = next((e for e in open_pendings
                     if e.get("agent_id") == agent_id), None) if agent_id else None
+    if agent_id and agent_id in _abandoned_ids and any(
+            e.get("kind") == "spawn-pending" and e.get("agent_id") == agent_id
+            for e in prior):
+        # Loud, like every other capture that deliberately does nothing: a
+        # dropped verdict must never be a silent no-op (the undiagnosable
+        # failure this file has precedent for). Token accounting below still
+        # runs — the agent burned those tokens whatever the ledger decided
+        # about its verdict, and the pending is already PAIRED by the
+        # abandonment, so the gauge and run health are settled; the visible
+        # anomaly record is the `stall-verdict-override` the stall verb wrote.
+        print(f"ai-sdlc-harness: background spawn '{agent_id}' stopped, but "
+              "its `spawn-pending` was ABANDONED by a stall override — this "
+              "reply arrived after abandonment and was NOT captured (no "
+              "verdict row, no status-block event). That round was declared "
+              "dead; act on the re-spawn that replaced it.", file=sys.stderr)
     if not agent_id and open_pendings:
         # The pairing key is missing on a stop that could plausibly be the
         # one a pending is waiting for. Silent before (the whole gate simply
@@ -2210,8 +2407,11 @@ def capture_subagent_stop(p: dict) -> None:
             print(f"ai-sdlc-harness: background spawn '{agent_id}' stopped "
                   "but neither its own transcript nor last_assistant_message "
                   "carried any reply text — verdict/status NOT captured, the "
-                  "spawn-pending flag stays OPEN. Re-spawn FRESH in the "
-                  "foreground to recover.", file=sys.stderr)
+                  "spawn-pending flag stays OPEN — and an open pending holds "
+                  "this (task, mode) against a re-spawn, so recover by "
+                  "abandoning it first: `harness stall --confirm-no-verdict` "
+                  "(add `--task` for a per-task spawn), then re-spawn FRESH.",
+                  file=sys.stderr)
         else:
             _capture_reply(run, pend_shape, pend_mode, pend_task, text)
             ndjson.append_record(run / "events.ndjson", {
@@ -2423,7 +2623,7 @@ def _capture_reply(run, shape, mode, task, text) -> None:
         elif VERDICT_ANYWHERE_RE.search(text):
             # A verdict exists but isn't line-anchored in the final status
             # block — correctly NOT captured (fail-closed), but say so and
-            # name the one recovery that works: a fresh foreground spawn.
+            # name the one recovery that works: a whole fresh spawn.
             # SendMessage/resume replies pass through no capture hook, so
             # a restated verdict there can never register (field finding).
             ndjson.append_record(run / "events.ndjson", {
@@ -2431,8 +2631,8 @@ def _capture_reply(run, shape, mode, task, text) -> None:
                 "reason": "a verdict: token appears in the reply but not as "
                           "its own line in the final status block — not "
                           "captured (fail-closed). Recover by re-spawning "
-                          "the reviewer FRESH in the foreground (same "
-                          "headers); never SendMessage/resume — those "
+                          "the reviewer FRESH (same headers, a NEW spawn); "
+                          "never SendMessage/resume — those "
                           "replies bypass capture entirely"})
     if not STATUS_RE.search(text):
         if captured and mode in ENGINE_VERDICT_MODES:
@@ -2526,15 +2726,40 @@ def capture_post_spawn(p: dict) -> None:
     if not runs:
         return
     prompt = tool_input.get("prompt") or ""
-    run = _resolve_run(runs, prompt, cwd) or (runs[0] if len(runs) == 1 else None)
+    task = (TASK_HEADER_RE.search(prompt) or [None, None])[1]
+    mode = (MODE_HEADER_RE.search(prompt) or [None, None])[1]
+    run = _resolve_run(runs, prompt, cwd)
+    if (run is None and RUN_HEADER_RE.search(prompt) is None
+            and {"shape": shape, "mode": mode} in (
+                surfaces.get("out_of_run_spawns") or [])):
+        # An OUT-OF-RUN spawn belongs to no run by declaration
+        # (surfaces.yaml: `/repo-map-refresh` is legal with no run at all),
+        # and it carries no `harness-run:` header because there is no run to
+        # name. The single-run fallback below would nonetheless file its
+        # records into whichever run happens to be live — adversarial review
+        # executed it: a backgrounded repo-map spawn wrote a `spawn-pending`
+        # {mode: repo-map, task: None} into an unrelated dev-workflow run,
+        # which DEGRADED that run's health and (before the mode-bound
+        # matching in transitions) wedged its step-keyed stalls behind a
+        # pending no orchestrator of that run had ever spawned. Write
+        # NOTHING, anywhere: this mode's product is files on disk, not a
+        # ledger verdict, and no run is entitled to its records. A
+        # header-LESS spawn of an in-run mode still takes the fallback — that
+        # one really does belong to a run, and losing its verdict is the
+        # worse failure.
+        print(f"ai-sdlc-harness: out-of-run spawn ({shape}, {mode}) carries "
+              "no harness-run: header (it belongs to no run — "
+              "surfaces.yaml's out_of_run_spawns) — nothing recorded for it "
+              f"in any of the {len(runs)} live run(s).", file=sys.stderr)
+        return
+    if run is None and len(runs) == 1:
+        run = runs[0]
     if run is None:
         print(f"ai-sdlc-harness: could not attribute a subagent reply to one of "
               f"{len(runs)} live runs (no matching harness-run: header) — "
               "review-verdict/stall capture for this invocation is not "
               "recorded.", file=sys.stderr)
         return
-    task = (TASK_HEADER_RE.search(prompt) or [None, None])[1]
-    mode = (MODE_HEADER_RE.search(prompt) or [None, None])[1]
     tool_response = p.get("tool_response")
     # An async LAUNCH STUB, recognised by the RESPONSE's own shape rather
     # than by the run_in_background parameter — the shape MEASURED on
@@ -2585,7 +2810,14 @@ def capture_post_spawn(p: dict) -> None:
                           "SubagentStop. Still outstanding means that stop "
                           "never arrived (subagent crashed, or the session "
                           "ended under it) and NOTHING was captured for it — "
-                          "re-spawn FRESH in the foreground to recover"})
+                          "abandon it (`harness stall --confirm-no-verdict`, "
+                          "`--task` for a per-task spawn) and re-spawn FRESH; "
+                          "while open it holds this (task, mode) against a "
+                          "second spawn — EXCEPT for the deliberately "
+                          "unserialized classes: plan-attack lenses and "
+                          "always-legal modes are never refused on it (see "
+                          "guard_spawn), and an out-of-run mode writes no "
+                          "pending at all"})
             return
         # No agentId: the handoff has no key, so SubagentStop can never pair
         # this spawn's stop to anything and the deferred capture is not
@@ -2601,11 +2833,15 @@ def capture_post_spawn(p: dict) -> None:
             "reason": "harness-shape spawn launched in the BACKGROUND and "
                       "its launch stub carried NO agentId — unpairable: "
                       "nothing can match this spawn's SubagentStop, so its "
-                      "verdict/status can never be captured. Re-spawn in "
-                      "the FOREGROUND (batch multiple foreground spawns in "
-                      "one message for parallelism)"})
+                      "verdict/status can never be captured. Re-spawn FRESH "
+                      "(under Qwen Code, in the FOREGROUND — "
+                      "run_in_background: false); batch multiple spawns in "
+                      "one message for parallelism"})
         return
-    if tool_input.get("run_in_background") in (True, "true", "True"):
+    text = _response_text(tool_response)
+    if (tool_input.get("run_in_background") in (True, "true", "True")
+            and not STATUS_RE.search(text)
+            and extract_verdict(text) is None):
         # The parameter-keyed fallback for a background launch whose
         # response shape this build does not recognise at all (a future or
         # older CLI whose stub carries neither `isAsync` nor
@@ -2614,17 +2850,35 @@ def capture_post_spawn(p: dict) -> None:
         # APPROVED verdict would be lost, and the stub's missing status
         # block FABRICATED a stall event whose reinvoke then raced the
         # still-live background original). guard_spawn blocks explicit-param
-        # backgrounds up front; this branch is belt-and-braces for an older
-        # guard copy — record what actually happened instead of fake stall
-        # evidence.
+        # backgrounds under Qwen Code, whose stub is the unmeasured one this
+        # branch is really about; on Claude Code the shape gate above
+        # recognises the stub and this is belt-and-braces for an unknown
+        # schema — either way, record what actually happened instead of fake
+        # stall evidence.
+        #
+        # RESPONSE-CONDITIONED, not param-conditioned. When WI-3 was
+        # rescoped to Qwen, `run_in_background: true` became LEGAL on Claude
+        # Code — and this branch, keyed on the param alone, then fired over
+        # responses that carried the agent's whole reply: adversarial review
+        # executed it and watched a captured `verdict: APPROVED` be thrown
+        # away and the run marked DEGRADED for an uncapturable spawn that
+        # had in fact reported in full. The param stopped being proof of a
+        # stub the moment it stopped being forbidden; the RESPONSE SHAPE is
+        # the evidence. So: only when the reply holds nothing capturable —
+        # no status block and no extractable verdict — is this the honest
+        # record. Anything else falls through to the normal capture, which
+        # already handles every partial shape (blockless reply, malformed
+        # block, verdict-without-block) on its own terms.
         ndjson.append_record(run / "events.ndjson", {
             "kind": "background-spawn-uncaptured", "task": task,
             "actor": shape, "mode": mode,
-            "reason": "harness-shape spawn ran in the background — only the "
-                      "launch stub reaches PostToolUse, so verdict/status "
-                      "capture is impossible; re-spawn in the FOREGROUND "
-                      "(batch multiple foreground spawns in one message for "
-                      "parallelism)"})
+            "reason": "harness-shape spawn ran in the background and its "
+                      "launch response was not a recognised stub — only that "
+                      "response reaches PostToolUse, so verdict/status "
+                      "capture is impossible; re-spawn FRESH (under Qwen "
+                      "Code, in the FOREGROUND — run_in_background: false), "
+                      "batching multiple spawns in one message for "
+                      "parallelism"})
         return
     # Qwen Code: a Task/Agent spawn's token counts live ONLY in the PostToolUse
     # payload, never the (usage-less Gemini) SubagentStop transcript —
@@ -2658,7 +2912,7 @@ def capture_post_spawn(p: dict) -> None:
             # carry none) — the same discrimination this branch already
             # makes, now written down
             _record_agent_identity(run, "qwen-code", None)
-    _capture_reply(run, shape, mode, task, _response_text(tool_response))
+    _capture_reply(run, shape, mode, task, text)
 
 
 GUARDS = {"bash": guard_bash, "write": guard_write, "read": guard_read,

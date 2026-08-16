@@ -350,12 +350,12 @@ One Python entry point ([hooks/guards.py](hooks/guards.py)) handles every event,
 |---|---|---|
 | bash | PreToolUse · Bash | Blocks raw history-mutating git inside any workspace that has completed `/init-workspace` and points to the owned verbs. Role-aware shell-write analysis (quote-masked shape matching on redirects, `tee`, `cp`/`mv`, in-place editors): reviewer writes only to literal `/tmp` paths; developer confined to its worktree; secret/evidence files unreadable. |
 | write | PreToolUse · Write/Edit/MultiEdit/NotebookEdit | Path confinement per shape (planner → `ai/<run>/` + `.claude/context/`; developer → its worktree with the pre-red test-first lock; reviewer → nothing) plus sensitive-file patterns. |
-| spawn | PreToolUse · Agent/Task | Only the spawn-set the manifest declares for the current cursor is legal — shape *and* `harness-mode:` header both checked; out-of-run spawns (e.g. repo-map generation) must be declared in [pipeline/surfaces.yaml](pipeline/surfaces.yaml). Fail-closed. |
+| spawn | PreToolUse · Agent/Task | Only the spawn-set the manifest declares for the current cursor is legal — shape *and* `harness-mode:` header both checked; out-of-run spawns (e.g. repo-map generation) must be declared in [pipeline/surfaces.yaml](pipeline/surfaces.yaml). Fail-closed. Also **one live spawn per (task, mode)**: a second agent cannot be launched to answer a question an unreported one is still answering (two verdicts for one round, and latest-wins picks the stale one) — different tasks and modes stay parallel. It is a CROSS-MESSAGE rule only: spawns batched into one message all clear the guard before any of them reports back, which is what keeps a batched review panel legal; adversarial-panel lenses (`plan-attack`) are exempt outright, since no engine-read verdict rides on a lens. Background spawns are allowed under Claude Code, where the launch-stub shape is measured and capture handles both ends; under Qwen Code, whose format is unmeasured, `run_in_background: false` is still mandatory. |
 | skill | PreToolUse · Skill | USER-ENTRY skills (`/dev-workflow`, `/init-workspace`, …) refuse invocation from subagents or autonomous triggering — they run only when you ran them. |
 | read | PreToolUse · Read/Grep | Red-proofs are readable by harness shapes only via `harness show-redproof` (chain-verified) — a raw `.redproof/` read skips integrity verification and is blocked. |
 | prompt capture | UserPromptSubmit | Verbatim capture of your replies into `human-input.ndjson` — the only evidence `gate --decide` accepts. |
 | verdict capture | PostToolUse · Agent/Task | The authoritative writer of `reviews.ndjson` (reviewer verdicts) and the missing-status-block / status-block-malformed events for FOREGROUND spawns — anchored here because this payload deterministically carries both the spawn prompt and the agent's final reply. A background spawn returns only a launch stub, recorded as a `spawn-pending` handoff. |
-| stop capture | SubagentStop | Per-invocation token accounting into `tokens.ndjson`, and the authoritative verdict/status writer for BACKGROUND spawns — whose reply reaches no other hook — completing the matching `spawn-pending` (`spawn-captured`). Never captures a reply that has no pending: a foreground spawn's verdict is written once, at PostToolUse. |
+| stop capture | SubagentStop | Per-invocation token accounting into `tokens.ndjson`, and the authoritative verdict/status writer for BACKGROUND spawns — whose reply reaches no other hook — completing the matching `spawn-pending` (`spawn-captured`). Never captures a reply that has no pending: a foreground spawn's verdict is written once, at PostToolUse. Nor one whose pending a stall override already abandoned (`spawn-abandoned`) — that round was declared dead and re-spawned, so a late reply would be exactly the stale verdict the spawn guard refuses to create. |
 
 Every guard's fail-open/fail-closed policy is chosen deliberately and tested: recognised violations always block; the spawn guard is fail-closed even on ambiguity.
 
@@ -423,7 +423,7 @@ ai-sdlc-harness/
 │   └── init-workspace/ · add-repo/ · migrate-workspace/ · workspace-config/ · workflow-status/ · repo-map-refresh/
 ├── bin/harness                  # wrapper script resolving the plugin venv (+ harness.cmd for Windows)
 ├── tools/                       # meta-tooling: line-budget checker, sandbox workspace generators
-└── tests/                       # 1114 stdlib-unittest tests
+└── tests/                       # 1142 stdlib-unittest tests
 ```
 
 Workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside *your* working directory by `/init-workspace` and the pipeline. They never live inside this plugin repo.
@@ -453,7 +453,7 @@ python -m venv .venv; .venv\Scripts\pip install pyyaml
 .venv\Scripts\python -m unittest discover -s tests
 ```
 
-The test suite (1114 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (1142 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 

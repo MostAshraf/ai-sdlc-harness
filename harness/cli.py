@@ -1616,17 +1616,65 @@ def main(argv: list[str] | None = None) -> int:
                         # "record it anyway"; anything the guard says on the
                         # way is a note, never a veto.
                         overridden = f"{type(exc).__name__}: {exc}"[:200]
+                if overridden:
+                    # BEFORE record_stall, deliberately (adversarial review,
+                    # executed): `record_stall` raises "unknown task" for a
+                    # key absent from state["tasks"], and nothing ever
+                    # validates a `harness-task:` header against the task
+                    # list — so one typo'd header produced a pending under a
+                    # key the counter rejects, and the retirement that would
+                    # have freed it lived AFTER the raise. Result: the key
+                    # blocked by guard_spawn's one-live-spawn rule, the run
+                    # DEGRADED, and no verb able to move either. The flag's
+                    # contract is "record it anyway" (see the catch above);
+                    # a counter failure is allowed to fail the verb, never to
+                    # void the retirement the override already decided on.
+                    # The TransitionError still propagates — these writes are
+                    # ledger appends, not part of the state save below.
+                    ndjson.append_record(
+                        args.run / "events.ndjson",
+                        {"kind": "stall-verdict-override", "task": stall_key,
+                         "reason": overridden, "actor": "stall"})
+                    # The override's OTHER consequence, and the only writer
+                    # of this kind: declaring a spawn dead has to actually
+                    # retire it. Without this the run deadlocks — the
+                    # abandoned pending stays open, so guard_spawn's
+                    # one-live-spawn rule refuses the very re-spawn the
+                    # stall's `reinvoke` action just asked for, and no verb
+                    # exists to clear it. It also settles the two other
+                    # readers: the pending stops counting on the flagged
+                    # gauge / run health (the `stall-verdict-override`
+                    # above is the visible anomaly record for this round —
+                    # counting both would double-report one event), and a
+                    # late SubagentStop for this agent is refused capture
+                    # instead of injecting a stale verdict into a round
+                    # somebody else has already been spawned to redo.
+                    #
+                    # EVERY open pending for the key, not just the one the
+                    # guard happened to name: a batched panel leaves several
+                    # in flight under one key, and a half-abandoned key
+                    # deadlocks exactly like an un-abandoned one.
+                    for pend in transitions.open_spawn_pendings(
+                            args.run, stall_key, manifest):
+                        ndjson.append_record(
+                            args.run / "events.ndjson",
+                            {"kind": "spawn-abandoned",
+                             "agent_id": pend.get("agent_id"),
+                             "task": pend.get("task"),
+                             "mode": pend.get("mode"), "actor": "stall",
+                             "reason": f"a stall for '{stall_key}' was "
+                                       "recorded over this open "
+                                       "spawn-pending with "
+                                       "--confirm-no-verdict: the spawn is "
+                                       "declared dead, the key is freed for "
+                                       "a fresh spawn, and a reply arriving "
+                                       "late is no longer captured"})
                 action = transitions.record_stall(st, config, stall_key)
                 ndjson.append_record(
                     args.run / "events.ndjson",
                     {"kind": "stall", "task": stall_key, "action": action,
                      **({"override": "confirm-no-verdict"} if overridden
                         else {})})
-                if overridden:
-                    ndjson.append_record(
-                        args.run / "events.ndjson",
-                        {"kind": "stall-verdict-override", "task": stall_key,
-                         "reason": overridden, "actor": "stall"})
                 state_mod.save(args.run, args.workspace, st)
                 _emit({"ok": True, "action": action})
                 return 0

@@ -106,7 +106,9 @@ FLAGGED_EVENT_KINDS = (
     # independently). Not HEALTH_DEGRADING either: no evidence was lost and
     # the run's own machinery is intact — only the external tracker is behind.
     "write-back-failed",
-    # Class (c), RESOLVABLE — paired off BY AGENT ID by `spawn-captured`.
+    # Class (c), RESOLVABLE — paired off BY AGENT ID by `spawn-captured`
+    # (the stop arrived and the reply was captured) or by `spawn-abandoned`
+    # (a stall override declared that spawn dead and retired it).
     # Claude Code 2.1.232 backgrounds subagent spawns by default, and a
     # background spawn's PostToolUse carries only a launch stub: the reply,
     # its verdict and its status block all arrive later, at SubagentStop.
@@ -251,7 +253,21 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
             resolved.update(id(x) for x in open_base.pop(_base_key(e), []))
         elif kind == "spawn-pending":
             open_spawn.setdefault(e.get("agent_id"), []).append(e)
-        elif kind == "spawn-captured" and e.get("actor") == "capture":
+        elif ((kind == "spawn-captured" and e.get("actor") == "capture")
+                or (kind == "spawn-abandoned" and e.get("actor") == "stall")):
+            # TWO resolvers, one pairing. `spawn-captured` means the stop
+            # arrived and the reply was captured; `spawn-abandoned` means a
+            # stall override (`--confirm-no-verdict`) declared that spawn
+            # dead and retired it — written by the stall verb, nothing else.
+            # An abandoned pending is no longer OUTSTANDING and no longer
+            # degrades health: the round's anomaly is already recorded, and
+            # visibly, as the `stall-verdict-override` the same override
+            # wrote (also in this list) — on the legitimate path; nothing
+            # here verifies that pairing, see `run_health` for the bound.
+            # Leaving the pending open too would
+            # report one event twice and leave the gauge permanently red for
+            # a spawn the run has already given up on and replaced.
+            #
             # Keyed by AGENT ID, like base-branch-stale's per-repo keying and
             # for the same reason: several background spawns are in flight at
             # once by design (plan-review.md mandates batching every lens
@@ -271,7 +287,8 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
             # capture-owned value that was missing (the record now carries
             # the spawn shape under `shape` instead) — the same bound the
             # siblings have, no more: a caller that writes the actor still
-            # clears.
+            # clears. `spawn-abandoned` carries `actor: "stall"` on the
+            # identical terms.
             resolved.update(id(x) for x in open_spawn.pop(e.get("agent_id"), []))
         elif kind in ("risk-without-tests", "tests-without-production",
                       "contract-fragment-weak"):
@@ -342,7 +359,28 @@ def run_health(events: list[dict], stalls: int = 0) -> tuple[str, dict[str, int]
     history-vs-gauge tension cuts the other way here): a pending that got
     its `spawn-captured` lost NOTHING — the evidence arrived late, exactly
     as designed — so unlike a stall there is no degradation in the history
-    to remember (adversarial review on this change).
+    to remember (adversarial review on this change). A pending paired by
+    `spawn-abandoned` does not degrade either, for a different reason: that
+    round WAS anomalous, but on the LEGITIMATE path the override that
+    abandoned it also wrote a `stall-verdict-override` (flagged) and bumped
+    the stall counters this function already degrades on — degrading a
+    second time on the pending would report one incident twice.
+
+    The honest bound on that (adversarial review): nothing here CHECKS the
+    pairing — the companion records are ASSUMED, not verified. Two ways the
+    assumption can be false. (1) A forged abandonment: `spawn-abandoned` is
+    actor-checked ("stall") by every reader of the pairing, which is what
+    stops a `log-event` forgery from unblocking a spawn or suppressing a
+    capture, but a forged one carrying that actor still erases the incident
+    from this gauge — the same accepted residual class as its capture sibling
+    (a forged `spawn-captured` silently costs a verdict), since `log-event`
+    is the one unvalidated writer and closing it would mean signing every
+    event, which this design does not claim. (2) The stall verb's own
+    unknown-task path: the override retires the pending BEFORE `record_stall`
+    runs (cli.py, deliberately — a counter failure must not wedge the key),
+    so a typo'd task key leaves the abandonment written and the counter never
+    bumped. The incident is still visible, as the flagged
+    `stall-verdict-override`, but not as a health degradation.
     """
     counts: dict[str, int] = {}
     for e in events:

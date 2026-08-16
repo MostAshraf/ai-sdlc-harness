@@ -69,8 +69,9 @@ Per task:
    developer with the findings. `APPROVED` → continue.
    **Verdict not captured** (a `verdict-uncaptured` event, or step 7
    refused with reviews.ndjson missing this task)? Re-spawn the reviewer
-   FRESH — foreground, same headers. NEVER SendMessage/resume the finished
-   one: continuation replies pass through no capture hook, so a restated
+   FRESH — same headers, spawned per SKILL.md step 3 (and only once the
+   previous one has reported; the guard refuses a second live spawn for the
+   same task and mode). NEVER SendMessage/resume the finished one: continuation replies pass through no capture hook, so a restated
    verdict there can never register, however clean (field finding).
 6. **Squash:** from the feature-branch checkout:
    `${CLAUDE_PLUGIN_ROOT}/bin/harness merge-task --repo <repo> --task-id <T> --task-branch

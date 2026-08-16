@@ -85,19 +85,25 @@ successful sibling of abort — the final step's file says exactly when).
    which case omit the `model` param entirely so the subagent runs on the
    session model. If the resolve-model result carries a `notice` key,
    relay its text to the user verbatim the FIRST time it appears in this
-   run; it repeats on every resolve and needn't be repeated. Every harness-shape spawn runs FOREGROUND — pass
-   `run_in_background: false` explicitly (newer platforms default to
-   background; a background spawn returns only a launch stub, and while
-   capture now defers that spawn's verdict to its SubagentStop, the
-   wait-vs-stall orchestration around it has not landed — the guard
-   requires an explicit `false`). Parallelism =
-   batch multiple foreground spawns in ONE message, never backgrounding.
+   run; it repeats on every resolve and needn't be repeated. **Foreground
+   where the tool supports it:** pass `run_in_background: false` — under Qwen
+   Code that is REQUIRED (the guard blocks an absent or true value; its
+   background format is unmeasured). Where the Agent tool has no such
+   parameter, the spawn returns a launch STUB and the agent runs in the
+   background: that is expected and captured — WAIT for its completion
+   notification, do not proceed on the stub, and do not `stall` (the
+   events-tail triage below covers `spawn-pending`). Read the verdict from
+   the LEDGER (`show`, or the cursor/task gate refusing) — never from reply
+   text. One live spawn per (task, mode): the guard refuses a second while
+   the first is unreported; different tasks and modes stay parallel, panel
+   lenses (`plan-attack`) are exempt, and batching spawns in ONE message
+   still runs them concurrently.
 4. Advance: `${CLAUDE_PLUGIN_ROOT}/bin/harness cursor --to <next> --run <run>`. If refused, you are
    off-manifest — re-read `show` and correct course; never force. If the
    refusal is `verdict_bound` (a reviewer verdict was not captured), the
    **only** sanctioned recovery is to re-spawn the reviewer for that mode
-   — correct agent identity (`ai-sdlc-reviewer`), foreground, full
-   headers — and let the hook capture it. Never write `reviews.ndjson` or
+   — correct agent identity (`ai-sdlc-reviewer`), full headers, spawned per
+   (3) — and let the hook capture it. Never write `reviews.ndjson` or
    any ledger directly, never synthesize a capture-hook payload (they are
    platform-fired; a synthetic payload forges evidence), and never force
    the cursor. If a second correctly-formed spawn still yields no verdict,
@@ -131,7 +137,15 @@ successful sibling of abort — the final step's file says exactly when).
   block — proceed on the ledger, never stall; `missing-status-block` →
   genuine stall, procedure above; an unresolved `spawn-pending` (also in
   `show`'s `outstanding_flagged`) → that subagent is still running in the
-  background, WAIT for its SubagentStop; never stall. For a task-less **step** key, `stall`
+  background, WAIT for its completion; never stall — `stall` refuses over an
+  open pending, and forcing it (`--confirm-no-verdict`) ABANDONS that spawn:
+  its key is freed for a re-spawn and its reply, if it ever lands, is
+  refused rather than captured. EXCEPT a pending from a step the run has
+  already LEFT (a task-less pending belongs to the step whose spawn-set
+  declares its `mode`): waiting is wrong there, nothing is coming — abandon
+  it with THAT step's key, `stall --task step:<its step>
+  --confirm-no-verdict`, which is the only key that reaches it. For a
+  task-less **step** key, `stall`
   refuses outright when that step's ledger already holds a verdict for the
   current round (`--confirm-no-verdict` overrides, for a spawn that stalled
   *after* the capture); per-task and per-lens keys are never refused — the

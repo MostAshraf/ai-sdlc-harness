@@ -30,7 +30,7 @@ class GuardHarness(unittest.TestCase):
     def run_guard(self, name: str, payload: dict,
                   env: dict | None = None) -> tuple[int, str]:
         payload.setdefault("cwd", str(self.workspace))
-        # deterministic env, two axes: the suite itself may run inside a
+        # deterministic env, three axes: the suite itself may run inside a
         # Claude Code session that sets CLAUDE_PROJECT_DIR — strip it so
         # only tests that inject it exercise the env-first capture path —
         # and that exports PYTHONIOENCODING, which would hand the child a
@@ -38,9 +38,15 @@ class GuardHarness(unittest.TestCase):
         # stdin-pin mutation entirely: the multibyte capture test passed
         # against a reverted guards.py). Strip every ambient encoding
         # override so guards.py's OWN utf-8 stdin pin is what's tested.
+        # QWEN_CODE joins them for the same reason CLAUDE_PROJECT_DIR does:
+        # the suite can be RUN under Qwen Code, and guard_spawn's WI-3 block
+        # is keyed on that variable — inherited, it would silently turn every
+        # "Claude Code allows backgrounding" assertion below into a test of
+        # the Qwen branch (and pass for the wrong reason).
         base = {k: v for k, v in os.environ.items()
                 if k not in ("CLAUDE_PROJECT_DIR", "PYTHONIOENCODING",
-                             "PYTHONUTF8", "PYTHONLEGACYWINDOWSSTDIO")}
+                             "QWEN_CODE", "PYTHONUTF8",
+                             "PYTHONLEGACYWINDOWSSTDIO")}
         # ensure_ascii=False: the platform sends hook payloads as RAW
         # UTF-8 JSON, not \uXXXX-escaped ASCII — an escaped wire format
         # never exercises the child's stdin DECODING, which made the
@@ -55,14 +61,15 @@ class GuardHarness(unittest.TestCase):
                               env={**base, **(env or {})})
         return proc.returncode, proc.stderr
 
-    def assert_allows(self, name, payload):
-        code, err = self.run_guard(name, payload)
+    def assert_allows(self, name, payload, env=None):
+        code, err = self.run_guard(name, payload, env=env)
         self.assertEqual(code, 0, f"expected allow, blocked with: {err}")
 
-    def assert_blocks(self, name, payload, needle):
-        code, err = self.run_guard(name, payload)
+    def assert_blocks(self, name, payload, needle, env=None):
+        code, err = self.run_guard(name, payload, env=env)
         self.assertEqual(code, 2, "expected block, was allowed")
         self.assertIn(needle, err)
+        return err
 
     def make_run(self, mode="full", to_step=None, run_name="2026-01-01-G-1",
                 item_id="G-1"):
@@ -1888,24 +1895,41 @@ class SpawnGuard(GuardHarness):
     def test_non_harness_shapes_ignored(self):
         self.assert_allows("spawn", spawn("Explore", "find the tests"))
 
-    def test_background_harness_spawn_blocked(self):
-        # Deliberate backgrounding stays blocked this round — not because
-        # the verdict is unrecoverable (capture now defers it to the
-        # agent's SubagentStop via `spawn-pending`), but because the
-        # orchestration around it — wait-vs-stall, reinvoke safety in a
-        # shared worktree — has not landed. An otherwise fully legal spawn
-        # is blocked on the flag alone.
+    def test_background_harness_spawn_allowed_on_claude_code(self):
+        # WI-3 lifted for the platform whose stub shape is MEASURED: an
+        # otherwise legal spawn is no longer blocked on the flag alone,
+        # because capture handles both ends (launch stub -> `spawn-pending`,
+        # SubagentStop -> verdict + `spawn-captured`). All three spellings
+        # of the parameter pass; on the newer Agent schema there is no such
+        # parameter to pass at all, which is the absent case.
         run = self.make_run(to_step="develop")
-        p = spawn("reviewer", f"harness-mode: review\nharness-run: {run}\ngo")
-        p["tool_input"]["run_in_background"] = True
-        self.assert_blocks("spawn", p, "FOREGROUND")
-        # and the same spawn without the flag stays legal
-        self.assert_allows("spawn", spawn(
-            "reviewer", f"harness-mode: review\nharness-run: {run}\ngo"))
-        # explicit foreground is also legal (the mandated form)
+        for bg in (True, False, "__absent__"):
+            p = spawn("reviewer",
+                      f"harness-mode: review\nharness-run: {run}\ngo")
+            if bg == "__absent__":
+                del p["tool_input"]["run_in_background"]
+            else:
+                p["tool_input"]["run_in_background"] = bg
+            self.assert_allows("spawn", p)
+
+    def test_background_harness_spawn_still_blocked_under_qwen_code(self):
+        # …and NOT lifted where the stub shape is unmeasured: an
+        # unrecognised Qwen stub reaching verdict capture fabricates a
+        # stalled-agent event for a live agent — the bug round 1 killed on
+        # Claude. Explicit false remains the one legal form there.
+        run = self.make_run(to_step="develop")
+        qwen = {"QWEN_CODE": "1"}
+        for bg in (True, "__absent__"):
+            p = spawn("reviewer",
+                      f"harness-mode: review\nharness-run: {run}\ngo")
+            if bg == "__absent__":
+                del p["tool_input"]["run_in_background"]
+            else:
+                p["tool_input"]["run_in_background"] = bg
+            self.assert_blocks("spawn", p, "FOREGROUND", env=qwen)
         p2 = spawn("developer", f"harness-mode: develop\nharness-run: {run}\ngo")
         p2["tool_input"]["run_in_background"] = False
-        self.assert_allows("spawn", p2)
+        self.assert_allows("spawn", p2, env=qwen)
 
     def test_background_non_harness_spawn_ignored(self):
         # a user's own background Explore agent is none of our business
@@ -1937,6 +1961,194 @@ class SpawnGuard(GuardHarness):
                              item_id="GOOD-1")
         self.assert_allows("spawn", spawn(
             "developer", f"harness-mode: develop\nharness-run: {good}\ngo"))
+
+
+class SpawnSerialization(GuardHarness):
+    """ONE live spawn per (task, mode). With backgrounding legal, round N's
+    reviewer can still be running when round N+1's is spawned — both finish,
+    and latest-wins on reviews.ndjson crowns the STALE verdict (round 1's
+    review executed exactly that through the stall door; this closes the
+    launch door). A pending is open until `spawn-captured` (the stop arrived)
+    or `spawn-abandoned` (a stall override retired it)."""
+
+    def setUp(self):
+        super().setUp()
+        self.run = self.make_run(to_step="develop")
+
+    def _pending(self, task="T1", mode="review", agent_id="a-1"):
+        ndjson.append_record(self.run / "events.ndjson", {
+            "kind": "spawn-pending", "task": task, "actor": "reviewer",
+            "mode": mode, "agent_id": agent_id})
+
+    def _spawn(self, mode="review", task="T1", shape="reviewer"):
+        task_hdr = f"harness-task: {task}\n" if task else ""
+        return spawn(shape, f"harness-mode: {mode}\n{task_hdr}"
+                            f"harness-run: {self.run}\ngo")
+
+    def _cli(self, *args) -> dict:
+        proc = subprocess.run(
+            [sys.executable, "-m", "harness", "--workspace",
+             str(self.workspace), "--run", str(self.run), *args],
+            cwd=ROOT, capture_output=True, text=True, encoding="utf-8",
+            timeout=120)
+        return json.loads(proc.stdout) if proc.stdout.strip() else {}
+
+    def test_a_second_spawn_for_the_same_key_is_refused(self):
+        self._pending()
+        err = self.assert_blocks("spawn", self._spawn(), "ALREADY in flight")
+        self.assertIn("a-1", err)                    # names the live agent
+        self.assertIn("completion notification", err)   # exit 1: wait
+        self.assertIn("--confirm-no-verdict", err)      # exit 2: it died
+
+    def test_a_different_task_is_never_blocked(self):
+        # cross-task parallelism is the point of backgrounding: T2's reviewer
+        # is answering a different question and must stay legal
+        self._pending(task="T1")
+        self.assert_allows("spawn", self._spawn(task="T2"))
+
+    def test_a_different_mode_for_the_same_task_is_never_blocked(self):
+        # the developer and the reviewer of one task are not competing for a
+        # verdict — only a second agent answering the SAME question is refused
+        self._pending(task="T1", mode="review")
+        self.assert_allows("spawn", self._spawn(mode="develop",
+                                                shape="developer"))
+
+    def test_the_capture_of_the_first_spawn_frees_the_key(self):
+        self._pending()
+        self.assert_blocks("spawn", self._spawn(), "ALREADY")
+        ndjson.append_record(self.run / "events.ndjson", {
+            "kind": "spawn-captured", "agent_id": "a-1", "task": "T1",
+            "actor": "capture", "shape": "reviewer", "mode": "review"})
+        self.assert_allows("spawn", self._spawn())
+
+    def test_a_forged_resolver_cannot_free_the_key(self):
+        # third reader of the same actor-checked pairing (gauge, stall guard,
+        # here) — the agent_id is published in the very ledger `log-event`
+        # appends to, so the capture-owned actor is the whole bound
+        self._pending()
+        for forged in ({"kind": "spawn-captured", "agent_id": "a-1"},
+                       {"kind": "spawn-captured", "agent_id": "a-1",
+                        "actor": "reviewer"},
+                       {"kind": "spawn-abandoned", "agent_id": "a-1"},
+                       {"kind": "spawn-abandoned", "agent_id": "a-1",
+                        "actor": "capture"}):
+            ndjson.append_record(self.run / "events.ndjson", forged)
+            self.assert_blocks("spawn", self._spawn(), "ALREADY")
+
+    def test_the_stall_override_frees_a_key_its_agent_died_on(self):
+        """The deadlock this closes, end to end through the REAL verb: with
+        the pending open, `stall` refuses (a live spawn is not a stall) and
+        the spawn is refused (one live spawn per key) — so a genuinely dead
+        agent would wedge the key with no verb able to clear it. The
+        documented exit is `--confirm-no-verdict`, whose override now ALSO
+        writes `spawn-abandoned`. Drop that write and this test deadlocks:
+        the block below survives the override."""
+        self._pending()
+        self.assert_blocks("spawn", self._spawn(), "ALREADY")
+        blocked = self._cli("stall", "--task", "T1")
+        self.assertFalse(blocked["ok"])
+        self.assertIn("still RUNNING", blocked["error"])
+
+        forced = self._cli("stall", "--task", "T1", "--confirm-no-verdict")
+        self.assertEqual(forced["action"], "reinvoke")
+        events = ndjson.read_records(self.run / "events.ndjson")
+        gone = next(e for e in events if e["kind"] == "spawn-abandoned")
+        self.assertEqual((gone["agent_id"], gone["task"], gone["mode"],
+                          gone["actor"]), ("a-1", "T1", "review", "stall"))
+        # …and the key is free again: the reinvoke the stall just prescribed
+        # can actually be spawned
+        self.assert_allows("spawn", self._spawn())
+
+    def test_the_override_abandons_every_pending_on_the_key(self):
+        # a batched panel leaves several in flight under one key; a
+        # half-abandoned key deadlocks exactly like an un-abandoned one
+        self._pending(task="step:plan-review", mode="plan-attack",
+                      agent_id="a-1")
+        self._pending(task="step:plan-review", mode="plan-attack",
+                      agent_id="a-2")
+        self._cli("stall", "--task", "step:plan-review",
+                  "--confirm-no-verdict")
+        gone = [e["agent_id"] for e in
+                ndjson.read_records(self.run / "events.ndjson")
+                if e["kind"] == "spawn-abandoned"]
+        self.assertEqual(sorted(gone), ["a-1", "a-2"])
+
+    def test_a_panel_lens_is_exempt_from_the_refusal(self):
+        """plan-attack is the ONE exempt mode. The refusal is a hard block
+        resting on the batched-panel premise (`_flag_serialized_panel`'s own
+        docstring calls that premise "field-consistent, not provable", and
+        deliberately only OBSERVES on it) with a millisecond-thin margin: if
+        it ever fails, lenses 2..N of every panel are blocked and the only
+        escape retires the whole panel including lens 1's real work. It also
+        blocked the single-lens stall recovery plan-review.md documents
+        outright — a re-spawned lens necessarily arrives while its siblings
+        are in flight. Safe because no engine-read verdict rides on a lens:
+        two of them cost tokens, never a wrong verdict."""
+        run = self.make_run(to_step="plan-review", run_name="2026-03-01-G-11",
+                            item_id="G-11")
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "spawn-pending", "task": None, "actor": "reviewer",
+            "mode": "plan-attack", "agent_id": "lens-1"})
+        lens = spawn("x:reviewer", f"harness-mode: plan-attack\n"
+                                   f"harness-run: {run}\nlens: gaps\ngo")
+        self.assert_allows("spawn", lens)
+        # the exemption is from the BLOCK only — the non-blocking detector
+        # still reports a genuinely serialized panel
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "plan-registered", "actor": "plan-register", "count": 2})
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "lens-complete", "actor": "reviewer",
+            "mode": "plan-attack"})
+        self.assert_allows("spawn", lens)
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertIn("panel-serialized", kinds)
+        # …and the SYNTHESIZER — the one spawn of this panel whose verdict
+        # the engine reads — is not exempt
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "spawn-pending", "task": None, "actor": "reviewer",
+            "mode": "plan-review", "agent_id": "synth-1"})
+        self.assert_blocks("spawn", spawn(
+            "x:reviewer", f"harness-mode: plan-review\nharness-run: {run}\ngo"),
+            "ALREADY in flight")
+
+    def test_the_task_less_refusal_names_the_plural_reach_of_the_override(self):
+        # the CLI abandons EVERY open pending on the key it is given; the
+        # message used to promise a singular retirement for a task-less key,
+        # where the key is the step's and several spawns can sit under it
+        run = self.make_run(to_step="plan-review", run_name="2026-03-02-G-12",
+                            item_id="G-12")
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "spawn-pending", "task": None, "actor": "reviewer",
+            "mode": "plan-review", "agent_id": "synth-1"})
+        err = self.assert_blocks("spawn", spawn(
+            "x:reviewer", f"harness-mode: plan-review\nharness-run: {run}\ngo"),
+            "ALREADY in flight")
+        self.assertIn("EVERY open pending", err)
+        # …and the command it prescribes carries no --task: this key IS the
+        # step's, and a --task-less stall is what reaches it
+        self.assertIn("stall --confirm-no-verdict` (no --task", err)
+
+    def test_a_torn_ledger_line_is_reported_not_silently_skipped(self):
+        # `read_records` skips an unparseable line, and this predicate reads
+        # absence as "nothing in flight" — so ONE torn `spawn-pending` line
+        # silently disables the refusal (adversarial review). Failing closed
+        # would block every spawn in a run whose ledger a crash tore, so the
+        # skip stays and is made VISIBLE instead.
+        self._pending()
+        with open(self.run / "events.ndjson", "a", encoding="utf-8") as fh:
+            fh.write("{torn record\n")
+        code, err = self.run_guard("spawn", self._spawn())
+        self.assertEqual(code, 2)                 # the readable pending still refuses
+        self.assertIn("unparseable line(s)", err)
+
+    def test_an_unrelated_runs_pending_does_not_block(self):
+        # the check reads the RESOLVED run's ledger, not the workspace's
+        other = self.make_run(to_step="develop", run_name="2026-02-02-G-9",
+                              item_id="G-9")
+        ndjson.append_record(other / "events.ndjson", {
+            "kind": "spawn-pending", "task": "T1", "actor": "reviewer",
+            "mode": "review", "agent_id": "a-other"})
+        self.assert_allows("spawn", self._spawn())
 
 
 class SpawnIdentityNearMiss(GuardHarness):
@@ -1977,24 +2189,46 @@ class SpawnIdentityNearMiss(GuardHarness):
         self.assertIn("ai-sdlc-reviewer", err)
         self.assertIn("no verdict capture", err)
 
-    def test_harness_spawn_absent_run_in_background_blocked(self):
-        # WI-3: under Qwen Code, omitting run_in_background DEFAULTS to
-        # background for top-level spawns — so the guard must require
-        # explicit false, not just forbid explicit true.
+    def test_harness_spawn_absent_run_in_background_blocked_under_qwen(self):
+        # WI-3, now Qwen-only: under Qwen Code, omitting run_in_background
+        # DEFAULTS to background for top-level spawns — so the guard must
+        # require explicit false there, not just forbid explicit true.
         payload = spawn("planner", "harness-mode: repo-map\ngo")
         del payload["tool_input"]["run_in_background"]
-        self.assert_blocks("spawn", payload, "run_in_background: false")
+        self.assert_blocks("spawn", payload, "run_in_background: false",
+                           env={"QWEN_CODE": "1"})
 
-    def test_harness_spawn_explicit_true_still_blocked(self):
-        # regression: explicit true was already blocked; WI-3 keeps it
+    def test_harness_spawn_explicit_true_still_blocked_under_qwen(self):
+        # regression: explicit true was already blocked; WI-3 keeps it where
+        # the stub shape is unmeasured
         payload = spawn("planner", "harness-mode: repo-map\ngo")
         payload["tool_input"]["run_in_background"] = True
-        self.assert_blocks("spawn", payload, "FOREGROUND")
+        self.assert_blocks("spawn", payload, "FOREGROUND",
+                           env={"QWEN_CODE": "1"})
+
+    def test_the_qwen_block_is_keyed_on_the_env_var_alone(self):
+        """The reversal's stated risk, pinned both ways: the SAME payload
+        that Qwen refuses is allowed on Claude Code. The block lives or dies
+        by QWEN_CODE reaching the hook subprocess — if it ever stopped
+        propagating, this is the assertion that would flip, and the failure
+        direction (silent permit) is why it is documented in guards.py rather
+        than merely relied upon."""
+        payload = spawn("planner", "harness-mode: repo-map\ngo")
+        del payload["tool_input"]["run_in_background"]
+        self.assert_blocks("spawn", payload, "FOREGROUND",
+                           env={"QWEN_CODE": "1"})
+        self.assert_allows("spawn", payload)                     # no env
+        # any truthy spelling keeps the protective block on — over-refusing
+        # is the direction a caller can see and fix
+        self.assert_blocks("spawn", payload, "FOREGROUND",
+                           env={"QWEN_CODE": "true"})
 
     def test_harness_spawn_explicit_false_allowed(self):
         # regression: explicit false must still pass (repo-map is always-legal)
         self.assert_allows("spawn", spawn(
             "planner", "harness-mode: repo-map\ngo"))
+        self.assert_allows("spawn", spawn(
+            "planner", "harness-mode: repo-map\ngo"), env={"QWEN_CODE": "1"})
 
 
 class SpawnGuardAbortedRun(GuardHarness):
@@ -2503,6 +2737,77 @@ class CaptureHooks(GuardHarness):
              events[-1]["actor"], events[-1]["mode"]),
             ("spawn-pending", "a-7", "T1", "reviewer", "review"))
 
+    def test_explicit_background_param_never_discards_a_real_reply(self):
+        """The param branch fired on `run_in_background: true` ALONE. That
+        was sound while the param was forbidden — its presence meant a stub.
+        WI-3's rescope made explicit-true LEGAL on Claude Code, and the
+        branch then threw away responses carrying the agent's whole reply:
+        adversarial review executed it and watched a `verdict: APPROVED` be
+        discarded and the run marked DEGRADED for a spawn that had reported
+        in full. The RESPONSE's shape is the evidence, not the parameter."""
+        run = self.make_run()
+        p = self._post_spawn(run, "reviewer",
+                             reply="harness-status: SUCCESS\nharness-task: T1\n"
+                                   "outcome: reviewed\nverdict: APPROVED")
+        p["tool_input"]["run_in_background"] = True
+        self.assert_allows("post-spawn", p)
+        rec = ndjson.read_records(run / "reviews.ndjson")[-1]
+        self.assertEqual((rec["task"], rec["mode"], rec["verdict"]),
+                         ("T1", "review", "APPROVED"))
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertNotIn("background-spawn-uncaptured", kinds)
+        # a verdict with NO status block is capturable too (the normal path
+        # signposts it; discarding it here would lose the same evidence)
+        p2 = self._post_spawn(run, "reviewer", reply="verdict: APPROVED")
+        p2["tool_input"]["run_in_background"] = True
+        self.assert_allows("post-spawn", p2)
+        self.assertEqual(len(ndjson.read_records(run / "reviews.ndjson")), 2)
+        # …and with NOTHING capturable the honest record is unchanged: this
+        # really is a background launch whose reply reaches no hook
+        p3 = self._post_spawn(run, "reviewer",
+                              reply="Agent launched in background: a-77")
+        p3["tool_input"]["run_in_background"] = True
+        self.assert_allows("post-spawn", p3)
+        last = ndjson.read_records(run / "events.ndjson")[-1]
+        self.assertEqual(last["kind"], "background-spawn-uncaptured")
+        # (explicit-true over a recognised STUB still records the pending —
+        # the shape gate above this branch owns that case)
+
+    def test_a_headerless_out_of_run_spawn_files_into_no_run(self):
+        """A backgrounded `/repo-map-refresh` planner carries no
+        `harness-run:` header — it belongs to no run by declaration
+        (surfaces.yaml `out_of_run_spawns`) — and the single-run fallback
+        filed its `spawn-pending` into whichever run happened to be live:
+        executed, that DEGRADED an unrelated dev-workflow run and left a
+        pending its orchestrator never spawned and could not wait for. Its
+        product is files on disk, not a ledger verdict."""
+        run = self.make_run()
+        p = {"tool_name": "Agent",
+             "tool_input": {"subagent_type": "x:planner",
+                            "prompt": "harness-mode: repo-map\nmap the repo"},
+             "tool_response": {"isAsync": True, "status": "async_launched",
+                               "agentId": "rm-1"}}
+        code, err = self.run_guard("post-spawn", p)
+        self.assertEqual(code, 0, err)
+        self.assertIn("out-of-run spawn", err)
+        self.assertFalse((run / "events.ndjson").exists()
+                         and [e for e in
+                              ndjson.read_records(run / "events.ndjson")
+                              if e["kind"].startswith("spawn-")])
+        # …while a header-less IN-RUN mode keeps the single-run fallback:
+        # that spawn really does belong to the run, and losing its verdict
+        # is the worse failure
+        p2 = {"tool_name": "Agent",
+              "tool_input": {"subagent_type": "x:reviewer",
+                             "prompt": "harness-mode: review\n"
+                                       "harness-task: T1\nreview it"},
+              "tool_response": {"isAsync": True, "status": "async_launched",
+                                "agentId": "rv-1"}}
+        self.assert_allows("post-spawn", p2)
+        last = ndjson.read_records(run / "events.ndjson")[-1]
+        self.assertEqual((last["kind"], last["agent_id"], last["mode"]),
+                         ("spawn-pending", "rv-1", "review"))
+
     def test_background_reply_is_captured_at_its_subagent_stop(self):
         """The other half of the handoff: the background reply reaches no
         PostToolUse at all, so SubagentStop — which fires for background
@@ -2780,6 +3085,77 @@ class CaptureHooks(GuardHarness):
         self.assertNotIn("missing-status-block", kinds)
         # token capture is unchanged: it may still use that chain
         self.assertTrue(ndjson.read_records(run / "tokens.ndjson"))
+
+    def _bg_transcript(self, run, name, reply, mode="review", task="T1"):
+        transcript = self.workspace / name
+        lines = [
+            {"type": "user", "message": {"content": [
+                {"type": "text",
+                 "text": f"harness-mode: {mode}\nharness-task: {task}\n"
+                         f"harness-run: {run}\ngo"}]}},
+            {"type": "assistant", "message": {
+                "model": "m", "usage": {"input_tokens": 8, "output_tokens": 2},
+                "content": [{"type": "text", "text": reply}]}},
+        ]
+        transcript.write_text("\n".join(json.dumps(l) for l in lines))
+        return transcript
+
+    def test_a_stop_for_an_abandoned_pending_is_not_captured(self):
+        """The completion-side half of the stale-verdict race. A stall
+        override declared this spawn dead and abandoned its pending — so the
+        round it belonged to is closed, a replacement may already be running,
+        and letting this late reply mint a verdict row would hand the run
+        whichever agent finished last. Refused, and LOUDLY: a dropped verdict
+        must never be a silent no-op."""
+        run = self.make_run()
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "reviewer", response={"isAsync": True,
+                                       "status": "async_launched",
+                                       "agentId": "a-dead"}))
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "spawn-abandoned", "agent_id": "a-dead", "task": "T1",
+            "mode": "review", "actor": "stall", "reason": "declared dead"})
+        before = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        code, err = self.run_guard("subagent-stop", {
+            "agent_type": "x:reviewer", "agent_id": "a-dead",
+            "agent_transcript_path": str(self._bg_transcript(
+                run, "late.jsonl",
+                "harness-status: SUCCESS\nharness-task: T1\n"
+                "verdict: APPROVED"))})
+        self.assertEqual(code, 0, err)
+        self.assertIn("a-dead", err)
+        self.assertIn("ABANDONED", err)
+        self.assertIn("NOT captured", err)
+        # no verdict row, and nothing capture-ish on the event ledger — no
+        # `spawn-captured`, and no fabricated stall either
+        self.assertFalse((run / "reviews.ndjson").exists())
+        after = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertEqual([k for k in after if k not in ("agent-identity",)],
+                         before)
+        # the cost the agent really burned is still accounted (the token row
+        # and its CLI-identity marker are all this stop writes): abandonment
+        # decides what the VERDICT ledger accepts, not what was spent
+        self.assertTrue(ndjson.read_records(run / "tokens.ndjson"))
+
+    def test_a_forged_abandonment_cannot_suppress_a_capture(self):
+        # the actor check runs in this direction too: without it, a
+        # hand-written `log-event` could silently cost a run a real verdict
+        run = self.make_run()
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "reviewer", response={"isAsync": True,
+                                       "status": "async_launched",
+                                       "agentId": "a-live"}))
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "spawn-abandoned", "agent_id": "a-live"})   # no actor
+        self.assert_allows("subagent-stop", {
+            "agent_type": "x:reviewer", "agent_id": "a-live",
+            "agent_transcript_path": str(self._bg_transcript(
+                run, "forged.jsonl",
+                "harness-status: SUCCESS\nharness-task: T1\n"
+                "verdict: APPROVED"))})
+        self.assertEqual(
+            ndjson.read_records(run / "reviews.ndjson")[-1]["verdict"],
+            "APPROVED")
 
     def test_a_pending_with_no_reply_text_anywhere_stays_open(self):
         """Closing a pending on empty text ran the capture over "" and
@@ -3441,11 +3817,12 @@ class PreSetupDegradation(GuardHarness):
     fresh install. Yaml-free guards keep BLOCKING; yaml-needing guards
     degrade open with one quiet line."""
 
-    def run_guard(self, name, payload):  # same, but on the yaml-less python
+    def run_guard(self, name, payload, env=None):  # same, yaml-less python
         payload.setdefault("cwd", str(self.workspace))
         proc = subprocess.run([_yamlless_python(), str(GUARDS), name],
                               input=json.dumps(payload), capture_output=True,
-                              text=True, encoding="utf-8", timeout=60)
+                              text=True, encoding="utf-8", timeout=60,
+                              env={**os.environ, **(env or {})} if env else None)
         return proc.returncode, proc.stderr
 
     def test_bash_guard_still_blocks_without_yaml(self):

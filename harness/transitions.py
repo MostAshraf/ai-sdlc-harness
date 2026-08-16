@@ -10,6 +10,7 @@ declarations (design.md pieces 1-2).
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 from . import chain, ndjson
@@ -660,38 +661,153 @@ def _stall_round_anchor(state: dict, run: Path, stall_key: str,
     return max(marks, default="")
 
 
-def _open_spawn_pending(run: Path, stall_key: str) -> dict | None:
-    """The `spawn-pending` for THIS stall key that no `spawn-captured` has
-    closed yet, or None.
+def stall_key_spawn_modes(manifest: dict, stall_key: str) -> set[str]:
+    """The modes a TASK-LESS `spawn-pending` may carry to belong to this
+    stall key — DECLARED data, read off the manifest, never inferred.
+
+    A stall key is either a task id or `step:<step>[:<lens>]`. A task-less
+    spawn records no `harness-task` header, so its pending carries task=None
+    and cannot be matched by equality; what it CAN be matched by is the step
+    that is allowed to spawn it — `steps.<step>.spawns` is exactly the set of
+    modes a run at that step launches without a task.
+
+    Two bounds, both executed in adversarial review before they were closed:
+
+    * a PER-TASK key matches no task-less pending at all (the early return).
+      This is what keeps the parse total, too: a task id has no step
+      component to unpack.
+    * a LENS key (`step:plan-review:contradictions`) additionally EXCLUDES
+      the step's `verdict_bound` mode. The lens counters exist because a
+      panel member stalls independently of the synthesizer, and the
+      synthesizer's verdict is the one the FSM reads — so a per-lens
+      override that retired the live synthesizer would abandon the whole
+      round's real work to recover one advisory lens.
+
+    Consequence, stated: a task-less pending belongs to ITS OWN step's key
+    and to no other, so a pending left dangling by a step the run has since
+    LEFT no longer refuses (or is swept by) a later step's stall — it clears
+    through its own `step:<that step>` key, which is the key the orchestrator
+    reads off the pending's own mode. The unclearable set is ANY task-less
+    pending whose mode no step declares in its spawns — not only the
+    mode-less case (PreToolUse bypass) but also, today, `repo-map` and
+    `request-triage`: both are declared OUTSIDE the step spawn-sets
+    (out_of_run_spawns / always_legal_spawns), so a pending of theirs that
+    lands in a run via the single-run fallback matches no `step:` key
+    (adversarial re-verification, executed without any bypass). All of
+    these refuse nothing, so they cannot wedge a run, and they self-clear
+    on a normal SubagentStop; a stop that never arrives leaves them on the
+    flagged gauge until the run ends. Accepted, and cheaper than the
+    alternative, which is the cross-step sweep this replaced."""
+    if not stall_key.startswith("step:"):
+        return set()
+    _, step, *lens = stall_key.split(":")
+    step_def = (manifest.get("steps") or {}).get(step) or {}
+    modes = {s.get("mode") for s in (step_def.get("spawns") or [])}
+    if lens:
+        modes.discard((step_def.get("verdict_bound") or {}).get("mode"))
+    return {m for m in modes if m}
+
+
+def _read_pairing_events(run: Path) -> list[dict]:
+    """events.ndjson for the pending-pairing readers — lenient, and LOUD
+    about what it skipped (adversarial review): these readers decide "no
+    spawn is in flight" from absence, so a torn `spawn-pending` line
+    silently disables the refusal built on it."""
+    events, skipped = ndjson.read_records_counting(run / "events.ndjson")
+    if skipped:
+        print(f"ai-sdlc-harness: {run / 'events.ndjson'} has {skipped} "
+              "unparseable line(s) — a torn `spawn-pending` line is invisible "
+              "to the stalled-agent guard, which then cannot see a spawn that "
+              "is still in flight.", file=sys.stderr)
+    return events
+
+
+def open_spawn_pendings(run: Path, stall_key: str,
+                        manifest: dict) -> list[dict]:
+    """Every `spawn-pending` for THIS stall key that nothing has closed yet.
+
+    Closed = the agent_id carries a `spawn-captured` (actor "capture": its
+    SubagentStop arrived and the reply was captured) or a `spawn-abandoned`
+    (actor "stall": a stall override declared that round dead). Both
+    resolvers are actor-checked — without it a hand-written `log-event`
+    could UNBLOCK a stall by faking either one, which is the forgery
+    direction that matters here.
 
     Keyed the way `_stall_round_anchor` keys its own event scan — the
     record's `task` against the stall key — so the guard only ever refuses a
     stall it can positively attribute to a spawn in flight; a pending under
-    a different key (or none) is left to that key's own stall.
+    a different key is left to that key's own stall, and a TASK-LESS one is
+    attributed by mode (below) rather than swept up by any key that happens
+    to be asked about.
 
     The pairing repeats `workflow.outstanding_flagged`'s rule rather than
     importing it: that is the run-wide GAUGE (every open pending, no key),
     while this is a per-key question, and `harness.workflow` imports the
-    engine, not the other way round. The `actor == "capture"` check is the
-    part that must not drift — without it a hand-written `log-event` could
-    UNBLOCK a stall by faking the capture, which is the forgery direction
-    that matters here.
+    engine, not the other way round.
 
-    Reads leniently and returns None on an unreadable ledger: this guard
-    SUPPRESSES an action, so it fails OPEN for the same reason the verdict
-    check below does — a ledger that cannot be read cannot prove a spawn is
-    live, and bricking the stalled-agent procedure is the worse failure."""
+    Reads leniently and returns [] on an unreadable ledger: the guard built
+    on this SUPPRESSES an action, so it fails OPEN for the same reason the
+    verdict check below does — a ledger that cannot be read cannot prove a
+    spawn is live, and bricking the stalled-agent procedure is the worse
+    failure. The stall verb's abandonment write inherits that: it can only
+    ever abandon pendings it could actually read.
+
+    LIST rather than first-match because the override that abandons them
+    must reach every one — a plan panel batches its lens spawns, so one
+    stall key can legitimately hold several open pendings, and leaving the
+    others open would deadlock that key against guard_spawn's
+    one-live-spawn rule with no verb left to clear them.
+
+    TASK-LESS spawns match a `step:` key BY MODE. A pending records the
+    spawn prompt's `harness-task` header, which a task-less spawn
+    (plan-review, pre-pr, a panel lens) does not carry at all — so its
+    pending's task is None while its stall is counted per STEP (`stall` with
+    no `--task`). Keying on equality alone made those two spellings of one
+    spawn miss each other entirely: the plan-review synthesizer — the field
+    case this whole guard was written for — could be live in the background
+    and still return `reinvoke`, and with backgrounding now legal the miss
+    compounds into a DEAD END (the spawn guard refuses the re-spawn as
+    already in flight, and the override that would free it never fires
+    because nothing refused).
+    Bound, stated (and MODE-bound, not `step:`-prefix-bound — the first
+    spelling of this widening swept every task-less pending in the run,
+    which adversarial review executed three ways: a per-lens override
+    abandoned the live synthesizer, a `step:develop` override abandoned
+    plan-review and pre-pr pendings from other steps, and one dangling
+    cross-step ghost refused every later step-keyed stall in the run): a
+    task-less pending matches only the step whose declared spawn-set holds
+    its mode, minus the verdict_bound mode when the key names a lens — see
+    `stall_key_spawn_modes`, which owns that rule and its consequences. An
+    override on the matching key still abandons EVERY pending it matches, a
+    batched panel's siblings included: that reach is deliberate (a
+    half-abandoned key deadlocks exactly like an un-abandoned one), it only
+    ever fires behind an explicit `--confirm-no-verdict`, and no engine-read
+    verdict rides on a lens (plan-review.md: lens verdicts are advisory, the
+    synthesizer's is the one the FSM reads)."""
     try:
-        events = ndjson.read_records(run / "events.ndjson")
+        events = _read_pairing_events(run)
     except OSError:
-        return None
+        return []
     closed = {e.get("agent_id") for e in events
-              if e.get("kind") == "spawn-captured"
-              and e.get("actor") == "capture"}
-    return next((e for e in events
-                 if e.get("kind") == "spawn-pending"
-                 and e.get("task") == stall_key
-                 and e.get("agent_id") not in closed), None)
+              if (e.get("kind") == "spawn-captured"
+                  and e.get("actor") == "capture")
+              or (e.get("kind") == "spawn-abandoned"
+                  and e.get("actor") == "stall")}
+    task_less_modes = stall_key_spawn_modes(manifest, stall_key)
+    return [e for e in events
+            if e.get("kind") == "spawn-pending"
+            and (e.get("task") == stall_key
+                 or (e.get("task") is None
+                     and e.get("mode") in task_less_modes))
+            and e.get("agent_id") not in closed]
+
+
+def _open_spawn_pending(run: Path, stall_key: str,
+                        manifest: dict) -> dict | None:
+    """The first still-open `spawn-pending` for this stall key, or None —
+    the one-record question `guard_stall_verdict` asks (it needs an agent id
+    to name in the refusal, not the whole set)."""
+    return next(iter(open_spawn_pendings(run, stall_key, manifest)), None)
 
 
 def guard_stall_verdict(state: dict, manifest: dict, run: Path,
@@ -724,7 +840,7 @@ def guard_stall_verdict(state: dict, manifest: dict, run: Path,
     run the STALE APPROVED. Checked before the `step:` filter because the
     proven case is a per-task review key, and "the agent is still running"
     is true of any spawn, verdict_bound or not."""
-    open_pending = _open_spawn_pending(run, stall_key)
+    open_pending = _open_spawn_pending(run, stall_key, manifest)
     if open_pending is not None:
         raise TransitionError(
             f"'{stall_key}': a spawn for this key is still RUNNING in the "
@@ -736,7 +852,12 @@ def guard_stall_verdict(state: dict, manifest: dict, run: Path,
             "Reinvoking now runs a second agent against the same worktree "
             "and latest-wins can hand the run the STALE verdict. If that "
             "agent genuinely died (its session ended, the CLI crashed), "
-            "re-run with --confirm-no-verdict.")
+            "re-run with --confirm-no-verdict: that records the stall AND "
+            "abandons every open pending on this key (`spawn-abandoned`) — "
+            "for a task-less key that is every in-flight spawn of a mode "
+            "this step declares — which frees the key "
+            "for a fresh spawn and makes the dead agent's reply — should it "
+            "surface after all — refused rather than captured.")
     if not stall_key.startswith("step:"):
         return  # per-task spawn: no verdict ledger governs it
     step = stall_key[len("step:"):]
