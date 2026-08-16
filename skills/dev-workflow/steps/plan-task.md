@@ -32,12 +32,15 @@ Tasks keyed by id (`T1`, `T2`…), each with: description, repo, edge-case
 enumeration, risk tier, dependencies. One task = one reviewable unit.
 
 **`depends_on` is HARD technical blockers ONLY — it is mechanically
-enforced and gates cross-repo parallelism.** A task can't start until every
-task it `depends_on` is done (the `dependencies-done` guard refuses), and
-you can't loosen the graph past the plan gate (registration is plan-step-
-only) — so an over-declared edge permanently *serializes work that could
-run concurrently*. Declare an edge only when B literally cannot begin until
-A completes (B compiles against a symbol A introduces, B's tests need code
+enforced and gates ALL parallelism, within a repo as much as across repos**
+(dispatch is DAG-driven: every task whose edges are satisfied starts at
+once). A task can't start until every task it `depends_on` is done (the
+`dependencies-done` guard refuses), and you can't loosen the graph past the
+plan gate (registration is plan-step-only) — so an over-declared edge,
+*intra-repo ones included*, permanently *serializes work the dispatcher
+would have run concurrently*. Two tasks merely touching the same file is
+NOT an edge: `ready-tasks` reports that overlap, develop.md staggers them.
+Declare an edge only when B literally cannot begin until A completes (B compiles against a symbol A introduces, B's tests need code
 A writes first, B mutates state A sets up). Do NOT encode as `depends_on`:
 a cross-repo consumer whose contract is already ratified in
 `requirements.md` (it doesn't depend on the producer's *implementation* —
@@ -121,7 +124,8 @@ fork identified: <why>` under the task table, visible either way.
   entries don't). This is the single biggest developer accelerant in the
   plan: the developer starts editing instead of re-discovering. The
   orchestrator carries the paths (not the whys) into `plan-register`'s
-  `files` field — the same carry-over the test-intent names get.
+  `files` field — the same carry-over the test-intent names get. Nothing
+  verifies it, so a file left out is a `conflicts` overlap nobody flags.
   ```
   Files:
   - modify src/auth/service.py — add the token-refresh branch

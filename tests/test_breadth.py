@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from harness import gitops, ndjson, state as state_mod
+from harness import gitops, ndjson, state as state_mod, workflow
 from harness.providers import git_providers
 from tests.test_gitops import (FAILING_TEST, TEST_CMD, make_monorepo,
                                make_repo)
@@ -78,12 +78,24 @@ class BreadthHarness(unittest.TestCase):
             t["status"] = "done"
         state_mod.save(run, self.workspace, st)
 
-    def tdd_task(self, run, task_id, worktree: Path, review=None):
-        self.cli("task", "--id", task_id, "--to", "in-progress", run=run)
-        (worktree / "tests" / "test_x.py").write_text(FAILING_TEST)
+    def tdd_task(self, run, task_id, worktree: Path, review=None, start=True,
+                 stem="x"):
+        # `start=False` for a lane the ready-set loop already dispatched:
+        # pipelined dispatch moves the task to in-progress when it goes out,
+        # so its recipe resumes at the developer step, not before it.
+        # `stem` gives each task its OWN module: several tasks in ONE repo
+        # (the shape DAG dispatch makes routine) cut their worktrees from a
+        # branch that already carries the earlier tasks' merged files, and
+        # rewriting an identical `tests/test_x.py` is not a change — verify-red
+        # then correctly reports "no test files identified".
+        if start:
+            self.cli("task", "--id", task_id, "--to", "in-progress", run=run)
+        (worktree / "tests" / f"test_{stem}.py").write_text(
+            FAILING_TEST.replace("import x", f"import {stem}")
+                        .replace("x.val()", f"{stem}.val()"))
         self.cli("verify-red", "--repo", str(worktree), "--task", task_id,
                  "--test-cmd", TEST_CMD, "--intents", "test_val", run=run)
-        (worktree / "x.py").write_text("def val():\n    return 1\n")
+        (worktree / f"{stem}.py").write_text("def val():\n    return 1\n")
         self.cli("commit", "--repo", str(worktree), "--task-id", task_id,
                  "--summary", "implement val", run=run)
         self.cli("task", "--id", task_id, "--to", "in-review",
@@ -304,6 +316,494 @@ class FullWalk(BreadthHarness):
         self.assertTrue(status["completed"]["at"])
         out = self.cli("cursor", "--to", "metrics", run=run, expect=1)
         self.assertIn("completed run", out["error"])
+
+
+class DagDispatchHarness(BreadthHarness):
+    """Shared setup for the two DAG classes below — a registered three-task
+    DAG (T1, T2 independent; T3 after T1) sitting at the develop cursor.
+    Helpers only, no tests: subclassing a test class would re-run every
+    sibling's tests under the second name."""
+
+    TASKS = ({"id": "T1"}, {"id": "T2"}, {"id": "T3", "depends_on": ["T1"]})
+
+    def at_develop(self, tasks=None, item="W-90", date="2026-05-01",
+                   repo=None):
+        """The honest path to the develop cursor: every gate decided from
+        captured input, the plan registered through plan-register (which is
+        what validates the DAG), the feature branch cut by preflight."""
+        repo = repo or self.repo
+        self.story(item, "DAG dispatch")
+        run = Path(self.cli("fetch", "--id", item, "--date", date)["run"])
+        self.cli("cursor", "--to", "intake", run=run)
+        self.scope(run)
+        self.cli("cursor", "--to", "plan", run=run)
+        (run / "plan.md").write_text("# Plan\n")
+        self.cli("plan-register", "--tasks-json",
+                 json.dumps([{**t, "repo": str(repo)}
+                             for t in (tasks or self.TASKS)]), run=run)
+        self.pass_plan_review(run)
+        self.cli("cursor", "--to", "approve-plan", run=run)
+        self.gate(run, "approve-plan")
+        self.cli("cursor", "--to", "preflight", run=run)
+        branch = self.cli("preflight", "--repo", str(repo), run=run)["branch"]
+        self.cli("cursor", "--to", "develop", run=run)
+        return run, branch
+
+    def picture(self, run):
+        out = self.cli("ready-tasks", run=run)
+        return {k: out[k] for k in ("ready", "in_flight", "blocked", "terminal")}
+
+
+class DagDispatch(DagDispatchHarness):
+    """`ready-tasks` — the owned dispatch picture develop asks for after
+    every completion. Pinned against the real verbs at each stage, because
+    the alternative it replaces (the orchestrator deriving readiness from
+    `show`) fails in ways that only surface mid-develop."""
+
+    def test_the_picture_partitions_the_dag_at_every_stage(self):
+        self.init()
+        run, _ = self.at_develop()
+        # nothing started: both roots dispatchable, the dependent one is not,
+        # and it says WHAT it waits on rather than just "blocked"
+        self.assertEqual(self.picture(run), {
+            "ready": ["T1", "T2"], "in_flight": [], "terminal": [],
+            "blocked": [{"id": "T3", "waiting_on": ["T1"]}]})
+
+        # dispatched: an in-flight task is NOT ready (dispatching it twice is
+        # what the spawn guard then refuses, with the loop holding a block it
+        # has no vocabulary for), and T3 is still waiting
+        self.cli("task", "--id", "T1", "--to", "in-progress", run=run)
+        self.assertEqual(self.picture(run)["ready"], ["T2"])
+        self.assertEqual(self.picture(run)["in_flight"],
+                         [{"id": "T1", "status": "in-progress"}])
+
+        # IN REVIEW is not done: reading it as satisfied is exactly how a
+        # dependent gets dispatched into the FSM's "not yet done" refusal
+        self.cli("task", "--id", "T1", "--to", "in-review", run=run)
+        self.assertEqual(self.picture(run)["in_flight"],
+                         [{"id": "T1", "status": "in-review"}])
+        self.assertEqual(self.picture(run)["blocked"],
+                         [{"id": "T3", "waiting_on": ["T1"]}])
+
+        # done unblocks the dependent — the loop's whole trigger
+        self.review_approve(run, "T1")
+        self.cli("task", "--id", "T1", "--to", "done", run=run)
+        after = self.picture(run)
+        self.assertEqual(after["terminal"], ["T1"])
+        self.assertEqual(sorted(after["ready"]), ["T2", "T3"])
+        self.assertEqual(after["blocked"], [])
+
+    def test_archived_counts_as_terminal_like_the_guards_do(self):
+        # the FSM's terminal set is done|archived; a picture that disagreed
+        # with `_guard_dependencies_done` would point the loop at a
+        # transition the engine then refuses
+        self.init()
+        run, _ = self.at_develop()
+        st = state_mod.load(run, self.workspace)
+        st["tasks"][0]["status"] = "archived"     # reconcile's end state
+        state_mod.save(run, self.workspace, st)
+        picture = self.picture(run)
+        self.assertEqual(picture["terminal"], ["T1"])
+        self.assertIn("T3", picture["ready"])     # its dependency IS satisfied
+
+    def test_a_dangling_dependency_reads_as_waiting_not_a_crash(self):
+        """plan-register refuses dangling ids, so one can only arrive here
+        by hand-edit or migration — and then a dispatch verb's job is to SHOW
+        the wedge, not to take the loop down with it."""
+        self.init()
+        run, _ = self.at_develop()
+        st = state_mod.load(run, self.workspace)
+        st["tasks"][1]["depends_on"] = ["T9-typo"]
+        state_mod.save(run, self.workspace, st)
+        picture = self.picture(run)               # exit 0, not a traceback
+        self.assertEqual(picture["blocked"],
+                         [{"id": "T2", "waiting_on": ["T9-typo"]},
+                          {"id": "T3", "waiting_on": ["T1"]}])
+        self.assertEqual(picture["ready"], ["T1"])
+
+    def test_a_legacy_string_depends_on_is_coerced_not_crashed_on(self):
+        """Survivor M3, the read-only half. plan-register refuses the shape
+        now, so a state carrying it is hand-edited or predates that check —
+        and this verb's promise is to SHOW a broken plan, not to die on it.
+        Iterated raw, `"T1"` reads per CHARACTER (a dependency on 'T' and on
+        '1', neither of which any task provides), so the task would have been
+        reported blocked on ids nobody typed."""
+        self.init()
+        run, _ = self.at_develop()
+        st = state_mod.load(run, self.workspace)
+        st["tasks"][2]["depends_on"] = "T1"          # the legacy shape
+        state_mod.save(run, self.workspace, st)
+        picture = self.picture(run)                  # exit 0, not a traceback
+        self.assertEqual(picture["blocked"], [])
+        self.assertEqual(sorted(picture["ready"]), ["T1", "T2", "T3"])
+
+    def test_a_junk_entry_inside_the_list_is_dropped_not_iterated(self):
+        """The coercion is TOTAL, not just non-list-shaped. A nested list is
+        unhashable and a stray int is unorderable against task ids, so either
+        one took the set-and-sort down with a TypeError — the verb crashing on
+        exactly the broken plan it promises to SHOW. The real id beside them
+        still counts, which is what keeps dropping them safe."""
+        self.init()
+        run, _ = self.at_develop()
+        st = state_mod.load(run, self.workspace)
+        st["tasks"][1]["depends_on"] = [["T1"], 7, "T1"]
+        state_mod.save(run, self.workspace, st)
+        picture = self.picture(run)                  # exit 0, not a traceback
+        self.assertEqual(picture["blocked"],
+                         [{"id": "T2", "waiting_on": ["T1"]},
+                          {"id": "T3", "waiting_on": ["T1"]}])
+        self.assertEqual(picture["ready"], ["T1"])
+
+    def test_the_fsm_guard_reads_a_legacy_string_the_way_this_verb_does(self):
+        """The OTHER half of that survivor, and the disagreement this verb
+        exists to prevent — arriving inside it. `_guard_dependencies_done`
+        iterated the stored value raw, so the same legacy `depends_on: "T1"`
+        the picture coerces to "no dependencies" made `task --to in-progress`
+        refuse per CHARACTER: the owned derivation said READY and the
+        transition it was derived FOR said no. One coercion, both readers."""
+        self.init()
+        run, _ = self.at_develop()
+        # control first: a properly declared edge has teeth, and keeps them
+        self.assertEqual(self.picture(run)["blocked"],
+                         [{"id": "T3", "waiting_on": ["T1"]}])
+        out = self.cli("task", "--id", "T3", "--to", "in-progress", run=run,
+                       expect=1)
+        self.assertIn("depends_on T1", out["error"])
+        self.assertIn("not yet done", out["error"])
+
+        st = state_mod.load(run, self.workspace)
+        st["tasks"][2]["depends_on"] = "T1"          # the legacy shape
+        state_mod.save(run, self.workspace, st)
+        self.assertIn("T3", self.picture(run)["ready"])
+        self.cli("task", "--id", "T3", "--to", "in-progress", run=run)
+
+    def test_the_verb_is_read_only_and_never_manufactures_a_run(self):
+        self.init()
+        run, _ = self.at_develop()
+        before = (run / "state.yaml").read_bytes()
+        self.picture(run)
+        self.assertEqual((run / "state.yaml").read_bytes(), before)
+        bogus = self.workspace / "ai" / "2026-05-09-TYPO"
+        self.cli("ready-tasks", run=bogus, expect=1)
+        self.assertFalse(bogus.exists(), "a typo'd --run must not be created")
+
+
+class CoDispatchConflicts(DagDispatchHarness):
+    """`ready-tasks`' `conflicts` — ADVISORY, and the design chose advisory
+    deliberately. Two ready tasks in one repo whose declared `files` overlap
+    will each cut a worktree from the feature branch as it stands, so neither
+    tree contains the other's work and the shared file gets edited twice from
+    one starting point. A GUARD here would quietly become a second ordering
+    authority alongside `depends_on` and serialize work the DAG deliberately
+    parallelized; naming the pair lets develop.md stagger just that pair."""
+
+    def _conflicts(self, tasks):
+        return workflow.dispatch_picture({"tasks": tasks})["conflicts"]
+
+    def _t(self, tid, files=None, repo="/r", status="pending", **kw):
+        return {"id": tid, "repo": repo, "status": status,
+                **({"files": files} if files is not None else {}), **kw}
+
+    def test_an_overlapping_same_repo_ready_pair_is_named_with_its_files(self):
+        self.assertEqual(
+            self._conflicts([self._t("T1", ["src/a.py", "src/b.py"]),
+                             self._t("T2", ["src/b.py", "src/c.py"])]),
+            [{"tasks": ["T1", "T2"], "repo": "/r", "files": ["src/b.py"]}])
+
+    def test_different_repos_never_conflict(self):
+        # separate checkouts, separate merges — there is nothing to stagger
+        self.assertEqual(
+            self._conflicts([self._t("T1", ["src/a.py"], repo="/one"),
+                             self._t("T2", ["src/a.py"], repo="/two")]), [])
+
+    def test_disjoint_manifests_do_not_conflict(self):
+        self.assertEqual(
+            self._conflicts([self._t("T1", ["src/a.py"]),
+                             self._t("T2", ["src/b.py"])]), [])
+
+    def test_an_absent_or_empty_manifest_conflicts_with_nothing(self):
+        """Absent evidence is not evidence of overlap: every legacy plan and
+        every quick-mode seed carries no manifest, and flagging those as
+        conflicts would make the advisory noise the loop learns to ignore."""
+        self.assertEqual(
+            self._conflicts([self._t("T1"), self._t("T2")]), [])
+        self.assertEqual(
+            self._conflicts([self._t("T1", []), self._t("T2", [])]), [])
+        self.assertEqual(
+            self._conflicts([self._t("T1", ["src/a.py"]), self._t("T2", [])]),
+            [])
+
+    def test_only_READY_tasks_are_paired(self):
+        """A task in flight was dispatched before this one existed as a
+        choice, and a blocked task cannot be co-dispatched at all — pairing
+        either would report a decision nobody is about to make."""
+        overlap = ["src/a.py"]
+        self.assertEqual(
+            self._conflicts([self._t("T1", overlap, status="in-progress"),
+                             self._t("T2", overlap)]), [])
+        self.assertEqual(
+            self._conflicts([self._t("T1", overlap, status="done"),
+                             self._t("T2", overlap)]), [])
+        self.assertEqual(
+            self._conflicts([self._t("T1", overlap),
+                             self._t("T2", overlap, depends_on=["T1"])]), [])
+
+    def test_spelling_variants_of_one_path_still_overlap(self):
+        # plan-register stores one normal form, but a migrated/hand-edited
+        # state can carry either spelling — the advisory must not miss it
+        self.assertEqual(
+            self._conflicts([self._t("T1", ["./src/a.py"]),
+                             self._t("T2", ["src\\a.py"])])[0]["files"],
+            ["src/a.py"])
+
+    def test_the_real_verb_reports_it_end_to_end(self):
+        self.init()
+        run, _ = self.at_develop(
+            item="W-94", date="2026-05-05",
+            tasks=({"id": "T1", "files": ["src/shared.py", "src/one.py"]},
+                   {"id": "T2", "files": ["src/shared.py"]},
+                   {"id": "T3", "files": ["src/three.py"]}))
+        out = self.cli("ready-tasks", run=run)
+        self.assertEqual(sorted(out["ready"]), ["T1", "T2", "T3"])
+        self.assertEqual(out["conflicts"],
+                         [{"tasks": ["T1", "T2"], "repo": str(self.repo),
+                           "files": ["src/shared.py"]}])
+
+
+class PipelinedDevelop(DagDispatchHarness):
+    """The dispatch loop as develop.md now prescribes it, end to end: T1 and
+    T2 go out TOGETHER, T2's developer is still in flight (a real
+    `spawn-pending`, written by the real PostToolUse hook) while T1's review
+    completes through the stub -> stop capture pair, and T3 dispatches the
+    moment T1 reaches done. The old lane policy — one task at a time within
+    a repo — could not produce this shape at all."""
+
+    def developer_spawn_stub(self, run, task_id, agent_id=None):
+        """PostToolUse on a backgrounded developer spawn: the launch stub
+        only. Leaves an OPEN `spawn-pending` — this task's lane really is in
+        flight, which is the state the whole test turns on."""
+        agent_id = agent_id or f"dev-{task_id}"
+        self.hook("post-spawn", {
+            "tool_name": "Agent",
+            "tool_input": {"subagent_type": "ai-sdlc-developer",
+                           "prompt": f"harness-mode: develop\n"
+                                     f"harness-task: {task_id}\n"
+                                     f"harness-run: {run}\nimplement it"},
+            "tool_response": {"isAsync": True, "status": "async_launched",
+                              "agentId": agent_id,
+                              "outputFile": f"/tmp/{agent_id}.json"}})
+        return agent_id
+
+    def developer_reports(self, run, task_id, agent_id):
+        """…and its completion notification: SubagentStop with a real status
+        block, which is what closes the pending."""
+        transcript = self.workspace / f"{agent_id}.jsonl"
+        transcript.write_text("\n".join(json.dumps(line) for line in [
+            {"type": "user", "message": {"content": [
+                {"type": "text", "text": f"harness-mode: develop\n"
+                                         f"harness-task: {task_id}\n"
+                                         f"harness-run: {run}"}]}},
+            {"type": "assistant", "message": {
+                "model": "claude-opus-4-8",
+                "usage": {"input_tokens": 9, "output_tokens": 3},
+                "content": [{"type": "text",
+                             "text": f"harness-status: SUCCESS\n"
+                                     f"harness-task: {task_id}\n"
+                                     f"outcome: implemented"}]}}]))
+        self.hook("subagent-stop", {"agent_type": "ai-sdlc-developer",
+                                    "agent_id": agent_id,
+                                    "agent_transcript_path": str(transcript)})
+
+    def open_pendings(self, run):
+        events = ndjson.read_records(run / "events.ndjson")
+        closed = {e.get("agent_id") for e in events
+                  if e.get("kind") in ("spawn-captured", "spawn-abandoned")}
+        return [(e.get("task"), e.get("mode")) for e in events
+                if e.get("kind") == "spawn-pending"
+                and e.get("agent_id") not in closed]
+
+    def finish_task(self, run, task_id, branch, start=True):
+        """One lane's recipe steps 1-7, exactly as develop.md orders them —
+        publish-mirror included. It is part of step 7 and it now takes the
+        run lock, so leaving it out of the pipelined walk meant the walk
+        never exercised the real recipe (adversarial review, round 4): the
+        one verb that copies-and-prunes the live run into the repo, between
+        two lanes' merges, was the one verb this test skipped."""
+        wt = self.cli("worktree-add", "--repo", str(self.repo), "--task-id",
+                      task_id, "--base", branch, run=run)
+        self.tdd_task(run, task_id, Path(wt["path"]), start=start,
+                      stem=task_id.lower(),
+                      review=self.review_via_background_spawn)
+        gitops.run_git(self.repo, "checkout", branch)
+        self.cli("merge-task", "--repo", str(self.repo), "--task-id", task_id,
+                 "--task-branch", wt["branch"], "--summary", f"{task_id} work",
+                 run=run)
+        self.cli("task", "--id", task_id, "--to", "done", run=run)
+        self.cli("worktree-remove", "--repo", str(self.repo), "--task-id",
+                 task_id, run=run)
+        self.cli("publish-mirror", "--repo", str(self.repo), run=run)
+
+    def test_two_lanes_run_concurrently_and_the_third_waits_on_its_dep(self):
+        self.init()
+        run, branch = self.at_develop(item="W-91", date="2026-05-02")
+        self.assertEqual(self.picture(run)["ready"], ["T1", "T2"])
+
+        # ---- dispatch BOTH ready tasks, T2's developer left in flight ----
+        for task_id in ("T1", "T2"):
+            self.cli("task", "--id", task_id, "--to", "in-progress", run=run)
+        t2_agent = self.developer_spawn_stub(run, "T2")
+        self.assertIn(("T2", "develop"), self.open_pendings(run))
+        # cross-task parallelism is legal WHILE that pending is open — the
+        # one-live-spawn rule is keyed on (task, mode), which is what makes
+        # dispatching the whole ready set possible in the first place
+        self.hook("spawn", {"tool_name": "Agent", "tool_input": {
+            "subagent_type": "ai-sdlc-developer",
+            "prompt": f"harness-mode: develop\nharness-task: T1\n"
+                      f"harness-run: {run}\ngo",
+            "run_in_background": False}})
+        self.assertEqual(
+            self.picture(run),
+            {"ready": [], "terminal": [],
+             "in_flight": [{"id": "T1", "status": "in-progress"},
+                           {"id": "T2", "status": "in-progress"}],
+             "blocked": [{"id": "T3", "waiting_on": ["T1"]}]})
+
+        # ---- T1's whole lane completes while T2 is still running ----------
+        wt1 = self.cli("worktree-add", "--repo", str(self.repo), "--task-id",
+                       "T1", "--base", branch, run=run)
+        self.tdd_task(run, "T1", Path(wt1["path"]), start=False, stem="t1",
+                      review=self.review_via_background_spawn)
+        gitops.run_git(self.repo, "checkout", branch)
+        self.cli("merge-task", "--repo", str(self.repo), "--task-id", "T1",
+                 "--task-branch", wt1["branch"], "--summary", "T1 work",
+                 run=run)
+        self.cli("task", "--id", "T1", "--to", "done", run=run)
+        self.cli("worktree-remove", "--repo", str(self.repo), "--task-id",
+                 "T1", run=run)
+        self.assertIn(("T2", "develop"), self.open_pendings(run),
+                      "T2's lane must still be in flight — that is the point")
+
+        # T1 done is what unblocks T3: the loop re-asks and dispatches it
+        picture = self.picture(run)
+        self.assertEqual((picture["ready"], picture["terminal"]),
+                         (["T3"], ["T1"]))
+        self.assertEqual(picture["in_flight"],
+                         [{"id": "T2", "status": "in-progress"}])
+
+        # ---- the sync point holds the exit until every lane lands --------
+        out = self.cli("cursor", "--to", "approve-impl", run=run, expect=1)
+        self.assertIn("T2 is in-progress", out["error"])
+        self.assertIn("T3 is pending", out["error"])
+
+        self.developer_reports(run, "T2", t2_agent)     # T2 finally reports
+        self.assertEqual(self.open_pendings(run), [])
+        self.finish_task(run, "T2", branch, start=False)   # dispatched earlier
+        self.finish_task(run, "T3", branch)
+        self.assertEqual(self.picture(run),
+                         {"ready": [], "in_flight": [], "blocked": [],
+                          "terminal": ["T1", "T2", "T3"]})
+
+        # ---- and the run walks out of develop and to the end -------------
+        state = self.cli("show", run=run)["state"]
+        shas = {t["id"]: t["commit_sha"] for t in state["tasks"]}
+        self.assertEqual(len(set(shas.values())), 3, shas)
+        self.cli("artifact", "--name", "task-commits", "--value",
+                 "; ".join(f"{k}: {v}" for k, v in sorted(shas.items())),
+                 run=run)
+        self.cli("cursor", "--to", "approve-impl", run=run)
+        self.gate(run, "approve-impl")
+        self.cli("cursor", "--to", "harden", run=run)
+        self.cli("cursor", "--to", "security", run=run)
+        self.cli("security-scan", run=run)
+        self.cli("cursor", "--to", "pre-pr", run=run)
+        self.cli("reconcile-contracts", run=run)
+        (run / "reports").mkdir(exist_ok=True)
+        (run / "reports" / "pre-pr.md").write_text("# Pre-PR\nfine\n")
+        self.cli("cursor", "--to", "approve-pre-pr", run=run)
+        self.gate(run, "approve-pre-pr")
+        self.cli("cursor", "--to", "create-pr", run=run)
+        self.cli("create-pr", "--repo", str(self.repo), run=run)
+        self.cli("cursor", "--to", "reconcile", run=run)
+        self.cli("reconcile", run=run)
+        final = self.cli("show", run=run)["state"]
+        self.assertEqual({t["status"] for t in final["tasks"]}, {"archived"})
+        self.cli("verify", run=run)          # the chain survived all of it
+
+    def test_merge_task_refuses_a_checkout_a_sibling_lane_moved(self):
+        """The CLI half of the merge preconditions: with lanes pipelined,
+        the shared checkout can be on the wrong branch (or carry a sibling's
+        half-finished work) at the moment a lane reaches its merge — and the
+        refusal has to name which, through the JSON error contract."""
+        self.init()
+        run, branch = self.at_develop(item="W-92", date="2026-05-03",
+                                      tasks=({"id": "T1"},))
+        wt = self.cli("worktree-add", "--repo", str(self.repo), "--task-id",
+                      "T1", "--base", branch, run=run)
+        self.tdd_task(run, "T1", Path(wt["path"]),
+                      review=self.review_via_background_spawn)
+        # still on the base branch — the classic stray-checkout state
+        gitops.run_git(self.repo, "checkout", "main")
+        out = self.cli("merge-task", "--repo", str(self.repo), "--task-id",
+                       "T1", "--task-branch", wt["branch"], "--summary", "x",
+                       run=run, expect=1)
+        self.assertIn("MergePreconditionError", out["error"])
+        self.assertIn(branch, out["error"])
+
+        gitops.run_git(self.repo, "checkout", branch)
+        (self.repo / "README.md").write_text("a sibling lane, mid-merge\n")
+        out = self.cli("merge-task", "--repo", str(self.repo), "--task-id",
+                       "T1", "--task-branch", wt["branch"], "--summary", "x",
+                       run=run, expect=1)
+        self.assertIn("uncommitted change", out["error"])
+        self.assertIsNone(self.cli("show", run=run)["state"]["tasks"][0]
+                          ["commit_sha"], "a refused merge records nothing")
+
+        gitops.run_git(self.repo, "checkout", "--", "README.md")
+        self.cli("merge-task", "--repo", str(self.repo), "--task-id", "T1",
+                 "--task-branch", wt["branch"], "--summary", "x", run=run)
+
+    def test_a_repo_with_no_recorded_feature_branch_is_refused_not_guessed(self):
+        # merge-task learns the target branch from the run's own `branches`
+        # artifact; an unregistered/unpreflighted repo has none, and guessing
+        # "whatever is checked out" is the hole the expectation closes
+        repo_b = make_repo(self.workspace, name="repo-b")
+        self.init(extra_repos=f"repo-b={repo_b}")
+        run, _ = self.at_develop(item="W-93", date="2026-05-04",
+                                 tasks=({"id": "T1"},))
+        out = self.cli("merge-task", "--repo", str(repo_b), "--task-id", "T1",
+                       "--task-branch", "task/T1", "--summary", "x",
+                       run=run, expect=1)
+        self.assertIn("no feature branch recorded for repo 'repo-b'",
+                      out["error"])
+
+    def test_the_autosquash_form_refuses_the_unrecorded_repo_too(self):
+        """Only the squash form was pinned, so a mutation letting the
+        AUTOSQUASH form guess (`main`, or whatever HEAD happens to be)
+        survived the suite — and that form has strictly more to lose: it
+        rewrites every commit from `--base` to HEAD rather than adding one.
+        The refusal names preflight, the verb that cuts and records the
+        branch, and the repo's history is untouched."""
+        repo_b = make_repo(self.workspace, name="repo-b")
+        self.init(extra_repos=f"repo-b={repo_b}")
+        run, _ = self.at_develop(item="W-94", date="2026-05-05",
+                                 tasks=({"id": "T1"},))
+        # a real fold to lose: one task commit plus its `fixup!`, so a guessed
+        # branch would visibly rewrite this history instead of no-op'ing
+        base = gitops.run_git(repo_b, "rev-parse", "HEAD")
+        (repo_b / "a.txt").write_text("v1\n")
+        gitops.run_git(repo_b, "add", "-A")
+        gitops.run_git(repo_b, "commit", "-m", "fix: #W-94 work")
+        work = gitops.run_git(repo_b, "rev-parse", "HEAD")
+        (repo_b / "a.txt").write_text("v2 fixed\n")
+        gitops.commit_fixup(repo_b, work)
+        before = gitops.run_git(repo_b, "rev-parse", "HEAD")
+        out = self.cli("merge-task", "--repo", str(repo_b), "--autosquash",
+                       "--base", base, run=run, expect=1)
+        self.assertIn("no feature branch recorded for repo 'repo-b'",
+                      out["error"])
+        self.assertIn("preflight", out["error"])
+        self.assertEqual(gitops.run_git(repo_b, "rev-parse", "HEAD"), before,
+                         "a refused autosquash rewrote history anyway")
 
 
 class ShowTypoRun(BreadthHarness):
@@ -2295,6 +2795,41 @@ class PlanRegisterValidation(BreadthHarness):
         out = self._register([{"id": "T 1"}], expect=1)
         self.assertIn("not usable", out["error"])
 
+    def test_a_string_depends_on_is_refused_naming_the_type(self):
+        """Survivor M3. `list("T1")` is `['T', '1']`, so a bare string
+        registered as a dependency on 'T' and on '1' — the dangling check
+        then failed naming ids nobody typed, and for a single-character id it
+        passed and wedged the task with an unsatisfiable edge."""
+        out = self._register([{"id": "T1", "repo": str(self.repo)},
+                              {"id": "T2", "repo": str(self.repo),
+                               "depends_on": "T1"}], expect=1)
+        self.assertIn("must be a LIST", out["error"])
+        self.assertIn("(got str)", out["error"])  # what was actually given
+        # the OLD failure mode was a dangling-id refusal listing the
+        # characters — the shape error must arrive before that check runs
+        self.assertNotIn("unknown task", out["error"])
+
+    def test_a_non_string_entry_is_refused_inside_the_json_contract(self):
+        out = self._register([{"id": "T1", "repo": str(self.repo)},
+                              {"id": "T2", "repo": str(self.repo),
+                               "depends_on": [7]}], expect=1)
+        self.assertIn("non-empty task id strings", out["error"])
+        self.assertIn("int", out["error"])
+        self.assertTrue(out["error"].startswith("StateError"), out["error"])
+
+    def test_a_mapping_depends_on_is_refused_not_a_traceback(self):
+        out = self._register([{"id": "T1", "repo": str(self.repo),
+                               "depends_on": {"after": "T0"}}], expect=1)
+        self.assertIn("must be a LIST", out["error"])
+        self.assertIn("dict", out["error"])
+
+    def test_a_null_depends_on_means_no_dependencies(self):
+        # absent and null are the same statement; only a WRONG shape refuses
+        self._register([{"id": "T1", "repo": str(self.repo),
+                         "depends_on": None}])
+        st = state_mod.load(self.run_dir, self.workspace)
+        self.assertEqual(st["tasks"][0]["depends_on"], [])
+
     def test_valid_dag_registers(self):
         self._register([{"id": "T1", "repo": str(self.repo)},
                         {"id": "T2", "repo": str(self.repo),
@@ -3034,6 +3569,12 @@ class AutosquashMultiRepo(BreadthHarness):
             {**st["tasks"][0], "id": "T2", "repo": str(repo_b),
              "commit_sha": sha_b},
         ]
+        # Test-only stand-in for preflight: BOTH merge-task forms now read
+        # the run's recorded feature branch (round 4 — the autosquash form
+        # used to return before this lookup and inherited none of the
+        # wrong-branch protection).
+        st["artifacts"]["branches"] = {"repo": {"branch": "feature",
+                                                "base": "main"}}
         state_mod.save(run, self.workspace, st)
         # pre-fix this crashed resolving T2's (repo-b) SHA inside self.repo
         self.cli("merge-task", "--repo", str(self.repo), "--autosquash",

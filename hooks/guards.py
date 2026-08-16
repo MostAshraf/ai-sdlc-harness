@@ -77,6 +77,21 @@ def load_yaml(path: Path):
     with path.open(encoding="utf-8") as fh:
         return yaml.safe_load(fh)
 
+
+_TERMINAL_CACHE: tuple = ()
+
+
+def _terminal_statuses() -> tuple:
+    """The task FSM's declared terminal statuses — the SAME `terminal:` list
+    `harness.transitions.terminal_statuses` reads, not a second copy. A guard
+    that disagreed with the engine about what "finished" means would refuse a
+    spawn the engine considers legal, or wave one through that it doesn't."""
+    global _TERMINAL_CACHE
+    if not _TERMINAL_CACHE:
+        fsm = load_yaml(PLUGIN_ROOT / "pipeline" / "task-fsm.yaml") or {}
+        _TERMINAL_CACHE = tuple(fsm.get("terminal") or ())
+    return _TERMINAL_CACHE
+
 # A single "word" a flag's value can take — a whole quoted string (its
 # space(s) included) counts as ONE token, not just up to the first
 # whitespace (adversarial-review round 3 finding: plain `\S+` matched only
@@ -493,6 +508,19 @@ SUBAGENT_REGISTER_RE = re.compile(
 # from treating the quoted example as the real header.
 MODE_HEADER_RE = re.compile(r"^harness-mode:\s*(?!<)(\S+)", re.MULTILINE)
 TASK_HEADER_RE = re.compile(r"^harness-task:\s*(?!<)(\S+)", re.MULTILINE)
+# The OTHER side of that `(?!<)`: a `harness-task:` line whose value IS a
+# placeholder. Capture-side semantics are unchanged (an unsubstituted
+# placeholder must still parse as "no task", or a pending would be filed
+# under the literal string `<task-id>`); this pattern exists only so
+# `guard_spawn` can BLOCK a prompt that carries nothing but the placeholder.
+# It is not hypothetical: skills/dev-workflow/steps/develop.md and
+# agents/developer.md both print `harness-task: <task-id>` verbatim as the
+# header block to send, so copying that block without substituting produces
+# a spawn the whole downstream chain treats as task-LESS — no id validation,
+# no (task, mode) serialization, and a verdict captured against None that
+# `task --to done` can never read.
+TASK_PLACEHOLDER_RE = re.compile(r"^harness-task:[ \t]*(<[^\n]*)",
+                                 re.MULTILINE)
 # `harness-run`'s value is a filesystem PATH, which CAN contain spaces
 # (field report: a workspace under `.../AI Engine/...` truncated at the
 # first space with a `\S+` capture, so the resolved run never matched any
@@ -1677,6 +1705,33 @@ def _live_spawn_for(run: Path, task: str | None, mode: str) -> dict | None:
                  and e.get("agent_id") not in closed), None)
 
 
+def leading_header_block(prompt: str) -> str:
+    """The prompt's LEADING run of `harness-*:` lines — where SKILL.md puts
+    the orchestrator's own headers, and the only region where an
+    angle-bracket value can be an unsubstituted placeholder rather than a
+    quoted example.
+
+    This scoping is what keeps the placeholder refusal below from firing on
+    the NORMAL shape: shared/status-block.md's reply template carries a
+    literal `harness-task: <task-id or ->` line, prompts quote it verbatim as
+    instructions to the subagent, and a TASK-LESS spawn (plan-review, pre-pr)
+    quoting it has no real task header to be distinguished by. The template
+    always sits below prose, never in the opening header run.
+
+    Fails OPEN by construction — a prompt that opens with a sentence has an
+    empty leading block, so the new refusal can only ever under-fire."""
+    lines: list[str] = []
+    for line in prompt.splitlines():
+        if not line.strip():
+            if lines:
+                break          # a blank line ends the block; leading ones skip
+            continue
+        if not line.startswith("harness-"):
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def guard_spawn(p: dict) -> None:
     surfaces = load_yaml(PLUGIN_ROOT / "pipeline" / "surfaces.yaml")
     manifest = load_yaml(PLUGIN_ROOT / "pipeline" / "manifest.yaml")
@@ -1812,6 +1867,135 @@ def guard_spawn(p: dict) -> None:
                 step_would_match = True  # legal step, but unattributable
                 continue
             if run.resolve() == header_run:
+                # THE TASK HEADER MUST NAME A REGISTERED TASK. Nothing
+                # validated it anywhere before — not here, not at capture —
+                # so a typo'd `harness-task: T2x` sailed through, and every
+                # downstream consumer keyed off the typo: the capture hook
+                # wrote a `spawn-pending` under it, `guard_spawn` (below)
+                # then refused the CORRECTLY-spelled re-spawn's sibling key,
+                # and `harness stall` refused to count it ("unknown task"),
+                # leaving a run DEGRADED with no verb able to move it. Round
+                # 2's G4 made that wedge RECOVERABLE (the
+                # `--confirm-no-verdict` override retires the pending before
+                # the counter can raise); this closes it at the source for
+                # every RUN-LEGALIZED spawn, where the cost is one clear
+                # refusal instead of a recovery procedure. NOT at every
+                # source: an `always_legal_spawns` pair returned far above,
+                # before any run was resolved (measured), so a cross-cutting
+                # request-triage carrying a bad task header still passes —
+                # correctly, since it answers no run-owned question and
+                # nothing keys off its header. Pipelined dispatch is what
+                # makes closing the run-legalized door worth it: with several
+                # tasks in flight, hand-typed ids multiply and a wrong one is
+                # no longer obvious from context.
+                #
+                # A TASK-LESS spawn stays legal and unchecked (plan-review,
+                # pre-pr, repo-map): absent is a declared shape here, and
+                # both this guard and the capture hook parse the same absent
+                # header into the same None.
+                known = [t.get("id") for t in (st.get("tasks") or [])]
+                if task is None:
+                    # UNSUBSTITUTED PLACEHOLDER — `harness-task: <task-id>`,
+                    # exactly as develop.md and agents/developer.md print the
+                    # header block. TASK_HEADER_RE's `(?!<)` makes it parse
+                    # as absent, so without this the spawn ran as a
+                    # deliberately task-less one: no id check, no (task,
+                    # mode) serialization, and a reviewer verdict filed under
+                    # None that no `task --to done` can ever read.
+                    #
+                    # Two things keep it off the NORMAL shape: it fires only
+                    # when no real header accompanies it, and it looks only
+                    # in the LEADING header block (see
+                    # `leading_header_block`). Prompts routinely quote
+                    # shared/status-block.md's reply template —
+                    # `harness-task: <task-id or ->` — as instructions to the
+                    # subagent, and a task-LESS spawn quoting it has no real
+                    # header to be told apart by; the template always sits
+                    # below prose, never in the opening header run.
+                    ph = TASK_PLACEHOLDER_RE.search(
+                        leading_header_block(prompt))
+                    if ph:
+                        block(
+                            f"spawn's `harness-task:` header is still the "
+                            f"literal placeholder ({ph.group(1).strip()}) — "
+                            "substitute the real task id. It is copied "
+                            "verbatim from the header block in develop.md / "
+                            "agents/developer.md, and left unsubstituted it "
+                            "reads as a TASK-LESS spawn: the id is never "
+                            "validated, two dispatches of the same task stop "
+                            "serializing, and this agent's verdict is "
+                            "captured under no task at all, where `task --to "
+                            "done` will never find it. This run's registered "
+                            f"task ids are: "
+                            f"{', '.join(str(k) for k in known) or 'none'}. A "
+                            "genuinely task-less spawn omits the header line "
+                            "entirely.", cwd, p)
+                if task is not None:
+                    if task not in known:
+                        block(
+                            f"spawn carries `harness-task: {task}`, which is "
+                            "not a task in this run — registered task ids "
+                            f"are: {', '.join(str(k) for k in known) or 'none'}"
+                            ". Everything downstream keys off this header "
+                            "(the spawn-pending, the token ledger, the "
+                            "reviewer verdict `task --to done` reads), so a "
+                            "typo here does not fail loudly later — it files "
+                            "a real agent's work under an id no verb can "
+                            "reach. Fix the header and re-spawn; a task-less "
+                            "spawn omits it entirely.", cwd, p)
+                    # …AND IT MUST STILL BE LIVE, for the modes that consume
+                    # a task (develop, review). Dispatching a finished task
+                    # is a real orchestrator slip under pipelined dispatch —
+                    # the loop re-reads `ready-tasks` after every completion
+                    # and a stale id from the previous round is one line
+                    # away — and it fails LATE and confusingly: the developer
+                    # does real work, then `task --to in-review` is refused
+                    # because there is no such transition from `done`.
+                    #
+                    # Scoped to those two modes deliberately: `harden` and
+                    # `fixup` run at steps the develop sync point already
+                    # required every task to be TERMINAL for, so blocking a
+                    # terminal task there would block their only legal shape.
+                    # And this refuses nothing else that is legal either —
+                    # the FSM's one way back out of a terminal status is the
+                    # hotfix re-entry edge (`archived -> in-progress`, and
+                    # `done -> archived` before it), which transitions FIRST
+                    # and then dispatches, so a legitimate re-entry is
+                    # already non-terminal by the time it spawns.
+                    #
+                    # …but mode-scoping alone was NOT enough (re-verification,
+                    # executed): `review` is in the HARDEN step's spawn-set
+                    # too (manifest.yaml:279), and harden sits PAST the sync
+                    # point — every task is required terminal there, so a
+                    # harden-step review spawn can only ever name a terminal
+                    # task, and it was refused with advice that dead-ends
+                    # ("re-read `harness ready-tasks` and spawn for an id it
+                    # lists as ready" — there are none, and never will be).
+                    # So the block keys on the same fact its own rationale
+                    # rests on: a terminal id is suspicious only while
+                    # SIBLINGS ARE STILL LIVE, which is exactly the pipelined
+                    # develop loop the stale-id slip happens in. Once every
+                    # registered task is terminal (harden and later), naming
+                    # one is the normal shape, not a slip.
+                    terminal = _terminal_statuses()
+                    registered = st.get("tasks") or []
+                    all_terminal = all(t.get("status") in terminal
+                                       for t in registered)
+                    if mode in ("develop", "review") and not all_terminal:
+                        status = next((t.get("status") for t in registered
+                                       if t.get("id") == task), None)
+                        if status in terminal:
+                            block(
+                                f"spawn carries `harness-task: {task}`, which "
+                                f"is already {status} in this run — a "
+                                f"terminal task has no '{mode}' work left. "
+                                "Dispatching it produces real work the FSM "
+                                "then refuses to record (there is no "
+                                f"transition out of {status} except the "
+                                "hotfix re-entry, which transitions the task "
+                                "back to in-progress FIRST). Re-read "
+                                "`harness ready-tasks` and spawn for an id it "
+                                "lists as ready.", cwd, p)
                 # ONE LIVE SPAWN PER (task, mode). The failure this closes
                 # was executed in round 1's review: round N's background
                 # reviewer was still running when round N+1's was spawned,

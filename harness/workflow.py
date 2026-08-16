@@ -18,7 +18,7 @@ import yaml
 
 from . import gitops, ndjson, state as state_mod
 from .state import safe_id
-from .transitions import set_artifact
+from .transitions import depends_on, set_artifact, terminal_statuses
 
 # The ONE definition of which event kinds a human should be shown — read by
 # both `status` (count) and `metrics_report` (table). These used to be two
@@ -338,6 +338,111 @@ def stall_count(st: dict) -> int:
     must still degrade the run."""
     return (sum(t.get("stalls", 0) for t in st.get("tasks", []))
             + sum((st.get("step_stalls") or {}).values()))
+
+
+def dispatch_picture(st: dict) -> dict:
+    """`harness ready-tasks` — who can start RIGHT NOW, who is running, who is
+    waiting on whom. The engine's own answer to the question develop's
+    dispatch loop asks after every completion.
+
+    It exists because the alternative is the orchestrator deriving it from
+    `show`'s task list in prose, and both halves of that derivation are easy
+    to get subtly wrong in ways nothing catches until mid-develop:
+      - reading a dependency as satisfied when it is merely IN REVIEW (the
+        FSM then refuses `pending -> in-progress` with "not yet done", after
+        the worktree was already created for it), and
+      - re-dispatching a task that is already in flight (the spawn guard
+        refuses the second spawn on the (task, mode) key, and the loop stalls
+        holding a block it has no vocabulary for).
+    Same terminal vocabulary as `_guard_dependencies_done` and
+    `requires_tasks_terminal` — read from the FSM's own `terminal:`
+    declaration, by all three — because a picture that disagreed with the
+    guard would send the loop at a transition the engine then refuses.
+
+    A DANGLING dependency (an id no task carries) reads as unmet, never as an
+    error: `plan_register` refuses those at registration, so one can only
+    reach here through a hand-edited or migrated state — and a dispatch
+    verb's job then is to SHOW the wedge (`waiting_on` names the id nobody
+    provides), not to crash the loop that would have surfaced it. A
+    `depends_on` of the wrong SHAPE gets the same treatment for the same
+    reason — `transitions.depends_on` coerces it (a non-list to "no
+    dependencies", a non-string ENTRY dropped) rather than letting it raise,
+    since a legacy `depends_on: "T1"` string iterates per CHARACTER and a
+    nested list or stray int takes the set-and-sort below down outright.
+    Same coercion the `dependencies-done` guard applies, from the same
+    function: this promise is SHOW, not crash, and the guard's promise is to
+    agree with what was shown.
+
+    Any non-terminal status outside pending is reported as in-flight,
+    including a status this FSM does not declare: the fail-safe direction is
+    "visible but never dispatched", where treating an unknown as ready would
+    hand it to a `task --to in-progress` the FSM has no transition for.
+
+    `conflicts` is ADVISORY and nothing enforces it: pairs of READY tasks in
+    the SAME repo whose declared `files` manifests overlap. Co-dispatched,
+    each cuts its worktree from the feature branch as it stands, so the
+    second one's tree does not contain the first one's merged code and the
+    overlapping file is edited twice from one starting point — the merge
+    conflicts, or worse, silently resolves in favour of whoever merged last.
+    Nothing here refuses it: the plan's `depends_on` remains the ONLY
+    ordering authority (an advisory that quietly became a guard would
+    serialize work the DAG deliberately parallelized), and develop.md says
+    what to do — dispatch a conflicting pair's members one at a time,
+    re-cutting the second worktree after the first merge lands. Tasks in
+    DIFFERENT repos never conflict (separate checkouts, separate merges), and
+    a task with no `files` manifest — or an empty one — conflicts with
+    nothing: absent evidence is not evidence of overlap, and saying otherwise
+    would flag every legacy plan as a conflict."""
+    tasks = st.get("tasks") or []
+    terminal = terminal_statuses()
+    status_by_id = {t.get("id"): t.get("status") for t in tasks}
+    picture: dict = {"ready": [], "in_flight": [], "blocked": [],
+                     "terminal": [], "conflicts": []}
+    for t in tasks:
+        tid, status = t.get("id"), t.get("status")
+        if status in terminal:
+            picture["terminal"].append(tid)
+            continue
+        if status != "pending":
+            picture["in_flight"].append({"id": tid, "status": status})
+            continue
+        unmet = sorted({d for d in depends_on(t)
+                        if status_by_id.get(d) not in terminal})
+        if unmet:
+            picture["blocked"].append({"id": tid, "waiting_on": unmet})
+        else:
+            picture["ready"].append(tid)
+    by_id = {t.get("id"): t for t in tasks}
+    ready = picture["ready"]
+    for i, a_id in enumerate(ready):
+        a = by_id.get(a_id) or {}
+        a_files = _file_manifest(a)
+        if not a_files:
+            continue
+        for b_id in ready[i + 1:]:
+            b = by_id.get(b_id) or {}
+            if (b.get("repo") or ".") != (a.get("repo") or "."):
+                continue
+            shared = sorted(a_files & _file_manifest(b))
+            if shared:
+                picture["conflicts"].append(
+                    {"tasks": [a_id, b_id], "repo": a.get("repo") or ".",
+                     "files": shared})
+    return picture
+
+
+def _file_manifest(task: dict) -> set[str]:
+    """The task's declared file-touch manifest in ONE normal form —
+    `plan_register` already stores it normalized, so this only re-normalizes
+    for states that predate that (or were hand-edited). Non-list and
+    non-string values are dropped rather than iterated, for the same reason
+    `transitions.depends_on` coerces: a read-only picture shows a broken
+    plan, it does not split a stray string into per-character 'paths'."""
+    raw = task.get("files")
+    if not isinstance(raw, list):
+        return set()
+    return {posixpath.normpath(f.strip().replace("\\", "/"))
+            for f in raw if isinstance(f, str) and f.strip()}
 
 
 def run_health(events: list[dict], stalls: int = 0) -> tuple[str, dict[str, int]]:
@@ -1034,6 +1139,32 @@ def plan_register(workspace: Path, run: Path, manifest: dict,
         # Enforcement of the declared order lives in the task FSM's
         # `dependencies-done` guard; registration just refuses bad shapes.
         id_set = set(ids)
+        # SHAPE BEFORE CONTENT (adversarial-review finding, round 4): the
+        # dangling/cycle checks below build `list(t["depends_on"] or [])`,
+        # and a bare STRING survives that call by being iterated CHARACTER BY
+        # CHARACTER — `"T1"` registered as depends_on ['T', '1'], which then
+        # failed the dangling check naming ids nobody typed, or (for a
+        # single-char id) passed and wedged the task forever. A mapping was
+        # read as its KEYS, just as quietly; an unhashable entry (a nested
+        # list) raised a bare TypeError out of `set()`. `None` is the absent
+        # case and means "no dependencies", the same as an omitted key.
+        for t in tasks:
+            dep = t.get("depends_on")
+            if dep is None:
+                continue
+            if not isinstance(dep, list):
+                raise state_mod.StateError(
+                    f"plan-register: task {t['id']}: depends_on must be a "
+                    f"LIST of task ids (got {type(dep).__name__}) — a bare "
+                    "string is read one CHARACTER at a time, so 'T1' "
+                    "registers as a dependency on 'T' and on '1'")
+            bad = [d for d in dep
+                   if not isinstance(d, str) or not d.strip()]
+            if bad:
+                raise state_mod.StateError(
+                    f"plan-register: task {t['id']}: depends_on entries must "
+                    f"be non-empty task id strings ({bad[0]!r} is "
+                    f"{type(bad[0]).__name__})")
         deps = {t["id"]: list(t.get("depends_on") or []) for t in tasks}
         for tid, dlist in deps.items():
             dangling = sorted(set(dlist) - id_set)
@@ -1247,7 +1378,11 @@ def plan_register(workspace: Path, run: Path, manifest: dict,
                     "reason that isn't true)")
         st["tasks"] = [
             {"id": t["id"], "repo": t.get("repo", "."), "status": "pending",
-             "depends_on": t.get("depends_on", []), "risk": t.get("risk", "low"),
+             # `or []`, not a `.get` default: an explicit `depends_on: null`
+             # is the same statement as an omitted key, and storing the None
+             # verbatim handed every consumer a third shape to handle
+             "depends_on": t.get("depends_on") or [],
+             "risk": t.get("risk", "low"),
              "test_intents": t.get("test_intents", []),
              # the SAME normal form the policy judged — a stored
              # backslashed/`./` spelling would hand the first future
@@ -2183,7 +2318,7 @@ def complete_run(workspace: Path, run: Path, manifest: dict) -> dict:
                 f"('{seq[-1]}') — cursor is at '{current}'; walk the manifest "
                 "to the end first, or `harness abort` to end the run early")
         not_terminal = [t["id"] for t in st["tasks"]
-                        if t.get("status") not in ("done", "archived")]
+                        if t.get("status") not in terminal_statuses()]
         if not_terminal:
             raise TransitionError(
                 f"complete refused: task(s) {', '.join(not_terminal)} are not "
@@ -2680,7 +2815,7 @@ def env_check(workspace: Path, run: Path, config: dict,
                 f"unknown task '{task_id}' — check --task")
     else:
         scoped = [t for t in tasks
-                  if t.get("status") not in ("done", "archived")]
+                  if t.get("status") not in terminal_statuses()]
     declared = (config or {}).get("env_requirements") or {}
     if not isinstance(declared, dict):
         # `env_requirements` is not schema-validated (nor is `language.*`), so

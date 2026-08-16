@@ -9,6 +9,17 @@
 states: [pending, in-progress, in-review, done, archived]
 initial: pending
 
+# The TERMINAL vocabulary — which statuses count as "this task is finished".
+# Declared here because seven places in the engine ask the question and every
+# one of them used to answer it with its own hardcoded `("done", "archived")`
+# literal (adversarial-review finding): the dispatch picture, the develop sync
+# point's two halves, the `dependencies-done` guard, `complete`'s refusal, and
+# `env-check`'s scoping. Seven copies of a vocabulary is six chances for a
+# future state (`abandoned`, say) to be terminal to some of the engine and
+# live to the rest — a task the dispatcher calls finished while the sync point
+# still waits on it. Validated against `states` by harness/schema.py.
+terminal: [done, archived]
+
 transitions:
   # A task may start only once every task it depends_on is done/archived
   # (adversarial-review finding: depends_on was stored, validated nowhere,

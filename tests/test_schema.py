@@ -280,6 +280,35 @@ class ValidatorCatchesBrokenFsm(unittest.TestCase):
         broken["transitions"].append({"from": "pending", "to": "in-progress"})
         self.assertTrue(any("duplicate transition" in e for e in self._errors(broken)))
 
+    def test_a_missing_terminal_list_is_an_error(self):
+        """`terminal` is read by the engine (transitions.terminal_statuses),
+        so an absent one silently empties the set that seven "is this task
+        finished?" questions share — the develop sync point would never
+        release and no task would ever count as done."""
+        broken = copy.deepcopy(self.fsm)
+        del broken["terminal"]
+        self.assertTrue(any("`terminal`" in e for e in self._errors(broken)))
+
+    def test_an_empty_terminal_list_is_an_error_too(self):
+        broken = copy.deepcopy(self.fsm)
+        broken["terminal"] = []
+        self.assertTrue(any("`terminal`" in e for e in self._errors(broken)))
+
+    def test_a_terminal_entry_must_be_a_declared_state(self):
+        broken = copy.deepcopy(self.fsm)
+        broken["terminal"] = ["done", "finished"]     # typo for `archived`
+        self.assertTrue(any("terminal 'finished'" in e
+                            for e in self._errors(broken)))
+
+    def test_the_shipped_terminal_set_is_what_the_engine_reads(self):
+        """The declaration and the loader must not be two truths — a test
+        pinning only the literal would pass against a loader reading the
+        wrong key."""
+        from harness import transitions
+        self.assertEqual(list(transitions.terminal_statuses()),
+                         self.fsm["terminal"])
+        self.assertEqual(self.fsm["terminal"], ["done", "archived"])
+
 
 class ValidatorCatchesBrokenConfig(unittest.TestCase):
     def setUp(self):

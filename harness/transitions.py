@@ -17,6 +17,38 @@ from . import chain, ndjson
 
 FORWARD_DEFAULT = ("approved",)
 
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+_TERMINAL_CACHE: tuple[str, ...] | None = None
+
+
+def terminal_statuses() -> tuple[str, ...]:
+    """The declared terminal task statuses — `terminal:` in
+    pipeline/task-fsm.yaml, never a literal.
+
+    Seven references across six functions asked "is this task finished?" and
+    each answered with its own `("done", "archived")` (adversarial-review
+    finding): `dispatch_picture` twice (the partition and the unmet-dependency
+    scan), the develop sync point's legality half and its refusal half, the
+    `dependencies-done` guard, `complete`'s refusal, and `env-check`'s
+    scoping. The FSM is data everywhere else in this engine; this was the one
+    piece of its vocabulary that lived in code, in seven copies — so adding a
+    terminal status meant finding all seven, and missing one would make a
+    task finished to the dispatcher and still live to the sync point.
+
+    Cached per process (the file is shipped data, immutable for a run's
+    lifetime), which is what keeps it from being a hidden file read inside a
+    lock. It used to take an optional already-loaded `fsm` to bypass that
+    cache; every call site — the six in this engine plus the schema test —
+    passed none (grepped), so the parameter was only ever a second, untested
+    way to answer the question this function owns. Removed rather than
+    documented."""
+    global _TERMINAL_CACHE
+    if _TERMINAL_CACHE is None:
+        from .schema import load_yaml
+        loaded = load_yaml(PLUGIN_ROOT / "pipeline" / "task-fsm.yaml") or {}
+        _TERMINAL_CACHE = tuple(loaded.get("terminal") or ())
+    return _TERMINAL_CACHE
+
 
 class TransitionError(Exception):
     pass
@@ -235,7 +267,7 @@ def cursor_candidates(state: dict, manifest: dict, config: dict,
     # next in sequence (with conditional-gate skip + fail-closed sync point)
     seq_key = None
     tasks_ready = not cur_def.get("requires_tasks_terminal") or all(
-        t.get("status") in ("done", "archived") for t in state.get("tasks", [])
+        t.get("status") in terminal_statuses() for t in state.get("tasks", [])
     )
     # (requires_tasks_registered is handled by the early return above — it
     # gates every exit edge, not just this sequence one.)
@@ -326,6 +358,46 @@ def advance_cursor(state: dict, manifest: dict, config: dict, target: str,
                 "Propose one from the repo-map evidence, confirm it with the "
                 "user, then run `harness confirm-repo --repo <registered "
                 "path>`")
+        if cur_def.get("requires_tasks_terminal"):
+            terminal = terminal_statuses()
+            waiting = [(t.get("id"), t.get("status"))
+                       for t in state.get("tasks", [])
+                       if t.get("status") not in terminal]
+            # DECLARED LEGALITY FIRST (adversarial review, round 4): this
+            # refusal claims the sync point is what is holding the move —
+            # true only for a target the manifest would otherwise allow. A
+            # typo'd or unreachable target got it too, and was told to go
+            # finish its tasks for a move that would stay refused after they
+            # were all done. Probed by asking what the exits WOULD be with
+            # every task terminal; anything outside that set falls through to
+            # the generic "not declared legal" message, which names the real
+            # legal targets.
+            if waiting and terminal:
+                probe = {**state,
+                         "tasks": [{**t, "status": terminal[0]}
+                                   for t in state.get("tasks", [])]}
+                would_allow = target in cursor_candidates(
+                    probe, manifest, config, run=run)
+            else:
+                would_allow = False
+            if waiting and would_allow:
+                # Its own refusal, unlike before — this sync point used to
+                # fall through to the generic "not declared legal" message,
+                # which names the LEGAL targets (none) and says nothing about
+                # why. Its two siblings above have always named their cause;
+                # this one is the sole reason develop has no exits far more
+                # often than they are, and with DAG-pipelined dispatch the
+                # answer the orchestrator needs is specifically WHICH task is
+                # still moving — "legal: none (gate undecided?)" sent it
+                # looking for an undecided gate on a step that has no gate.
+                raise TransitionError(
+                    f"cursor move '{current}' -> '{target}' is blocked: "
+                    f"'{current}' cannot be left until every task is terminal "
+                    f"({'/'.join(terminal)}), and these are not — "
+                    + ", ".join(f"{tid} is {status}" for tid, status in waiting)
+                    + ". The declared sync point, not a gate: finish or "
+                    "archive those tasks (`harness ready-tasks` shows where "
+                    "each one is); it is never forced.")
         if cur_def.get("verdict_bound") and not candidates:
             raise TransitionError(
                 f"cursor move '{current}' -> '{target}' is blocked by "
@@ -542,15 +614,44 @@ def _guard_reviewer_approved(state: dict, task: dict, run: Path) -> None:
             "`task --to in-progress` (round-bounded), then re-review")
 
 
+def depends_on(task: dict) -> list[str]:
+    """A task's `depends_on` as a list of id STRINGS, whatever the stored
+    value is. Defensive on purpose: `plan_register` refuses every non-list
+    shape and every non-string entry at registration, so a bad one here came
+    from a hand edit or a pre-validation state.
+
+    ONE definition, and that IS the finding it closes (re-verification,
+    executed): its two readers — `workflow.dispatch_picture`, which shows the
+    orchestrator what is ready, and `_guard_dependencies_done` below, which
+    decides whether `task --to in-progress` is legal — must answer "what does
+    this task depend on?" identically. The guard used to iterate the raw
+    value, so a legacy `depends_on: "T1"` string made it refuse per CHARACTER
+    ('T' and '1', neither of which any task provides) while `ready-tasks`,
+    which coerced, reported the task READY: the exact reader-disagreement
+    `dispatch_picture` exists to prevent, arriving inside it. It lives HERE,
+    the lower layer, because `harness.workflow` imports the engine and never
+    the other way round.
+
+    Non-string ENTRIES are dropped rather than kept, which is what makes the
+    coercion total: a nested list is unhashable and a stray int is
+    unorderable against ids, so either one takes `ready-tasks`' set-and-sort
+    down with a TypeError instead of naming the wedge — and the read-only
+    surfaces promise to SHOW a broken plan, not to crash on it."""
+    raw = task.get("depends_on")
+    if not isinstance(raw, list):
+        return []
+    return [d for d in raw if isinstance(d, str)]
+
+
 def _guard_dependencies_done(state: dict, task: dict) -> None:
     """pending -> in-progress requires every depends_on task done/archived —
     the declared task DAG, enforced (it used to be stored and read by
     nothing). plan_register already refused dangling ids and cycles, so
     blocked here always means "not yet", never "never"."""
     by_id = {t["id"]: t for t in state["tasks"]}
-    waiting = sorted({d for d in (task.get("depends_on") or [])
-                      if by_id.get(d, {}).get("status")
-                      not in ("done", "archived")})
+    terminal = terminal_statuses()
+    waiting = sorted({d for d in depends_on(task)
+                      if by_id.get(d, {}).get("status") not in terminal})
     if waiting:
         raise TransitionError(
             f"task {task['id']}: depends_on {', '.join(waiting)} "

@@ -51,6 +51,86 @@ All notable changes to `ai-sdlc-harness` are documented here.
   stall key are spelled differently, and used to miss each other — so the
   plan-review synthesizer, the case the refusal was written for, could be
   running in the background and still be told to re-spawn.
+- **Tasks now run as the plan's dependency graph allows, not one at a
+  time.** `develop` dispatched tasks sequentially within a repo — a rule
+  that was never about the tasks: it stood in for the fact that every task
+  merges into one shared feature-branch checkout, and two merges landing at
+  once corrupted it silently. That contention is now handled where it lives.
+  `merge-task` holds the run's exclusive lock across the merge itself
+  (previously only the SHA write-back took it) and refuses before touching
+  the index when a git operation is unfinished in the checkout, when the
+  checkout is on the wrong branch, or when it carries someone else's
+  uncommitted work — the states that used to put a task's whole diff on the
+  base branch, or fold a sibling's half-finished work into this task's
+  integration commit. **Both forms are covered**: the `--autosquash` form,
+  which rewrites every commit on the branch, gets the identical checks (it
+  previously had none, and a call issued from the base branch rewrote *that*
+  branch and then recorded a wrong same-subject commit as a task's work).
+  Which branch a task integrates onto is read from the run's own recorded
+  `branches` artifact, so **a repo `preflight` never cut a branch in is
+  refused rather than guessed at** — for both forms. With that owned,
+  `depends_on` is the only thing that orders anything: every task whose
+  dependencies are done starts
+  together, and a task finishing releases its dependents immediately. A new
+  read-only verb, `harness ready-tasks`, is the engine's own answer to
+  "what can start now" — ready, in flight, blocked (and on what), terminal —
+  so readiness is never re-derived by hand, where a dependency merely *in
+  review* reads as satisfied. The step's exit is unchanged and still
+  fail-closed: no task left un-terminal, and the refusal now names which
+  tasks are still moving and how far along they are, instead of reporting
+  "no legal move". `ready-tasks` also reports `conflicts`: pairs of ready
+  tasks in one repo whose declared file manifests overlap. Purely advisory —
+  the plan's `depends_on` remains the only ordering authority — but the
+  dispatch loop now staggers such a pair, because a worktree cut before a
+  sibling merges cannot contain that sibling's code.
+- **A long merge no longer kills every other command on Windows.** With the
+  merge inside the run lock, any concurrent harness command waits for it —
+  and the platform's lock gave up after ~10 seconds with a raw
+  `Resource deadlock avoided` system error. Measured on a 20k-file checkout,
+  a 15.6-second merge failed *every* other command issued during it,
+  `show` and `status` included. Commands now wait out the holder, and only
+  after two minutes give up with a message that names the run lock, says a
+  sibling verb (typically a merge) holds it, and to re-run the identical
+  command. The pipeline instructions say the same thing, so a lock wait is
+  never mistaken for being off-manifest.
+- **An interrupted merge is now recoverable and honestly reported.** A death
+  between the squash and its commit left the whole squash staged, no commit,
+  and the task still reported as ready — while every retry was refused by
+  its own leftovers with a message about "uncommitted changes" that read as
+  the operator's fault. That state is now recognised as what it is and the
+  refusal names the one command that clears it (`git reset --merge`). In the
+  same pass, a merge that fails for a reason that is *not* a conflict — a
+  git lock collision, say — is no longer relabelled "conflicted (working
+  tree restored)": git's own error is reported verbatim, and the
+  tree-restored claim is made only when the cleanup actually succeeded. Any
+  unfinished git operation is refused up front naming *its own* conclusion
+  command, never another's — the previous advice could orphan a live rebase.
+- `publish-mirror` now runs under the run lock, like every other verb that
+  reads run authority and writes a repo. Unlocked, it could snapshot state
+  mid-write and commit a run whose seal did not match its contents, or
+  collide with a sibling lane's merge. The push it optionally performs stays
+  outside the lock — no other command should queue behind a network call.
+- A spawn whose `harness-task:` header names a task that does not exist is
+  blocked at the spawn, listing the run's real task ids. Nothing validated
+  that header before: a typo produced a real agent doing real work filed
+  under a key no verb could reach — its pending blocked the correctly-spelled
+  spawn, and the stall procedure refused to count it. Task-less spawns are
+  unaffected. Two neighbours of that check landed with it: a header left as
+  the literal `harness-task: <task-id>` placeholder (copied from the
+  instructions without substituting) is blocked instead of silently running
+  as a task-less spawn, and a `develop`/`review` spawn for a task that is
+  already finished is blocked rather than producing work the engine then
+  refuses to record.
+- The plan's `depends_on` is now type-checked at registration: a bare string
+  was read one character at a time (`"T1"` became a dependency on `T` and on
+  `1`), which either failed with ids nobody typed or wedged the task
+  silently. Read-only views coerce a bad legacy value instead of crashing —
+  their job is to show a broken plan, not to die on it.
+- Which task statuses count as *finished* is now declared once in the task
+  FSM (`terminal: [done, archived]`) and read from there by all seven places
+  that ask. It was seven separate hardcoded copies, so adding a status would
+  have made a task finished to the dispatcher and still live to the step
+  that waits for it.
 - Evidence-forgery hardening, from an adversarial review of this change:
   the record that clears a pending spawn is now capture-owned and checked by
   every reader (a hand-written ledger event could previously silence the

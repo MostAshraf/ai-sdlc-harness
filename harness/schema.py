@@ -287,6 +287,19 @@ def validate_fsm(fsm: dict, issues: Issues) -> None:
         issues.err("fsm: duplicate states")
     if fsm.get("initial") not in states:
         issues.err(f"fsm: initial '{fsm.get('initial')}' not a declared state")
+    # `terminal` is READ by the engine (transitions.terminal_statuses), not
+    # decorative — an absent or misspelled entry would silently shrink the
+    # set every "is this task finished?" question shares, so it is required
+    # and every member must be a declared state.
+    terminal = fsm.get("terminal")
+    if not isinstance(terminal, list) or not terminal:
+        issues.err("fsm: `terminal` must be a non-empty list of declared "
+                   "states — the engine reads it wherever it asks whether a "
+                   "task is finished")
+    else:
+        for t in terminal:
+            if t not in states:
+                issues.err(f"fsm: terminal '{t}' not a declared state")
     seen = set()
     for t in fsm.get("transitions", []) or []:
         frm, to = t.get("from"), t.get("to")

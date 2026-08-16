@@ -12,8 +12,10 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from harness import chain, gates, ndjson, state as state_mod, transitions, workflow
 from harness.cli import load_declared
@@ -260,6 +262,142 @@ class LockedReadMutualExclusion(Harness):
         self.assertFalse(bogus.exists())
 
 
+class RunLockWaitsOutItsHolder(Harness):
+    """Round 4, measured: with `merge-task` holding the run lock across the
+    merge itself, EVERY other run-scoped verb queues behind it — and on
+    Windows `msvcrt.LK_LOCK` gave up after ~10s with a raw
+    `OSError: Resource deadlock avoided`. A 15.6s merge on a 20k-file
+    checkout therefore killed every concurrent verb at ~9.4s, `show`
+    included. Waiting is the correct behaviour; the budget exists only so an
+    abandoned lock ends in a named refusal rather than a hang."""
+
+    HOLD = 0.6      # seconds — short and synthetic; the point is that the
+                    # second verb WAITS, not how long it can wait
+    TINY_BUDGET = 0.5           # injected into the WAITER (env override)
+    REVERT_WOULD_ACQUIRE_BY = 6.0   # holder cap: inside LK_LOCK's own ~10s
+                                    # retry, so a reverted build acquires here
+                                    # rather than erroring for the wrong reason
+
+    def test_a_second_verb_waits_for_the_holder_and_then_succeeds(self):
+        """Kills the no-retry mutation: a bare non-blocking lock attempt
+        fails instantly here, where the fix's retry loop rides out the
+        hold. Deliberately NOT a 10s hold — that would test the platform's
+        old budget rather than this code, and cost 10s every run."""
+        run, _ = _bootstrap(self.workspace, "full")
+        acquired: list[float] = []
+        holder_has_it = threading.Event()
+
+        def holder():
+            with state_mod.locked(run):
+                holder_has_it.set()
+                time.sleep(self.HOLD)
+
+        def waiter():
+            holder_has_it.wait(timeout=10)
+            started = time.monotonic()
+            with state_mod.locked(run):       # must WAIT, never raise
+                acquired.append(time.monotonic() - started)
+
+        t_hold = threading.Thread(target=holder)
+        t_wait = threading.Thread(target=waiter)
+        t_hold.start()
+        self.assertTrue(holder_has_it.wait(timeout=10), "holder never locked")
+        t_wait.start()
+        t_hold.join(timeout=30)
+        t_wait.join(timeout=30)
+        self.assertEqual(len(acquired), 1,
+                         "the second verb never acquired the lock")
+        # …and it genuinely waited rather than sailing through a lock that
+        # wasn't held (POSIX flock and the Windows retry loop both block)
+        self.assertGreater(acquired[0], self.HOLD / 2)
+
+    def test_past_the_budget_the_refusal_names_the_lock_and_the_retry(self):
+        """The other half: a lock nobody ever releases must end in a
+        StateError that says what is holding it and what to do — not the
+        platform's `Resource deadlock avoided`, which named neither and
+        reached the CLI's JSON error contract verbatim.
+
+        Driven through the retry helper with an always-failing attempt, so
+        it runs on POSIX too (where the real `flock` path blocks forever by
+        design and cannot produce this state at all)."""
+        def never_acquires():
+            raise OSError(36, "Resource deadlock avoided")
+
+        with mock.patch.object(state_mod, "LOCK_WAIT_BUDGET", 0.05):
+            with self.assertRaises(state_mod.StateError) as ctx:
+                state_mod._wait_for_lock(never_acquires,
+                                         self.workspace / "ai" / "r"
+                                         / ".state.lock")
+        msg = str(ctx.exception)
+        self.assertIn("run lock", msg)
+        self.assertIn("merge-task", msg)          # the likely holder class
+        self.assertIn("retry the identical command", msg)
+        self.assertIn(".state.lock", msg)         # which lock
+
+    def test_the_budget_is_injectable_per_process_for_a_real_cli_run(self):
+        """The env override exists so a subprocess CLI invocation can be
+        given a tiny budget; a garbage value falls back to the declared
+        default rather than crashing the verb that reads it."""
+        with mock.patch.dict(os.environ,
+                             {state_mod._BUDGET_ENV: "0.25"}):
+            self.assertEqual(state_mod._lock_wait_budget(), 0.25)
+        for garbage in ("not-a-number", "inf", "nan"):
+            # inf and nan PARSE — and each defeats the budget's whole purpose
+            # (inf never expires; nan makes every deadline comparison False),
+            # which is the hang the StateError exists to replace.
+            with mock.patch.dict(os.environ,
+                                 {state_mod._BUDGET_ENV: garbage}):
+                self.assertEqual(state_mod._lock_wait_budget(),
+                                 state_mod.LOCK_WAIT_BUDGET, garbage)
+
+    @unittest.skipUnless(sys.platform == "win32",
+                         "the retry loop is Windows-only in effect — POSIX "
+                         "`flock` blocks in the kernel and never reaches it")
+    def test_the_retry_loop_itself_is_what_waits_not_the_platform(self):
+        """The DISCRIMINATOR the 0.6s-hold test above is not: reverting
+        `_lock_exclusive` to a plain `msvcrt.LK_LOCK` rides out a sub-second
+        hold exactly as well as the retry loop does, so that test alone left
+        the whole fix mutable.
+
+        Injects a tiny budget behind a holder that outlasts it by an order of
+        magnitude. THIS code refuses at ~the budget with the StateError that
+        names the lock; LK_LOCK — whose own retry is ~10 one-second attempts,
+        wider than the hold — would instead sit there and ACQUIRE once the
+        holder released, raising nothing at all. Asserting both the refusal
+        and that it arrived fast is what tells the two apart."""
+        run, _ = _bootstrap(self.workspace, "full")
+        holder_has_it = threading.Event()
+        release = threading.Event()
+
+        def holder():
+            with state_mod.locked(run):
+                holder_has_it.set()
+                release.wait(timeout=self.REVERT_WOULD_ACQUIRE_BY)
+        t_hold = threading.Thread(target=holder)
+        t_hold.start()
+        try:
+            self.assertTrue(holder_has_it.wait(timeout=10),
+                            "holder never locked")
+            started = time.monotonic()
+            with mock.patch.dict(
+                    os.environ,
+                    {state_mod._BUDGET_ENV: str(self.TINY_BUDGET)}):
+                with self.assertRaises(state_mod.StateError) as ctx:
+                    with state_mod.locked(run):
+                        pass                  # LK_LOCK's revert lands HERE
+            elapsed = time.monotonic() - started
+        finally:
+            # released and joined INSIDE the test, not via addCleanup: those
+            # run after tearDown, and Windows refuses to unlink a .state.lock
+            # a live holder thread still has open.
+            release.set()
+            t_hold.join(timeout=30)
+        self.assertIn("run lock", str(ctx.exception))
+        self.assertLess(elapsed, 5.0,
+                        "the refusal came from waiting out the holder, not "
+                        f"from the injected {self.TINY_BUDGET}s budget")
+
+
 class CursorLegality(Harness):
     def test_sequence_order_enforced(self):
         run, st = _bootstrap(self.workspace, "full")
@@ -365,6 +503,153 @@ class CursorLegality(Harness):
         st["tasks"][1]["status"] = "done"
         cands = transitions.cursor_candidates(st, self.manifest, self.config)
         self.assertIn("approve-impl", cands)
+
+    def test_the_sync_point_refusal_names_the_laggard_and_its_status(self):
+        """The sync point used to fall through to the generic "not declared
+        legal / legal: none (gate undecided?)" message — which names the one
+        thing develop does NOT have (a gate) and never the thing the
+        orchestrator has to act on. With DAG-pipelined dispatch several tasks
+        are moving at once, so "which one is still going, and how far is it"
+        is the whole content of the answer."""
+        run, st = _bootstrap(self.workspace, "full",
+                             tasks=[{"id": "T1"}, {"id": "T2"}, {"id": "T3"}])
+        self.advance_to(st, run, "develop")
+        st["tasks"][0]["status"] = "done"
+        st["tasks"][1]["status"] = "in-review"
+        st["tasks"][2]["status"] = "pending"
+        with self.assertRaises(transitions.TransitionError) as ctx:
+            transitions.advance_cursor(st, self.manifest, self.config,
+                                       "approve-impl", T0, run=run)
+        msg = str(ctx.exception)
+        self.assertIn("T2 is in-review", msg)
+        self.assertIn("T3 is pending", msg)
+        self.assertNotIn("T1", msg)              # terminal tasks are not news
+        self.assertIn("ready-tasks", msg)        # the verb that shows the why
+        self.assertNotIn("gate undecided", msg)  # the old misdirection
+        # …and once they are all terminal the same move is simply legal —
+        # the refusal is about task state, never about this edge
+        for t in st["tasks"]:
+            t["status"] = "done"
+        transitions.advance_cursor(st, self.manifest, self.config,
+                                   "approve-impl", T0, run=run)
+        self.assertEqual(st["cursor"]["current_step"], "approve-impl")
+
+    def test_an_undeclared_target_still_gets_the_generic_refusal(self):
+        """The dedicated message must not swallow every refusal AT develop:
+        with all tasks terminal, a nonsense target is a legality error and
+        has to read as one."""
+        run, st = _bootstrap(self.workspace, "full", tasks=[{"id": "T1"}])
+        self.advance_to(st, run, "develop")
+        for t in st["tasks"]:
+            t["status"] = "done"
+        with self.assertRaises(transitions.TransitionError) as ctx:
+            transitions.advance_cursor(st, self.manifest, self.config,
+                                       "create-pr", T0, run=run)
+        self.assertIn("not declared legal", str(ctx.exception))
+
+    def test_a_bogus_target_gets_the_generic_refusal_MID_develop_too(self):
+        """Round 4: declared legality is checked FIRST. The sync-point
+        message claims the tasks are what is holding the move — true only
+        for a target the manifest would otherwise allow. A typo'd target got
+        it too, so the orchestrator was sent to go finish its tasks for a
+        move that would still be refused afterwards."""
+        run, st = _bootstrap(self.workspace, "full",
+                             tasks=[{"id": "T1"}, {"id": "T2"}])
+        self.advance_to(st, run, "develop")
+        st["tasks"][0]["status"] = "in-review"        # genuinely mid-develop
+        with self.assertRaises(transitions.TransitionError) as ctx:
+            transitions.advance_cursor(st, self.manifest, self.config,
+                                       "create-pr", T0, run=run)
+        msg = str(ctx.exception)
+        self.assertIn("not declared legal", msg)
+        self.assertNotIn("T1 is in-review", msg)      # not the tasks' fault
+        # …while the target the sync point IS holding still gets named
+        with self.assertRaises(transitions.TransitionError) as ctx:
+            transitions.advance_cursor(st, self.manifest, self.config,
+                                       "approve-impl", T0, run=run)
+        self.assertIn("T1 is in-review", str(ctx.exception))
+        self.assertIn("shows where each one is", str(ctx.exception))
+
+
+class TerminalVocabularyIsDeclared(Harness):
+    """RC-H: `terminal:` in pipeline/task-fsm.yaml is the ONE definition of
+    "this task is finished", read by every site that asks. Seven hardcoded
+    `("done", "archived")` literals were the alternative, and six of them
+    were chances for a future status to be terminal to part of the engine
+    and live to the rest. Driven by patching the loader's cache: if a site
+    still carried its own literal, that site would not move with the
+    declaration."""
+
+    def _declaring(self, *statuses):
+        return mock.patch.object(transitions, "_TERMINAL_CACHE",
+                                 tuple(statuses))
+
+    def test_the_picture_and_the_dependency_guard_move_with_it(self):
+        run, st = _bootstrap(self.workspace, "full",
+                             tasks=[{"id": "T1"},
+                                    {"id": "T2", "depends_on": ["T1"]}])
+        st["tasks"][0]["status"] = "done"
+        with self._declaring("archived"):     # `done` no longer counts
+            picture = workflow.dispatch_picture(st)
+            self.assertEqual(picture["terminal"], [])
+            self.assertEqual(picture["in_flight"],
+                             [{"id": "T1", "status": "done"}])
+            self.assertEqual(picture["blocked"],
+                             [{"id": "T2", "waiting_on": ["T1"]}])
+            with self.assertRaises(transitions.TransitionError):
+                transitions.transition_task(st, self.fsm, self.config, run,
+                                            self.key, "T2", "in-progress")
+        # …and under the real declaration the identical state dispatches
+        picture = workflow.dispatch_picture(st)
+        self.assertEqual((picture["terminal"], picture["ready"]),
+                         (["T1"], ["T2"]))
+        transitions.transition_task(st, self.fsm, self.config, run, self.key,
+                                    "T2", "in-progress")
+
+    def test_the_develop_sync_point_moves_with_it_on_both_halves(self):
+        run, st = _bootstrap(self.workspace, "full", tasks=[{"id": "T1"}])
+        self.advance_to(st, run, "develop")
+        st["tasks"][0]["status"] = "done"
+        with self._declaring("archived"):
+            # legality half
+            self.assertEqual(
+                transitions.cursor_candidates(st, self.manifest, self.config),
+                {})
+            # refusal half — and it names the declared vocabulary, not a
+            # hardcoded "(done/archived)"
+            with self.assertRaises(transitions.TransitionError) as ctx:
+                transitions.advance_cursor(st, self.manifest, self.config,
+                                           "approve-impl", T0, run=run)
+            self.assertIn("(archived)", str(ctx.exception))
+            self.assertIn("T1 is done", str(ctx.exception))
+        self.assertIn("approve-impl",
+                      transitions.cursor_candidates(st, self.manifest,
+                                                    self.config))
+
+    def test_complete_and_env_check_move_with_it_too(self):
+        run, st = _bootstrap(self.workspace, "full", tasks=[{"id": "T1"}])
+        self.advance_to(st, run, "metrics",
+                        artifacts={"security": {"security.max_severity": "low"}})
+        st["tasks"][0]["status"] = "done"    # advance_to's own shortcut, pinned
+        st["tasks"][0]["env_requires"] = ["docker"]
+        state_mod.save(run, self.workspace, st)
+        probe = {"env_requirements": {"docker": {"probe": support.NOP_CMD,
+                                                 "hint": "start it"}}}
+        with self._declaring("archived"):
+            # `complete` refuses a run whose tasks are not terminal…
+            with self.assertRaises(transitions.TransitionError) as ctx:
+                workflow.complete_run(self.workspace, run, self.manifest)
+            self.assertIn("are not terminal", str(ctx.exception))
+            # …and env-check still probes a task it no longer considers done
+            self.assertEqual(
+                [c["name"] for c in
+                 workflow.env_check(self.workspace, run, probe)["checked"]],
+                ["docker"])
+        # a done task is nobody's problem, and the run completes
+        self.assertEqual(
+            workflow.env_check(self.workspace, run, probe)["checked"], [])
+        self.assertTrue(
+            workflow.complete_run(self.workspace, run, self.manifest)["completed"])
 
     def test_quick_escalation_edge_switches_mode(self):
         run, st = _bootstrap(self.workspace, "quick")

@@ -97,10 +97,19 @@ successful sibling of abort — the final step's file says exactly when).
    text. One live spawn per (task, mode): the guard refuses a second while
    the first is unreported; different tasks and modes stay parallel, panel
    lenses (`plan-attack`) are exempt, and batching spawns in ONE message
-   still runs them concurrently.
+   still runs them concurrently. `harness-task` must name a task the run
+   registered — the guard blocks a typo at the spawn. Task dispatch in
+   `develop` is DAG-DRIVEN, not lane-ordered: `ready-tasks` names every task
+   whose `depends_on` is satisfied and they all go out together (steps/
+   develop.md owns the loop).
 4. Advance: `${CLAUDE_PLUGIN_ROOT}/bin/harness cursor --to <next> --run <run>`. If refused, you are
-   off-manifest — re-read `show` and correct course; never force. If the
-   refusal is `verdict_bound` (a reviewer verdict was not captured), the
+   off-manifest — re-read `show` and correct course; never force. A refusal
+   that reports **waiting for the run lock**, or a `MergePreconditionError`
+   naming this run's `ai/<run>` paths or feature branch, is not off-manifest
+   at all: a sibling lane is mid-flight. Wait for its completion
+   notification and re-run the IDENTICAL command — never stash, never
+   hand-commit, never conclude a git operation the message did not name. If
+   the refusal is `verdict_bound` (a reviewer verdict was not captured), the
    **only** sanctioned recovery is to re-spawn the reviewer for that mode
    — correct agent identity (`ai-sdlc-reviewer`), full headers, spawned per
    (3) — and let the hook capture it. Never write `reviews.ndjson` or

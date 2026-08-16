@@ -72,12 +72,18 @@ class GuardHarness(unittest.TestCase):
         return err
 
     def make_run(self, mode="full", to_step=None, run_name="2026-01-01-G-1",
-                item_id="G-1"):
+                item_id="G-1", task_ids=("T1",)):
+        # `task_ids` exists because the spawn guard now validates the
+        # `harness-task:` header against the run's REGISTERED ids: a test
+        # about cross-TASK parallelism has to register the sibling task it
+        # spawns for, or it silently exercises the typo refusal instead of
+        # the serialization rule it names.
         run = self.workspace / "ai" / run_name
         state_mod.bootstrap(run, self.workspace,
                             work_item={"id": item_id, "title": "t", "provider_ref": ""},
                             mode=mode, change_type="fix",
-                            tasks=[{"id": "T1"}], entry_step="fetch")
+                            tasks=[{"id": t} for t in task_ids],
+                            entry_step="fetch")
         if to_step:
             manifest, _, config = load_declared(self.workspace)
             st = state_mod.load(run, self.workspace)
@@ -1973,7 +1979,9 @@ class SpawnSerialization(GuardHarness):
 
     def setUp(self):
         super().setUp()
-        self.run = self.make_run(to_step="develop")
+        # T2 is registered so the cross-task case below tests the
+        # serialization key and not the header-validation refusal
+        self.run = self.make_run(to_step="develop", task_ids=("T1", "T2"))
 
     def _pending(self, task="T1", mode="review", agent_id="a-1"):
         ndjson.append_record(self.run / "events.ndjson", {
@@ -2149,6 +2157,180 @@ class SpawnSerialization(GuardHarness):
             "kind": "spawn-pending", "task": "T1", "actor": "reviewer",
             "mode": "review", "agent_id": "a-other"})
         self.assert_allows("spawn", self._spawn())
+
+
+class SpawnTaskHeaderValidation(GuardHarness):
+    """`harness-task:` must name a task the run registered. Nothing checked
+    it anywhere before — not at spawn, not at capture — so a typo'd id
+    produced a real agent doing real work filed under a key no verb can
+    reach: the capture hook opened a `spawn-pending` on it, the
+    one-live-spawn rule then blocked the correctly-spelled sibling key, and
+    `harness stall` refused to count it ("unknown task"). Round 2's G4 made
+    that wedge recoverable; this closes it at the source, where the cost is
+    one refusal instead of a recovery procedure."""
+
+    def setUp(self):
+        super().setUp()
+        self.run = self.make_run(to_step="develop", task_ids=("T1", "T2"))
+
+    def _spawn(self, task, mode="develop", shape="developer"):
+        header = f"harness-task: {task}\n" if task else ""
+        return spawn(shape, f"harness-mode: {mode}\n{header}"
+                            f"harness-run: {self.run}\ngo")
+
+    def test_an_unregistered_task_id_is_blocked_and_the_ids_are_named(self):
+        err = self.assert_blocks("spawn", self._spawn("T2x"),
+                                 "not a task in this run")
+        self.assertIn("T1, T2", err)      # what the orchestrator should type
+        self.assertIn("T2x", err)         # what it actually typed
+
+    def test_a_registered_task_passes(self):
+        self.assert_allows("spawn", self._spawn("T2"))
+        self.assert_allows("spawn", self._spawn("T1", mode="review",
+                                                shape="reviewer"))
+
+    def test_a_task_less_spawn_stays_legal(self):
+        # absent is a declared shape (plan-review, pre-pr, repo-map): both
+        # this guard and the capture hook parse the same missing header into
+        # the same None, so validation must not turn absence into a typo
+        run = self.make_run(to_step="plan-review", run_name="2026-04-01-G-20",
+                            item_id="G-20")
+        self.assert_allows("spawn", spawn(
+            "reviewer", f"harness-mode: plan-review\nharness-run: {run}\ngo"))
+
+    def test_the_check_reads_the_named_runs_task_list(self):
+        # a sibling run registering T9 must not legalize T9 here — the
+        # validation follows the same run resolution the legality check does
+        other = self.make_run(to_step="develop", run_name="2026-04-02-G-21",
+                              item_id="G-21", task_ids=("T9",))
+        self.assertTrue(other.exists())
+        self.assert_blocks("spawn", self._spawn("T9"), "not a task in this run")
+
+    def test_a_typo_is_refused_before_the_serialization_check(self):
+        # order matters for the message: with a pending open on the REAL
+        # task, a typo'd spawn must still say "unknown id", not "already in
+        # flight" — the latter sends the orchestrator to `stall`, which
+        # refuses the unknown key and wedges exactly as before
+        ndjson.append_record(self.run / "events.ndjson", {
+            "kind": "spawn-pending", "task": "T1", "actor": "developer",
+            "mode": "develop", "agent_id": "a-1"})
+        self.assert_blocks("spawn", self._spawn("T1x"), "not a task in this run")
+
+    def test_an_unsubstituted_placeholder_header_is_blocked(self):
+        """Round 4, survivor: `TASK_HEADER_RE` carries `(?!<)` so a
+        placeholder parses as ABSENT — and develop.md and agents/developer.md
+        both print `harness-task: <task-id>` verbatim as the block to send.
+        Copied without substituting, the spawn ran as a deliberately
+        task-less one: id never validated, (task, mode) serialization off,
+        and the reviewer's verdict captured under no task at all, where
+        `task --to done` can never find it."""
+        for placeholder in ("<task-id>", "<T>", "<the task id>"):
+            err = self.assert_blocks("spawn", self._spawn(placeholder),
+                                     "still the literal placeholder")
+            self.assertIn(placeholder, err)
+            self.assertIn("T1, T2", err)      # what to substitute
+        self.assert_allows("spawn", self._spawn("T1"))
+
+    def test_a_quoted_reply_template_alongside_a_real_header_still_passes(self):
+        """The placeholder block must not break the NORMAL shape: spawn
+        prompts routinely quote shared/status-block.md's reply template —
+        `harness-task: <task-id or ->` — as instructions to the subagent,
+        next to the orchestrator's own real header. Only a prompt whose ONLY
+        task header is a placeholder is refused."""
+        self.assert_allows("spawn", spawn(
+            "developer",
+            f"harness-mode: develop\nharness-task: T1\n"
+            f"harness-run: {self.run}\n"
+            "reply with:\nharness-task: <task-id or ->\nharness-status: ..."))
+
+    def test_a_task_less_spawn_is_not_read_as_a_placeholder(self):
+        run = self.make_run(to_step="plan-review", run_name="2026-04-03-G-22",
+                            item_id="G-22")
+        self.assert_allows("spawn", spawn(
+            "reviewer", f"harness-mode: plan-review\nharness-run: {run}\ngo"))
+
+    def test_a_task_less_spawn_may_quote_the_reply_template_verbatim(self):
+        """The hard case, and the reason the check is scoped to the LEADING
+        header block: a task-less spawn has no real header to be told apart
+        by, so a quoted `harness-task: <task-id or ->` in its instructions
+        looks exactly like an unsubstituted one. The template sits below
+        prose; the orchestrator's headers open the prompt."""
+        run = self.make_run(to_step="plan-review", run_name="2026-04-04-G-23",
+                            item_id="G-23")
+        self.assert_allows("spawn", spawn(
+            "reviewer",
+            f"harness-mode: plan-review\nharness-run: {run}\n\n"
+            "review the plan, then close with:\n\n"
+            "harness-status: SUCCESS\nharness-task: <task-id or ->\n"))
+
+
+class SpawnForATerminalTask(GuardHarness):
+    """RC-I(a): a `develop`/`review` spawn for a task that is already
+    finished. Under pipelined dispatch the loop re-reads `ready-tasks` after
+    every completion, so a stale id from the previous round is one line away
+    — and it fails LATE: the developer does real work, and only then is
+    `task --to in-review` refused for having no such transition from `done`.
+
+    Refuses nothing legal: the FSM's one way back out of a terminal status is
+    the hotfix re-entry edge, which transitions the task to in-progress
+    FIRST and dispatches after."""
+
+    def setUp(self):
+        super().setUp()
+        self.run = self.make_run(to_step="develop", task_ids=("T1", "T2"))
+
+    def _finish(self, task_id, status="done"):
+        st = state_mod.load(self.run, self.workspace)
+        for t in st["tasks"]:
+            if t["id"] == task_id:
+                t["status"] = status
+        state_mod.save(self.run, self.workspace, st)
+
+    def _spawn(self, task, mode="develop", shape="developer"):
+        return spawn(shape, f"harness-mode: {mode}\nharness-task: {task}\n"
+                            f"harness-run: {self.run}\ngo")
+
+    def test_a_done_task_is_refused_for_develop_and_for_review(self):
+        # T2 stays pending: a terminal id is suspicious precisely because
+        # SIBLINGS ARE STILL LIVE — this is the pipelined develop loop the
+        # stale-id slip happens in, and the "spawn for an id `ready-tasks`
+        # lists as ready" advice has somewhere to point.
+        self._finish("T1")
+        for mode, shape in (("develop", "developer"), ("review", "reviewer")):
+            err = self.assert_blocks("spawn", self._spawn("T1", mode, shape),
+                                     "already done in this run")
+            self.assertIn("ready-tasks", err)
+        self.assert_allows("spawn", self._spawn("T2"))   # its sibling is fine
+
+    def test_with_every_task_terminal_the_block_stands_down(self):
+        """Re-verification, executed: `review` is in the HARDEN step's
+        spawn-set too (manifest.yaml:279), and harden sits PAST the develop
+        sync point — where the manifest REQUIRES every task to be terminal. A
+        harden-step review spawn can therefore only ever name a terminal task,
+        and this block refused it with advice that dead-ends: `ready-tasks`
+        lists nothing as ready there, and never will. So the rule keys on the
+        fact its own rationale rests on — once every registered task is
+        terminal, naming one is the normal shape, not a stale id."""
+        run = self.make_run(to_step="harden", run_name="2026-01-01-G-24",
+                            item_id="G-24", task_ids=("T1", "T2"))
+        st = state_mod.load(run, self.workspace)
+        self.assertEqual({t["status"] for t in st["tasks"]}, {"done"},
+                         "fixture: harden is past the requires_tasks_terminal "
+                         "sync point, so every task is already terminal")
+        self.assert_allows("spawn", spawn(
+            "reviewer", f"harness-mode: review\nharness-task: T1\n"
+                        f"harness-run: {run}\nreview the hardened diff"))
+
+    def test_an_archived_task_is_refused_too(self):
+        self._finish("T1", "archived")
+        self.assert_blocks("spawn", self._spawn("T1"), "already archived")
+
+    def test_the_hotfix_re_entry_shape_is_untouched(self):
+        """`archived -> in-progress` transitions FIRST, then dispatches — so
+        a legitimate re-entry is already non-terminal at spawn time and this
+        refuses nothing it should allow."""
+        self._finish("T1", "in-progress")
+        self.assert_allows("spawn", self._spawn("T1"))
 
 
 class SpawnIdentityNearMiss(GuardHarness):
