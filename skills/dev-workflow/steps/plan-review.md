@@ -15,10 +15,13 @@ independent evidence attached, not just the planner's word.
    lens, spawn `reviewer` with `harness-mode: plan-attack` (+
    `harness-run`, `harness-repo`, `harness-plugin-root` — NO `harness-task`), naming the lens in
    the ask; each follows `steps/plan-attack-task.md` (the lens vocabulary
-   and findings format). Batch ALL lens spawns in ONE message (foreground
-   — the standard parallelism rule; hook-CHECKED, not just stated: a lens
+   and findings format). Batch ALL lens spawns in ONE message — the standard
+   parallelism rule (SKILL.md step 3), hook-CHECKED, not just stated: a lens
    spawn arriving after a sibling completed this round logs a flagged
-   `panel-serialized` event). Lenses are read-only, so YOU persist each
+   `panel-serialized` event. Lens spawns are the one class EXEMPT from the
+   one-live-spawn refusal (no engine-read verdict rides on a lens), so a
+   single stalled lens can be re-spawned while its siblings are still in
+   flight. Lenses are read-only, so YOU persist each
    report — through the owned verb, never by hand. Write the reply body to
    a scratch file first, then:
    `${CLAUDE_PLUGIN_ROOT}/bin/harness save-report --mode plan-attack --lens
@@ -105,15 +108,20 @@ counter would hit `human_after` on unrelated hiccups):
   that capture, re-run with `--confirm-no-verdict`. If `cursor --to` is
   refused for a missing verdict (no captured APPROVED/CHANGES_REQUESTED),
   re-spawn the synthesizer once — correct agent identity
-  (`ai-sdlc-reviewer`), foreground, full headers — and let the hook
-  capture it. Never write `reviews.ndjson` or any ledger directly, never
+  (`ai-sdlc-reviewer`), full headers, spawned per SKILL.md step 3 — and let
+  the hook capture it. Never write `reviews.ndjson` or any ledger directly, never
   synthesize a capture-hook payload, and never force the cursor. If a
   second spawn still yields no verdict, stop and report to the user.
 - **A lens** stalled (no status block / no report — an oddly-formatted
   advisory verdict alone is NOT a stall; the engine never reads lens
   verdicts): `${CLAUDE_PLUGIN_ROOT}/bin/harness stall --run <run>
   --task step:plan-review:<lens>` — any `step:`-prefixed key gets the
-  step-counter treatment, and real task ids can never contain `:`.
+  step-counter treatment, and real task ids can never contain `:`. A lens
+  key reaches LENS pendings only: `--confirm-no-verdict` on it abandons
+  in-flight lenses (all of them — they share one key), never the
+  synthesizer, whose verdict the engine reads. The bare `step:plan-review`
+  key above is the wider one — it reaches every task-less spawn this step
+  declares, synthesizer included.
 
 Follow the returned action (`reinvoke` → `recovery` → `human`); never loop
 re-spawns outside these counters.

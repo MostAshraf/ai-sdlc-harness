@@ -15,14 +15,32 @@ import subprocess
 from pathlib import Path
 
 from . import chain
+from . import ndjson as ndjson_mod
 from . import state as state_mod
 from .ndjson import append_record, now_iso
 
-MIRROR_EXCLUDE = ("human-input.ndjson", ".redproof", ".state.lock")
+# `.ledger.lock` joins `.state.lock` for the same reason: a lock sidecar is
+# run-local machinery, not run evidence, and mirroring it would commit a file
+# whose whole purpose is to be contended on this machine (whole-system review,
+# round 4 — the ledger appends now take their own lock).
+MIRROR_EXCLUDE = ("human-input.ndjson", ".redproof", ".state.lock",
+                  ndjson_mod.LEDGER_LOCK_NAME)
 
 
 class GitError(Exception):
     pass
+
+
+class MergePreconditionError(GitError):
+    """`squash_merge` / `autosquash` refused BEFORE touching the index — an
+    unfinished git operation in the checkout, the wrong branch checked out,
+    or tracked changes already in the tree. A distinct type because it is
+    not a merge FAILURE: nothing was attempted, nothing needs cleaning up,
+    and the answer is always "fix the checkout, then retry the same command"
+    — where a conflicted merge's answer is "resolve on the task branch".
+    Callers that catch GitError keep catching it (the CLI's JSON error
+    contract prints the type name, so the two read differently in a run's
+    transcript without any call site changing)."""
 
 
 class SecretSweepError(GitError):
@@ -335,33 +353,196 @@ def commit_fixup(repo: Path, target_sha: str) -> str:
     return head_sha(repo)
 
 
-def squash_merge(repo: Path, task_branch: str, message: str) -> str:
+def _abort_command(operation: str) -> str:
+    """The conclusion command for an operation `_in_progress_operation`
+    named — its OWN, never another's. Getting this wrong is not cosmetic:
+    the pre-round-4 advice for a detached HEAD ("check the feature branch
+    out first") was measured orphaning a live rebase-merge, and telling
+    anyone to `rebase --abort` a staged squash discards the wrong thing.
+    Two of the states have no marker file of their own (`_in_progress_
+    operation` returns prose for them), so they are matched by prefix."""
+    if operation.startswith(("staged squash merge", "unresolved merge")):
+        # `merge --abort` needs a MERGE_HEAD `merge --squash` never writes;
+        # `reset --merge` drops the staged/conflicted squash without
+        # touching any prior local commit.
+        return "git reset --merge"
+    return {"rebase": "git rebase --abort",
+            "merge": "git merge --abort",
+            "cherry-pick": "git cherry-pick --abort",
+            "revert": "git revert --abort",
+            "bisect": "git bisect reset"}.get(
+                operation, f"conclude the {operation} yourself")
+
+
+def _refuse_unmergeable(repo: Path, expected_branch: str, action: str,
+                        hazard: str) -> None:
+    """The preconditions BOTH `merge-task` forms check before touching the
+    index — shared so the squash path and the autosquash path cannot drift
+    apart (adversarial review, round 4: they had, and the autosquash form
+    had none at all, which is how a `--autosquash` issued from `main`
+    rebased MAIN and then re-pointed a task's commit_sha at a wrong
+    same-subject commit).
+
+    Three checks, in this order:
+      1. **no unfinished git operation.** FIRST, and that placement is the
+         fix, not a detail: an in-flight rebase/merge/cherry-pick or a
+         staged-but-uncommitted squash puts HEAD somewhere the branch check
+         below would then describe as a stray checkout — and its advice
+         ("check the feature branch out first") ORPHANS the live operation.
+         Refused naming the operation's OWN conclusion command; never
+         auto-concluded, and never another operation's abort.
+      2. **the right checkout.** The tree must be ON `expected_branch` —
+         the run's own feature branch, which only the caller knows. `merge
+         --squash` and `rebase` both act on whatever HEAD happens to be, so
+         one issued while the shared checkout sat on `main` (a stray
+         `checkout`, an aborted sibling run) lands or rewrites work on the
+         base branch — and `create-pr` then opens a PR whose head branch has
+         none of it.
+      3. **nobody else's work in the tree.** A dirty tree here is another
+         task's merge mid-flight: folding it in makes the per-task
+         commit_sha map stop describing what each commit contains. Untracked
+         files are deliberately NOT dirt — they are not in the index, `merge
+         --squash` refuses on its own if it would clobber one, and a scratch
+         file beside a checkout is the normal state of a working repo.
+
+    All three are needed because task dispatch is DAG-pipelined: several
+    tasks are in flight at once and every one of them integrates into the
+    SAME feature-branch checkout, one shared index and one shared HEAD. The
+    exclusive run lock (cli.py merge-task) is what makes them meaningful
+    rather than racy — it serializes the merges; these refuse the states the
+    lock cannot rule out (something OUTSIDE the run moved HEAD, dirtied the
+    tree, or died mid-operation)."""
+    in_progress = _in_progress_operation(repo)
+    if in_progress:
+        # Whose leftovers these are decides who should act. A staged squash
+        # is THIS pipeline's own dead lane — safe to clear, and clearing it
+        # is all the retry needs. Anything else may be a human's live work,
+        # so the refusal hands the command over rather than running it.
+        whose = ("A staged squash is a previous lane of this run dying "
+                 "between its merge and its commit — clearing it loses "
+                 "nothing, and the retry afterwards is the identical command."
+                 if in_progress.startswith("staged squash merge") else
+                 "It may be a human's live work, so it is never concluded "
+                 "for you.")
+        raise MergePreconditionError(
+            f"{repo}: refusing to {action} — a {in_progress} is unfinished in "
+            f"this checkout. Conclude it first with "
+            f"`{_abort_command(in_progress)}`, which is THIS operation's own "
+            "conclusion — never another operation's abort, and never a "
+            f"`checkout` (which orphans it). {whose}")
+    current = run_git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    if current != expected_branch:
+        where = ("a DETACHED HEAD" if current == "HEAD"
+                 else f"branch '{current}'")
+        raise MergePreconditionError(
+            f"{repo}: refusing to {action} — the checkout "
+            f"is on {where}, not this run's feature branch "
+            f"'{expected_branch}'. {hazard} Check the feature branch out "
+            "first (never auto-switched — a checkout switch rewrites every "
+            "file in this tree, including a sibling task's).")
+    # Probed at the PHYSICAL toplevel for the same reason
+    # `ensure_default_branch` is: the operation below rewrites the whole
+    # checkout, so a sibling logical repo's uncommitted work is just as much
+    # at risk as this one's — and `--relative` would hide it. `diff HEAD`
+    # (not `changed_files`) is staged+unstaged and untracked-blind by
+    # construction. A leftover squash normally never reaches here — it has
+    # its own refusal above, which names `git reset --merge` instead of
+    # telling the human to go commit or stash a machine's abandoned index.
+    # ONE way past that: `SQUASH_MSG` deleted by hand while the staged squash
+    # is left in place (re-verification reproduced it), which is the only
+    # evidence the marker check has — the leftovers then arrive here and are
+    # reported as uncommitted changes. Deliberate tampering only, and the
+    # refusal still refuses; it just names the less useful of the two
+    # remedies.
+    top = toplevel(repo)
+    dirty = [p for p in run_git(top, "diff", "--name-only", "HEAD").splitlines()
+             if p.strip()]
+    if dirty:
+        shown = ", ".join(dirty[:5]) + ("..." if len(dirty) > 5 else "")
+        raise MergePreconditionError(
+            f"{_dirt_subject(repo, top)} has {len(dirty)} uncommitted "
+            f"change(s) ({shown}) — refusing to {action} "
+            "over them. On a pipelined develop step this is "
+            "most likely a sibling task's merge caught mid-flight or a "
+            "conflicted squash nobody resolved; folding it into this task's "
+            "integration commit would misattribute both. Commit, stash, or "
+            "resolve it yourself first; never auto-discarded.")
+
+
+def squash_merge(repo: Path, task_branch: str, message: str,
+                 expected_branch: str) -> str:
     """`harness merge-task` — one integration commit per task.
 
-    On conflict the working tree is RESTORED before raising (adversarial-
-    review finding, verified by execution: `merge --squash` creates no
-    MERGE_HEAD, so a conflicted one left `<<<<<<<` markers that
-    `_in_progress_operation` couldn't see — and the next `harness commit`'s
-    `git add -A` committed the conflict markers under a legitimate task
-    message). `reset --merge` is the documented cleanup for a failed
-    squash merge — it drops the conflicted index/tree changes without
-    touching prior local commits; `merge --abort` needs the MERGE_HEAD
-    that squash never writes."""
+    PRECONDITIONS FIRST — see `_refuse_unmergeable`, which owns them and
+    explains why each exists.
+
+    THE SQUASH AND ITS COMMIT ARE ONE UNIT. The commit used to sit outside
+    the try (adversarial review, round 4, verified by execution): a death
+    between them — Ctrl-C, a killed lane, a crashed shell — left the FULL
+    squash staged with no commit, `ready-tasks` kept reporting the task
+    READY, and every retry was refused by its own leftovers with a message
+    about "uncommitted changes" that read as operator dirt. Both steps now
+    live inside the try, `reset --merge` cleans up either failure, and the
+    leftovers of a death BETWEEN them are recognised (`SQUASH_MSG` is an
+    in-progress marker) and named with the cleanup that clears them.
+
+    FAILURE IS NOT ALWAYS CONFLICT. The blanket `except GitError` used to
+    relabel ANY git failure as "conflicted (working tree restored…)" —
+    measured on an `index.lock` collision, where the label was wrong, the
+    remedy it prescribed ("resolve on the task branch") was wrong, and the
+    `reset --merge` cleanup could not have run either since it needed the
+    same lock. A real conflict is now DETECTED (unmerged entries in the
+    index) rather than assumed; anything else re-raises with git's own
+    stderr verbatim, and the "working tree restored" claim is made only when
+    the reset actually succeeded."""
+    _refuse_unmergeable(
+        repo, expected_branch, f"squash-merge '{task_branch}'",
+        "The merge would land the task's whole diff wherever HEAD happens "
+        "to point.")
     try:
         run_git(repo, "merge", "--squash", task_branch)
+        run_git(repo, "commit", "-m", message)
     except GitError as exc:
-        run_git(repo, "reset", "--merge", check=False)
+        conflicted = bool(run_git(repo, "ls-files", "-u", check=False))
+        try:
+            run_git(repo, "reset", "--merge")
+            restored = "working tree restored"
+        except GitError as cleanup:
+            restored = ("the `git reset --merge` cleanup ALSO failed, so the "
+                        f"index/tree is still mid-squash — {cleanup}")
+        if not conflicted:
+            raise GitError(
+                f"squash-merge of '{task_branch}' failed, and NOT on a "
+                f"conflict (no unmerged paths in the index; {restored}). "
+                f"git said: {exc}") from exc
         raise GitError(
-            f"squash-merge of '{task_branch}' conflicted (working tree "
-            f"restored — resolve on the task branch, then retry): {exc}"
+            f"squash-merge of '{task_branch}' conflicted ({restored} — "
+            f"resolve on the task branch, then retry): {exc}"
         ) from exc
-    run_git(repo, "commit", "-m", message)
     return head_sha(repo)
 
 
-def autosquash(repo: Path, base: str) -> None:
-    """Fold `fixup!` commits non-interactively (coverage B10)."""
+def autosquash(repo: Path, base: str, expected_branch: str) -> None:
+    """Fold `fixup!` commits non-interactively (coverage B10).
+
+    Same preconditions as `squash_merge` (round 4), and it needed them more:
+    this rewrites EVERY commit from `base` to HEAD, so a call issued while
+    the shared checkout sat on the base branch rebased `main` itself — then
+    the caller's SHA re-derivation happily matched a same-subject commit
+    that was not the task's, and wrote it into state.yaml as that task's
+    integration commit (measured). Nothing failed; the run just started
+    lying about what it built.
+
+    The `rebase --abort` cleanup fires ONLY for a rebase THIS call started.
+    Aborting one it merely found would destroy a human's in-flight work —
+    which is exactly why the precondition above refuses a pre-existing
+    rebase, naming `git rebase --abort` as the OPERATOR's action rather
+    than performing it."""
     import os
+    _refuse_unmergeable(
+        repo, expected_branch, f"autosquash onto '{base}'",
+        "The rebase would rewrite every commit on whatever branch HEAD "
+        "points at — the base branch itself, if that is where it is.")
     # `true` on EVERY platform: git launches editors through its own sh —
     # which Git for Windows bundles, `/usr/bin/true` included — so the
     # plain POSIX no-op works there too (probe-verified on this exact
@@ -375,8 +556,17 @@ def autosquash(repo: Path, base: str) -> None:
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         env={**os.environ, "GIT_SEQUENCE_EDITOR": noop, "GIT_EDITOR": noop})
     if proc.returncode != 0:
-        run_git(repo, "rebase", "--abort", check=False)
-        raise GitError(f"autosquash rebase failed (aborted cleanly): {proc.stderr.strip()}")
+        # The precondition proved there was no rebase before this call, so a
+        # rebase here is unambiguously ours to abort. Absent one, the rebase
+        # never started (an unresolvable `base`, say) — say that instead of
+        # claiming a cleanup that did not happen.
+        if _in_progress_operation(repo) == "rebase":
+            run_git(repo, "rebase", "--abort", check=False)
+            outcome = "aborted cleanly"
+        else:
+            outcome = "nothing to abort — the rebase never started"
+        raise GitError(f"autosquash rebase failed ({outcome}): "
+                       f"{proc.stderr.strip()}")
 
 
 def find_commit_by_subject(repo: Path, base: str, subject: str) -> str:
@@ -938,6 +1128,21 @@ def _in_progress_operation(repo: Path) -> str | None:
             return name
     if run_git(repo, "ls-files", "-u", check=False):
         return "unresolved merge (conflicted paths in the index)"
+    # SQUASH_MSG: a `merge --squash` whose integration commit never happened
+    # (adversarial review, round 4). git writes it at squash time and deletes
+    # it at commit time, so its presence on a clean index means exactly one
+    # thing — a lane died between the two halves of `squash_merge`, leaving
+    # the whole squash staged. Nothing could see that state before: it has no
+    # MERGE_HEAD, and once the conflict-free squash is staged there are no
+    # unmerged entries either, so every checker upstream read it as a plain
+    # dirty tree and blamed the operator.
+    #
+    # Checked LAST, and the order is load-bearing: a CONFLICTED squash writes
+    # SQUASH_MSG too (probe-verified), and that state must keep reporting as
+    # the unresolved merge it is — the same string `ensure_default_branch`'s
+    # tests pin.
+    if (git_dir / "SQUASH_MSG").exists():
+        return "staged squash merge (never committed)"
     return None
 
 

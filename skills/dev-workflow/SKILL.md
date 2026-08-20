@@ -85,18 +85,35 @@ successful sibling of abort — the final step's file says exactly when).
    which case omit the `model` param entirely so the subagent runs on the
    session model. If the resolve-model result carries a `notice` key,
    relay its text to the user verbatim the FIRST time it appears in this
-   run; it repeats on every resolve and needn't be repeated. Every harness-shape spawn runs FOREGROUND — pass
-   `run_in_background: false` explicitly (newer platforms default to
-   background, and capture reads the spawn's own tool_response; a
-   background spawn returns only a launch stub — verdict lost, stall
-   event fabricated; the guard requires an explicit `false`). Parallelism =
-   batch multiple foreground spawns in ONE message, never backgrounding.
+   run; it repeats on every resolve and needn't be repeated. **Foreground
+   where the tool supports it:** pass `run_in_background: false` — under Qwen
+   Code that is REQUIRED (the guard blocks an absent or true value; its
+   background format is unmeasured). Where the Agent tool has no such
+   parameter, the spawn returns a launch STUB and the agent runs in the
+   background: that is expected and captured — WAIT for its completion
+   notification, do not proceed on the stub, and do not `stall` (`show`'s
+   `outstanding_spawns` names every spawn still in flight — the Stalls
+   triage below starts there, not at the events tail). Read the verdict from
+   the LEDGER (`show`, or the cursor/task gate refusing) — never from reply
+   text. One live spawn per (task, mode): the guard refuses a second while
+   the first is unreported; different tasks and modes stay parallel, panel
+   lenses (`plan-attack`) are exempt, and batching spawns in ONE message
+   still runs them concurrently. `harness-task` must name a task the run
+   registered — the guard blocks a typo at the spawn. Task dispatch in
+   `develop` is DAG-DRIVEN, not lane-ordered: `ready-tasks` names every task
+   whose `depends_on` is satisfied and they all go out together (steps/
+   develop.md owns the loop).
 4. Advance: `${CLAUDE_PLUGIN_ROOT}/bin/harness cursor --to <next> --run <run>`. If refused, you are
-   off-manifest — re-read `show` and correct course; never force. If the
-   refusal is `verdict_bound` (a reviewer verdict was not captured), the
+   off-manifest — re-read `show` and correct course; never force. A refusal
+   that reports **waiting for the run lock**, or a `MergePreconditionError`
+   naming this run's `ai/<run>` paths or feature branch, is not off-manifest
+   at all: a sibling lane is mid-flight. Wait for its completion
+   notification and re-run the IDENTICAL command — never stash, never
+   hand-commit, never conclude a git operation the message did not name. If
+   the refusal is `verdict_bound` (a reviewer verdict was not captured), the
    **only** sanctioned recovery is to re-spawn the reviewer for that mode
-   — correct agent identity (`ai-sdlc-reviewer`), foreground, full
-   headers — and let the hook capture it. Never write `reviews.ndjson` or
+   — correct agent identity (`ai-sdlc-reviewer`), full headers, spawned per
+   (3) — and let the hook capture it. Never write `reviews.ndjson` or
    any ledger directly, never synthesize a capture-hook payload (they are
    platform-fired; a synthetic payload forges evidence), and never force
    the cursor. If a second correctly-formed spawn still yields no verdict,
@@ -125,14 +142,40 @@ successful sibling of abort — the final step's file says exactly when).
   `<run>/reviews.ndjson`; `<run>/events.ndjson` carries stall/hook/
   status-block events, never verdicts** — looking for a verdict in the wrong
   ledger is what makes a captured round read as a stall. Blockless reply?
-  Check the TAIL of `<run>/events.ndjson` before calling `stall`:
-  `status-block-malformed` → the verdict was captured despite the loose
-  block — proceed on the ledger, never stall; `missing-status-block` →
-  genuine stall, procedure above. For a task-less **step** key, `stall`
-  refuses outright when that step's ledger already holds a verdict for the
-  current round (`--confirm-no-verdict` overrides, for a spawn that stalled
-  *after* the capture); per-task and per-lens keys are never refused — the
-  engine reads no verdict for those.
+  Ask `show` before calling `stall`: `outstanding_spawns` names every spawn
+  still in flight as `{task, mode, agent_id, step, at, clearable,
+  clearing_key}` — the owned answer to "which lane is wedged", so never
+  hand-read the events ledger for it. Yours listed there → that subagent is
+  still running in the background, WAIT for it; never stall — `stall`
+  refuses over an open pending, and forcing it (`--confirm-no-verdict`)
+  ABANDONS that spawn: its key is freed for a re-spawn and its reply, if it
+  ever lands, is refused rather than captured. Three exceptions, in order:
+  - **`clearable: false`** (a `repo-map` / `request-triage` pending — no
+    step's spawn-set declares its mode, so no `stall` key matches it) →
+    **leave it.** It refuses nothing and cannot wedge a run; it clears when
+    that agent stops. Forcing a key here bumps a stall counter, writes no
+    override, clears nothing, and degrades the run for a brand-new reason.
+  - **`step` is not the cursor's** → the run has LEFT that step and nothing
+    is coming. Abandon it with the key the entry hands you:
+    `stall --task <clearing_key> --confirm-no-verdict`.
+  - **`step` IS the cursor's, and siblings share it** — pipelined `develop`
+    holds every lane at one step (the cursor cannot leave while any task is
+    non-terminal), so a dead lane and a live one differ only in `at`.
+    Compare ages: the OUTLIER — launched with the batch, still open long
+    after its siblings reported — is the wedged lane. Age is evidence, not
+    proof (a big task is slow, not dead), so name the lane and why, and get
+    the user's go-ahead before `stall --task <its clearing_key>
+    --confirm-no-verdict`.
+  NOT listed → check `legacy_spawn_pendings` first: one listed there was
+  launched by a pre-upgrade harness, its deferred capture is impossible, and
+  the fix is to re-spawn that agent in the FOREGROUND — never stall it.
+  Otherwise read the TAIL of `<run>/events.ndjson`: `status-block-malformed`
+  → the verdict WAS captured despite the loose block, proceed on the ledger,
+  never stall; `missing-status-block` → genuine stall, procedure above. For
+  a task-less **step** key, `stall` refuses outright when that step's ledger
+  already holds a verdict for the current round (`--confirm-no-verdict`
+  overrides, for a spawn that stalled *after* the capture); per-task and
+  per-lens keys are never refused — the engine reads no verdict for those.
 - **Ad-hoc human requests mid-run:** spawn `reviewer` with
   `harness-mode: request-triage` (+ plugin-root header, always legal), surface the triage verdict
   to the user; out-of-scope items are never silently merged.

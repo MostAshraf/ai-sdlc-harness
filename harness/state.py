@@ -3,7 +3,9 @@
 `state.yaml` is loaded/saved ONLY through this module — inside an exclusive
 file lock (`flock` on POSIX, an `msvcrt` region lock on Windows; RC4:
 parallel `set-state` calls serialize; no lost updates) and sealed by the
-integrity chain (RC4: out-of-band writes detected at next read).
+integrity chain (RC4: out-of-band writes detected at next read). Contention
+is WAITED OUT, not failed: see LOCK_WAIT_BUDGET, whose expiry is the one
+case that refuses.
 
 Bootstrap is the FSM's declared from-nothing transition; it REFUSES when a
 live run already exists for the work item (coverage B5) — the caller then
@@ -11,9 +13,88 @@ offers Resume or Abort, never a silent clobber.
 """
 from __future__ import annotations
 
+import math
+import os
 import re
+import time
 from contextlib import contextmanager
 from pathlib import Path
+
+# How long a lock acquisition may WAIT before giving up. Windows-only in
+# effect (POSIX `flock` blocks indefinitely and is left exactly as it was),
+# but declared unconditionally so the retry helper below — and the tests
+# that inject a tiny budget into it — exist on every platform.
+#
+# 120s, not the ~10s `msvcrt.LK_LOCK` used to enforce: the critical sections
+# this lock protects are NO LONGER all sub-second. `merge-task` now holds it
+# across the merge itself (round 3), and a squash on a large repo with a cold
+# cache is git, not YAML — measured at 15.6s on a 20k-file checkout, where
+# EVERY other run-scoped verb died at ~9.4s with a raw
+# `OSError: [Errno 36] Resource deadlock avoided` (adversarial review of that
+# change, measured: a `show` issued during a merge, not a pathological state
+# at all). A verb must WAIT OUT a sibling lane's merge; the budget exists only
+# so a genuinely abandoned lock still ends in a named refusal rather than a
+# hang.
+LOCK_WAIT_BUDGET = 120.0
+# Poll backoff: fast enough that a sub-second holder costs nothing, capped so
+# a long merge doesn't spin. Doubling from 10ms to 250ms.
+_LOCK_POLL_MIN = 0.01
+_LOCK_POLL_MAX = 0.25
+# Cross-PROCESS injection point: monkeypatching the constant cannot reach a
+# CLI invocation in a subprocess, which is the shape any end-to-end probe of
+# the budget path would take. Never set in production; a garbage value falls
+# back to the declared default rather than failing the verb that reads it.
+_BUDGET_ENV = "HARNESS_LOCK_WAIT_BUDGET"
+
+
+def _lock_wait_budget() -> float:
+    raw = os.environ.get(_BUDGET_ENV)
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            pass                       # garbage env → the declared default
+        else:
+            # `float("inf")`/`float("nan")` parse fine and are the two values
+            # that would defeat the budget's whole purpose: inf never expires
+            # (the hang the StateError exists to replace) and nan makes every
+            # `>=` deadline comparison False, which is the same hang spelled
+            # differently. Non-finite is garbage too.
+            if math.isfinite(value):
+                return value
+    return LOCK_WAIT_BUDGET
+
+
+def _wait_for_lock(attempt, path) -> None:
+    """Retry a NON-BLOCKING lock `attempt` until it succeeds or the budget
+    runs out — the shape Windows needs and POSIX gets for free.
+
+    The budget expiring is a StateError, never a bare OSError: the raw
+    `Resource deadlock avoided` the platform raises names neither the lock,
+    nor who is likely holding it, nor what to do — and it reached the CLI's
+    JSON error contract verbatim, where a run's transcript recorded a
+    concurrency wait as an unexplained system fault."""
+    budget = _lock_wait_budget()
+    deadline = time.monotonic() + budget
+    delay = _LOCK_POLL_MIN
+    while True:
+        try:
+            attempt()
+            return
+        except OSError as exc:
+            if time.monotonic() >= deadline:
+                raise StateError(
+                    f"gave up after {budget:g}s waiting for the run lock "
+                    f"({path}) — another harness verb still holds this run's "
+                    "lock, typically a merge (`merge-task` holds it across "
+                    "the squash, the longest git operation any verb runs). "
+                    "Nothing here read or wrote state: wait for that verb's "
+                    "completion, then retry the identical command. Never "
+                    "stash, hand-commit, or delete the lock file to get "
+                    "past this.") from exc
+            time.sleep(delay)
+            delay = min(delay * 2, _LOCK_POLL_MAX)
+
 
 try:
     import fcntl
@@ -30,13 +111,16 @@ except ImportError:  # Windows — no fcntl; msvcrt region locks (still stdlib)
     import msvcrt
 
     def _lock_exclusive(fh) -> None:
-        # LK_LOCK retries for ~10s then raises OSError — a bounded wait
-        # with a clean error under pathological contention, vs flock's
-        # unbounded block. Critical sections here are sub-second (test
-        # execution deliberately stays OUTSIDE the lock, RC4), so the
-        # bound is comfortable.
-        fh.seek(0)
-        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+        # LK_NBLCK in a retry loop, NOT LK_LOCK: LK_LOCK's own retry is
+        # ~10s and its expiry is an untranslatable OSError, which made a
+        # long merge fatal to every concurrent verb (see LOCK_WAIT_BUDGET).
+        # The loop waits far longer and ends in a StateError that names the
+        # lock and the remedy.
+        def _attempt() -> None:
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+
+        _wait_for_lock(_attempt, getattr(fh, "name", "<lock>"))
 
     # msvcrt has no shared locks: readers serialize behind writers AND each
     # other — correctness-preserving (never a torn read), just less

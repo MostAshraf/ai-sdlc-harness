@@ -5,10 +5,13 @@ path-exclusivity, sync-branch, commit classes."""
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import threading
 import unittest
 from pathlib import Path
 
@@ -82,6 +85,33 @@ class GitopsHarness(unittest.TestCase):
         st = state_mod.load(self.run, self.workspace)
         st["tasks"][0]["test_intents"] = names
         state_mod.save(self.run, self.workspace, st)
+
+    def _task_branch(self, name="task/T1", filename="a.txt", back_to="main"):
+        """A task branch with one commit, leaving the checkout back on
+        `back_to` — the shape every merge/autosquash precondition test needs."""
+        gitops.run_git(self.repo, "checkout", "-b", name)
+        (self.repo / filename).write_text("task work\n")
+        gitops.run_git(self.repo, "add", "-A")
+        gitops.run_git(self.repo, "commit", "-m", "task work")
+        gitops.run_git(self.repo, "checkout", back_to)
+
+    def _stall_a_rebase(self, repo=None):
+        """Leave a REAL rebase mid-flight (`edit` on the first todo line), the
+        way an interrupted history rewrite does. Real, not a fabricated
+        marker directory: the tests below assert the refusal does not ABORT
+        it, and only a real rebase can actually be destroyed."""
+        repo = repo or self.repo
+        for text in ("one\n", "two\n"):
+            (repo / "r.txt").write_text(text)
+            gitops.run_git(repo, "add", "-A")
+            gitops.run_git(repo, "commit", "-m", f"r {text.strip()}")
+        subprocess.run(["git", "-C", str(repo), "rebase", "-i", "HEAD~2"],
+                       capture_output=True,
+                       env={**os.environ,
+                            "GIT_SEQUENCE_EDITOR": "sed -i.bak '1s/pick/edit/'"})
+        self.assertEqual(gitops._in_progress_operation(repo), "rebase",
+                         "fixture failed to leave a rebase in progress")
+        self.addCleanup(gitops.run_git, repo, "rebase", "--abort", check=False)
 
 
 class TddProofPair(GitopsHarness):
@@ -291,7 +321,8 @@ class CommitAndSquash(GitopsHarness):
         (self.repo / "b.txt").write_text("b\n")
         gitops.commit_class(self.repo, self.config, "working", task="T1", summary="b")
         gitops.run_git(self.repo, "checkout", "main")
-        sha = gitops.squash_merge(self.repo, "task/T1", "fix: #GIT-1 do the thing")
+        sha = gitops.squash_merge(self.repo, "task/T1",
+                                  "fix: #GIT-1 do the thing", "main")
         subjects = gitops.run_git(self.repo, "log", "--format=%s",
                                   f"{base}..HEAD").splitlines()
         self.assertEqual(subjects, ["fix: #GIT-1 do the thing"])   # ONE commit
@@ -306,7 +337,7 @@ class CommitAndSquash(GitopsHarness):
         task_sha = gitops.head_sha(self.repo)
         (self.repo / "a.txt").write_text("v2 fixed\n")
         gitops.commit_fixup(self.repo, task_sha)
-        gitops.autosquash(self.repo, base)
+        gitops.autosquash(self.repo, base, "main")
         subjects = gitops.run_git(self.repo, "log", "--format=%s",
                                   f"{base}..HEAD").splitlines()
         self.assertEqual(subjects, ["fix: #GIT-1 task one"])   # fixup folded
@@ -400,7 +431,7 @@ class SquashConflictCleanup(GitopsHarness):
         task message."""
         self._conflicting_branch()
         with self.assertRaises(gitops.GitError) as ctx:
-            gitops.squash_merge(self.repo, "task/T1", "fix: #X collide")
+            gitops.squash_merge(self.repo, "task/T1", "fix: #X collide", "main")
         self.assertIn("conflicted", str(ctx.exception))
         # tree restored: no markers, no unmerged index, nothing staged
         self.assertEqual((self.repo / "c.txt").read_text(encoding="utf-8"), "main version\n")
@@ -408,6 +439,22 @@ class SquashConflictCleanup(GitopsHarness):
         with self.assertRaises(gitops.GitError):   # nothing to commit
             gitops.commit_class(self.repo, self.config, "working",
                                 task="T1", summary="post-conflict")
+
+    def test_a_conflicted_squash_leaves_no_dirt_the_preconditions_would_see(self):
+        """The two new preconditions and the old conflict cleanup have to
+        agree: `reset --merge` restores the tree, so a task whose merge
+        conflicted does not poison the NEXT task's precondition check. If it
+        did, one conflict would freeze the whole pipelined tail."""
+        self._conflicting_branch()
+        with self.assertRaises(gitops.GitError):
+            gitops.squash_merge(self.repo, "task/T1", "fix: #X collide", "main")
+        gitops.run_git(self.repo, "checkout", "-b", "task/T2", "main")
+        (self.repo / "unrelated.txt").write_text("sibling work\n")
+        gitops.run_git(self.repo, "add", "-A")
+        gitops.run_git(self.repo, "commit", "-m", "sibling")
+        gitops.run_git(self.repo, "checkout", "main")
+        sha = gitops.squash_merge(self.repo, "task/T2", "fix: #X sibling", "main")
+        self.assertEqual(sha, gitops.head_sha(self.repo))
 
     def test_unresolved_merge_blocks_ensure_default_branch(self):
         # a plain (non-squash) conflicted state must also be seen via the
@@ -445,6 +492,502 @@ class SquashConflictCleanup(GitopsHarness):
         gitops.run_git(wt_path, "rebase", "--abort", check=False)
 
 
+class SquashMergePreconditions(GitopsHarness):
+    """Round 3 (DAG-pipelined dispatch): several tasks are in flight at once
+    and every one of them squash-merges into the SAME feature-branch
+    checkout. The two states that used to corrupt silently — a merge issued
+    on the wrong HEAD, and a merge stacked on a sibling's half-finished tree
+    — now refuse BEFORE the index is touched."""
+
+    def test_a_head_that_is_not_the_feature_branch_is_refused(self):
+        """The silent corruption: the whole task diff lands on whatever is
+        checked out — classically `main`, from a stray checkout or an
+        aborted sibling — and create-pr then opens a PR whose head branch
+        has none of it."""
+        gitops.run_git(self.repo, "checkout", "-b", "feat/W-1")
+        gitops.run_git(self.repo, "checkout", "main")
+        self._task_branch()
+        before = gitops.head_sha(self.repo)
+        with self.assertRaises(gitops.MergePreconditionError) as ctx:
+            gitops.squash_merge(self.repo, "task/T1", "fix: #W-1 land it",
+                                "feat/W-1")
+        msg = str(ctx.exception)
+        self.assertIn("'main'", msg)          # where HEAD actually is
+        self.assertIn("feat/W-1", msg)        # where it was expected
+        self.assertEqual(gitops.head_sha(self.repo), before)   # nothing moved
+        self.assertFalse(gitops.changed_files(self.repo))      # nothing staged
+        # …and on the right branch the identical call goes through
+        gitops.run_git(self.repo, "checkout", "feat/W-1")
+        sha = gitops.squash_merge(self.repo, "task/T1", "fix: #W-1 land it",
+                                  "feat/W-1")
+        self.assertEqual(sha, gitops.head_sha(self.repo))
+
+    def test_a_detached_head_says_so(self):
+        # `rev-parse --abbrev-ref` answers the literal string "HEAD" here,
+        # which as a branch name in a refusal reads like nonsense
+        self._task_branch()
+        gitops.run_git(self.repo, "checkout", "--detach", "main")
+        with self.assertRaises(gitops.MergePreconditionError) as ctx:
+            gitops.squash_merge(self.repo, "task/T1", "fix: #W-1 x", "main")
+        self.assertIn("DETACHED", str(ctx.exception))
+
+    def test_a_dirty_tree_is_refused_and_names_the_paths(self):
+        """A dirty tree here is a sibling task's merge caught mid-flight;
+        squashing over it folds that task's changes into THIS task's
+        integration commit, so the per-task commit_sha map stops describing
+        what each commit contains."""
+        self._task_branch()
+        (self.repo / "README.md").write_text("a sibling's half-finished work\n")
+        before = gitops.head_sha(self.repo)
+        with self.assertRaises(gitops.MergePreconditionError) as ctx:
+            gitops.squash_merge(self.repo, "task/T1", "fix: #W-1 x", "main")
+        msg = str(ctx.exception)
+        self.assertIn("README.md", msg)
+        self.assertIn("1 uncommitted change", msg)
+        self.assertEqual(gitops.head_sha(self.repo), before)
+        # cleaning it is all it takes — the refusal is about tree state, and
+        # the same command then succeeds unchanged
+        gitops.run_git(self.repo, "checkout", "--", "README.md")
+        gitops.squash_merge(self.repo, "task/T1", "fix: #W-1 x", "main")
+        self.assertTrue((self.repo / "a.txt").exists())
+
+    def test_a_staged_change_is_dirt_too(self):
+        # `diff HEAD` covers both halves: a merge stacked on someone else's
+        # staged-but-uncommitted index is the same misattribution
+        self._task_branch()
+        (self.repo / "staged.txt").write_text("staged\n")
+        gitops.run_git(self.repo, "add", "-A")
+        with self.assertRaises(gitops.MergePreconditionError):
+            gitops.squash_merge(self.repo, "task/T1", "fix: #W-1 x", "main")
+
+    def test_untracked_files_are_deliberately_not_dirt(self):
+        """Scoped on purpose: an untracked scratch file is the normal state
+        of a working checkout, it is not in the index, and `merge --squash`
+        refuses on its own if it would clobber one. Refusing here would make
+        every task's merge hostage to a stray editor file."""
+        self._task_branch()
+        (self.repo / "scratch.log").write_text("not tracked\n")
+        gitops.squash_merge(self.repo, "task/T1", "fix: #W-1 x", "main")
+        self.assertTrue((self.repo / "scratch.log").exists())   # left alone
+        self.assertIn("a.txt", gitops.run_git(self.repo, "ls-files"))
+
+    def test_an_unfinished_rebase_is_refused_first_and_left_running(self):
+        """Round 4: the in-progress probe now runs BEFORE the branch check,
+        and that order is the fix. Mid-rebase, HEAD is detached — so the
+        branch check used to answer first and told the operator to "check
+        the feature branch out first", which ORPHANS the live rebase. The
+        refusal must name the rebase's OWN abort, and must not perform it."""
+        self._task_branch()
+        self._stall_a_rebase()
+        with self.assertRaises(gitops.MergePreconditionError) as ctx:
+            gitops.squash_merge(self.repo, "task/T1", "fix: #W-1 x", "main")
+        msg = str(ctx.exception)
+        self.assertIn("rebase", msg)
+        self.assertIn("git rebase --abort", msg)
+        self.assertNotIn("check the feature branch out", msg.lower())
+        # the human's rebase is still theirs — untouched, not concluded
+        self.assertEqual(gitops._in_progress_operation(self.repo), "rebase")
+
+
+class InterruptedSquashRecovery(GitopsHarness):
+    """Round 4, verified by execution: `squash_merge`'s commit sat OUTSIDE
+    the try, so a death between the squash and its commit (Ctrl-C, a killed
+    lane, a crashed shell) left the FULL squash staged with no commit.
+    Nothing could see that state — no MERGE_HEAD, no unmerged entries — so
+    `ready-tasks` kept reporting the task READY while every retry was
+    refused by its own leftovers, described as the operator's uncommitted
+    changes."""
+
+    def _die_mid_merge(self):
+        """The interrupted state itself: the squash lands, the commit never
+        happens. Reproduced with the raw git call the verb makes."""
+        self._task_branch()
+        gitops.run_git(self.repo, "merge", "--squash", "task/T1")
+        self.assertTrue(gitops.run_git(self.repo, "diff", "--cached",
+                                       "--name-only"), "nothing staged")
+
+    def test_a_staged_squash_is_detected_as_an_operation_in_progress(self):
+        self._die_mid_merge()
+        self.assertEqual(gitops._in_progress_operation(self.repo),
+                         "staged squash merge (never committed)")
+
+    def test_the_retry_is_refused_naming_reset_merge_not_operator_dirt(self):
+        """The message is the whole point: a machine's abandoned index is not
+        something to go commit or stash, and `rebase --abort` would be the
+        wrong tool. One command clears it."""
+        self._die_mid_merge()
+        with self.assertRaises(gitops.MergePreconditionError) as ctx:
+            gitops.squash_merge(self.repo, "task/T1", "fix: #W-1 x", "main")
+        msg = str(ctx.exception)
+        self.assertIn("git reset --merge", msg)
+        self.assertIn("staged squash merge", msg)
+        self.assertNotIn("Commit, stash", msg)    # not the dirt refusal
+
+    def test_the_named_cleanup_works_and_the_identical_command_then_lands(self):
+        self._die_mid_merge()
+        gitops.run_git(self.repo, "reset", "--merge")   # what the refusal says
+        sha = gitops.squash_merge(self.repo, "task/T1", "fix: #W-1 x", "main")
+        self.assertEqual(sha, gitops.head_sha(self.repo))
+        self.assertEqual(gitops.run_git(self.repo, "log", "-1", "--format=%s"),
+                         "fix: #W-1 x")
+        self.assertIsNone(gitops._in_progress_operation(self.repo))
+
+    def test_a_failing_commit_no_longer_strands_the_squash(self):
+        """The commit is inside the try now, so its failure gets the same
+        `reset --merge` cleanup the merge's does — otherwise one bad commit
+        (a rejected hook, a full disk) leaves exactly the state above."""
+        self._task_branch()
+        real = gitops.run_git
+
+        def fail_the_commit(repo, *args, **kw):
+            if args[:1] == ("commit",):
+                raise gitops.GitError("git commit: simulated failure")
+            return real(repo, *args, **kw)
+
+        with mock.patch("harness.gitops.run_git", side_effect=fail_the_commit):
+            with self.assertRaises(gitops.GitError):
+                gitops.squash_merge(self.repo, "task/T1", "fix: #W-1 x", "main")
+        self.assertIsNone(gitops._in_progress_operation(self.repo))
+        self.assertFalse(gitops.run_git(self.repo, "diff", "--cached",
+                                        "--name-only"))
+
+
+class SquashFailureIsNotAlwaysConflict(GitopsHarness):
+    """Round 4, measured on an `index.lock` collision: the blanket
+    `except GitError` relabelled ANY git failure as "conflicted (working
+    tree restored — resolve on the task branch, then retry)". All three
+    claims were false — it was not a conflict, there was nothing to resolve
+    on the task branch, and the `reset --merge` cleanup ran `check=False`
+    against the same lock and could not have restored anything."""
+
+    def test_an_index_lock_collision_reports_gits_own_error_verbatim(self):
+        self._task_branch()
+        lock = self.repo / ".git" / "index.lock"
+        lock.write_text("")
+        self.addCleanup(lambda: lock.exists() and lock.unlink())
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.squash_merge(self.repo, "task/T1", "fix: #W-1 x", "main")
+        msg = str(ctx.exception)
+        self.assertIn("NOT on a conflict", msg)
+        self.assertIn("index.lock", msg)            # git's words, kept
+        self.assertNotIn("resolve on the task branch", msg)
+        # …and the restoration claim is honest: the cleanup hit the same lock
+        self.assertIn("cleanup ALSO failed", msg)
+        self.assertNotIn("working tree restored — ", msg)
+
+    def test_a_real_conflict_still_reads_as_one(self):
+        """The narrowing must not cost the conflict path its message: an
+        actual conflict leaves unmerged entries, which is what distinguishes
+        the two."""
+        (self.repo / "c.txt").write_text("main version\n")
+        gitops.run_git(self.repo, "add", "-A")
+        gitops.run_git(self.repo, "commit", "-m", "main side")
+        gitops.run_git(self.repo, "checkout", "-b", "task/T1", "HEAD~1")
+        (self.repo / "c.txt").write_text("task version\n")
+        gitops.run_git(self.repo, "add", "-A")
+        gitops.run_git(self.repo, "commit", "-m", "task side")
+        gitops.run_git(self.repo, "checkout", "main")
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.squash_merge(self.repo, "task/T1", "fix: #X collide", "main")
+        msg = str(ctx.exception)
+        self.assertIn("conflicted", msg)
+        self.assertIn("working tree restored", msg)
+
+
+class AutosquashPreconditions(GitopsHarness):
+    """Round 4, measured — survivor M5. `autosquash` had NO preconditions and
+    the CLI returned before the recorded-branch lookup, so a `--autosquash`
+    issued while the shared checkout sat on `main` rebased MAIN itself; the
+    SHA re-derivation then matched a same-subject commit that was not the
+    task's and wrote it into state.yaml. Nothing failed — the run simply
+    started lying about what it had built."""
+
+    def _fixup_history(self, branch="feat/W-1"):
+        """A branch carrying one task commit plus its `fixup!` — what
+        autosquash exists to fold. Returns the base SHA."""
+        base = gitops.head_sha(self.repo)
+        gitops.run_git(self.repo, "checkout", "-b", branch)
+        (self.repo / "a.txt").write_text("v1\n")
+        gitops.run_git(self.repo, "add", "-A")
+        gitops.run_git(self.repo, "commit", "-m", "fix: #GIT-1 task one")
+        task_sha = gitops.head_sha(self.repo)
+        (self.repo / "a.txt").write_text("v2 fixed\n")
+        gitops.commit_fixup(self.repo, task_sha)
+        return base
+
+    def test_a_wrong_checkout_is_refused_and_rewrites_nothing(self):
+        base = self._fixup_history()
+        gitops.run_git(self.repo, "checkout", "main")
+        main_before = gitops.head_sha(self.repo)
+        feat_before = gitops.run_git(self.repo, "rev-parse", "feat/W-1")
+        with self.assertRaises(gitops.MergePreconditionError) as ctx:
+            gitops.autosquash(self.repo, base, "feat/W-1")
+        msg = str(ctx.exception)
+        self.assertIn("'main'", msg)         # where HEAD actually is
+        self.assertIn("feat/W-1", msg)       # where the run's work lives
+        self.assertEqual(gitops.head_sha(self.repo), main_before)
+        self.assertEqual(gitops.run_git(self.repo, "rev-parse", "feat/W-1"),
+                         feat_before)
+        # …and on the right branch the identical call goes through
+        gitops.run_git(self.repo, "checkout", "feat/W-1")
+        gitops.autosquash(self.repo, base, "feat/W-1")
+        self.assertEqual(
+            gitops.run_git(self.repo, "log", "--format=%s",
+                           f"{base}..HEAD").splitlines(),
+            ["fix: #GIT-1 task one"])
+
+    def test_a_pre_existing_rebase_is_refused_without_being_aborted(self):
+        """The cleanup path aborts only a rebase THIS call started — so one
+        it merely FINDS has to be refused, naming `git rebase --abort` as the
+        operator's action. Aborting someone else's in-flight rewrite would
+        destroy real work."""
+        base = self._fixup_history()
+        self._stall_a_rebase()
+        with self.assertRaises(gitops.MergePreconditionError) as ctx:
+            gitops.autosquash(self.repo, base, "feat/W-1")
+        self.assertIn("git rebase --abort", str(ctx.exception))
+        self.assertEqual(gitops._in_progress_operation(self.repo), "rebase",
+                         "the pre-existing rebase was aborted for the caller")
+
+    def test_a_dirty_tree_is_refused_too(self):
+        base = self._fixup_history()
+        (self.repo / "README.md").write_text("a sibling lane, mid-merge\n")
+        with self.assertRaises(gitops.MergePreconditionError) as ctx:
+            gitops.autosquash(self.repo, base, "feat/W-1")
+        self.assertIn("README.md", str(ctx.exception))
+
+    def test_a_rebase_that_never_started_says_so_instead_of_claiming_a_cleanup(self):
+        self._fixup_history()
+        with self.assertRaises(gitops.GitError) as ctx:
+            gitops.autosquash(self.repo, "no-such-base", "feat/W-1")
+        msg = str(ctx.exception)
+        self.assertIn("never started", msg)
+        self.assertNotIn("aborted cleanly", msg)
+
+
+class ConcurrentTaskMerges(unittest.TestCase):
+    """The seam DAG-pipelined dispatch created, exercised through the REAL
+    CLI: two tasks, two worktrees, one shared feature-branch checkout — and
+    both `merge-task` calls issued at the same instant.
+
+    One index, one HEAD, two `git merge --squash` + `git commit` pairs. With
+    the merge outside the run lock (where it lived until round 3, with only
+    the SHA write-back re-taking it) the two interleave: git's own
+    `index.lock` fails one of them outright, or the loser's commit sweeps
+    the winner's staged tree into its own integration commit. Either way a
+    task's work is misfiled or missing, and nothing in the run says so.
+
+    Deliberately NOT a unit test of the lock: the whole point is that the
+    real verb takes it, from two OS processes, exactly as two dispatched
+    lanes would.
+
+    Two measurements shaped this test, because the obvious version of it
+    CANNOT LOSE — and a race test that cannot lose is evidence of nothing:
+      - Launching both processes from a barrier is not enough. Interpreter
+        startup jitter is ~0.5s and unequal between two simultaneously
+        launched processes; the two merges landed 1.2s apart and never
+        touched. So the RUN LOCK ITSELF is the starting gate: the test holds
+        it while both `merge-task` processes launch and queue on it.
+      - Even then they stagger by ~1s on Windows, where `msvcrt.locking`
+        retries at ONE-SECOND intervals — so the loser of the state read
+        arrives a full second late. The merge therefore has to stay open
+        longer than that stagger, which is what `N_FILES` buys (measured on
+        this repo's fixture: 2000 files ≈ 1.9s inside git, 120 ≈ 0.1s —
+        and at 120 the mutation testing survived 3/3 runs)."""
+
+    N_FILES = 2000         # ≈1.9s inside git — wider than the ~1s stagger
+    GATE_HOLD = 1.0        # seconds — long enough for both to reach the lock
+    # For the deterministic queue probes below: comfortably wider than
+    # interpreter startup (~0.5s, measured on this repo), so "hasn't finished
+    # yet" means "queued on the lock" rather than "still importing".
+    QUEUE_HOLD = 2.5
+
+    def setUp(self):
+        self.workspace = Path(tempfile.mkdtemp())
+        (self.workspace / "stories").mkdir()
+        self.repo = make_repo(self.workspace)
+        self.run = self.workspace / "ai" / "2026-01-01-RACE-1"
+        self._cli("init", "--stories-dir", str(self.workspace / "stories"),
+                  "--repo", f"repo={self.repo}",
+                  "--test-cmd", f"repo={support.NOP_TEST_CMD}", run=False)
+        state_mod.bootstrap(
+            self.run, self.workspace,
+            work_item={"id": "RACE-1", "title": "t", "provider_ref": ""},
+            mode="full", change_type="fix",
+            tasks=[{"id": "T1", "repo": str(self.repo)},
+                   {"id": "T2", "repo": str(self.repo)}],
+            entry_step="fetch")
+        self.branch = "feat/RACE-1"
+        gitops.run_git(self.repo, "checkout", "-b", self.branch)
+        self.base = gitops.head_sha(self.repo)
+        # Test-only stand-in for preflight, which records exactly this and
+        # nothing else that matters here: merge-task reads the run's own
+        # `branches` artifact to know which branch a task integrates onto.
+        st = state_mod.load(self.run, self.workspace)
+        st["artifacts"]["branches"] = {"repo": {"branch": self.branch,
+                                                "base": "main"}}
+        state_mod.save(self.run, self.workspace, st)
+
+    def tearDown(self):
+        support.rmtree(self.workspace, ignore_errors=True)
+
+    def _argv(self, *args, run=True):
+        cmd = [sys.executable, "-m", "harness", "--workspace",
+               str(self.workspace)]
+        if run:
+            cmd += ["--run", str(self.run)]
+        return [*cmd, *args]
+
+    def _cli(self, *args, run=True):
+        return subprocess.run(self._argv(*args, run=run), cwd=support.ROOT,
+                              capture_output=True, text=True,
+                              encoding="utf-8", timeout=300)
+
+    def _flow(self, task_id: str, wt: dict, gate, results: dict) -> None:
+        """One task's full commit+merge flow, as its lane would run it. The
+        merge is LAUNCHED before the gate opens and blocks on the run lock
+        the test is holding — that is what makes the two merges simultaneous
+        rather than merely concurrent."""
+        path = Path(wt["path"])
+        for i in range(self.N_FILES):
+            (path / f"{task_id}-{i}.txt").write_text(f"{task_id} file {i}\n")
+        commit = self._cli("commit", "--repo", str(path), "--task-id", task_id,
+                           "--summary", f"{task_id} work")
+        merge = subprocess.Popen(
+            self._argv("merge-task", "--repo", str(self.repo),
+                       "--task-id", task_id, "--task-branch", wt["branch"],
+                       "--summary", f"{task_id} landed"),
+            cwd=support.ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8")
+        gate.wait(timeout=120)             # launched — the gate may open
+        out, err = merge.communicate(timeout=300)
+        results[task_id] = (commit, merge.returncode, out, err)
+
+    def test_two_task_merges_race_and_both_land(self):
+        worktrees = {t: gitops.worktree_add(self.repo, t, self.branch)
+                     for t in ("T1", "T2")}
+        for wt in worktrees.values():
+            self.addCleanup(gitops.worktree_remove, self.repo, wt)
+        results: dict = {}
+        gate = threading.Barrier(len(worktrees) + 1)      # lanes + this thread
+        threads = [threading.Thread(target=self._flow,
+                                    args=(t, wt, gate, results))
+                   for t, wt in worktrees.items()]
+        with state_mod.locked(self.run):
+            for th in threads:
+                th.start()
+            gate.wait(timeout=300)         # every merge process has launched
+            time.sleep(self.GATE_HOLD)     # …and is now queued on this lock
+        # released: both merges enter git within milliseconds of each other
+        for th in threads:
+            th.join(timeout=600)
+        self.assertEqual(sorted(results), ["T1", "T2"], "a lane never finished")
+        for task_id, (commit, code, out, err) in results.items():
+            self.assertEqual(commit.returncode, 0,
+                             f"{task_id} commit: {commit.stdout}{commit.stderr}")
+            self.assertEqual(code, 0, f"{task_id} merge: {out}{err}")
+
+        # BOTH integration commits are on the branch — no lost merge, and no
+        # third commit from a half-swept index
+        subjects = gitops.run_git(self.repo, "log", "--format=%s",
+                                  f"{self.base}..{self.branch}").splitlines()
+        self.assertEqual(sorted(subjects),
+                         ["fix: #RACE-1 T1 landed", "fix: #RACE-1 T2 landed"])
+        # …carrying BOTH tasks' files, every one of them
+        tracked = set(gitops.run_git(self.repo, "ls-files").splitlines())
+        for task_id in ("T1", "T2"):
+            missing = [f"{task_id}-{i}.txt" for i in range(self.N_FILES)
+                       if f"{task_id}-{i}.txt" not in tracked]
+            self.assertFalse(missing, f"{task_id} lost files: {missing[:5]}")
+        # …and the checkout is intact: no unmerged entries, nothing left
+        # staged or modified by an interleaved merge
+        self.assertFalse(gitops.run_git(self.repo, "ls-files", "-u"))
+        self.assertFalse(gitops.run_git(self.repo, "status", "--porcelain"))
+        # state agrees, with one distinct SHA per task (the write-back that
+        # used to be the only locked part of this verb)
+        st = state_mod.load(self.run, self.workspace)
+        shas = {t["id"]: t["commit_sha"] for t in st["tasks"]}
+        self.assertEqual(len(set(shas.values())), 2, shas)
+        landed = set(gitops.run_git(self.repo, "log", "--format=%H",
+                                    f"{self.base}..{self.branch}").splitlines())
+        self.assertEqual(set(shas.values()), landed)
+
+    def _assert_queues_on_the_run_lock(self, *args) -> str:
+        """Launch a verb while THIS test holds the run lock and prove it
+        QUEUED: still running when the hold ends, successful once released.
+
+        Deterministic where a two-process race is not — the lock is the same
+        object either way, so proving each verb takes it proves the pair
+        serializes in both directions, without depending on which of two
+        launches wins."""
+        proc = subprocess.Popen(
+            self._argv(*args), cwd=support.ROOT, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, encoding="utf-8")
+        try:
+            with state_mod.locked(self.run):
+                time.sleep(self.QUEUE_HOLD)
+                queued = proc.poll() is None
+            out, err = proc.communicate(timeout=300)
+        finally:
+            if proc.poll() is None:                # never leak a hung child
+                proc.kill()
+        self.assertTrue(queued, "the verb ran to completion while the run "
+                                f"lock was held: {out}{err}")
+        self.assertEqual(proc.returncode, 0, f"{out}{err}")
+        return out
+
+    def test_publish_mirror_queues_on_the_run_lock_like_a_merge_does(self):
+        """Round 4: `publish-mirror` ran with NO lock at all. It walks the
+        live run directory, copies and PRUNES it into the repo, then stages
+        and commits — while a sibling lane may be rewriting that repo's index
+        (merge) or mid-`chain.seal` on state.yaml (two separate atomic
+        replaces). Both verbs take the run lock now, so the pair serializes
+        whichever arrives first."""
+        out = self._assert_queues_on_the_run_lock(
+            "publish-mirror", "--repo", str(self.repo))
+        self.assertTrue(json.loads(out)["ok"])
+        self.assertTrue((self.repo / "ai" / self.run.name / "state.yaml").exists())
+
+    def test_a_typoed_run_is_refused_before_publish_mirror_takes_the_lock(self):
+        """`locked()` mkdirs unconditionally, so the phantom-run check has to
+        come first — the same stray-directory class `show`/`merge-task`
+        already guard against."""
+        bogus = self.workspace / "ai" / "2026-01-01-TYPO"
+        proc = subprocess.run(
+            [*self._argv("publish-mirror", "--repo", str(self.repo), run=False),
+             "--run", str(bogus)],
+            cwd=support.ROOT, capture_output=True, text=True,
+            encoding="utf-8", timeout=300)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("not a run", json.loads(proc.stdout)["error"])
+        self.assertFalse(bogus.exists(), "a typo'd --run must not be created")
+
+    def test_autosquash_queues_on_the_run_lock_too(self):
+        """Survivor M5: the autosquash form REWRITES every commit on the
+        branch, so a sibling merge landing mid-rebase is silently dropped
+        from the rewritten history — and the SHA re-derivation then records a
+        subject-matched commit for a task whose real work is gone. It is the
+        longest lock hold this verb has, and the one that most needs it."""
+        out = self._assert_queues_on_the_run_lock(
+            "merge-task", "--repo", str(self.repo), "--autosquash",
+            "--base", "main")
+        self.assertTrue(json.loads(out)["autosquashed"])
+
+    def test_a_merge_task_on_a_typoed_run_manufactures_nothing(self):
+        bogus = self.workspace / "ai" / "2026-01-01-NOPE"
+        proc = subprocess.run(
+            [*self._argv("merge-task", "--repo", str(self.repo), "--task-id",
+                         "T1", "--task-branch", "task/T1", "--summary", "x",
+                         run=False), "--run", str(bogus)],
+            cwd=support.ROOT, capture_output=True, text=True,
+            encoding="utf-8", timeout=300)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        err = json.loads(proc.stdout)["error"]
+        self.assertIn("StateError", err)
+        self.assertIn("not a run", err)
+        self.assertFalse(bogus.exists(), "a typo'd --run must not be created")
+
+
 class PushRemoteResolution(GitopsHarness):
     def test_single_nonorigin_remote_used_multiple_refused(self):
         gitops.run_git(self.repo, "remote", "add", "upstream", "u://x")
@@ -478,6 +1021,25 @@ class MirrorAndSync(GitopsHarness):
         self.assertNotIn(".redproof", joined)       # wrapper-owned scratch
         self.assertNotIn(".hmac", joined)           # seals are workspace-local
         self.assertIn("unrelated.txt", gitops.changed_files(self.repo))
+
+    def test_the_ledger_lock_sidecar_is_never_mirrored(self):
+        """`.ledger.lock` joins `.state.lock` on MIRROR_EXCLUDE for the same
+        reason: a lock sidecar is run-local machinery, not run evidence, and
+        committing a file whose whole purpose is to be contended on this
+        machine puts it in every reviewer's PR — and back into the checkout
+        of anyone who pulls it. Untested when it was added (round-4 review);
+        the exclusion is one tuple entry away from silently lapsing."""
+        from harness import ndjson as ndjson_mod
+        self.assertIn(ndjson_mod.LEDGER_LOCK_NAME, gitops.MIRROR_EXCLUDE)
+        # the REAL writer creates it: an append takes the lock, so a run that
+        # has ever written a ledger has the sidecar sitting beside it
+        ndjson.append_record(self.run / "events.ndjson", {"kind": "x"})
+        self.assertTrue((self.run / ndjson_mod.LEDGER_LOCK_NAME).exists(),
+                        "the lock sidecar should exist after a real append")
+        gitops.publish_mirror(self.repo, self.run, self.config, self.run.name)
+        listed = gitops.run_git(self.repo, "ls-files", f"ai/{self.run.name}")
+        self.assertIn("events.ndjson", listed)       # the evidence mirrors
+        self.assertNotIn("ledger.lock", listed)      # its lock does not
 
     def test_mirror_prunes_deletions_and_near_name_private_variants(self):
         """Adversarial-review findings: (a) copy-only mirroring kept both

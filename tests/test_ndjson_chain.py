@@ -26,6 +26,36 @@ class NdjsonLedger(unittest.TestCase):
         self.assertEqual(kinds, ["a", "b"])
         self.assertTrue(all("at" in r for r in ndjson.read_records(self.ledger)))
 
+    def test_the_fail_open_warning_is_printed_once_per_process(self):
+        """It was printed PER APPEND — executed in round-4 review: five
+        appends, five identical lines, and through a real blocking guard the
+        whole pile arrived PREPENDED to the block reason, which is the text
+        the model reads as its instruction. A degradation this broad is a
+        property of the process, so it gets guards.main's one-shot
+        treatment. Fail-OPEN is unchanged: every record still lands."""
+        import io
+        import contextlib
+        from unittest import mock
+
+        def _refuse(fh):
+            raise OSError("lock refused")
+
+        err = io.StringIO()
+        with mock.patch.object(ndjson, "_take_ledger_lock", _refuse), \
+                mock.patch.object(ndjson, "_FAIL_OPEN_REPORTED", False), \
+                contextlib.redirect_stderr(err):
+            for i in range(5):
+                ndjson.append_record(self.ledger, {"kind": "k", "i": i})
+            # a SECOND ledger in the same process stays quiet too
+            ndjson.append_record(self.root / "reviews.ndjson", {"kind": "r"})
+        lines = [l for l in err.getvalue().splitlines() if l.strip()]
+        self.assertEqual(len(lines), 1, err.getvalue())
+        self.assertIn("could not take the ledger lock", lines[0])
+        # …and nothing was dropped for it
+        self.assertEqual(len(ndjson.read_records(self.ledger)), 5)
+        self.assertEqual(len(ndjson.read_records(self.root / "reviews.ndjson")),
+                         1)
+
     def test_torn_tail_is_tolerated(self):
         ndjson.append_record(self.ledger, {"kind": "a"})
         with self.ledger.open("a") as fh:

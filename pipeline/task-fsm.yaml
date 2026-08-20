@@ -1,13 +1,29 @@
-# pipeline/task-fsm.yaml — per-task status FSM (design.md piece 2).
+# pipeline/task-fsm.yaml — per-task status FSM (design.md piece 2), plus the
+# spawn-pairing record vocabulary at the bottom.
 # Declared once, as data. Enforced by `harness set-state` (the single validated
 # write path); read by any agent that needs the legal moves. Never hardcoded.
 #
 # `guard` names a check implemented in harness code — data names it, code
 # provides it. Adding a transition is a data change unless it needs a novel
 # guard kind (modularity section).
+#
+# This is also the ONE declared file BOTH layers already read — the engine via
+# `harness.transitions`, the hooks via `hooks/guards.py`'s own loader — which
+# is why `spawn_pairing` lives here rather than in a fifth pipeline file.
 
 states: [pending, in-progress, in-review, done, archived]
 initial: pending
+
+# The TERMINAL vocabulary — which statuses count as "this task is finished".
+# Declared here because seven places in the engine ask the question and every
+# one of them used to answer it with its own hardcoded `("done", "archived")`
+# literal (adversarial-review finding): the dispatch picture, the develop sync
+# point's two halves, the `dependencies-done` guard, `complete`'s refusal, and
+# `env-check`'s scoping. Seven copies of a vocabulary is six chances for a
+# future state (`abandoned`, say) to be terminal to some of the engine and
+# live to the rest — a task the dispatcher calls finished while the sync point
+# still waits on it. Validated against `states` by harness/schema.py.
+terminal: [done, archived]
 
 transitions:
   # A task may start only once every task it depends_on is done/archived
@@ -47,3 +63,48 @@ transitions:
   # Hotfix re-entry: legal only on a cloned tracker (the hotfix command is
   # deferred; the edge is declared now so the FSM never needs a breaking change).
   - {from: archived, to: in-progress, only_when: hotfix-clone}
+
+# The BACKGROUND-SPAWN pairing vocabulary — which events.ndjson records assert
+# "a spawn is in flight", which ones close it, and which actor owns each.
+#
+# Declared here for exactly the reason `terminal:` above is: the rule was
+# written out FOUR times independently (workflow.outstanding_flagged,
+# transitions.open_spawn_pendings, hooks/guards.py's `_live_spawn_for` and its
+# SubagentStop capture), and unlike a mere duplicated literal these four are
+# read by DIFFERENT layers that must agree — divergence means a pending that is
+# closed to the health gauge but open to the spawn guard (a run reading HEALTHY
+# while every re-spawn is refused), or the reverse (a wedged lane that nothing
+# reports). Prose reads it too: the dev-workflow triage names all three kinds.
+# One declaration, one shared helper (`transitions.open_pendings` /
+# `closed_agent_ids`), four readers — whole-system review, round 4.
+#
+# `actor` is the anti-forgery bound, not decoration. `harness log-event` is
+# unvalidated by design, and every agent-visible id in this ledger is published
+# in plain text, so a record matched on `kind` alone can be hand-written to
+# clear a real pending — or, for the pending itself, to FORGE one that blocks a
+# legitimate spawn, refuses the stall that would clear it, and degrades run
+# health (executed, round 4: `spawn-pending` was the one record in the family
+# with no actor check). The writer of every record here is a capture hook or
+# the stall verb; a caller that troubles to write the actor still gets through,
+# which is the same accepted bound the rest of this design takes.
+#
+# `resolvers` is a MAPPING because code interprets the names: `abandoned` is
+# the one a late SubagentStop asks about by name (its reply must be refused,
+# not captured). Schema validation requires EXACTLY the names the engine
+# interprets — the same "data names it, code provides it" contract as
+# `guard:`, in both directions. An extra resolver was honoured by
+# `closed_agent_ids` as a further way to close a pending while no code path
+# ever wrote it (round-4 fuzzing found one under the empty-string name), and
+# the split this whole block exists to prevent was reachable a second way:
+# a pending `kind` outside `workflow.FLAGGED_EVENT_KINDS` validated clean and
+# then refused every re-spawn while the gauge and run health saw nothing.
+# Both are errors now, as is an `actor` that collides with a declared spawn
+# SHAPE — that would put the anti-forgery bound back on a value every spawn
+# publishes about itself.
+spawn_pairing:
+  pending: {kind: spawn-pending, actor: capture}
+  resolvers:
+    # the stop arrived and the reply was captured
+    captured: {kind: spawn-captured, actor: capture}
+    # a stall override (`--confirm-no-verdict`) declared that round dead
+    abandoned: {kind: spawn-abandoned, actor: stall}

@@ -69,8 +69,13 @@ Check, in order of importance:
 4. **Dependency-edge audit.** Every `depends_on` edge must be a HARD
    technical blocker (per plan-task.md §1). An edge that reads as
    "soft / for clarity / merge order" serializes parallel work forever —
-   name it. A ratified cross-repo contract modeled as an edge instead of a
-   contract is the same finding.
+   name it. Edges between tasks in the SAME repo get the same scrutiny as
+   cross-repo ones: dispatch is DAG-driven, so an intra-repo edge costs
+   real concurrency rather than merely restating a lane order. A ratified
+   cross-repo contract modeled as an edge instead of a contract is the same
+   finding, and so is an edge whose only justification is that two tasks
+   touch the same file (advisory, reported by `ready-tasks`, staggered by
+   the dispatch loop — not an edge).
 5. **Contract signatures.** Each declared cross-repo contract signature
    fragment must be a grep-able code token that appears (or will appear
    verbatim) in source — plan-register rejects prose fragments; catch them

@@ -2,7 +2,9 @@
 round-bound escalation, red-proof guard, stall procedure, escalation edge."""
 from __future__ import annotations
 
+import contextlib
 import copy
+import io
 import json
 import os
 import shutil
@@ -10,8 +12,10 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from harness import chain, gates, ndjson, state as state_mod, transitions, workflow
 from harness.cli import load_declared
@@ -258,6 +262,142 @@ class LockedReadMutualExclusion(Harness):
         self.assertFalse(bogus.exists())
 
 
+class RunLockWaitsOutItsHolder(Harness):
+    """Round 4, measured: with `merge-task` holding the run lock across the
+    merge itself, EVERY other run-scoped verb queues behind it — and on
+    Windows `msvcrt.LK_LOCK` gave up after ~10s with a raw
+    `OSError: Resource deadlock avoided`. A 15.6s merge on a 20k-file
+    checkout therefore killed every concurrent verb at ~9.4s, `show`
+    included. Waiting is the correct behaviour; the budget exists only so an
+    abandoned lock ends in a named refusal rather than a hang."""
+
+    HOLD = 0.6      # seconds — short and synthetic; the point is that the
+                    # second verb WAITS, not how long it can wait
+    TINY_BUDGET = 0.5           # injected into the WAITER (env override)
+    REVERT_WOULD_ACQUIRE_BY = 6.0   # holder cap: inside LK_LOCK's own ~10s
+                                    # retry, so a reverted build acquires here
+                                    # rather than erroring for the wrong reason
+
+    def test_a_second_verb_waits_for_the_holder_and_then_succeeds(self):
+        """Kills the no-retry mutation: a bare non-blocking lock attempt
+        fails instantly here, where the fix's retry loop rides out the
+        hold. Deliberately NOT a 10s hold — that would test the platform's
+        old budget rather than this code, and cost 10s every run."""
+        run, _ = _bootstrap(self.workspace, "full")
+        acquired: list[float] = []
+        holder_has_it = threading.Event()
+
+        def holder():
+            with state_mod.locked(run):
+                holder_has_it.set()
+                time.sleep(self.HOLD)
+
+        def waiter():
+            holder_has_it.wait(timeout=10)
+            started = time.monotonic()
+            with state_mod.locked(run):       # must WAIT, never raise
+                acquired.append(time.monotonic() - started)
+
+        t_hold = threading.Thread(target=holder)
+        t_wait = threading.Thread(target=waiter)
+        t_hold.start()
+        self.assertTrue(holder_has_it.wait(timeout=10), "holder never locked")
+        t_wait.start()
+        t_hold.join(timeout=30)
+        t_wait.join(timeout=30)
+        self.assertEqual(len(acquired), 1,
+                         "the second verb never acquired the lock")
+        # …and it genuinely waited rather than sailing through a lock that
+        # wasn't held (POSIX flock and the Windows retry loop both block)
+        self.assertGreater(acquired[0], self.HOLD / 2)
+
+    def test_past_the_budget_the_refusal_names_the_lock_and_the_retry(self):
+        """The other half: a lock nobody ever releases must end in a
+        StateError that says what is holding it and what to do — not the
+        platform's `Resource deadlock avoided`, which named neither and
+        reached the CLI's JSON error contract verbatim.
+
+        Driven through the retry helper with an always-failing attempt, so
+        it runs on POSIX too (where the real `flock` path blocks forever by
+        design and cannot produce this state at all)."""
+        def never_acquires():
+            raise OSError(36, "Resource deadlock avoided")
+
+        with mock.patch.object(state_mod, "LOCK_WAIT_BUDGET", 0.05):
+            with self.assertRaises(state_mod.StateError) as ctx:
+                state_mod._wait_for_lock(never_acquires,
+                                         self.workspace / "ai" / "r"
+                                         / ".state.lock")
+        msg = str(ctx.exception)
+        self.assertIn("run lock", msg)
+        self.assertIn("merge-task", msg)          # the likely holder class
+        self.assertIn("retry the identical command", msg)
+        self.assertIn(".state.lock", msg)         # which lock
+
+    def test_the_budget_is_injectable_per_process_for_a_real_cli_run(self):
+        """The env override exists so a subprocess CLI invocation can be
+        given a tiny budget; a garbage value falls back to the declared
+        default rather than crashing the verb that reads it."""
+        with mock.patch.dict(os.environ,
+                             {state_mod._BUDGET_ENV: "0.25"}):
+            self.assertEqual(state_mod._lock_wait_budget(), 0.25)
+        for garbage in ("not-a-number", "inf", "nan"):
+            # inf and nan PARSE — and each defeats the budget's whole purpose
+            # (inf never expires; nan makes every deadline comparison False),
+            # which is the hang the StateError exists to replace.
+            with mock.patch.dict(os.environ,
+                                 {state_mod._BUDGET_ENV: garbage}):
+                self.assertEqual(state_mod._lock_wait_budget(),
+                                 state_mod.LOCK_WAIT_BUDGET, garbage)
+
+    @unittest.skipUnless(sys.platform == "win32",
+                         "the retry loop is Windows-only in effect — POSIX "
+                         "`flock` blocks in the kernel and never reaches it")
+    def test_the_retry_loop_itself_is_what_waits_not_the_platform(self):
+        """The DISCRIMINATOR the 0.6s-hold test above is not: reverting
+        `_lock_exclusive` to a plain `msvcrt.LK_LOCK` rides out a sub-second
+        hold exactly as well as the retry loop does, so that test alone left
+        the whole fix mutable.
+
+        Injects a tiny budget behind a holder that outlasts it by an order of
+        magnitude. THIS code refuses at ~the budget with the StateError that
+        names the lock; LK_LOCK — whose own retry is ~10 one-second attempts,
+        wider than the hold — would instead sit there and ACQUIRE once the
+        holder released, raising nothing at all. Asserting both the refusal
+        and that it arrived fast is what tells the two apart."""
+        run, _ = _bootstrap(self.workspace, "full")
+        holder_has_it = threading.Event()
+        release = threading.Event()
+
+        def holder():
+            with state_mod.locked(run):
+                holder_has_it.set()
+                release.wait(timeout=self.REVERT_WOULD_ACQUIRE_BY)
+        t_hold = threading.Thread(target=holder)
+        t_hold.start()
+        try:
+            self.assertTrue(holder_has_it.wait(timeout=10),
+                            "holder never locked")
+            started = time.monotonic()
+            with mock.patch.dict(
+                    os.environ,
+                    {state_mod._BUDGET_ENV: str(self.TINY_BUDGET)}):
+                with self.assertRaises(state_mod.StateError) as ctx:
+                    with state_mod.locked(run):
+                        pass                  # LK_LOCK's revert lands HERE
+            elapsed = time.monotonic() - started
+        finally:
+            # released and joined INSIDE the test, not via addCleanup: those
+            # run after tearDown, and Windows refuses to unlink a .state.lock
+            # a live holder thread still has open.
+            release.set()
+            t_hold.join(timeout=30)
+        self.assertIn("run lock", str(ctx.exception))
+        self.assertLess(elapsed, 5.0,
+                        "the refusal came from waiting out the holder, not "
+                        f"from the injected {self.TINY_BUDGET}s budget")
+
+
 class CursorLegality(Harness):
     def test_sequence_order_enforced(self):
         run, st = _bootstrap(self.workspace, "full")
@@ -363,6 +503,155 @@ class CursorLegality(Harness):
         st["tasks"][1]["status"] = "done"
         cands = transitions.cursor_candidates(st, self.manifest, self.config)
         self.assertIn("approve-impl", cands)
+
+    def test_the_sync_point_refusal_names_the_laggard_and_its_status(self):
+        """The sync point used to fall through to the generic "not declared
+        legal / legal: none (gate undecided?)" message — which names the one
+        thing develop does NOT have (a gate) and never the thing the
+        orchestrator has to act on. With DAG-pipelined dispatch several tasks
+        are moving at once, so "which one is still going, and how far is it"
+        is the whole content of the answer."""
+        run, st = _bootstrap(self.workspace, "full",
+                             tasks=[{"id": "T1"}, {"id": "T2"}, {"id": "T3"}])
+        self.advance_to(st, run, "develop")
+        st["tasks"][0]["status"] = "done"
+        st["tasks"][1]["status"] = "in-review"
+        st["tasks"][2]["status"] = "pending"
+        with self.assertRaises(transitions.TransitionError) as ctx:
+            transitions.advance_cursor(st, self.manifest, self.config,
+                                       "approve-impl", T0, run=run)
+        msg = str(ctx.exception)
+        self.assertIn("T2 is in-review", msg)
+        self.assertIn("T3 is pending", msg)
+        self.assertNotIn("T1", msg)              # terminal tasks are not news
+        self.assertIn("ready-tasks", msg)        # the verb that shows the why
+        self.assertNotIn("gate undecided", msg)  # the old misdirection
+        # …and once they are all terminal the same move is simply legal —
+        # the refusal is about task state, never about this edge
+        for t in st["tasks"]:
+            t["status"] = "done"
+        transitions.advance_cursor(st, self.manifest, self.config,
+                                   "approve-impl", T0, run=run)
+        self.assertEqual(st["cursor"]["current_step"], "approve-impl")
+
+    def test_an_undeclared_target_still_gets_the_generic_refusal(self):
+        """The dedicated message must not swallow every refusal AT develop:
+        with all tasks terminal, a nonsense target is a legality error and
+        has to read as one."""
+        run, st = _bootstrap(self.workspace, "full", tasks=[{"id": "T1"}])
+        self.advance_to(st, run, "develop")
+        for t in st["tasks"]:
+            t["status"] = "done"
+        with self.assertRaises(transitions.TransitionError) as ctx:
+            transitions.advance_cursor(st, self.manifest, self.config,
+                                       "create-pr", T0, run=run)
+        self.assertIn("not declared legal", str(ctx.exception))
+
+    def test_a_bogus_target_gets_the_generic_refusal_MID_develop_too(self):
+        """Round 4: declared legality is checked FIRST. The sync-point
+        message claims the tasks are what is holding the move — true only
+        for a target the manifest would otherwise allow. A typo'd target got
+        it too, so the orchestrator was sent to go finish its tasks for a
+        move that would still be refused afterwards."""
+        run, st = _bootstrap(self.workspace, "full",
+                             tasks=[{"id": "T1"}, {"id": "T2"}])
+        self.advance_to(st, run, "develop")
+        st["tasks"][0]["status"] = "in-review"        # genuinely mid-develop
+        with self.assertRaises(transitions.TransitionError) as ctx:
+            transitions.advance_cursor(st, self.manifest, self.config,
+                                       "create-pr", T0, run=run)
+        msg = str(ctx.exception)
+        self.assertIn("not declared legal", msg)
+        self.assertNotIn("T1 is in-review", msg)      # not the tasks' fault
+        # …while the target the sync point IS holding still gets named
+        with self.assertRaises(transitions.TransitionError) as ctx:
+            transitions.advance_cursor(st, self.manifest, self.config,
+                                       "approve-impl", T0, run=run)
+        self.assertIn("T1 is in-review", str(ctx.exception))
+        self.assertIn("shows where each one is", str(ctx.exception))
+
+
+class TerminalVocabularyIsDeclared(Harness):
+    """RC-H: `terminal:` in pipeline/task-fsm.yaml is the ONE definition of
+    "this task is finished", read by every site that asks. Seven hardcoded
+    `("done", "archived")` literals were the alternative, and six of them
+    were chances for a future status to be terminal to part of the engine
+    and live to the rest. Driven by patching the loader's cache: if a site
+    still carried its own literal, that site would not move with the
+    declaration."""
+
+    def _declaring(self, *statuses):
+        return mock.patch.object(transitions, "_TERMINAL_CACHE",
+                                 tuple(statuses))
+
+    def test_the_picture_and_the_dependency_guard_move_with_it(self):
+        run, st = _bootstrap(self.workspace, "full",
+                             tasks=[{"id": "T1"},
+                                    {"id": "T2", "depends_on": ["T1"]}])
+        st["tasks"][0]["status"] = "done"
+        with self._declaring("archived"):     # `done` no longer counts
+            picture = workflow.dispatch_picture(st)
+            self.assertEqual(picture["terminal"], [])
+            self.assertEqual(picture["in_flight"],
+                             [{"id": "T1", "repo": ".", "status": "done"}])
+            self.assertEqual(picture["blocked"],
+                             [{"id": "T2", "repo": ".",
+                               "waiting_on": ["T1"]}])
+            with self.assertRaises(transitions.TransitionError):
+                transitions.transition_task(st, self.fsm, self.config, run,
+                                            self.key, "T2", "in-progress")
+        # …and under the real declaration the identical state dispatches
+        picture = workflow.dispatch_picture(st)
+        self.assertEqual((picture["terminal"], picture["ready"]),
+                         ([{"id": "T1", "repo": "."}],
+                          [{"id": "T2", "repo": "."}]))
+        transitions.transition_task(st, self.fsm, self.config, run, self.key,
+                                    "T2", "in-progress")
+
+    def test_the_develop_sync_point_moves_with_it_on_both_halves(self):
+        run, st = _bootstrap(self.workspace, "full", tasks=[{"id": "T1"}])
+        self.advance_to(st, run, "develop")
+        st["tasks"][0]["status"] = "done"
+        with self._declaring("archived"):
+            # legality half
+            self.assertEqual(
+                transitions.cursor_candidates(st, self.manifest, self.config),
+                {})
+            # refusal half — and it names the declared vocabulary, not a
+            # hardcoded "(done/archived)"
+            with self.assertRaises(transitions.TransitionError) as ctx:
+                transitions.advance_cursor(st, self.manifest, self.config,
+                                           "approve-impl", T0, run=run)
+            self.assertIn("(archived)", str(ctx.exception))
+            self.assertIn("T1 is done", str(ctx.exception))
+        self.assertIn("approve-impl",
+                      transitions.cursor_candidates(st, self.manifest,
+                                                    self.config))
+
+    def test_complete_and_env_check_move_with_it_too(self):
+        run, st = _bootstrap(self.workspace, "full", tasks=[{"id": "T1"}])
+        self.advance_to(st, run, "metrics",
+                        artifacts={"security": {"security.max_severity": "low"}})
+        st["tasks"][0]["status"] = "done"    # advance_to's own shortcut, pinned
+        st["tasks"][0]["env_requires"] = ["docker"]
+        state_mod.save(run, self.workspace, st)
+        probe = {"env_requirements": {"docker": {"probe": support.NOP_CMD,
+                                                 "hint": "start it"}}}
+        with self._declaring("archived"):
+            # `complete` refuses a run whose tasks are not terminal…
+            with self.assertRaises(transitions.TransitionError) as ctx:
+                workflow.complete_run(self.workspace, run, self.manifest)
+            self.assertIn("are not terminal", str(ctx.exception))
+            # …and env-check still probes a task it no longer considers done
+            self.assertEqual(
+                [c["name"] for c in
+                 workflow.env_check(self.workspace, run, probe)["checked"]],
+                ["docker"])
+        # a done task is nobody's problem, and the run completes
+        self.assertEqual(
+            workflow.env_check(self.workspace, run, probe)["checked"], [])
+        self.assertTrue(
+            workflow.complete_run(self.workspace, run, self.manifest)["completed"])
 
     def test_quick_escalation_edge_switches_mode(self):
         run, st = _bootstrap(self.workspace, "quick")
@@ -649,6 +938,131 @@ class ShowNextSteps(Harness):
         # seal) — the persisted outcome is still the pre-show `pending`
         reloaded = state_mod.load(run, self.workspace)
         self.assertEqual(reloaded["artifacts"]["plan-review.outcome"], "pending")
+
+    def test_outstanding_flagged_summary_is_reported_per_kind(self):
+        """The wait-vs-stall decision is made at exactly the moment the
+        orchestrator re-reads `show`, and `show` reported no flagged events
+        at all — so the one record that answers it (`spawn-pending`: that
+        subagent is still running) was invisible without reading ndjson by
+        hand. Same shared filter as `status`/metrics, so the numbers can
+        never disagree; resolved items pair off and drop out."""
+        run, _ = self._plan_review_run()
+        self.assertEqual(self._show(run)["outstanding_flagged"], {})
+        for rec in ({"kind": "spawn-pending", "agent_id": "a-1",
+                     "actor": "capture", "mode": "plan-attack",
+                     "step": "plan-review",
+                     "task": "step:plan-review:contradictions"},
+                    {"kind": "spawn-pending", "agent_id": "a-2",
+                     "actor": "capture", "mode": "plan-attack",
+                     "step": "plan-review",
+                     "task": "step:plan-review:coverage"},
+                    {"kind": "hook-blocked", "actor": "reviewer"}):
+            ndjson.append_record(run / "events.ndjson", rec)
+        self.assertEqual(self._show(run)["outstanding_flagged"],
+                         {"spawn-pending": 2, "hook-blocked": 1})
+        ndjson.append_record(run / "events.ndjson",
+                             {"kind": "spawn-captured", "agent_id": "a-1",
+                              "actor": "capture"})
+        self.assertEqual(self._show(run)["outstanding_flagged"],
+                         {"spawn-pending": 1, "hook-blocked": 1})
+
+    def test_show_attributes_each_open_spawn_to_its_task(self):
+        """The {kind: count} summary above is right for the other ten kinds
+        and destroys the only thing the dispatch loop needs from this one.
+        Executed (whole-system review, round 4): with one lane's agent dead
+        and another's alive, `show` and `ready-tasks` read IDENTICALLY, so
+        the only way to find the wedged lane was to `stall` one and see
+        which refused — a destructive probe that SUCCEEDS on the healthy lane
+        and returns the wrong instruction. A sibling key, so the pinned
+        summary shape above is untouched."""
+        run, _ = self._plan_review_run()
+        self.assertEqual(self._show(run)["outstanding_spawns"], [])
+        stamped = {}
+        for agent, task in (("a-1", "T1"), ("a-2", "T2")):
+            stamped[task] = ndjson.append_record(run / "events.ndjson", {
+                "kind": "spawn-pending", "agent_id": agent, "task": task,
+                "actor": "capture", "shape": "reviewer", "mode": "review",
+                "step": "develop"})["at"]
+        self.assertEqual(
+            self._show(run)["outstanding_spawns"],
+            [{"task": "T1", "mode": "review", "agent_id": "a-1",
+              "step": "develop", "at": stamped["T1"], "clearable": True,
+              "clearing_key": "T1"},
+             {"task": "T2", "mode": "review", "agent_id": "a-2",
+              "step": "develop", "at": stamped["T2"], "clearable": True,
+              "clearing_key": "T2"}])
+        # …and it pairs off exactly like the summary does: one closed spawn
+        # leaves its sibling, so the lane still in flight is the one named
+        ndjson.append_record(run / "events.ndjson",
+                             {"kind": "spawn-captured", "agent_id": "a-1",
+                              "actor": "capture"})
+        self.assertEqual([s["task"] for s in
+                          self._show(run)["outstanding_spawns"]], ["T2"])
+
+    def test_two_spawns_at_one_step_are_told_apart_by_age(self):
+        """The case pipelining actually produces, and the one attribution
+        alone does NOT close (round-4 re-review): develop declares
+        `requires_tasks_terminal`, so while T1's lane is wedged the cursor
+        can NEVER leave develop — both pendings carry `step: develop`, the
+        step comparison can never fire, and health cannot separate them
+        either. `at` is the discriminator, so `show` must emit it per entry
+        and the two must differ."""
+        run, _ = self._plan_review_run()
+        wedged = ndjson.append_record(run / "events.ndjson", {
+            "kind": "spawn-pending", "agent_id": "a-dead", "task": "T1",
+            "actor": "capture", "shape": "developer", "mode": "develop",
+            "step": "develop"})["at"]
+        live = ndjson.append_record(run / "events.ndjson", {
+            "kind": "spawn-pending", "agent_id": "a-live", "task": "T2",
+            "actor": "capture", "shape": "developer", "mode": "develop",
+            "step": "develop"})["at"]
+        spawns = self._show(run)["outstanding_spawns"]
+        self.assertEqual([s["step"] for s in spawns], ["develop", "develop"])
+        # every entry carries its own launch time, and the older one is the
+        # candidate the triage names — nothing else in the entry differs
+        self.assertEqual([s["at"] for s in spawns], [wedged, live])
+        self.assertLess(spawns[0]["at"], spawns[1]["at"])
+        self.assertEqual(min(spawns, key=lambda s: s["at"])["task"], "T1")
+
+    def test_an_unclearable_pending_says_so(self):
+        """`repo-map` and `request-triage` are declared OUTSIDE every step's
+        spawn-set (out_of_run_spawns / always_legal_spawns), so no `stall
+        --task step:<x>` key matches their pendings: the abandon instruction
+        bumps a stall counter, writes no override and clears nothing. The
+        entry now says which it is, so the triage can route it to "leave
+        it" instead."""
+        run, _ = self._plan_review_run()
+        for agent, mode in (("a-rm", "repo-map"), ("a-rt", "request-triage"),
+                            ("a-pr", "plan-review")):
+            ndjson.append_record(run / "events.ndjson", {
+                "kind": "spawn-pending", "agent_id": agent, "task": None,
+                "actor": "capture", "shape": "reviewer", "mode": mode,
+                "step": "plan-review"})
+        by_mode = {s["mode"]: s for s in self._show(run)["outstanding_spawns"]}
+        for mode in ("repo-map", "request-triage"):
+            self.assertFalse(by_mode[mode]["clearable"], mode)
+            self.assertIsNone(by_mode[mode]["clearing_key"], mode)
+        # …while a task-less mode a step DOES declare hands over its key
+        self.assertTrue(by_mode["plan-review"]["clearable"])
+        self.assertEqual(by_mode["plan-review"]["clearing_key"],
+                         "step:plan-review")
+
+    def test_a_legacy_pending_is_surfaced_rather_than_absent(self):
+        """A pending written before round 4 carries the spawn SHAPE where
+        `actor` now lives, so it fails the anti-forgery check and is
+        invisible to every reader of the family — gauge, health, both
+        guards. The actor bound is NOT widened (that would re-open the
+        forgery); the record surfaces under its own key instead."""
+        run, _ = self._plan_review_run()
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "spawn-pending", "agent_id": "old-1", "task": "T1",
+            "actor": "reviewer", "mode": "review", "step": "develop"})
+        out = self._show(run)
+        self.assertEqual(out["outstanding_spawns"], [])   # still not "open"
+        self.assertEqual(out["outstanding_flagged"], {})
+        self.assertEqual([r["agent_id"] for r in out["legacy_spawn_pendings"]],
+                         ["old-1"])
+        self.assertEqual(out["legacy_spawn_pendings"][0]["task"], "T1")
 
     def test_no_verdict_yields_empty_next_steps(self):
         # fail-closed exactly like the engine: no in-window verdict -> no
@@ -1364,6 +1778,282 @@ class StallVerdictGuard(Harness):
         self.assertEqual(
             transitions.record_stall(self.st, self.config, "T1"), "reinvoke")
 
+    def _pending(self, key, agent_id="a-1"):
+        # `actor: capture` (the writer), `shape` for the spawn role: the
+        # declared `spawn_pairing.pending` shape every reader now matches on
+        self.assertEqual(transitions.spawn_pairing()["pending"],
+                         {"kind": "spawn-pending", "actor": "capture"})
+        ndjson.append_record(self.run / "events.ndjson",
+                             {"kind": "spawn-pending", "task": key,
+                              "actor": "capture", "shape": "reviewer",
+                              "agent_id": agent_id})
+
+    def test_an_open_pending_refuses_the_stall(self):
+        """A background spawn between launch and completion leaves the
+        ledgers looking exactly like a stall — no verdict, no status block —
+        and `spawn-pending` is the record that says otherwise. The stall
+        layer was the one layer never taught to read it: executed, `stall`
+        returned `reinvoke` over a live background reviewer, both copies
+        finished, and latest-wins handed the run the STALE APPROVED.
+
+        Checked for a PER-TASK key too (that is the proven case): the
+        verdict-ledger half below never runs for one, but "the agent is
+        still running" is true of any spawn."""
+        self._pending("T1")
+        before = json.dumps(self.st, sort_keys=True, default=str)
+        with self.assertRaises(transitions.TransitionError) as ctx:
+            self._guard("T1")
+        msg = str(ctx.exception)
+        self.assertIn("still RUNNING", msg)
+        self.assertIn("SubagentStop", msg)
+        self.assertIn("--confirm-no-verdict", msg)
+        # refuses BEFORE record_stall, so no counter moved (same contract as
+        # the verdict half)
+        self.assertEqual(json.dumps(self.st, sort_keys=True, default=str),
+                         before)
+        # …and a pending under a DIFFERENT key is that key's business, not
+        # this one's — the guard only refuses what it can attribute
+        self._guard(self.KEY)
+
+    def test_a_captured_spawn_stops_refusing(self):
+        # the pending pairs off by agent id the moment SubagentStop captures
+        # its reply, and the stall procedure is available again immediately
+        self._pending("T1")
+        with self.assertRaises(transitions.TransitionError):
+            self._guard("T1")
+        ndjson.append_record(self.run / "events.ndjson",
+                             {"kind": "spawn-captured", "agent_id": "a-1",
+                              "actor": "capture", "shape": "reviewer"})
+        self._guard("T1")
+        self.assertEqual(
+            transitions.record_stall(self.st, self.config, "T1"), "reinvoke")
+
+    def test_a_forged_capture_cannot_unblock_the_stall(self):
+        # the resolver is actor-checked in BOTH readers (gauge and guard):
+        # here the forgery direction is unblocking a refusal, and the
+        # agent_id is published in the very ledger `log-event` appends to
+        self._pending("T1")
+        ndjson.append_record(self.run / "events.ndjson",
+                             {"kind": "spawn-captured", "agent_id": "a-1"})
+        with self.assertRaises(transitions.TransitionError):
+            self._guard("T1")
+
+    def test_the_pending_refusal_is_overridable(self):
+        # for the spawn that genuinely died (session ended, CLI crashed) the
+        # existing escape hatch still records the stall — and still leaves
+        # the visible override marker
+        state_mod.save(self.run, self.workspace, self.st)
+        self._pending(self.KEY)
+        blocked = self._cli("stall")
+        self.assertFalse(blocked["ok"])
+        self.assertIn("still RUNNING", blocked["error"])
+        forced = self._cli("stall", "--confirm-no-verdict")
+        self.assertTrue(forced["ok"], forced)
+        self.assertEqual(forced["action"], "reinvoke")
+        override = next(e for e in ndjson.read_records(self.run / "events.ndjson")
+                        if e["kind"] == "stall-verdict-override")
+        self.assertIn("still RUNNING", override["reason"])
+
+    def test_the_override_abandons_the_pending_it_overrode(self):
+        """Declaring a spawn dead has to RETIRE it. Otherwise the pending
+        stays open forever: this same guard keeps refusing the next stall,
+        the spawn guard's one-live-spawn rule keeps refusing the reinvoke the
+        stall just prescribed, and no verb exists to clear either."""
+        state_mod.save(self.run, self.workspace, self.st)
+        self._pending(self.KEY)
+        self._cli("stall", "--confirm-no-verdict")
+        gone = next(e for e in ndjson.read_records(self.run / "events.ndjson")
+                    if e["kind"] == "spawn-abandoned")
+        self.assertEqual((gone["agent_id"], gone["task"], gone["actor"]),
+                         ("a-1", self.KEY, "stall"))
+        # the pending is closed for every reader of the pairing…
+        self.assertEqual(
+            transitions.open_spawn_pendings(self.run, self.KEY,
+                                            self.manifest), [])
+        # …so a LATER genuine stall on this key is no longer refused as
+        # "a spawn is still running"
+        self.st = state_mod.load(self.run, self.workspace)
+        self._guard()
+
+    def _task_less(self, mode, agent_id):
+        ndjson.append_record(self.run / "events.ndjson",
+                             {"kind": "spawn-pending", "task": None,
+                              "actor": "capture", "shape": "reviewer",
+                              "mode": mode, "agent_id": agent_id})
+
+    def _abandoned(self):
+        return sorted(e["agent_id"] for e in
+                      ndjson.read_records(self.run / "events.ndjson")
+                      if e["kind"] == "spawn-abandoned")
+
+    def test_a_task_less_pending_matches_the_step_key_it_stalls_under(self):
+        """The two spellings of one spawn. A task-less spawn (plan-review,
+        pre-pr, a panel lens) carries no `harness-task` header, so capture
+        records its pending with task=None — while its stall is counted per
+        STEP. Equality alone missed that pairing completely: the plan-review
+        synthesizer, the field case this guard was written for, could be live
+        in the background and still get `reinvoke`. With backgrounding legal
+        the miss compounds — the spawn guard refuses the re-spawn as already
+        in flight, and the override that frees it never fires because nothing
+        refused: a wedged run with no verb able to move it."""
+        state_mod.save(self.run, self.workspace, self.st)
+        self._task_less("plan-review", "a-taskless")
+        with self.assertRaises(transitions.TransitionError) as ctx:
+            self._guard()                       # step:plan-review
+        self.assertIn("a-taskless", str(ctx.exception))
+        # A PER-TASK key never sees it — asserted HERE, while the pending is
+        # still OPEN, because after the abandonment below every key answers
+        # [] and the pin proves nothing (it sat below and was vacuous:
+        # dropping the guard that keeps task keys out of the task-less
+        # predicate left every test green).
+        self.assertEqual(
+            transitions.open_spawn_pendings(self.run, "T1", self.manifest), [])
+        # …and the escape hatch reaches it, so the key can be re-spawned
+        self._cli("stall", "--confirm-no-verdict")
+        gone = next(e for e in ndjson.read_records(self.run / "events.ndjson")
+                    if e["kind"] == "spawn-abandoned")
+        self.assertEqual(gone["agent_id"], "a-taskless")
+        self.assertEqual(
+            transitions.open_spawn_pendings(self.run, self.KEY,
+                                            self.manifest), [])
+
+    def test_a_lens_override_never_retires_the_synthesizer(self):
+        """Executed in adversarial review: `stall --task
+        step:plan-review:<lens> --confirm-no-verdict` — the per-lens counter
+        plan-review.md mandates — abandoned the LIVE synthesizer along with
+        every lens, because a task-less pending matched any `step:`-prefixed
+        key. The synthesizer's is the one verdict the FSM reads
+        (verdict_bound.mode), so recovering one advisory lens threw away the
+        round's actual work. A lens key now reaches lens modes only: the
+        step's declared spawn-set minus its verdict_bound mode."""
+        state_mod.save(self.run, self.workspace, self.st)
+        self._task_less("plan-attack", "lens-1")
+        self._task_less("plan-attack", "lens-2")
+        self._task_less("plan-review", "synth")
+        forced = self._cli("stall", "--task", "step:plan-review:gaps",
+                           "--confirm-no-verdict")
+        self.assertTrue(forced["ok"], forced)
+        self.assertEqual(self._abandoned(), ["lens-1", "lens-2"])
+        # the synthesizer is untouched: still open, and still refusing a
+        # stall on the step key it belongs to
+        self.assertEqual(
+            [e["agent_id"] for e in transitions.open_spawn_pendings(
+                self.run, self.KEY, self.manifest)], ["synth"])
+        self.st = state_mod.load(self.run, self.workspace)
+        with self.assertRaises(transitions.TransitionError) as ctx:
+            self._guard()
+        self.assertIn("synth", str(ctx.exception))
+
+    def test_another_steps_override_does_not_reach_this_steps_pendings(self):
+        """`stall --confirm-no-verdict` at `step:develop` abandoned a live
+        plan-review synthesizer and a live pre-pr reviewer — pendings of
+        steps it has nothing to do with (executed). The key's reach is the
+        modes the manifest says THAT step spawns."""
+        state_mod.save(self.run, self.workspace, self.st)
+        self._task_less("plan-review", "synth")
+        self._task_less("pre-pr", "prepr")
+        forced = self._cli("stall", "--task", "step:develop",
+                           "--confirm-no-verdict")
+        self.assertTrue(forced["ok"], forced)
+        self.assertEqual(self._abandoned(), [])
+        self.assertEqual(
+            [e["agent_id"] for e in transitions.open_spawn_pendings(
+                self.run, self.KEY, self.manifest)], ["synth"])
+        self.assertEqual(
+            [e["agent_id"] for e in transitions.open_spawn_pendings(
+                self.run, "step:pre-pr", self.manifest)], ["prepr"])
+
+    def test_a_cross_step_ghost_refuses_nothing_but_clears_via_its_own_key(self):
+        """The cascade the widening caused: ONE dangling task-less pending
+        (a spawn whose stop never came, at a step the run has long left)
+        falsely refused EVERY later step-keyed stall in the run — each of
+        which then had to be forced with `--confirm-no-verdict`, flagging
+        and degrading a run that was fine. Coherent semantics instead: the
+        ghost belongs to its own step's key, refuses only there, and clears
+        there."""
+        state_mod.save(self.run, self.workspace, self.st)
+        self._task_less("plan-review", "ghost")
+        self._guard("step:develop")             # a later step: no refusal
+        self._guard("step:pre-pr")
+        self._guard("T1")                       # nor any per-task key
+        with self.assertRaises(transitions.TransitionError):
+            self._guard()                       # …only its own step's key
+        forced = self._cli("stall", "--task", self.KEY,
+                           "--confirm-no-verdict")
+        self.assertTrue(forced["ok"], forced)
+        self.assertEqual(self._abandoned(), ["ghost"])
+
+    def test_a_typoed_task_key_still_frees_the_pending(self):
+        """G4, executed: `record_stall` raises "unknown task" for a key that
+        is not in state["tasks"], and nothing ever validates a spawn
+        prompt's `harness-task:` header against the task list — so ONE typo
+        produced a pending under a key the counter rejects, with the
+        abandonment sitting after the raise: the key stayed blocked by the
+        one-live-spawn rule, health DEGRADED, and no verb could move it. The
+        override's contract is "record it anyway"; the counter failing must
+        not void the retirement."""
+        state_mod.save(self.run, self.workspace, self.st)
+        self._pending("T-TYPO", agent_id="a-typo")
+        failed = self._cli("stall", "--task", "T-TYPO",
+                           "--confirm-no-verdict")
+        self.assertFalse(failed["ok"], failed)          # the verb still fails
+        self.assertIn("unknown task", failed["error"])
+        # …and the retirement happened anyway: the key is free
+        self.assertEqual(self._abandoned(), ["a-typo"])
+        self.assertEqual(
+            transitions.open_spawn_pendings(self.run, "T-TYPO",
+                                            self.manifest), [])
+
+    def test_a_forged_abandonment_cannot_unblock_the_stall(self):
+        # actor-checked in this reader too: `log-event` is unvalidated and
+        # the agent_id is published in the same ledger it appends to
+        self._pending("T1")
+        for forged in ({"kind": "spawn-abandoned", "agent_id": "a-1"},
+                       {"kind": "spawn-abandoned", "agent_id": "a-1",
+                        "actor": "capture"}):
+            ndjson.append_record(self.run / "events.ndjson", forged)
+            with self.assertRaises(transitions.TransitionError):
+                self._guard("T1")
+
+    def test_a_forged_pending_refuses_no_stall(self):
+        """The ASSERTING record was the one member of this family matched on
+        `kind` alone (whole-system review, round 4). Executed: `harness
+        log-event --json '{"kind":"spawn-pending","agent_id":"forged-1",
+        "task":"T1","mode":"review"}'` made this guard REFUSE — so the one
+        verb that clears a wedged key was itself wedged, and recovery cost a
+        stall counter plus a flagged override. It now carries the same
+        capture-owned actor its resolvers always did."""
+        state_mod.save(self.run, self.workspace, self.st)
+        forged = self._cli("log-event", "--json", json.dumps(
+            {"kind": "spawn-pending", "agent_id": "forged-1", "task": "T1",
+             "mode": "review"}))
+        self.assertTrue(forged["ok"], forged)
+        self.assertEqual(
+            transitions.open_spawn_pendings(self.run, "T1", self.manifest), [])
+        self._guard("T1")                       # no refusal to override
+        # …and the pre-round-4 spelling, where `actor` carried the SHAPE,
+        # is inert for the same reason (the upgrade-window cost, pinned)
+        ndjson.append_record(self.run / "events.ndjson",
+                             {"kind": "spawn-pending", "task": "T1",
+                              "actor": "reviewer", "agent_id": "legacy-1"})
+        self.assertEqual(
+            transitions.open_spawn_pendings(self.run, "T1", self.manifest), [])
+
+    def test_a_genuine_stall_abandons_nothing(self):
+        # the abandonment rides on the OVERRIDE, not on the flag: a stall
+        # with no refusal to suppress retires no spawn (and a pending under
+        # another key is never in scope for this one)
+        state_mod.save(self.run, self.workspace, self.st)
+        self._pending("T1")                     # a different key's spawn
+        forced = self._cli("stall", "--confirm-no-verdict")
+        self.assertTrue(forced["ok"], forced)
+        kinds = [e["kind"] for e in
+                 ndjson.read_records(self.run / "events.ndjson")]
+        self.assertNotIn("spawn-abandoned", kinds)
+        self.assertEqual(
+            len(transitions.open_spawn_pendings(self.run, "T1",
+                                                self.manifest)), 1)
+
     def test_step_without_verdict_bound_is_unaffected(self):
         support.seed_review_verdict(self.run, verdict="CHANGES_REQUESTED")
         self._guard("step:develop")
@@ -1404,7 +2094,13 @@ class StallVerdictGuard(Harness):
                              {"kind": "plan-registered", "actor": "plan-register"})
         with open(self.run / "events.ndjson", "a", encoding="utf-8") as fh:
             fh.write("{torn record\n")
-        self._guard()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self._guard()
+        # …but the pending reader must SAY so: it decides "no spawn is in
+        # flight" from absence, so a torn `spawn-pending` line silently
+        # disables this refusal (adversarial review). Lenient AND loud.
+        self.assertIn("unparseable line(s)", err.getvalue())
 
     def test_cli_refuses_then_honours_the_escape_hatch(self):
         state_mod.save(self.run, self.workspace, self.st)

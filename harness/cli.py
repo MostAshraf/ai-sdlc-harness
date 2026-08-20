@@ -94,6 +94,89 @@ def _json_source(flag: str, inline: str | None, file_path: Path | None, default)
     return default
 
 
+def _merge_task(args, config: dict, st: dict) -> str | None:
+    """The body of `merge-task`, executed entirely INSIDE the exclusive run
+    lock (see the call site for why that moved). `st` is the caller's
+    already-loaded state, mutated in place for the caller's single save —
+    there is no second read, so there is no window between deciding the SHA
+    and recording it. Returns the new integration SHA, or None for the
+    autosquash form (which re-derives every task's existing SHA rather than
+    adding one).
+
+    Autosquash holds the same lock for a blunter reason: it REWRITES every
+    integration commit on the branch, so a sibling task's merge landing
+    mid-rebase would be silently dropped from the rewritten history — and
+    the SHA re-derivation below would then record a subject-matched commit
+    for a task whose real work is gone. It also holds the lock LONGEST: an
+    interactive rebase over a branch's whole history is the longest git
+    operation this verb can run, so every other run-scoped verb queues
+    behind it (state.py's LOCK_WAIT_BUDGET is what makes that a wait
+    instead of a crash)."""
+    from . import initws
+    # WHICH branch this run's work lives on is a fact of the RUN, not of the
+    # checkout: preflight cut the feature branch and recorded it per repo.
+    # Reading it here (rather than trusting whatever HEAD is) is what lets
+    # gitops refuse an operation aimed at the wrong branch — the caller
+    # cannot state an expectation it never had. An unrecorded repo is a
+    # refusal, never a guess: the two ways to get here are a --repo that
+    # names a different repo than the run cut a branch in, and a run whose
+    # preflight never happened; guessing "whatever is checked out" would
+    # re-open exactly the hole the expectation closes.
+    #
+    # BOTH FORMS read it (adversarial review, round 4). The autosquash form
+    # used to return before this lookup ever ran, so it inherited none of the
+    # protection — measured: a `--autosquash` issued while the shared
+    # checkout sat on `main` rebased MAIN, and the SHA re-derivation below
+    # then matched a same-subject commit that was not the task's and wrote it
+    # into state.yaml. A rewrite of every commit on the branch has strictly
+    # more to lose from a wrong HEAD than a single squash does.
+    name = initws.repo_name(config, args.repo) or str(args.repo)
+    branches = (st.get("artifacts") or {}).get("branches") or {}
+    recorded = (branches.get(name) or {}).get("branch")
+    if not recorded:
+        raise gitops.GitError(
+            f"merge-task: no feature branch recorded for repo '{name}' — this "
+            "run's `branches` artifact covers: "
+            f"{', '.join(sorted(branches)) or 'none'}. preflight is what cuts "
+            "and records it; merge-task will not guess which branch a task's "
+            "work integrates onto.")
+    if args.autosquash:
+        if not args.base:
+            raise gitops.GitError("--autosquash requires --base")
+        # Scope the SHA map to THIS repo's tasks (field report: the
+        # unfiltered map swept every task in state.yaml, so on any
+        # multi-repo run the `git log` below ran a sibling repo's
+        # SHA in args.repo and crashed). Resolved-path comparison —
+        # the same spelling-variance stance as initws.repo_name; a
+        # task with no/'.' repo (pre-registration seed, unit
+        # fixtures) keeps the old include-it behavior, a shape only
+        # single-repo runs produce.
+        repo_r = args.repo.resolve()
+        old = {t["id"]: t["commit_sha"] for t in st["tasks"]
+               if t.get("commit_sha")
+               and (t.get("repo") in (None, ".")
+                    or Path(t["repo"]).resolve() == repo_r)}
+        subjects = {tid: gitops.run_git(args.repo, "log", "-1",
+                                        "--format=%s", sha)
+                    for tid, sha in old.items()}
+        gitops.autosquash(args.repo, args.base, recorded)
+        for task in st["tasks"]:
+            if task["id"] in subjects:  # SHA re-derivation (B10)
+                task["commit_sha"] = gitops.find_commit_by_subject(
+                    args.repo, args.base, subjects[task["id"]])
+        return None
+    if not (args.task_id and args.task_branch):
+        raise gitops.GitError("merge-task needs --task-id and --task-branch")
+    message = gitops.render(config["naming"]["commit"]["integration"],
+                            type=st["change_type"],
+                            id=st["work_item"]["id"], summary=args.summary)
+    sha = gitops.squash_merge(args.repo, args.task_branch, message, recorded)
+    for task in st["tasks"]:
+        if task["id"] == args.task_id:
+            task["commit_sha"] = sha
+    return sha
+
+
 def build_parser() -> tuple[argparse.ArgumentParser, dict]:
     """The full argparse surface, introspectable — tests validate every
     `harness <verb> --flag` a skill/agent markdown references against the
@@ -396,6 +479,14 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
     mt.add_argument("--summary", default="")
     mt.add_argument("--autosquash", action="store_true")
     mt.add_argument("--base", default=None)
+
+    # Read-only, and takes no flags on purpose: the dispatch picture is a
+    # property of the run's task DAG, not something a caller narrows or
+    # filters. Every filter would be a place for the orchestrator's own idea
+    # of readiness to creep back in.
+    sub.add_parser("ready-tasks", parents=[common],
+                   help="the dispatch picture: which tasks are ready now, "
+                        "which are in flight, which are blocked on what")
 
     pm = sub.add_parser("publish-mirror", parents=[common], help="path-exclusive ai/** snapshot commit")
     pm.add_argument("--repo", type=Path, required=True)
@@ -809,9 +900,16 @@ def main(argv: list[str] | None = None) -> int:
                     # machinery degraded — evidence-loss events or an
                     # engaged stall procedure (shared rule —
                     # workflow.run_health, the same one metrics' "## Run
-                    # health" section reads)
+                    # health" section reads). The cursor goes in because a
+                    # spawn still in flight IN THE CURRENT step is healthy
+                    # pipelining, not lost evidence (round 4); the round
+                    # anchor goes in with it because a step name repeats
+                    # across an `on_reject` bounce, and the verdict FLAPPED
+                    # back to HEALTHY when it did.
                     "health": workflow.run_health(
-                        events, workflow.stall_count(st))[0]})
+                        events, workflow.stall_count(st),
+                        st["cursor"]["current_step"],
+                        transitions.latest_gate_decision(st))[0]})
             _emit({"ok": True, "runs": runs})
             return 0
 
@@ -871,6 +969,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.cmd == "worktree-add":
+            # Already correct for pipelined dispatch, and deliberately left
+            # alone: the EXCLUSIVE lock spans the git call, not just the
+            # record-keeping around it (same shape merge-task now has). Two
+            # tasks' `worktree add` run against one shared checkout — they
+            # write the same `.git/worktrees/` index and cut branches from
+            # the same ref — so the serialization here is the reason a
+            # concurrent lane never sees a half-registered worktree.
             with state_mod.locked(args.run):
                 st = state_mod.load(args.run, args.workspace)
                 # never re-create a worktree abort just swept (leaks it —
@@ -901,6 +1006,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.cmd == "worktree-remove":
+            # Same span, same reason as worktree-add above: the removal (a
+            # write to the shared checkout's worktree index) happens inside
+            # the lock, so a sibling task's add cannot interleave with it.
             with state_mod.locked(args.run):
                 st = state_mod.load(args.run, args.workspace)
                 transitions.ensure_live(st, "worktree-remove")
@@ -1094,7 +1202,32 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.cmd == "publish-mirror":
-            sha = gitops.publish_mirror(args.repo, args.run, config, args.run.name)
+            # Same phantom-run pre-check merge-task makes, and for the same
+            # reason: `locked()`'s unconditional mkdir would build a run
+            # directory out of a typo'd --run before anything refused.
+            if not state_mod.state_path(args.run).exists():
+                raise state_mod.StateError(
+                    f"{args.run} is not a run (no state.yaml) — check --run; "
+                    "refusing to manufacture a phantom run directory")
+            # UNDER THE RUN LOCK (adversarial review of round 3, measured).
+            # This verb walks the whole live run directory, copies every file
+            # into the repo, PRUNES what no longer belongs, and then stages
+            # and commits the result — while `merge-task` may be rewriting
+            # the same repo's index and HEAD from another lane, and while
+            # any run-scoped writer may be mid-`chain.seal` (two separate
+            # atomic replaces) on state.yaml. Unlocked, the mirror could
+            # commit a state.yaml paired with the previous seal — a snapshot
+            # that fails `verify` on inspection for no real reason — or
+            # collide with a merge on git's own index.lock and fail the
+            # step. It is a read of run authority plus a write to the repo,
+            # so it takes the same lock both of those already take.
+            #
+            # The PUSH deliberately stays outside: it is network I/O with no
+            # bearing on run state, and holding the run lock across it would
+            # queue every other verb behind a remote round-trip.
+            with state_mod.locked(args.run):
+                sha = gitops.publish_mirror(args.repo, args.run, config,
+                                            args.run.name)
             out = {"ok": True, "sha": sha}
             if args.push:
                 # The final mirror's purpose is the PR's audit trail — and a
@@ -1126,53 +1259,69 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.cmd == "merge-task":
-            with state_mod.locked_read(args.run):  # torn-read guard; the
-                # mutating re-read below re-takes the EXCLUSIVE lock — this
-                # only protects the pre-read (task SHAs / naming context)
-                st = state_mod.load(args.run, args.workspace)
-            transitions.ensure_live(st, "merge-task")
-            if args.autosquash:
-                if not args.base:
-                    raise gitops.GitError("--autosquash requires --base")
-                # Scope the SHA map to THIS repo's tasks (field report: the
-                # unfiltered map swept every task in state.yaml, so on any
-                # multi-repo run the `git log` below ran a sibling repo's
-                # SHA in args.repo and crashed). Resolved-path comparison —
-                # the same spelling-variance stance as initws.repo_name; a
-                # task with no/'.' repo (pre-registration seed, unit
-                # fixtures) keeps the old include-it behavior, a shape only
-                # single-repo runs produce.
-                repo_r = args.repo.resolve()
-                old = {t["id"]: t["commit_sha"] for t in st["tasks"]
-                       if t.get("commit_sha")
-                       and (t.get("repo") in (None, ".")
-                            or Path(t["repo"]).resolve() == repo_r)}
-                subjects = {tid: gitops.run_git(args.repo, "log", "-1",
-                                                "--format=%s", sha)
-                            for tid, sha in old.items()}
-                gitops.autosquash(args.repo, args.base)
-                with state_mod.locked(args.run):
-                    st = state_mod.load(args.run, args.workspace)
-                    for task in st["tasks"]:
-                        if task["id"] in subjects:  # SHA re-derivation (B10)
-                            task["commit_sha"] = gitops.find_commit_by_subject(
-                                args.repo, args.base, subjects[task["id"]])
-                    state_mod.save(args.run, args.workspace, st)
-                _emit({"ok": True, "autosquashed": True})
-                return 0
-            if not (args.task_id and args.task_branch):
-                raise gitops.GitError("merge-task needs --task-id and --task-branch")
-            message = gitops.render(config["naming"]["commit"]["integration"],
-                                    type=st["change_type"],
-                                    id=st["work_item"]["id"], summary=args.summary)
-            sha = gitops.squash_merge(args.repo, args.task_branch, message)
+            # Checked BEFORE `locked()`, whose unconditional mkdir would
+            # otherwise build a phantom run directory out of a typo'd --run —
+            # the stray-directory class `locked_read` avoids by design, and
+            # this verb used to inherit that protection by opening with a
+            # `locked_read`. It no longer does (see the exclusive section
+            # below), so the check is explicit rather than incidental.
+            if not state_mod.state_path(args.run).exists():
+                raise state_mod.StateError(
+                    f"{args.run} is not a run (no state.yaml) — check --run; "
+                    "refusing to manufacture a phantom run directory")
+            # THE MERGE ITSELF RUNS UNDER THE EXCLUSIVE RUN LOCK (round 3).
+            # It used to sit outside, with only the SHA write-back re-taking
+            # the lock — harmless while develop merged one task at a time,
+            # wrong the moment dispatch became DAG-pipelined: two tasks'
+            # merges contend on ONE feature-branch checkout (one index, one
+            # HEAD), so a sibling's `merge --squash` could land between this
+            # one's merge and its commit. gitops.squash_merge's preconditions
+            # can only refuse states the lock cannot rule out; the lock is
+            # what stops the two merges from interleaving in the first place.
+            #
+            # WHAT THIS COSTS, corrected after measurement (the round-3 note
+            # here claimed "two tasks merging simultaneously is the ONLY
+            # contention this adds" — false, and the error it predicted was
+            # the wrong one). This lock is the RUN lock: every run-scoped
+            # verb takes it, exclusively on Windows even for reads. So a
+            # merge holding it for 15.6s (measured, 20k-file checkout)
+            # queues `show`, `verify`, `status`, `task`, `cursor`,
+            # `artifact`, `set-state`, `ready-tasks`, `publish-mirror`,
+            # `stall`, `abort`, `complete` — every one of them, not just a
+            # sibling merge. Pre-fix they did not queue, they DIED at ~9.4s
+            # with a raw `OSError: Resource deadlock avoided`; state.py now
+            # waits out the holder (LOCK_WAIT_BUDGET) and, only past that
+            # budget, refuses with a StateError naming the lock and saying
+            # to retry the identical command. Queueing behind a merge is the
+            # accepted cost. If the WAIT itself ever becomes the problem,
+            # the named escalation is a per-REPO lock (merges of different
+            # repos never contend, and would stop queueing behind each
+            # other) — deliberately not built now: an unused second lock
+            # ordering is its own deadlock risk.
             with state_mod.locked(args.run):
                 st = state_mod.load(args.run, args.workspace)
-                for task in st["tasks"]:
-                    if task["id"] == args.task_id:
-                        task["commit_sha"] = sha
+                transitions.ensure_live(st, "merge-task")
+                sha = _merge_task(args, config, st)
                 state_mod.save(args.run, args.workspace, st)
-            _emit({"ok": True, "sha": sha})
+            _emit({"ok": True, **({"autosquashed": True} if args.autosquash
+                                  else {"sha": sha})})
+            return 0
+
+        if args.cmd == "ready-tasks":
+            # The OWNED derivation of the dispatch picture (round 3). develop
+            # dispatches every task whose depends_on is satisfied, so someone
+            # has to answer "which are those, right now" — and it must not be
+            # the orchestrator, reading state.yaml and re-implementing the
+            # DAG walk in prose. Hand-derivation is how a task with an unmet
+            # dependency gets dispatched (the FSM refuses it, mid-loop, as a
+            # confusing 'not yet done'), and how an IN-FLIGHT task gets
+            # dispatched twice (the spawn guard refuses the second, and the
+            # orchestrator has no idea why). Read-only, shared lock, same
+            # torn-read guard as `show`; a corrupt state raises the CLI's
+            # normal integrity error rather than reporting a partial picture.
+            with state_mod.locked_read(args.run):
+                st = state_mod.load(args.run, args.workspace)
+            _emit({"ok": True, **workflow.dispatch_picture(st)})
             return 0
 
         if args.cmd in ("verify", "show"):
@@ -1301,8 +1450,105 @@ def main(argv: list[str] | None = None) -> int:
                 after = probe.get("artifacts") or {}
                 derived = {k: v for k, v in after.items()
                            if before.get(k) != v}
+            # A fourth ledger-fresh field, same motive as the three above —
+            # something true on disk that state.yaml alone cannot show. The
+            # orchestrator is told to re-read `show` whenever it is unsure
+            # what to do next, and "wait for a background spawn vs. call
+            # `stall`" is decided at exactly that moment — yet `show`
+            # reported no flagged events at all, so the one record that
+            # answers it (`spawn-pending`) was invisible unless the
+            # orchestrator went reading ndjson by hand. `status` has carried
+            # a flagged COUNT for runs; per-KIND is what makes the reading
+            # actionable here. Same shared filter, so the number can never
+            # disagree with `status` or with metrics' "## Flagged events".
+            #
+            # Enrichment, never a failure mode: an unreadable/absent ledger
+            # degrades to {} exactly like the probe above — `show` is the
+            # tool reached for when a run is wedged.
+            #
+            # `outstanding_spawns` is a SIBLING key, not a reshaping of the
+            # one above: the {kind: count} summary answers "how much is
+            # owed", and reducing to a count is exactly right for the other
+            # ten kinds. For `spawn-pending` it destroys the only thing the
+            # dispatch loop needs. Executed (whole-system review, round 4):
+            # with T1's developer dead and T2's alive, `ready-tasks` and
+            # `show` read IDENTICALLY — no owned verb attributed an open
+            # pending to a task — so the only way to find the wedged lane was
+            # to `stall` one and see which refused, a destructive probe that
+            # SUCCEEDS on the healthy lane and returns the wrong instruction.
+            # `outstanding_flagged` has carried the full dicts all along
+            # (task/mode/agent_id, and now the spawning step); this hands
+            # them over rather than making the orchestrator hand-read the
+            # events.ndjson tail, which is the thing owned verbs exist to
+            # prevent.
+            #
+            # `at` rides along, and it is the field that actually closes the
+            # case above (round-4 review re-executed it: attribution alone
+            # does NOT). Pipelined develop puts both lanes at the SAME step —
+            # and `requires_tasks_terminal` means the cursor can never leave
+            # develop while T1 is non-terminal, so the step comparison that
+            # separates a left-behind pending from a live one can never fire
+            # for a dead develop lane. Two entries then read identically
+            # except for their AGE, which is the whole discriminator: the
+            # outlier among siblings launched into one step is the wedged
+            # one. Health cannot make that call for the same reason (see
+            # workflow.run_health) — it is per-lane, so it is reported here
+            # and diagnosed in dev-workflow/SKILL.md's triage.
+            #
+            # `clearable`/`clearing_key` answer the NEXT question rather than
+            # leaving it to be derived: the declared-unclearable modes
+            # (repo-map, request-triage — declared outside every step's
+            # spawn-set) match no `stall` key at all, so the abandon
+            # instruction the triage used to give for any non-current-step
+            # entry bumped a stall counter, wrote no override, cleared
+            # nothing, and degraded the run for a brand-new reason.
+            outstanding: dict[str, int] = {}
+            spawns: list[dict] = []
+            legacy: list[dict] = []
+            try:
+                pending_kind = (transitions.spawn_pairing().get("pending")
+                                or {}).get("kind")
+                events = ndjson.read_records(args.run / "events.ndjson")
+                for e in workflow.outstanding_flagged(events):
+                    kind = e.get("kind")
+                    outstanding[kind] = outstanding.get(kind, 0) + 1
+                    if kind == pending_kind:
+                        key = transitions.spawn_clearing_key(manifest, e)
+                        spawns.append({"task": e.get("task"),
+                                       "mode": e.get("mode"),
+                                       "agent_id": e.get("agent_id"),
+                                       "step": e.get("step"),
+                                       "at": e.get("at"),
+                                       "clearable": key is not None,
+                                       "clearing_key": key})
+                # A pending written by a PRE-ROUND-4 harness carries the spawn
+                # shape where `actor` now lives, so it fails the anti-forgery
+                # actor check and is invisible to every reader of the family
+                # — including `outstanding_flagged` above. Executed (round-4
+                # review): a spawn in flight across the upgrade left the gauge
+                # empty, health HEALTHY, re-spawn allowed, stall allowed over
+                # a live agent, and its real SubagentStop exiting 0 with an
+                # empty stderr. Round 3's stale-verdict race, reopened for the
+                # upgrade window and reported by nothing. The actor bound is
+                # NOT widened to fix it — accepting a declared shape as an
+                # alternate actor re-opens the forgery round 4 closed — so
+                # these surface under their OWN key instead: visible, never
+                # mistaken for an open pending, and named for what they are.
+                closed = transitions.closed_agent_ids(events)
+                legacy = [{"agent_id": e.get("agent_id"),
+                           "task": e.get("task"),
+                           "mode": e.get("mode"), "at": e.get("at")}
+                          for e in events
+                          if e.get("kind") == pending_kind
+                          and not transitions.is_open_pending_record(e)
+                          and e.get("agent_id") not in closed]
+            except Exception:                                 # noqa: BLE001
+                outstanding, spawns, legacy = {}, [], []
             _emit({"ok": True, "state": st, "next_steps": next_steps,
-                   "derived": derived, "probe_error": probe_error})
+                   "derived": derived, "probe_error": probe_error,
+                   "outstanding_flagged": outstanding,
+                   "outstanding_spawns": spawns,
+                   "legacy_spawn_pendings": legacy})
             return 0
 
         # Expensive verify-green test run happens OUTSIDE the lock (RC4);
@@ -1592,17 +1838,68 @@ def main(argv: list[str] | None = None) -> int:
                         # "record it anyway"; anything the guard says on the
                         # way is a note, never a veto.
                         overridden = f"{type(exc).__name__}: {exc}"[:200]
+                if overridden:
+                    # BEFORE record_stall, deliberately (adversarial review,
+                    # executed): `record_stall` raises "unknown task" for a
+                    # key absent from state["tasks"], and nothing ever
+                    # validates a `harness-task:` header against the task
+                    # list — so one typo'd header produced a pending under a
+                    # key the counter rejects, and the retirement that would
+                    # have freed it lived AFTER the raise. Result: the key
+                    # blocked by guard_spawn's one-live-spawn rule, the run
+                    # DEGRADED, and no verb able to move either. The flag's
+                    # contract is "record it anyway" (see the catch above);
+                    # a counter failure is allowed to fail the verb, never to
+                    # void the retirement the override already decided on.
+                    # The TransitionError still propagates — these writes are
+                    # ledger appends, not part of the state save below.
+                    ndjson.append_record(
+                        args.run / "events.ndjson",
+                        {"kind": "stall-verdict-override", "task": stall_key,
+                         "reason": overridden, "actor": "stall"})
+                    # The override's OTHER consequence, and the only writer
+                    # of this kind: declaring a spawn dead has to actually
+                    # retire it. Without this the run deadlocks — the
+                    # abandoned pending stays open, so guard_spawn's
+                    # one-live-spawn rule refuses the very re-spawn the
+                    # stall's `reinvoke` action just asked for, and no verb
+                    # exists to clear it. It also settles the two other
+                    # readers: the pending stops counting on the flagged
+                    # gauge / run health (the `stall-verdict-override`
+                    # above is the visible anomaly record for this round —
+                    # counting both would double-report one event), and a
+                    # late SubagentStop for this agent is refused capture
+                    # instead of injecting a stale verdict into a round
+                    # somebody else has already been spawned to redo.
+                    #
+                    # EVERY open pending for the key, not just the one the
+                    # guard happened to name: a batched panel leaves several
+                    # in flight under one key, and a half-abandoned key
+                    # deadlocks exactly like an un-abandoned one.
+                    abandoned = (transitions.spawn_pairing()
+                                 .get("resolvers") or {})["abandoned"]
+                    for pend in transitions.open_spawn_pendings(
+                            args.run, stall_key, manifest):
+                        ndjson.append_record(
+                            args.run / "events.ndjson",
+                            {"kind": abandoned["kind"],
+                             "actor": abandoned["actor"],
+                             "agent_id": pend.get("agent_id"),
+                             "task": pend.get("task"),
+                             "mode": pend.get("mode"),
+                             "reason": f"a stall for '{stall_key}' was "
+                                       "recorded over this open "
+                                       "spawn-pending with "
+                                       "--confirm-no-verdict: the spawn is "
+                                       "declared dead, the key is freed for "
+                                       "a fresh spawn, and a reply arriving "
+                                       "late is no longer captured"})
                 action = transitions.record_stall(st, config, stall_key)
                 ndjson.append_record(
                     args.run / "events.ndjson",
                     {"kind": "stall", "task": stall_key, "action": action,
                      **({"override": "confirm-no-verdict"} if overridden
                         else {})})
-                if overridden:
-                    ndjson.append_record(
-                        args.run / "events.ndjson",
-                        {"kind": "stall-verdict-override", "task": stall_key,
-                         "reason": overridden, "actor": "stall"})
                 state_mod.save(args.run, args.workspace, st)
                 _emit({"ok": True, "action": action})
                 return 0
@@ -1619,6 +1916,14 @@ def main(argv: list[str] | None = None) -> int:
             state_mod.StateError, state_mod.CollisionError,
             gitops.GitError, gitops.RedProofError, mermaid.MermaidError,
             ProviderError, ValueError,
+            # TypeError joins them for the same reason ValueError is here:
+            # a hand-edited or migrated state.yaml can carry a field of the
+            # wrong SHAPE, and the engine's own list/dict operations then
+            # raise it (adversarial review, round 4: a legacy `depends_on:
+            # "T1"` string). The owned entry points refuse such shapes by
+            # name; this is the floor under everything they don't reach, so
+            # a shape defect reads as a refusal instead of a traceback.
+            TypeError,
             # Boundary failures must land in the JSON error contract too
             # (adversarial-review finding: a missing gh/glab binary
             # [FileNotFoundError], a CLI timeout [SubprocessError], or a
