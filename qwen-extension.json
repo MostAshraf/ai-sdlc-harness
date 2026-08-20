@@ -1,5 +1,5 @@
 {
   "name": "ai-sdlc-harness",
-  "version": "3.6.0",
+  "version": "3.7.0",
   "description": "Governed multi-agent SDLC pipeline for Claude Code and Qwen Code — v3.0, a ground-up rewrite of the v2.x line. Declared-data pipeline, owned entry points, proof-anchored TDD, code-modular providers."
 }

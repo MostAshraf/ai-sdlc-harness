@@ -6,206 +6,39 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
-- Reviewer verdicts from background subagents are no longer lost. Newer
-  Claude Code versions run subagents in the background by default, where the
-  pipeline's capture saw only a launch stub: the verdict was unrecoverable
-  and a spurious "stalled agent" event was fabricated in its place. Capture
-  now records a pending marker when a spawn is backgrounded and completes it
-  when that agent actually finishes — the verdict, status block, and token
-  cost all land under the same task attribution, and a background agent that
-  dies without ever finishing surfaces as an outstanding flag on the
-  dashboard (and degrades run health) instead of vanishing.
-- Background spawns of the pipeline's own agents are **no longer blocked
-  under Claude Code**. The old rule required an explicit
-  `run_in_background: false` on every spawn — impossible on the newer Agent
-  tool, which has no such parameter, so the guard blocked the entire
-  pipeline there. Capture now handles both ends of a background spawn, so
-  the rule applies only under Qwen Code, whose background format has not
-  been measured (an unrecognised launch stub there would fabricate the
-  stalled-agent event this work exists to prevent). The pipeline
-  instructions changed to match: pass `false` where the tool has the
-  parameter; where it does not, wait for the agent's completion
-  notification and read the verdict from the ledger, never from reply text.
-- **One live spawn per (task, mode).** With backgrounding allowed, a second
-  agent could be launched to answer a question the first was still
-  answering — both finish, and the newest verdict wins, which may be the
-  stale one. The spawn guard now refuses that, naming the agent still in
-  flight and the two ways out: wait for it, or — if it genuinely died —
-  record the stall with `--confirm-no-verdict`, which now also abandons the
-  pending, freeing the key for a fresh spawn. Spawns for a different task or
-  mode are untouched, so parallel work stays parallel — as are spawns
-  batched into a single message (they all clear the guard before any of them
-  reports, which is what keeps a batched review panel legal) and the panel's
-  own adversarial lenses, which are exempt outright: no engine-read verdict
-  rides on a lens, so two of them cost tokens, never a wrong verdict. A reply that arrives
-  after abandonment is reported and dropped rather than entering the ledger
-  behind the replacement round's back; the abandoned spawn stops counting on
-  the dashboard, where the override itself is already recorded.
-- Requesting the stalled-agent procedure while a background review is still
-  pending is now refused — re-spawning over a live reviewer produced two
-  verdicts for one round, and the stale one could win. The run dashboard
-  (`harness show`) now lists outstanding flagged events, so "still running"
-  is visible exactly where the stall/wait decision is made; an explicit
-  override remains available. This now covers task-less spawns
-  (plan-review, pre-pr, a plan panel's lenses) too: their pending and their
-  stall key are spelled differently, and used to miss each other — so the
-  plan-review synthesizer, the case the refusal was written for, could be
-  running in the background and still be told to re-spawn.
-- **Tasks now run as the plan's dependency graph allows, not one at a
-  time.** `develop` dispatched tasks sequentially within a repo — a rule
-  that was never about the tasks: it stood in for the fact that every task
-  merges into one shared feature-branch checkout, and two merges landing at
-  once corrupted it silently. That contention is now handled where it lives.
-  `merge-task` holds the run's exclusive lock across the merge itself
-  (previously only the SHA write-back took it) and refuses before touching
-  the index when a git operation is unfinished in the checkout, when the
-  checkout is on the wrong branch, or when it carries someone else's
-  uncommitted work — the states that used to put a task's whole diff on the
-  base branch, or fold a sibling's half-finished work into this task's
-  integration commit. **Both forms are covered**: the `--autosquash` form,
-  which rewrites every commit on the branch, gets the identical checks (it
-  previously had none, and a call issued from the base branch rewrote *that*
-  branch and then recorded a wrong same-subject commit as a task's work).
-  Which branch a task integrates onto is read from the run's own recorded
-  `branches` artifact, so **a repo `preflight` never cut a branch in is
-  refused rather than guessed at** — for both forms. With that owned,
-  `depends_on` is the only thing that orders anything: every task whose
-  dependencies are done starts
-  together, and a task finishing releases its dependents immediately. A new
-  read-only verb, `harness ready-tasks`, is the engine's own answer to
-  "what can start now" — ready, in flight, blocked (and on what), terminal —
-  so readiness is never re-derived by hand, where a dependency merely *in
-  review* reads as satisfied. The step's exit is unchanged and still
-  fail-closed: no task left un-terminal, and the refusal now names which
-  tasks are still moving and how far along they are, instead of reporting
-  "no legal move". `ready-tasks` also reports `conflicts`: pairs of ready
-  tasks in one repo whose declared file manifests overlap. Purely advisory —
-  the plan's `depends_on` remains the only ordering authority — but the
-  dispatch loop now staggers such a pair, because a worktree cut before a
-  sibling merges cannot contain that sibling's code.
-- **A long merge no longer kills every other command on Windows.** With the
-  merge inside the run lock, any concurrent harness command waits for it —
-  and the platform's lock gave up after ~10 seconds with a raw
-  `Resource deadlock avoided` system error. Measured on a 20k-file checkout,
-  a 15.6-second merge failed *every* other command issued during it,
-  `show` and `status` included. Commands now wait out the holder, and only
-  after two minutes give up with a message that names the run lock, says a
-  sibling verb (typically a merge) holds it, and to re-run the identical
-  command. The pipeline instructions say the same thing, so a lock wait is
-  never mistaken for being off-manifest.
-- **An interrupted merge is now recoverable and honestly reported.** A death
-  between the squash and its commit left the whole squash staged, no commit,
-  and the task still reported as ready — while every retry was refused by
-  its own leftovers with a message about "uncommitted changes" that read as
-  the operator's fault. That state is now recognised as what it is and the
-  refusal names the one command that clears it (`git reset --merge`). In the
-  same pass, a merge that fails for a reason that is *not* a conflict — a
-  git lock collision, say — is no longer relabelled "conflicted (working
-  tree restored)": git's own error is reported verbatim, and the
-  tree-restored claim is made only when the cleanup actually succeeded. Any
-  unfinished git operation is refused up front naming *its own* conclusion
-  command, never another's — the previous advice could orphan a live rebase.
-- `publish-mirror` now runs under the run lock, like every other verb that
-  reads run authority and writes a repo. Unlocked, it could snapshot state
-  mid-write and commit a run whose seal did not match its contents, or
-  collide with a sibling lane's merge. The push it optionally performs stays
-  outside the lock — no other command should queue behind a network call.
-- A spawn whose `harness-task:` header names a task that does not exist is
-  blocked at the spawn, listing the run's real task ids. Nothing validated
-  that header before: a typo produced a real agent doing real work filed
-  under a key no verb could reach — its pending blocked the correctly-spelled
-  spawn, and the stall procedure refused to count it. Task-less spawns are
-  unaffected. Two neighbours of that check landed with it: a header left as
-  the literal `harness-task: <task-id>` placeholder (copied from the
-  instructions without substituting) is blocked instead of silently running
-  as a task-less spawn, and a `develop`/`review` spawn for a task that is
-  already finished is blocked rather than producing work the engine then
-  refuses to record.
-- The plan's `depends_on` is now type-checked at registration: a bare string
-  was read one character at a time (`"T1"` became a dependency on `T` and on
-  `1`), which either failed with ids nobody typed or wedged the task
-  silently. Read-only views coerce a bad legacy value instead of crashing —
-  their job is to show a broken plan, not to die on it.
-- Which task statuses count as *finished* is now declared once in the task
-  FSM (`terminal: [done, archived]`) and read from there by all seven places
-  that ask. It was seven separate hardcoded copies, so adding a status would
-  have made a task finished to the dispatcher and still live to the step
-  that waits for it.
-- Evidence-forgery hardening, from an adversarial review of this change:
-  the record that clears a pending spawn is now capture-owned and checked by
-  every reader (a hand-written ledger event could previously silence the
-  "background spawn awaiting capture" flag), and the guard that blocks
-  hand-piped synthetic payloads into the capture hooks now catches the
-  line-continuation spelling that already evaded it for other verbs.
-- **Run evidence is no longer lost when several agents finish at once.** The
-  run's ledgers (reviewer verdicts, events, token costs) were written by
-  concurrent one-shot hook processes relying on the operating system to keep
-  single appends whole — which Windows does not. Measured on this platform:
-  six processes writing 120 records each left 376 of 720, with nothing torn
-  or corrupt to show for it, so a captured `APPROVED` could simply cease to
-  exist. Ledger appends now take their own brief lock. It is deliberately
-  separate from the run lock, so a capture still completes in a fraction of
-  a second while a long merge is in progress, and if the lock cannot be
-  taken at all the record is still written rather than dropped.
-- **A run with agents still working no longer reports DEGRADED.** With
-  `develop` now dispatching every ready task at once, several agents in
-  flight is the normal state of a healthy run — and `harness status` called
-  all of it degraded, which is exactly the reading that surface exists to
-  give. Health now degrades only on a spawn nothing is waiting for any
-  more — one the run has *moved past*, or one launched in a round a human
-  gate has since closed out — which is the case where evidence really was
-  lost. In-flight spawns stay visible on the flagged-events count
-  throughout. The second half matters because a rejected gate sends the
-  cursor back to the step it came from: tested on the step's *name* alone,
-  the verdict flipped back to HEALTHY the moment `approve-impl` was
-  rejected, with nothing about the lost spawn having changed.
-- `harness show` now lists in-flight spawns individually — task, mode, agent
-  id, the step each was launched from, when it was launched, and whether any
-  `stall` key can clear it — instead of only counting them. Before, nothing
-  attributed an open spawn to a task at all, so the only way to find a
-  wedged lane was to call `stall` on one and see which refused: a
-  destructive probe that succeeds on the healthy lane and gives the wrong
-  instruction. Attribution alone is not the whole answer, because pipelined
-  `develop` holds every lane at one step: the launch time is what separates
-  a dead lane from a live sibling, and the stall triage now says so. Two
-  entries that carry no clearing key at all (a repo-map or request-triage
-  spawn) are marked as such and left alone — the instruction to abandon them
-  matched nothing, cleared nothing, and cost the run a stall counter. The
-  dispatch loop and the stall triage now ask this verb rather than reading
-  the events ledger by hand.
-- `harness ready-tasks` now reports each task's repo on every entry — ready,
-  in flight, blocked and terminal alike — not only inside its file-overlap
-  advisory. The `develop` instructions scope the direct-branch worktree
-  fallback to "no sibling task in that repo is still running" and name this
-  verb as the way to check, which it could not answer.
-- **Upgrade note — drain in-flight spawns before upgrading.** A background
-  spawn that is *already running* when the harness is upgraded to this
-  version loses its deferred capture: the record pairing it to its agent was
-  written in the previous format, and the anti-forgery check this release
-  adds (deliberately, and not relaxed here) cannot verify it. The result is
-  no verdict and no status block for that one spawn (its token cost is still
-  recorded). It is now reported rather than silent — the completion prints
-  what happened
-  and what to do (re-spawn it in the foreground), and `harness show` lists
-  such spawns under `legacy_spawn_pendings` instead of showing nothing at
-  all. Spawns launched after the upgrade are unaffected.
-- `ready-tasks`' file-overlap advisory now also pairs a newly-ready task
-  against tasks **already in flight**, not just against other ready ones —
-  which is the situation pipelined dispatch is in for most of `develop`, and
-  the one the advisory could never see. Blocked and finished tasks are still
-  not paired.
-- The `develop` instructions now offer the direct-branch worktree fallback
-  **only when no sibling task in that repo is still running**. Taken while
-  one is, it parks a non-feature branch in the shared checkout, every
-  sibling's merge is then refused, and the loop is told to wait and retry a
-  command that can never succeed.
-- A hand-written "spawn in flight" ledger record can no longer wedge a run.
-  It was the one record of its family not checked against its owner, so a
-  forged one blocked the next legitimate spawn, made the stall that would
-  clear it refuse, and degraded run health — recoverable only at the cost of
-  a stall counter and a flagged override. The whole family — the record and
-  both ways it can be closed — is now declared in one place and read from
-  there by every part of the engine and the hooks that asks about it.
+## [3.7.0] — 2026-08-20
+
+> **Newer Claude Code versions run subagents in the background by default, and this harness could not survive it.** Reviewer verdicts were anchored to a spawn's own reply — for a background agent, only a launch stub — so a verdict was unrecoverable and a spurious "stalled agent" event was fabricated in its place; the guard that blocked background spawns as protection, on a CLI whose Agent tool no longer even carries the parameter it checked, blocked the entire pipeline. This release re-anchors verdict capture to the agent's own completion, lifts the block where capture can prove itself, and then goes where that safety allows: `develop` stops running tasks one at a time and dispatches everything the plan's dependency graph permits at once, with the merge contention, ledger concurrency, and dashboard semantics that one-at-a-time execution had been quietly hiding now handled directly. Five rounds of work, each through execution-verified adversarial review — including a whole-system pass across the composite that found (and this release fixes) defects in the earlier rounds' own fixes.
+
+### Release highlights
+
+| Theme | What changed |
+|---|---|
+| **Background verdicts are captured, not lost** | Capture records a pending marker when a spawn is backgrounded and completes it when that agent actually finishes — verdict, status, and token cost land under one task attribution, sourced only from the agent's own transcript or its final message, never the parent session's. An agent that dies without finishing surfaces as an outstanding flag instead of vanishing; a crashed capture leaves the flag open rather than fabricating a stall. |
+| **Background spawns are legal on Claude Code** | The foreground-only block is now scoped to Qwen Code, whose background format remains unmeasured. On Claude Code, where the newer Agent schema dropped the `run_in_background` parameter entirely and the old rule blocked every spawn, all spellings pass and capture handles both ends. |
+| **One live spawn per question, dead ones recoverable** | A second agent can no longer be launched (across messages) to answer a question an unreported one is still answering — the race a stale verdict wins. The stalled-agent procedure refuses to run over a live background spawn, and a genuinely dead one is freed by an explicit override scoped by what the stalled step actually spawns, so an override can never destroy a live synthesizer on another step. A late reply from an abandoned agent is refused rather than re-entering the race. Three new spawn refusals guard the same door: a `harness-task:` header naming an unregistered task, an unsubstituted `<task-id>` placeholder (the docs' own copy-paste shape), and a develop/review spawn naming an already-terminal task while siblings are still live. |
+| **Tasks dispatch by dependency graph, not one at a time** | `develop` dispatches every task whose dependencies are done, together; a task finishing releases its dependents immediately. A new read-only `harness ready-tasks` verb is the engine's own answer to "what can start now" — ready, in flight, blocked (and on what), terminal, each entry carrying its repo — plus a `conflicts` advisory naming same-repo pairs (ready or in flight) whose declared file manifests overlap, which the dispatch loop staggers. `depends_on` is now type-checked at registration and is the only ordering authority — over-declaring it serializes work the dispatcher would run in parallel. The step's exit is unchanged and fail-closed: every task terminal, with the refusal naming which tasks are still moving. |
+| **Merges are serialized and preconditioned** | Every task merges into one shared feature-branch checkout; two merges landing at once corrupted it silently. `merge-task` — both the squash and the autosquash form — now runs under the run's exclusive lock and refuses before touching the index when the checkout is on the wrong branch, carries uncommitted work, or has an unfinished git operation, naming that operation's own conclusion command. Which branch a task integrates onto is read from the run's own recorded `branches` artifact, so a repo `preflight` never cut a branch in is refused rather than guessed at. A merge killed between squash and commit is recognized and the refusal names `git reset --merge`; a non-conflict git failure is reported with git's own words instead of being relabelled a conflict. `publish-mirror` takes the same lock — it writes the same checkout. |
+| **The evidence ledger survives concurrent writers** | The append-only ledgers that carry verdicts were not atomic on Windows — measured, six concurrent capture hooks kept roughly half their records, and batched spawns are exactly that concurrency. Every append now takes a short-held `.ledger.lock` sidecar (a new file in each run directory), timestamps are minted inside it and clamped to the ledger's own tail so file order and timestamp order agree, and a long-held lock fails open — the record is written anyway, once-noisily — rather than dropping evidence. On Windows, commands that hit a lock held by a long merge wait it out (up to two minutes) instead of crashing with a raw system error. |
+| **Dashboards tell the truth under pipelining** | A healthy run with agents in flight no longer reads DEGRADED: health degrades only on a pending the run has left behind (its step stale or its launch predating the latest gate decision — which also stops the verdict flapping healthy across a gate rejection). `harness show` lists each open spawn with its task, mode, agent id, step, launch time, and whether any stall key can clear it — so a wedged lane is diagnosed by age from an owned verb, not by hand-reading ledgers or stalling the healthy lane to see which refuses. |
+| **The rules the pipeline runs on are declared, and the declaration gates** | The task FSM's terminal vocabulary and the spawn pending/resolver pairing (which records open a spawn, which close it, and who may write each) now live in `pipeline/task-fsm.yaml`, schema-validated — a declaration whose pending kind the gauges don't watch, an unknown resolver, or an actor colliding with a spawn shape is refused at `harness schema` time, not discovered as a wedged run. Forged ledger records (the `log-event` spelling) can no longer block spawns, refuse stalls, or clear the gauge: every record in the family is actor-checked by every reader. |
+
+### Upgrade notes
+
+- **Two behaviour changes can refuse what 3.6.0 accepted, deliberately.** `merge-task` now refuses a dirty checkout, a wrong branch, or an unrecorded feature branch — states that previously merged silently and sometimes wrongly; commit or clean the checkout and re-run. `plan-register` now refuses a `depends_on` that is not a list of strings. Workspaces that never hit those states see no change; foreground capture behaviour is unchanged everywhere.
+- **Drain in-flight background spawns before upgrading.** A spawn launched by a pre-3.7.0 harness carries the old record shape: its deferred capture is impossible after the upgrade. The completion now says so loudly and directs a foreground re-spawn (and `harness show` lists such records), but the verdict itself cannot be recovered.
+- **Pipelined lanes build against a partial branch.** A task's worktree is cut when it dispatches, so a co-dispatched sibling's code is not in it until the sibling merges and the lane re-cuts; each lane's tests prove its own change, and the merged feature branch is what `pre-pr` and reconciliation verify. Same-repo pairs with overlapping file manifests are staggered by the dispatch loop via the `conflicts` advisory — which trusts the plan's declared manifests; an incomplete manifest silently defeats it.
+- **Qwen Code's background format is not yet measured.** Background spawns of the pipeline's agents remain blocked there (explicit `run_in_background: false` still mandated, guard-enforced); if Qwen ever adopts the parameter-less schema, the pipeline hard-fails there until that measurement happens. The block's env-keyed scoping means a Qwen session whose `QWEN_CODE` variable fails to reach hook subprocesses would silently lose that protection.
+- **A new `.ledger.lock` file appears in each run directory** (and `.state.lock` behaviour on Windows changed from crash-after-10s to wait-up-to-120s, tunable via `HARNESS_LOCK_WAIT_BUDGET`). Neither is mirrored into the PR audit trail.
+- **Known residual** — a spawn class declared outside the step spawn-sets (`request-triage`, `repo-map`) that lands a pending via the single-run fallback cannot be cleared by any stall key; `show` marks it `clearable: false`, it refuses nothing meanwhile, and it self-clears when the agent stops.
+- **Known residual** — a forged ledger record carrying the capture-owned actor value can still clear or suppress one capture (a silently wasted review round, never a forged verdict); agent-id reuse by the platform would hide, not flag, the second pending; and a reply arriving after a run is aborted still lands in the dead run's ledger. All bounded, all recorded in code.
+- **`plan-task.md` sits at exactly its 200-line hard cap.** The next change to that file must trim before it can add.
+
+### Verification on tag tip
+
+- `python -m harness.schema` — declared data valid
+- `python tools/budget_check.py` — line budget green
+- `python -m unittest discover -s tests` — 1249 tests green (skipped=12); 157 new this cycle
 
 ## [3.6.0] — 2026-08-15
 > **A monorepo's second stack could be discovered, described, and then not registered — and its test suite silently never ran again.** Setup has proposed a `monorepo_split` for as long as it has proposed anything: one checkout, a .NET solution at its root, a Node app under `frontend/`, two logical repos sharing one `.git`. Nothing downstream could accept that answer. Verification asked whether the registered path had a `.git` directly under it — true only of a checkout root — so registering the two roots separately left both permanently failing the gate with no available fix, and the setup skills said the only thing that then worked: register the repo once, at its physical root. One stack got a test command; the other's suite dropped out of every pipeline that ever ran there, with no gate anywhere reporting the loss. A registered repo may now be **any subtree of a git checkout**, so the split registers as the several logical repos it always was. An adversarial review of the change then hardened it: the review found (and this release closes) a write path where an edit outside the task's subtree was silently destroyed on a green run, a contract check that could report clean against a sibling repo's files, a PR step that hard-failed for the second repo of a shared checkout, and four verification gaps where setup accepted a registration the pipeline could never run.
