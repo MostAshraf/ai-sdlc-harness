@@ -230,6 +230,101 @@ class InvocationConsistency(unittest.TestCase):
         self.assertIn("VERBATIM",
                       (steps / "review-task.md").read_text(encoding="utf-8"))
 
+    def test_the_direct_branch_fallback_is_scoped_to_a_quiet_repo(self):
+        """The M5 lane policy (one task at a time per repo) made the
+        direct-branch worktree fallback safe; round 3's pipelined dispatch
+        SUPERSEDED that policy and left the offer unscoped. Executed
+        (whole-system review, round 4): with T1 on a direct branch in the
+        shared checkout, T2's `merge-task` refuses — HEAD is not the feature
+        branch — and both develop.md step 5 and SKILL.md tell the loop that a
+        MergePreconditionError naming the feature branch means "a sibling is
+        mid-flight, wait and re-run the IDENTICAL command". It never
+        succeeds. Prose is the only place this can be scoped, so pin it."""
+        text = (ROOT / "skills" / "dev-workflow" / "steps"
+                / "develop.md").read_text(encoding="utf-8").replace("\r", "")
+        step1 = text.split("## Per task", 1)[1].split("\n2. ", 1)[0]
+        self.assertIn("direct-branch fallback", step1)
+        for needed in ("no sibling task in that repo is non-terminal",
+                       "ready-tasks", "LIVELOCK"):
+            self.assertIn(needed, step1,
+                          "develop.md must scope the direct-branch fallback "
+                          "to a repo with no live sibling, and say why")
+
+    def test_the_wait_vs_stall_triage_asks_an_owned_verb(self):
+        """"Which lane is still running" is `show`'s `outstanding_spawns`.
+        SKILL.md used to send the orchestrator to the TAIL of events.ndjson
+        for it — the hand-derivation owned verbs exist to prevent, and the
+        one that cannot attribute a pending to a task at all."""
+        skill = (ROOT / "skills" / "dev-workflow"
+                 / "SKILL.md").read_text(encoding="utf-8").replace("\r", "")
+        develop = (ROOT / "skills" / "dev-workflow" / "steps"
+                   / "develop.md").read_text(encoding="utf-8").replace("\r", "")
+        for name, text in (("SKILL.md", skill), ("develop.md", develop)):
+            self.assertIn("outstanding_spawns", text,
+                          f"{name} must point at the owned verb")
+        # …and in SKILL.md's stall triage the owned verb comes FIRST; the
+        # events tail is only for the two block-shaped kinds after it
+        stalls = skill.split("- **Stalls:**", 1)[1].split("\n- ", 1)[0]
+        self.assertLess(stalls.index("outstanding_spawns"),
+                        stalls.index("events.ndjson`:"),
+                        "the ledger read must not precede the owned verb")
+        # …and the spawn-launch step points at the SAME verb. It used to say
+        # "the events-tail triage below covers spawn-pending", which named a
+        # triage that no longer starts there (round-4 review).
+        launch = skill.split("do not `stall`", 1)[1].split("Read the verdict",
+                                                           1)[0]
+        self.assertIn("outstanding_spawns", launch)
+        self.assertNotIn("events-tail triage", skill)
+
+    def test_the_stall_triage_covers_the_same_step_and_unclearable_cases(self):
+        """Two branches the round-4 triage could not express, both executed.
+        (1) `requires_tasks_terminal` pins the cursor at develop while a lane
+        is wedged, so a dead pending and a live one BOTH read `step:
+        develop` — only `at` separates them, and the old prose had no branch
+        for it while the surviving lane's branch said "WAIT" forever.
+        (2) repo-map / request-triage pendings match no `stall` key at all
+        (`stall_key_spawn_modes`), so the abandon instruction cleared
+        nothing and cost the run a stall counter."""
+        stalls = ((ROOT / "skills" / "dev-workflow" / "SKILL.md")
+                  .read_text(encoding="utf-8").replace("\r", "")
+                  .split("- **Stalls:**", 1)[1].split("\n- ", 1)[0])
+        # the entry shape the triage reads must name both new fields
+        for field in ("at", "clearable", "clearing_key"):
+            self.assertIn(field, stalls, f"the triage must read `{field}`")
+        # the same-step branch: diagnosed by AGE, not by a fixed threshold
+        self.assertIn("OUTLIER", stalls)
+        self.assertNotIn("minutes", stalls, "no fixed staleness threshold")
+        # the unclearable branch routes to LEAVE IT, never to an override
+        unclearable = stalls.split("`clearable: false`", 1)[1].split("- **",
+                                                                     1)[0]
+        self.assertIn("leave it", unclearable.lower())
+        self.assertNotIn("--confirm-no-verdict", unclearable)
+        # …and the upgrade-window record has somewhere to be read
+        self.assertIn("legacy_spawn_pendings", stalls)
+
+    def test_the_dispatch_picture_prose_matches_the_entry_shape(self):
+        """develop.md scopes the direct-branch fallback per REPO and names
+        `ready-tasks` as the check; the verb carries `repo` on every entry
+        for exactly that, so the prose must describe the shape it will
+        actually receive."""
+        from harness import workflow
+        text = ((ROOT / "skills" / "dev-workflow" / "steps" / "develop.md")
+                .read_text(encoding="utf-8").replace("\r", ""))
+        picture = workflow.dispatch_picture(
+            {"tasks": [{"id": "T1", "status": "pending", "repo": "api"},
+                       {"id": "T2", "status": "in-progress", "repo": "web"},
+                       {"id": "T3", "status": "done", "repo": "api"},
+                       {"id": "T4", "status": "pending", "repo": "web",
+                        "depends_on": ["T2"]}]})
+        for bucket in ("ready", "in_flight", "blocked", "terminal"):
+            self.assertTrue(all("repo" in e for e in picture[bucket]), bucket)
+        self.assertEqual(picture["ready"], [{"id": "T1", "repo": "api"}])
+        self.assertEqual(picture["terminal"], [{"id": "T3", "repo": "api"}])
+        self.assertEqual([e["repo"] for e in picture["in_flight"]], ["web"])
+        self.assertEqual([e["repo"] for e in picture["blocked"]], ["web"])
+        step1 = text.split("## Per task", 1)[1].split("\n2. ", 1)[0]
+        self.assertIn("each entry's own `repo`", step1)
+
     def test_gate_md_disposition_example_matches_the_manifest(self):
         # gate.md shows the human a numbered security-gate option list; the
         # CLI resolves numbers against the manifest's declared dispositions

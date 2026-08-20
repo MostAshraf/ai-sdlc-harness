@@ -353,6 +353,14 @@ class DagDispatchHarness(BreadthHarness):
         out = self.cli("ready-tasks", run=run)
         return {k: out[k] for k in ("ready", "in_flight", "blocked", "terminal")}
 
+    def ids(self, run, bucket):
+        """Just the ids of one bucket. Every entry is a dict carrying at
+        least `{id, repo}` since round 4 — develop.md scopes the
+        direct-branch worktree fallback to "no sibling task IN THAT REPO is
+        non-terminal" and names this verb as the way to check it — while
+        most assertions below are about the PARTITION, not the repo."""
+        return [e["id"] for e in self.picture(run)[bucket]]
+
 
 class DagDispatch(DagDispatchHarness):
     """`ready-tasks` — the owned dispatch picture develop asks for after
@@ -363,35 +371,39 @@ class DagDispatch(DagDispatchHarness):
     def test_the_picture_partitions_the_dag_at_every_stage(self):
         self.init()
         run, _ = self.at_develop()
+        repo = str(self.repo)
         # nothing started: both roots dispatchable, the dependent one is not,
-        # and it says WHAT it waits on rather than just "blocked"
+        # and it says WHAT it waits on rather than just "blocked". Every
+        # entry names its repo, in all four buckets — the question
+        # develop.md's direct-branch fallback asks of this verb.
         self.assertEqual(self.picture(run), {
-            "ready": ["T1", "T2"], "in_flight": [], "terminal": [],
-            "blocked": [{"id": "T3", "waiting_on": ["T1"]}]})
+            "ready": [{"id": "T1", "repo": repo}, {"id": "T2", "repo": repo}],
+            "in_flight": [], "terminal": [],
+            "blocked": [{"id": "T3", "repo": repo, "waiting_on": ["T1"]}]})
 
         # dispatched: an in-flight task is NOT ready (dispatching it twice is
         # what the spawn guard then refuses, with the loop holding a block it
         # has no vocabulary for), and T3 is still waiting
         self.cli("task", "--id", "T1", "--to", "in-progress", run=run)
-        self.assertEqual(self.picture(run)["ready"], ["T2"])
+        self.assertEqual(self.ids(run, "ready"), ["T2"])
         self.assertEqual(self.picture(run)["in_flight"],
-                         [{"id": "T1", "status": "in-progress"}])
+                         [{"id": "T1", "repo": repo, "status": "in-progress"}])
 
         # IN REVIEW is not done: reading it as satisfied is exactly how a
         # dependent gets dispatched into the FSM's "not yet done" refusal
         self.cli("task", "--id", "T1", "--to", "in-review", run=run)
         self.assertEqual(self.picture(run)["in_flight"],
-                         [{"id": "T1", "status": "in-review"}])
+                         [{"id": "T1", "repo": repo, "status": "in-review"}])
         self.assertEqual(self.picture(run)["blocked"],
-                         [{"id": "T3", "waiting_on": ["T1"]}])
+                         [{"id": "T3", "repo": repo, "waiting_on": ["T1"]}])
 
         # done unblocks the dependent — the loop's whole trigger
         self.review_approve(run, "T1")
         self.cli("task", "--id", "T1", "--to", "done", run=run)
-        after = self.picture(run)
-        self.assertEqual(after["terminal"], ["T1"])
-        self.assertEqual(sorted(after["ready"]), ["T2", "T3"])
-        self.assertEqual(after["blocked"], [])
+        self.assertEqual(self.picture(run)["terminal"],
+                         [{"id": "T1", "repo": repo}])
+        self.assertEqual(sorted(self.ids(run, "ready")), ["T2", "T3"])
+        self.assertEqual(self.picture(run)["blocked"], [])
 
     def test_archived_counts_as_terminal_like_the_guards_do(self):
         # the FSM's terminal set is done|archived; a picture that disagreed
@@ -402,9 +414,9 @@ class DagDispatch(DagDispatchHarness):
         st = state_mod.load(run, self.workspace)
         st["tasks"][0]["status"] = "archived"     # reconcile's end state
         state_mod.save(run, self.workspace, st)
-        picture = self.picture(run)
-        self.assertEqual(picture["terminal"], ["T1"])
-        self.assertIn("T3", picture["ready"])     # its dependency IS satisfied
+        self.assertEqual(self.ids(run, "terminal"), ["T1"])
+        # its dependency IS satisfied
+        self.assertIn("T3", self.ids(run, "ready"))
 
     def test_a_dangling_dependency_reads_as_waiting_not_a_crash(self):
         """plan-register refuses dangling ids, so one can only arrive here
@@ -416,10 +428,12 @@ class DagDispatch(DagDispatchHarness):
         st["tasks"][1]["depends_on"] = ["T9-typo"]
         state_mod.save(run, self.workspace, st)
         picture = self.picture(run)               # exit 0, not a traceback
+        repo = str(self.repo)
         self.assertEqual(picture["blocked"],
-                         [{"id": "T2", "waiting_on": ["T9-typo"]},
-                          {"id": "T3", "waiting_on": ["T1"]}])
-        self.assertEqual(picture["ready"], ["T1"])
+                         [{"id": "T2", "repo": repo,
+                           "waiting_on": ["T9-typo"]},
+                          {"id": "T3", "repo": repo, "waiting_on": ["T1"]}])
+        self.assertEqual(self.ids(run, "ready"), ["T1"])
 
     def test_a_legacy_string_depends_on_is_coerced_not_crashed_on(self):
         """Survivor M3, the read-only half. plan-register refuses the shape
@@ -435,7 +449,7 @@ class DagDispatch(DagDispatchHarness):
         state_mod.save(run, self.workspace, st)
         picture = self.picture(run)                  # exit 0, not a traceback
         self.assertEqual(picture["blocked"], [])
-        self.assertEqual(sorted(picture["ready"]), ["T1", "T2", "T3"])
+        self.assertEqual(sorted(self.ids(run, "ready")), ["T1", "T2", "T3"])
 
     def test_a_junk_entry_inside_the_list_is_dropped_not_iterated(self):
         """The coercion is TOTAL, not just non-list-shaped. A nested list is
@@ -449,10 +463,11 @@ class DagDispatch(DagDispatchHarness):
         st["tasks"][1]["depends_on"] = [["T1"], 7, "T1"]
         state_mod.save(run, self.workspace, st)
         picture = self.picture(run)                  # exit 0, not a traceback
+        repo = str(self.repo)
         self.assertEqual(picture["blocked"],
-                         [{"id": "T2", "waiting_on": ["T1"]},
-                          {"id": "T3", "waiting_on": ["T1"]}])
-        self.assertEqual(picture["ready"], ["T1"])
+                         [{"id": "T2", "repo": repo, "waiting_on": ["T1"]},
+                          {"id": "T3", "repo": repo, "waiting_on": ["T1"]}])
+        self.assertEqual(self.ids(run, "ready"), ["T1"])
 
     def test_the_fsm_guard_reads_a_legacy_string_the_way_this_verb_does(self):
         """The OTHER half of that survivor, and the disagreement this verb
@@ -465,7 +480,8 @@ class DagDispatch(DagDispatchHarness):
         run, _ = self.at_develop()
         # control first: a properly declared edge has teeth, and keeps them
         self.assertEqual(self.picture(run)["blocked"],
-                         [{"id": "T3", "waiting_on": ["T1"]}])
+                         [{"id": "T3", "repo": str(self.repo),
+                           "waiting_on": ["T1"]}])
         out = self.cli("task", "--id", "T3", "--to", "in-progress", run=run,
                        expect=1)
         self.assertIn("depends_on T1", out["error"])
@@ -474,7 +490,7 @@ class DagDispatch(DagDispatchHarness):
         st = state_mod.load(run, self.workspace)
         st["tasks"][2]["depends_on"] = "T1"          # the legacy shape
         state_mod.save(run, self.workspace, st)
-        self.assertIn("T3", self.picture(run)["ready"])
+        self.assertIn("T3", self.ids(run, "ready"))
         self.cli("task", "--id", "T3", "--to", "in-progress", run=run)
 
     def test_the_verb_is_read_only_and_never_manufactures_a_run(self):
@@ -533,20 +549,62 @@ class CoDispatchConflicts(DagDispatchHarness):
             self._conflicts([self._t("T1", ["src/a.py"]), self._t("T2", [])]),
             [])
 
-    def test_only_READY_tasks_are_paired(self):
-        """A task in flight was dispatched before this one existed as a
-        choice, and a blocked task cannot be co-dispatched at all — pairing
-        either would report a decision nobody is about to make."""
+    def test_a_ready_task_pairs_with_an_IN_FLIGHT_sibling(self):
+        """The shape pipelining actually produces, and the advisory could not
+        see it (whole-system review, round 4, executed: a task in flight on
+        src/shared.py and a newly-ready sibling touching the same file
+        reported `conflicts: []` at every point in the run).
+
+        The rationale this replaces — "a task in flight was dispatched before
+        this one existed as a choice, so pairing them reports a decision
+        nobody is about to make" — was true under the M5 one-lane policy and
+        is false under round 3's loop, which re-derives this picture after
+        EVERY completion: "T2 just became ready while T1 is still building"
+        is the dominant moment the verb is asked, holding T2 until T1's merge
+        lands IS the decision develop.md step 2 prescribes, and plan-task.md
+        now steers planners away from declaring an edge for a file overlap
+        precisely because this verb is supposed to report it. The READY task
+        is named FIRST — it is the one the loop can still hold back."""
         overlap = ["src/a.py"]
+        for live in ("in-progress", "in-review"):
+            self.assertEqual(
+                self._conflicts([self._t("T1", overlap, status=live),
+                                 self._t("T2", overlap)]),
+                [{"tasks": ["T2", "T1"], "repo": "/r", "files": ["src/a.py"]}],
+                live)
+        # …still per repo: an in-flight sibling in ANOTHER checkout shares no
+        # worktree and no merge, so there is nothing to stagger
         self.assertEqual(
-            self._conflicts([self._t("T1", overlap, status="in-progress"),
-                             self._t("T2", overlap)]), [])
-        self.assertEqual(
-            self._conflicts([self._t("T1", overlap, status="done"),
-                             self._t("T2", overlap)]), [])
+            self._conflicts([self._t("T1", overlap, status="in-progress",
+                                     repo="/one"),
+                             self._t("T2", overlap, repo="/two")]), [])
+
+    def test_terminal_and_BLOCKED_siblings_are_not_paired(self):
+        """The two exclusions that survive. A terminal task's work is already
+        merged, so a worktree cut now contains it — there is nothing to
+        stagger. A blocked task cannot be co-dispatched at all, and its own
+        `depends_on` already orders it; naming it would report a decision
+        nobody is about to make."""
+        overlap = ["src/a.py"]
+        for done in ("done", "archived"):
+            self.assertEqual(
+                self._conflicts([self._t("T1", overlap, status=done),
+                                 self._t("T2", overlap)]), [], done)
         self.assertEqual(
             self._conflicts([self._t("T1", overlap),
                              self._t("T2", overlap, depends_on=["T1"])]), [])
+
+    def test_a_ready_pair_is_named_once_even_with_siblings_in_flight(self):
+        # ready x ready is de-duplicated by picture order; ready x in-flight
+        # needs no such rule, since only the ready half is ever left-hand
+        self.assertEqual(
+            self._conflicts([self._t("T1", ["src/a.py"]),
+                             self._t("T2", ["src/a.py"]),
+                             self._t("T3", ["src/a.py"],
+                                     status="in-progress")]),
+            [{"tasks": ["T1", "T2"], "repo": "/r", "files": ["src/a.py"]},
+             {"tasks": ["T1", "T3"], "repo": "/r", "files": ["src/a.py"]},
+             {"tasks": ["T2", "T3"], "repo": "/r", "files": ["src/a.py"]}])
 
     def test_spelling_variants_of_one_path_still_overlap(self):
         # plan-register stores one normal form, but a migrated/hand-edited
@@ -564,9 +622,19 @@ class CoDispatchConflicts(DagDispatchHarness):
                    {"id": "T2", "files": ["src/shared.py"]},
                    {"id": "T3", "files": ["src/three.py"]}))
         out = self.cli("ready-tasks", run=run)
-        self.assertEqual(sorted(out["ready"]), ["T1", "T2", "T3"])
+        self.assertEqual(sorted(t["id"] for t in out["ready"]),
+                         ["T1", "T2", "T3"])
         self.assertEqual(out["conflicts"],
                          [{"tasks": ["T1", "T2"], "repo": str(self.repo),
+                           "files": ["src/shared.py"]}])
+        # …and once T1 is dispatched the overlap is still reported, now with
+        # the still-holdable task named first. This is the state round 3's
+        # loop is in for most of develop, and it read `conflicts: []`.
+        self.cli("task", "--id", "T1", "--to", "in-progress", run=run)
+        out = self.cli("ready-tasks", run=run)
+        self.assertEqual([t["id"] for t in out["ready"]], ["T2", "T3"])
+        self.assertEqual(out["conflicts"],
+                         [{"tasks": ["T2", "T1"], "repo": str(self.repo),
                            "files": ["src/shared.py"]}])
 
 
@@ -646,7 +714,8 @@ class PipelinedDevelop(DagDispatchHarness):
     def test_two_lanes_run_concurrently_and_the_third_waits_on_its_dep(self):
         self.init()
         run, branch = self.at_develop(item="W-91", date="2026-05-02")
-        self.assertEqual(self.picture(run)["ready"], ["T1", "T2"])
+        repo = str(self.repo)
+        self.assertEqual(self.ids(run, "ready"), ["T1", "T2"])
 
         # ---- dispatch BOTH ready tasks, T2's developer left in flight ----
         for task_id in ("T1", "T2"):
@@ -664,9 +733,12 @@ class PipelinedDevelop(DagDispatchHarness):
         self.assertEqual(
             self.picture(run),
             {"ready": [], "terminal": [],
-             "in_flight": [{"id": "T1", "status": "in-progress"},
-                           {"id": "T2", "status": "in-progress"}],
-             "blocked": [{"id": "T3", "waiting_on": ["T1"]}]})
+             "in_flight": [{"id": "T1", "repo": repo,
+                            "status": "in-progress"},
+                           {"id": "T2", "repo": repo,
+                            "status": "in-progress"}],
+             "blocked": [{"id": "T3", "repo": repo,
+                          "waiting_on": ["T1"]}]})
 
         # ---- T1's whole lane completes while T2 is still running ----------
         wt1 = self.cli("worktree-add", "--repo", str(self.repo), "--task-id",
@@ -684,11 +756,11 @@ class PipelinedDevelop(DagDispatchHarness):
                       "T2's lane must still be in flight — that is the point")
 
         # T1 done is what unblocks T3: the loop re-asks and dispatches it
-        picture = self.picture(run)
-        self.assertEqual((picture["ready"], picture["terminal"]),
+        self.assertEqual((self.ids(run, "ready"), self.ids(run, "terminal")),
                          (["T3"], ["T1"]))
-        self.assertEqual(picture["in_flight"],
-                         [{"id": "T2", "status": "in-progress"}])
+        self.assertEqual(self.picture(run)["in_flight"],
+                         [{"id": "T2", "repo": repo,
+                           "status": "in-progress"}])
 
         # ---- the sync point holds the exit until every lane lands --------
         out = self.cli("cursor", "--to", "approve-impl", run=run, expect=1)
@@ -701,7 +773,8 @@ class PipelinedDevelop(DagDispatchHarness):
         self.finish_task(run, "T3", branch)
         self.assertEqual(self.picture(run),
                          {"ready": [], "in_flight": [], "blocked": [],
-                          "terminal": ["T1", "T2", "T3"]})
+                          "terminal": [{"id": t, "repo": repo}
+                                       for t in ("T1", "T2", "T3")]})
 
         # ---- and the run walks out of develop and to the end -------------
         state = self.cli("show", run=run)["state"]
@@ -3995,21 +4068,33 @@ class BackgroundSpawnGauge(unittest.TestCase):
     BACKGROUND spawn (PostToolUse sees only a launch stub; the reply lands at
     SubagentStop). A pending with no capture means that stop never came — the
     subagent crashed, or the session ended under it — and NOTHING was recorded
-    for that spawn, so the gauge must surface it until it pairs off."""
+    for that spawn, so the gauge must surface it until it pairs off.
+
+    Every record here carries the DECLARED shape (`spawn_pairing:` in
+    pipeline/task-fsm.yaml): the pending's `actor` names its WRITER
+    (`capture`), the spawn role rides in `shape`, and `step` records where the
+    cursor was — the three fields round 4 added or moved."""
+
+    def _pending(self, agent_id, task=None, step="develop", **kw):
+        return {"kind": "spawn-pending", "agent_id": agent_id, "task": task,
+                "actor": "capture", "shape": "reviewer", "mode": "review",
+                "step": step, **kw}
 
     def test_a_dangling_pending_is_outstanding_until_its_capture(self):
         from harness.workflow import (FLAGGED_EVENT_KINDS, outstanding_flagged,
-                                      run_health)
+                                      run_health, spawn_pairing)
         self.assertIn("spawn-pending", FLAGGED_EVENT_KINDS)
-        events = [{"kind": "spawn-pending", "agent_id": "a-1", "task": "T1",
-                   "actor": "reviewer", "mode": "review"}]
+        # the gauge's membership list and the declared pairing must name the
+        # SAME record, or the pending is either invisible or unpairable
+        self.assertIn(spawn_pairing()["pending"]["kind"], FLAGGED_EVENT_KINDS)
+        events = [self._pending("a-1", task="T1")]
         self.assertEqual(len(outstanding_flagged(events)), 1)
-        # …and while it is OUTSTANDING it degrades run health, exactly like
-        # its twin kind `background-spawn-uncaptured`: both describe a spawn
-        # whose verdict, status block and token row were never recorded, and
-        # which of the two a run gets is decided by the platform's stub
+        # …and once the run has LEFT that step it degrades run health, exactly
+        # like its twin kind `background-spawn-uncaptured`: both describe a
+        # spawn whose verdict, status block and token row were never recorded,
+        # and which of the two a run gets is decided by the platform's stub
         # schema, not by how the run went (adversarial review on this change)
-        verdict, counts = run_health(events)
+        verdict, counts = run_health(events, 0, "harden")
         self.assertEqual(verdict, "DEGRADED")
         self.assertEqual(counts["spawn-pending"], 1)
         events.append({"kind": "spawn-captured", "agent_id": "a-1",
@@ -4018,7 +4103,88 @@ class BackgroundSpawnGauge(unittest.TestCase):
         self.assertEqual(outstanding_flagged(events), [])
         # …and PAIRED it degrades nothing: the evidence arrived late, exactly
         # as designed, so unlike a stall there is no history to remember
-        self.assertEqual(run_health(events), ("HEALTHY", {}))
+        self.assertEqual(run_health(events, 0, "harden"), ("HEALTHY", {}))
+
+    def test_a_spawn_in_flight_in_the_current_step_is_flagged_but_healthy(self):
+        """Round 3 made 2N open pendings the CONTINUOUS state of a healthy
+        pipelined develop, and the old rule — degrade on ANY outstanding
+        pending — turned that into a permanent DEGRADED (whole-system review,
+        executed: 8 live pendings, nothing dead, `harness status` red). The
+        same record means "still RUNNING" to the stall guard, so it cannot
+        also mean "evidence lost" here. It stays on the FLAGGED gauge either
+        way: visibility was never the problem, the health verdict was."""
+        from harness.workflow import outstanding_flagged, run_health
+        events = [self._pending(f"dev-T{i}", task=f"T{i}") for i in range(1, 5)]
+        events += [self._pending(f"rev-T{i}", task=f"T{i}") for i in range(1, 5)]
+        self.assertEqual(len(outstanding_flagged(events)), 8)
+        self.assertEqual(run_health(events, 0, "develop"), ("HEALTHY", {}))
+
+    def test_a_pending_the_cursor_moved_past_still_degrades(self):
+        # the original evidence-loss shape, unchanged: nothing is waiting on
+        # this spawn any more, so its stop is never coming
+        from harness.workflow import outstanding_flagged, run_health
+        events = [self._pending("live", task="T1", step="develop"),
+                  self._pending("ghost", task=None, step="plan-review")]
+        self.assertEqual(len(outstanding_flagged(events)), 2)
+        self.assertEqual(run_health(events, 0, "develop"),
+                         ("DEGRADED", {"spawn-pending": 1}))
+
+    def test_a_pending_with_no_step_degrades_fail_closed(self):
+        """Three fail-CLOSED edges that keep the pre-round-4 verdict: a
+        pending written before the step was recorded carries none, a caller
+        that passes no cursor cannot compare one, and one carrying no `at`
+        sorts before every round anchor. All degrade, exactly as every
+        outstanding pending used to."""
+        from harness.workflow import run_health
+        legacy = self._pending("a-1", task="T1")
+        legacy.pop("step")
+        self.assertEqual(run_health([legacy], 0, "develop"),
+                         ("DEGRADED", {"spawn-pending": 1}))
+        self.assertEqual(run_health([self._pending("a-2", task="T1")]),
+                         ("DEGRADED", {"spawn-pending": 1}))
+        atless = self._pending("a-3", task="T1")
+        self.assertEqual(run_health([atless], 0, "develop", "2026-01-01T00:00:00+00:00"),
+                         ("DEGRADED", {"spawn-pending": 1}))
+
+    def test_health_no_longer_flaps_when_a_gate_rejects_back(self):
+        """Round 4's step test was bare string equality, and `on_reject`
+        makes a step name repeat: a dead pending stamped `develop` read
+        DEGRADED at `review` and `approve-impl`, then HEALTHY again the
+        instant approve-impl rejected the cursor back to `develop` — nothing
+        about the lost spawn having changed (round-4 review, both lenses).
+        Intersecting with the round anchor — the newest human gate decision,
+        the only event that moves the cursor backward — settles it."""
+        from harness.workflow import run_health
+        # the pending was launched in the FIRST develop round, before the
+        # gate that later rejected it back
+        dead = self._pending("a-dead", task="T1", step="develop",
+                             at="2026-01-01T10:00:00+00:00")
+        anchor = "2026-01-01T12:00:00+00:00"       # approve-impl: rejected
+        for cursor in ("develop", "review", "approve-impl", "develop"):
+            self.assertEqual(run_health([dead], 0, cursor, anchor),
+                             ("DEGRADED", {"spawn-pending": 1}), cursor)
+        # …and the round-3 property the step test exists for is untouched: a
+        # pending launched INTO the current round is healthy pipelining. On
+        # the forward path that is every in-flight pending, since a develop
+        # spawn postdates approve-plan by construction.
+        fresh = self._pending("a-live", task="T2", step="develop",
+                              at="2026-01-01T13:00:00+00:00")
+        self.assertEqual(run_health([fresh], 0, "develop", anchor),
+                         ("HEALTHY", {}))
+        # no gate decided yet -> no anchor to compare, step test alone
+        self.assertEqual(run_health([dead], 0, "develop", ""), ("HEALTHY", {}))
+
+    def test_the_round_anchor_is_the_one_the_stall_layer_computes(self):
+        """Two spellings of "which round is this?" — the stall guard's
+        verdict window and the health gauge — would drift into disagreeing
+        about whether a record belongs to the current round."""
+        from harness.transitions import latest_gate_decision
+        self.assertEqual(latest_gate_decision({}), "")
+        self.assertEqual(latest_gate_decision({"gates": {
+            "approve-plan": {"decided_at": "2026-01-01T10:00:00+00:00"},
+            "approve-impl": {"decided_at": "2026-01-01T12:00:00+00:00"},
+            "approve-security": {"presented_at": "2026-01-01T13:00:00+00:00"},
+        }}), "2026-01-01T12:00:00+00:00")
 
     def test_one_capture_clears_only_its_own_agent(self):
         # keyed by agent id rather than superseding the whole set: the plan
@@ -4026,14 +4192,14 @@ class BackgroundSpawnGauge(unittest.TestCase):
         # pendings are open at once and the first lens to finish must not
         # clear its siblings — the under-count a repo-only base key produced
         from harness.workflow import outstanding_flagged, run_health
-        events = [{"kind": "spawn-pending", "agent_id": "a-1"},
-                  {"kind": "spawn-pending", "agent_id": "a-2"},
+        events = [self._pending("a-1"), self._pending("a-2"),
                   {"kind": "spawn-captured", "agent_id": "a-1",
                    "actor": "capture"}]
         self.assertEqual([e["agent_id"] for e in outstanding_flagged(events)],
                          ["a-2"])
         # health counts the SAME survivors — one gauge, one rule
-        self.assertEqual(run_health(events), ("DEGRADED", {"spawn-pending": 1}))
+        self.assertEqual(run_health(events, 0, "harden"),
+                         ("DEGRADED", {"spawn-pending": 1}))
 
     def test_an_abandoned_pending_pairs_off_and_does_not_degrade(self):
         """The second resolver: a stall override (`--confirm-no-verdict`)
@@ -4044,38 +4210,37 @@ class BackgroundSpawnGauge(unittest.TestCase):
         override's own `stall-verdict-override` (flagged) and the stall
         counters it bumped are the record."""
         from harness.workflow import outstanding_flagged, run_health
-        events = [{"kind": "spawn-pending", "agent_id": "a-1", "task": "T1",
-                   "actor": "reviewer", "mode": "review"}]
+        events = [self._pending("a-1", task="T1")]
         self.assertEqual(len(outstanding_flagged(events)), 1)
-        self.assertEqual(run_health(events)[0], "DEGRADED")
+        self.assertEqual(run_health(events, 0, "harden")[0], "DEGRADED")
         events.append({"kind": "spawn-abandoned", "agent_id": "a-1",
                        "task": "T1", "mode": "review", "actor": "stall",
                        "reason": "declared dead"})
         self.assertEqual(outstanding_flagged(events), [])
-        self.assertEqual(run_health(events), ("HEALTHY", {}))
+        self.assertEqual(run_health(events, 0, "harden"), ("HEALTHY", {}))
 
     def test_abandoning_one_leaves_its_siblings_outstanding(self):
         # keyed by agent id like its `spawn-captured` twin: a batched panel
         # has several pendings open at once, and retiring the one that died
         # must not silently clear the ones still running
         from harness.workflow import outstanding_flagged, run_health
-        events = [{"kind": "spawn-pending", "agent_id": "a-1"},
-                  {"kind": "spawn-pending", "agent_id": "a-2"},
+        events = [self._pending("a-1"), self._pending("a-2"),
                   {"kind": "spawn-abandoned", "agent_id": "a-1",
                    "actor": "stall"}]
         self.assertEqual([e["agent_id"] for e in outstanding_flagged(events)],
                          ["a-2"])
-        self.assertEqual(run_health(events), ("DEGRADED", {"spawn-pending": 1}))
+        self.assertEqual(run_health(events, 0, "harden"),
+                         ("DEGRADED", {"spawn-pending": 1}))
 
     def test_a_forged_abandonment_cannot_clear_a_pending(self):
         # same actor bound as every other resolver on this gauge
         from harness.workflow import outstanding_flagged, run_health
-        events = [{"kind": "spawn-pending", "agent_id": "a-1", "task": "T1"},
+        events = [self._pending("a-1", task="T1"),
                   {"kind": "spawn-abandoned", "agent_id": "a-1"},
                   {"kind": "spawn-abandoned", "agent_id": "a-1",
                    "actor": "capture"}]
         self.assertEqual(len(outstanding_flagged(events)), 1)
-        self.assertEqual(run_health(events)[0], "DEGRADED")
+        self.assertEqual(run_health(events, 0, "harden")[0], "DEGRADED")
 
     def test_a_forged_capture_cannot_clear_a_pending(self):
         """The resolver is actor-checked like its four siblings. The first
@@ -4084,7 +4249,7 @@ class BackgroundSpawnGauge(unittest.TestCase):
         `log-event` appends to, so a hand-written record reads it off the
         pending and clears a real outstanding flag."""
         from harness.workflow import outstanding_flagged, run_health
-        events = [{"kind": "spawn-pending", "agent_id": "a-1", "task": "T1"},
+        events = [self._pending("a-1", task="T1"),
                   # what `harness log-event --json '{…}'` produces: right
                   # kind, right id, no capture-owned actor
                   {"kind": "spawn-captured", "agent_id": "a-1"},
@@ -4093,7 +4258,22 @@ class BackgroundSpawnGauge(unittest.TestCase):
                   {"kind": "spawn-captured", "agent_id": "a-1",
                    "actor": "reviewer"}]
         self.assertEqual(len(outstanding_flagged(events)), 1)
-        self.assertEqual(run_health(events)[0], "DEGRADED")
+        self.assertEqual(run_health(events, 0, "harden")[0], "DEGRADED")
+
+    def test_a_forged_pending_never_reaches_the_gauge(self):
+        """The ASSERTING record's own actor bound, the last one missing
+        (whole-system review, round 4): a `log-event` spawn-pending used to
+        degrade run health as readily as a real one, on top of blocking the
+        next legitimate spawn and refusing the stall that would clear it."""
+        from harness.workflow import outstanding_flagged, run_health
+        forged = [{"kind": "spawn-pending", "agent_id": "forged-1",
+                   "task": "T1", "mode": "review"},
+                  # …and the pre-round-4 spelling, where `actor` held the
+                  # SHAPE: inert now, which is the upgrade-window cost
+                  {"kind": "spawn-pending", "agent_id": "legacy-1",
+                   "task": "T1", "actor": "reviewer", "mode": "review"}]
+        self.assertEqual(outstanding_flagged(forged), [])
+        self.assertEqual(run_health(forged, 0, "harden"), ("HEALTHY", {}))
 
 
 class RunHealth(BreadthHarness):
@@ -4142,6 +4322,34 @@ class RunHealth(BreadthHarness):
         for kind in HEALTH_DEGRADING_KINDS:
             verdict, counts = run_health([{"kind": kind}])
             self.assertEqual((verdict, counts), ("DEGRADED", {kind: 1}), kind)
+
+    def test_live_spawns_in_the_current_step_keep_status_healthy(self):
+        """End to end on the surface a human actually reads. Round 3's
+        develop dispatches every ready task at once and batches their spawns
+        into ONE message, so N open pendings is the CONTINUOUS state of a
+        healthy run — and `status` reported DEGRADED for all of it
+        (whole-system review, executed with 8 live pendings and nothing
+        dead), destroying the mid-run signal workflow-status/SKILL.md
+        promises. They stay COUNTED on the flagged gauge throughout."""
+        cursor = self.cli("show", run=self.run_dir)["state"]["cursor"][
+            "current_step"]
+        for i in range(1, 5):
+            ndjson.append_record(self.run_dir / "events.ndjson", {
+                "kind": "spawn-pending", "agent_id": f"a-{i}", "task": f"T{i}",
+                "actor": "capture", "shape": "developer", "mode": "develop",
+                "step": cursor})
+        row = next(r for r in self.cli("status")["runs"]
+                   if r["run"] == self.run_dir.name)
+        self.assertEqual(row["health"], "HEALTHY")
+        self.assertEqual(row["flagged_events"], 4)   # visible, just not red
+        # …and one the cursor has moved past is the original evidence-loss
+        # shape, which still degrades both surfaces
+        ndjson.append_record(self.run_dir / "events.ndjson", {
+            "kind": "spawn-pending", "agent_id": "ghost", "task": None,
+            "actor": "capture", "shape": "reviewer", "mode": "plan-review",
+            "step": "a-step-this-run-has-left"})
+        self.assertEqual(self._status_health(), "DEGRADED")
+        self.assertIn("spawn-pending: 1", self._metrics_text())
 
     def test_engaged_stall_procedure_degrades_without_any_event(self):
         """Adversarial review of this change (both lenses): the stall

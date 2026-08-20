@@ -91,8 +91,9 @@ successful sibling of abort — the final step's file says exactly when).
    background format is unmeasured). Where the Agent tool has no such
    parameter, the spawn returns a launch STUB and the agent runs in the
    background: that is expected and captured — WAIT for its completion
-   notification, do not proceed on the stub, and do not `stall` (the
-   events-tail triage below covers `spawn-pending`). Read the verdict from
+   notification, do not proceed on the stub, and do not `stall` (`show`'s
+   `outstanding_spawns` names every spawn still in flight — the Stalls
+   triage below starts there, not at the events tail). Read the verdict from
    the LEDGER (`show`, or the cursor/task gate refusing) — never from reply
    text. One live spawn per (task, mode): the guard refuses a second while
    the first is unreported; different tasks and modes stay parallel, panel
@@ -141,24 +142,40 @@ successful sibling of abort — the final step's file says exactly when).
   `<run>/reviews.ndjson`; `<run>/events.ndjson` carries stall/hook/
   status-block events, never verdicts** — looking for a verdict in the wrong
   ledger is what makes a captured round read as a stall. Blockless reply?
-  Check the TAIL of `<run>/events.ndjson` before calling `stall`:
-  `status-block-malformed` → the verdict was captured despite the loose
-  block — proceed on the ledger, never stall; `missing-status-block` →
-  genuine stall, procedure above; an unresolved `spawn-pending` (also in
-  `show`'s `outstanding_flagged`) → that subagent is still running in the
-  background, WAIT for its completion; never stall — `stall` refuses over an
-  open pending, and forcing it (`--confirm-no-verdict`) ABANDONS that spawn:
-  its key is freed for a re-spawn and its reply, if it ever lands, is
-  refused rather than captured. EXCEPT a pending from a step the run has
-  already LEFT (a task-less pending belongs to the step whose spawn-set
-  declares its `mode`): waiting is wrong there, nothing is coming — abandon
-  it with THAT step's key, `stall --task step:<its step>
-  --confirm-no-verdict`, which is the only key that reaches it. For a
-  task-less **step** key, `stall`
-  refuses outright when that step's ledger already holds a verdict for the
-  current round (`--confirm-no-verdict` overrides, for a spawn that stalled
-  *after* the capture); per-task and per-lens keys are never refused — the
-  engine reads no verdict for those.
+  Ask `show` before calling `stall`: `outstanding_spawns` names every spawn
+  still in flight as `{task, mode, agent_id, step, at, clearable,
+  clearing_key}` — the owned answer to "which lane is wedged", so never
+  hand-read the events ledger for it. Yours listed there → that subagent is
+  still running in the background, WAIT for it; never stall — `stall`
+  refuses over an open pending, and forcing it (`--confirm-no-verdict`)
+  ABANDONS that spawn: its key is freed for a re-spawn and its reply, if it
+  ever lands, is refused rather than captured. Three exceptions, in order:
+  - **`clearable: false`** (a `repo-map` / `request-triage` pending — no
+    step's spawn-set declares its mode, so no `stall` key matches it) →
+    **leave it.** It refuses nothing and cannot wedge a run; it clears when
+    that agent stops. Forcing a key here bumps a stall counter, writes no
+    override, clears nothing, and degrades the run for a brand-new reason.
+  - **`step` is not the cursor's** → the run has LEFT that step and nothing
+    is coming. Abandon it with the key the entry hands you:
+    `stall --task <clearing_key> --confirm-no-verdict`.
+  - **`step` IS the cursor's, and siblings share it** — pipelined `develop`
+    holds every lane at one step (the cursor cannot leave while any task is
+    non-terminal), so a dead lane and a live one differ only in `at`.
+    Compare ages: the OUTLIER — launched with the batch, still open long
+    after its siblings reported — is the wedged lane. Age is evidence, not
+    proof (a big task is slow, not dead), so name the lane and why, and get
+    the user's go-ahead before `stall --task <its clearing_key>
+    --confirm-no-verdict`.
+  NOT listed → check `legacy_spawn_pendings` first: one listed there was
+  launched by a pre-upgrade harness, its deferred capture is impossible, and
+  the fix is to re-spawn that agent in the FOREGROUND — never stall it.
+  Otherwise read the TAIL of `<run>/events.ndjson`: `status-block-malformed`
+  → the verdict WAS captured despite the loose block, proceed on the ledger,
+  never stall; `missing-status-block` → genuine stall, procedure above. For
+  a task-less **step** key, `stall` refuses outright when that step's ledger
+  already holds a verdict for the current round (`--confirm-no-verdict`
+  overrides, for a spawn that stalled *after* the capture); per-task and
+  per-lens keys are never refused — the engine reads no verdict for those.
 - **Ad-hoc human requests mid-run:** spawn `reviewer` with
   `harness-mode: request-triage` (+ plugin-root header, always legal), surface the triage verdict
   to the user; out-of-scope items are never silently merged.

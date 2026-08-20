@@ -19,6 +19,88 @@ FORWARD_DEFAULT = ("approved",)
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 _TERMINAL_CACHE: tuple[str, ...] | None = None
+_PAIRING_CACHE: dict | None = None
+
+
+def _load_fsm() -> dict:
+    from .schema import load_yaml
+    return load_yaml(PLUGIN_ROOT / "pipeline" / "task-fsm.yaml") or {}
+
+
+def spawn_pairing() -> dict:
+    """The declared `spawn_pairing:` block of pipeline/task-fsm.yaml —
+    which record asserts "a spawn is in flight", which ones close it, and
+    the actor that owns each. Cached per process like `terminal_statuses`,
+    and for the same reason (shipped data, immutable for a run's lifetime;
+    never a file read inside a lock).
+
+    Schema-validated (harness/schema.py), so the shape is trusted here."""
+    global _PAIRING_CACHE
+    if _PAIRING_CACHE is None:
+        _PAIRING_CACHE = _load_fsm().get("spawn_pairing") or {}
+    return _PAIRING_CACHE
+
+
+def is_open_pending_record(e: dict) -> bool:
+    """Does this record ASSERT a spawn in flight? Declared kind AND declared
+    actor — the actor half is what stops a forgery.
+
+    Executed before it was closed (whole-system review, round 4):
+    `spawn-pending` was the one record in this family matched on `kind`
+    alone, while every resolver was actor-checked. `harness log-event --json
+    '{"kind":"spawn-pending","agent_id":"forged-1","task":"T1",
+    "mode":"review"}'` therefore BLOCKED the next legitimate (reviewer,
+    review, T1) spawn naming agent `forged-1`, made the stall that would
+    clear it REFUSE, and degraded run health — recoverable only at the cost
+    of a stall counter and a flagged override.
+
+    Consequence, stated: a pending written by a pre-round-4 harness carries
+    the spawn SHAPE in `actor` (the value now lives under `shape`) and is
+    therefore invisible to every reader here. That is an upgrade-window
+    cost — a spawn in flight ACROSS the upgrade loses its deferred capture —
+    accepted for the same reason the resolvers carry no legacy tolerance
+    either: a reader that accepts an actor-less record accepts a forged one.
+    """
+    spec = spawn_pairing().get("pending") or {}
+    return (e.get("kind") == spec.get("kind")
+            and e.get("actor") == spec.get("actor"))
+
+
+def closed_agent_ids(events: list[dict], resolver: str | None = None) -> set:
+    """Every agent_id whose pending is CLOSED — by any declared resolver, or
+    by the one `resolver` names (`abandoned` is asked for by name: a stop
+    arriving after an abandonment must be refused capture, not merely
+    ignored).
+
+    THE shared pairing rule. Four readers used to spell it out independently
+    — the flagged gauge, the stall guard's open-pending scan, the spawn
+    guard's one-live-spawn predicate, and the SubagentStop capture — across
+    two layers that must agree, or a pending ends up closed to one and open
+    to the other (HEALTHY while every re-spawn is refused, or the reverse).
+    Lives here, in the neutral lower layer `depends_on` already uses, so both
+    `harness.workflow` and `hooks/guards.py` import it without a cycle."""
+    specs = (spawn_pairing().get("resolvers") or {})
+    wanted = [specs[resolver]] if resolver else list(specs.values())
+    return {e.get("agent_id") for e in events
+            if any(e.get("kind") == s.get("kind")
+                   and e.get("actor") == s.get("actor") for s in wanted)}
+
+
+def open_pendings(events: list[dict]) -> list[dict]:
+    """Every still-open pending in this event list, in ledger order — no
+    key filtering, that is each caller's own question (per (task, mode) for
+    the spawn guard, per stall key for the stall guard, run-wide for the
+    gauge).
+
+    Closure is order-INDEPENDENT: a resolver closes its agent_id wherever it
+    sits in the ledger. The four readers this replaces already worked that
+    way in three cases; the gauge's own loop happened to require the
+    resolver to follow its pending, a distinction with no real shape behind
+    it (both records are written by hooks whose relative order the platform
+    picks)."""
+    closed = closed_agent_ids(events)
+    return [e for e in events
+            if is_open_pending_record(e) and e.get("agent_id") not in closed]
 
 
 def terminal_statuses() -> tuple[str, ...]:
@@ -44,9 +126,7 @@ def terminal_statuses() -> tuple[str, ...]:
     documented."""
     global _TERMINAL_CACHE
     if _TERMINAL_CACHE is None:
-        from .schema import load_yaml
-        loaded = load_yaml(PLUGIN_ROOT / "pipeline" / "task-fsm.yaml") or {}
-        _TERMINAL_CACHE = tuple(loaded.get("terminal") or ())
+        _TERMINAL_CACHE = tuple(_load_fsm().get("terminal") or ())
     return _TERMINAL_CACHE
 
 
@@ -718,6 +798,53 @@ def transition_task(state: dict, fsm: dict, config: dict, run: Path, key: bytes,
     return task
 
 
+def latest_gate_decision(state: dict) -> str:
+    """The newest human gate decision's `at`, or "" — the ROUND-OPENING mark
+    of the whole run, shared rather than re-derived.
+
+    Two layers ask it. `_stall_round_anchor` (below) uses it as the floor of
+    the verdict window. `workflow.run_health` uses it to decide whether an
+    open `spawn-pending` was LEFT BEHIND: a gate decision is the one event
+    that can send the cursor BACKWARD (manifest `on_reject`), so a pending
+    older than the newest decision belongs to a round the run has closed out,
+    whatever step the cursor is sitting on now. Spelling that twice is what
+    would let the stall layer and the health gauge disagree about which round
+    a record belongs to (whole-system review, round 4)."""
+    return max((g.get("decided_at", "") or ""
+                for g in (state.get("gates") or {}).values()), default="")
+
+
+def spawn_clearing_key(manifest: dict, pending: dict) -> str | None:
+    """The stall key that can CLEAR this pending, or None if none can.
+
+    The inverse of `stall_key_spawn_modes`, and derived from it rather than
+    from a second reading of the spawn-sets, so the two can never disagree
+    about which step owns a mode. A task-bound pending clears through its own
+    task id; a task-less one through `step:<the step whose declared spawn-set
+    holds its mode>`.
+
+    None is a real answer, not a failure: `stall_key_spawn_modes` states the
+    unclearable set — a mode no step declares in its `spawns` (today
+    `repo-map` and `request-triage`, declared in out_of_run_spawns /
+    always_legal_spawns, plus a pending that carried no mode at all). Those
+    refuse nothing and cannot wedge a run, so the right instruction is to
+    LEAVE them; before this, `show` reported them indistinguishably from a
+    clearable one and the triage sent the human at `stall --task step:<x>
+    --confirm-no-verdict`, which matches no pending, writes no override,
+    clears nothing, and degrades the run with a stall counter for its trouble
+    (round-4 review, executed)."""
+    task = pending.get("task")
+    if task:
+        return task
+    mode = pending.get("mode")
+    if not mode:
+        return None
+    for step in (manifest.get("steps") or {}):
+        if mode in stall_key_spawn_modes(manifest, f"step:{step}"):
+            return f"step:{step}"
+    return None
+
+
 def _stall_round_anchor(state: dict, run: Path, stall_key: str,
                         round_marker: str | None) -> str:
     """The timestamp a captured verdict must POST-DATE before it counts as
@@ -729,8 +856,9 @@ def _stall_round_anchor(state: dict, run: Path, stall_key: str,
     stalls, so the guard would refuse every subsequent stall forever. The
     anchor is therefore the newest of three round-opening marks:
 
-      (a) the latest human gate decision — `_verdict_window`'s own window
-          floor, included so the two never disagree about the window;
+      (a) the latest human gate decision (`latest_gate_decision`, shared with
+          the health gauge) — `_verdict_window`'s own window floor, included
+          so the two never disagree about the window;
       (b) the latest `stall` event for THIS stall key — a recorded stall
           means the orchestrator already re-spawned, so anything captured
           before it belongs to the previous attempt;
@@ -745,8 +873,7 @@ def _stall_round_anchor(state: dict, run: Path, stall_key: str,
     --confirm-no-verdict. Raising on corruption would instead brick the
     stalled-agent procedure, which is the one path a wedged run depends on.
     """
-    marks = [max((g.get("decided_at", "") or ""
-                  for g in (state.get("gates") or {}).values()), default="")]
+    marks = [latest_gate_decision(state)]
     events = ndjson.read_records(run / "events.ndjson")
     marks += [e.get("at", "") for e in events
               if e.get("kind") == "stall" and e.get("task") == stall_key]
@@ -825,14 +952,16 @@ def _read_pairing_events(run: Path) -> list[dict]:
 
 def open_spawn_pendings(run: Path, stall_key: str,
                         manifest: dict) -> list[dict]:
-    """Every `spawn-pending` for THIS stall key that nothing has closed yet.
+    """Every open `spawn-pending` for THIS stall key.
 
-    Closed = the agent_id carries a `spawn-captured` (actor "capture": its
-    SubagentStop arrived and the reply was captured) or a `spawn-abandoned`
-    (actor "stall": a stall override declared that round dead). Both
-    resolvers are actor-checked — without it a hand-written `log-event`
-    could UNBLOCK a stall by faking either one, which is the forgery
-    direction that matters here.
+    The pending/resolver vocabulary — which kinds, which owning actors — is
+    DECLARED (`spawn_pairing:` in pipeline/task-fsm.yaml) and applied by the
+    shared `open_pendings` above, not restated here. This function used to
+    carry its own copy of it, one of four; the divergence risk that created
+    is what the declaration exists to kill (whole-system review, round 4).
+    Every record in the family is actor-checked — without it a hand-written
+    `log-event` could UNBLOCK a stall by faking a resolver, or WEDGE one by
+    forging a pending, and both directions matter here.
 
     Keyed the way `_stall_round_anchor` keys its own event scan — the
     record's `task` against the stall key — so the guard only ever refuses a
@@ -841,10 +970,10 @@ def open_spawn_pendings(run: Path, stall_key: str,
     attributed by mode (below) rather than swept up by any key that happens
     to be asked about.
 
-    The pairing repeats `workflow.outstanding_flagged`'s rule rather than
-    importing it: that is the run-wide GAUGE (every open pending, no key),
-    while this is a per-key question, and `harness.workflow` imports the
-    engine, not the other way round.
+    The KEY filter is this function's own — `workflow.outstanding_flagged`
+    asks the run-wide question (every open pending, no key) off the same
+    shared helper, and `harness.workflow` imports the engine, not the other
+    way round.
 
     Reads leniently and returns [] on an unreadable ledger: the guard built
     on this SUPPRESSES an action, so it fails OPEN for the same reason the
@@ -889,18 +1018,11 @@ def open_spawn_pendings(run: Path, stall_key: str,
         events = _read_pairing_events(run)
     except OSError:
         return []
-    closed = {e.get("agent_id") for e in events
-              if (e.get("kind") == "spawn-captured"
-                  and e.get("actor") == "capture")
-              or (e.get("kind") == "spawn-abandoned"
-                  and e.get("actor") == "stall")}
     task_less_modes = stall_key_spawn_modes(manifest, stall_key)
-    return [e for e in events
-            if e.get("kind") == "spawn-pending"
-            and (e.get("task") == stall_key
-                 or (e.get("task") is None
-                     and e.get("mode") in task_less_modes))
-            and e.get("agent_id") not in closed]
+    return [e for e in open_pendings(events)
+            if e.get("task") == stall_key
+            or (e.get("task") is None
+                and e.get("mode") in task_less_modes)]
 
 
 def _open_spawn_pending(run: Path, stall_key: str,

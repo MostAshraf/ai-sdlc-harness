@@ -900,9 +900,16 @@ def main(argv: list[str] | None = None) -> int:
                     # machinery degraded — evidence-loss events or an
                     # engaged stall procedure (shared rule —
                     # workflow.run_health, the same one metrics' "## Run
-                    # health" section reads)
+                    # health" section reads). The cursor goes in because a
+                    # spawn still in flight IN THE CURRENT step is healthy
+                    # pipelining, not lost evidence (round 4); the round
+                    # anchor goes in with it because a step name repeats
+                    # across an `on_reject` bounce, and the verdict FLAPPED
+                    # back to HEALTHY when it did.
                     "health": workflow.run_health(
-                        events, workflow.stall_count(st))[0]})
+                        events, workflow.stall_count(st),
+                        st["cursor"]["current_step"],
+                        transitions.latest_gate_decision(st))[0]})
             _emit({"ok": True, "runs": runs})
             return 0
 
@@ -1458,17 +1465,90 @@ def main(argv: list[str] | None = None) -> int:
             # Enrichment, never a failure mode: an unreadable/absent ledger
             # degrades to {} exactly like the probe above — `show` is the
             # tool reached for when a run is wedged.
+            #
+            # `outstanding_spawns` is a SIBLING key, not a reshaping of the
+            # one above: the {kind: count} summary answers "how much is
+            # owed", and reducing to a count is exactly right for the other
+            # ten kinds. For `spawn-pending` it destroys the only thing the
+            # dispatch loop needs. Executed (whole-system review, round 4):
+            # with T1's developer dead and T2's alive, `ready-tasks` and
+            # `show` read IDENTICALLY — no owned verb attributed an open
+            # pending to a task — so the only way to find the wedged lane was
+            # to `stall` one and see which refused, a destructive probe that
+            # SUCCEEDS on the healthy lane and returns the wrong instruction.
+            # `outstanding_flagged` has carried the full dicts all along
+            # (task/mode/agent_id, and now the spawning step); this hands
+            # them over rather than making the orchestrator hand-read the
+            # events.ndjson tail, which is the thing owned verbs exist to
+            # prevent.
+            #
+            # `at` rides along, and it is the field that actually closes the
+            # case above (round-4 review re-executed it: attribution alone
+            # does NOT). Pipelined develop puts both lanes at the SAME step —
+            # and `requires_tasks_terminal` means the cursor can never leave
+            # develop while T1 is non-terminal, so the step comparison that
+            # separates a left-behind pending from a live one can never fire
+            # for a dead develop lane. Two entries then read identically
+            # except for their AGE, which is the whole discriminator: the
+            # outlier among siblings launched into one step is the wedged
+            # one. Health cannot make that call for the same reason (see
+            # workflow.run_health) — it is per-lane, so it is reported here
+            # and diagnosed in dev-workflow/SKILL.md's triage.
+            #
+            # `clearable`/`clearing_key` answer the NEXT question rather than
+            # leaving it to be derived: the declared-unclearable modes
+            # (repo-map, request-triage — declared outside every step's
+            # spawn-set) match no `stall` key at all, so the abandon
+            # instruction the triage used to give for any non-current-step
+            # entry bumped a stall counter, wrote no override, cleared
+            # nothing, and degraded the run for a brand-new reason.
             outstanding: dict[str, int] = {}
+            spawns: list[dict] = []
+            legacy: list[dict] = []
             try:
-                for e in workflow.outstanding_flagged(
-                        ndjson.read_records(args.run / "events.ndjson")):
+                pending_kind = (transitions.spawn_pairing().get("pending")
+                                or {}).get("kind")
+                events = ndjson.read_records(args.run / "events.ndjson")
+                for e in workflow.outstanding_flagged(events):
                     kind = e.get("kind")
                     outstanding[kind] = outstanding.get(kind, 0) + 1
+                    if kind == pending_kind:
+                        key = transitions.spawn_clearing_key(manifest, e)
+                        spawns.append({"task": e.get("task"),
+                                       "mode": e.get("mode"),
+                                       "agent_id": e.get("agent_id"),
+                                       "step": e.get("step"),
+                                       "at": e.get("at"),
+                                       "clearable": key is not None,
+                                       "clearing_key": key})
+                # A pending written by a PRE-ROUND-4 harness carries the spawn
+                # shape where `actor` now lives, so it fails the anti-forgery
+                # actor check and is invisible to every reader of the family
+                # — including `outstanding_flagged` above. Executed (round-4
+                # review): a spawn in flight across the upgrade left the gauge
+                # empty, health HEALTHY, re-spawn allowed, stall allowed over
+                # a live agent, and its real SubagentStop exiting 0 with an
+                # empty stderr. Round 3's stale-verdict race, reopened for the
+                # upgrade window and reported by nothing. The actor bound is
+                # NOT widened to fix it — accepting a declared shape as an
+                # alternate actor re-opens the forgery round 4 closed — so
+                # these surface under their OWN key instead: visible, never
+                # mistaken for an open pending, and named for what they are.
+                closed = transitions.closed_agent_ids(events)
+                legacy = [{"agent_id": e.get("agent_id"),
+                           "task": e.get("task"),
+                           "mode": e.get("mode"), "at": e.get("at")}
+                          for e in events
+                          if e.get("kind") == pending_kind
+                          and not transitions.is_open_pending_record(e)
+                          and e.get("agent_id") not in closed]
             except Exception:                                 # noqa: BLE001
-                outstanding = {}
+                outstanding, spawns, legacy = {}, [], []
             _emit({"ok": True, "state": st, "next_steps": next_steps,
                    "derived": derived, "probe_error": probe_error,
-                   "outstanding_flagged": outstanding})
+                   "outstanding_flagged": outstanding,
+                   "outstanding_spawns": spawns,
+                   "legacy_spawn_pendings": legacy})
             return 0
 
         # Expensive verify-green test run happens OUTSIDE the lock (RC4);
@@ -1796,14 +1876,17 @@ def main(argv: list[str] | None = None) -> int:
                     # guard happened to name: a batched panel leaves several
                     # in flight under one key, and a half-abandoned key
                     # deadlocks exactly like an un-abandoned one.
+                    abandoned = (transitions.spawn_pairing()
+                                 .get("resolvers") or {})["abandoned"]
                     for pend in transitions.open_spawn_pendings(
                             args.run, stall_key, manifest):
                         ndjson.append_record(
                             args.run / "events.ndjson",
-                            {"kind": "spawn-abandoned",
+                            {"kind": abandoned["kind"],
+                             "actor": abandoned["actor"],
                              "agent_id": pend.get("agent_id"),
                              "task": pend.get("task"),
-                             "mode": pend.get("mode"), "actor": "stall",
+                             "mode": pend.get("mode"),
                              "reason": f"a stall for '{stall_key}' was "
                                        "recorded over this open "
                                        "spawn-pending with "

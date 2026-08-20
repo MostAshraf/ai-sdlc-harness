@@ -15,10 +15,16 @@ import subprocess
 from pathlib import Path
 
 from . import chain
+from . import ndjson as ndjson_mod
 from . import state as state_mod
 from .ndjson import append_record, now_iso
 
-MIRROR_EXCLUDE = ("human-input.ndjson", ".redproof", ".state.lock")
+# `.ledger.lock` joins `.state.lock` for the same reason: a lock sidecar is
+# run-local machinery, not run evidence, and mirroring it would commit a file
+# whose whole purpose is to be contended on this machine (whole-system review,
+# round 4 — the ledger appends now take their own lock).
+MIRROR_EXCLUDE = ("human-input.ndjson", ".redproof", ".state.lock",
+                  ndjson_mod.LEDGER_LOCK_NAME)
 
 
 class GitError(Exception):

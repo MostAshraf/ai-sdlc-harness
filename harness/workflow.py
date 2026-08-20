@@ -18,7 +18,8 @@ import yaml
 
 from . import gitops, ndjson, state as state_mod
 from .state import safe_id
-from .transitions import depends_on, set_artifact, terminal_statuses
+from .transitions import (depends_on, latest_gate_decision, open_pendings,
+                          set_artifact, spawn_pairing, terminal_statuses)
 
 # The ONE definition of which event kinds a human should be shown — read by
 # both `status` (count) and `metrics_report` (table). These used to be two
@@ -120,7 +121,13 @@ FLAGGED_EVENT_KINDS = (
     # the evidence, unresolvable by the harness itself (only a fresh spawn
     # fixes it), which is exactly what this gauge exists to put in front of a
     # human. The ONE kind here that is conditionally HEALTH_DEGRADING: see
-    # run_health below — outstanding degrades, paired never does.
+    # run_health below — a pending the run LEFT BEHIND degrades; one still in
+    # flight at its own step does not (pipelined develop keeps 2N of them
+    # open continuously), and a paired one never does.
+    #
+    # This literal and the declared `spawn_pairing.pending.kind` name the same
+    # record and must keep doing so — pinned by a test, not derived here,
+    # because deriving it would put a YAML read in this module's import.
     "spawn-pending")
 # Ten of the eleven are never HEALTH_DEGRADING (below): each means "a human
 # should look", not "this run's machinery degraded / evidence was lost". The
@@ -169,14 +176,28 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
     `base-branch-stale` pairs off the same way but keyed BY REPO — see the
     branch below for why a whole-set supersede would under-count a multi-repo
     run. `spawn-pending` is keyed the same way by AGENT ID, for the same
-    reason: several background spawns run at once."""
+    reason: several background spawns run at once — but its pairing is NOT
+    spelled out here: it is declared data (`spawn_pairing:` in
+    pipeline/task-fsm.yaml) applied by `transitions.open_pendings`, the one
+    helper all four readers of that record family share (whole-system review,
+    round 4). This gauge and the spawn guard disagreeing about whether a
+    pending is closed is the failure that declaration prevents."""
     flagged = [e for e in events if e.get("kind") in FLAGGED_EVENT_KINDS]
+    # Keyed by AGENT ID, like base-branch-stale's per-repo keying and for the
+    # same reason: several background spawns are in flight at once by design
+    # (develop.md and plan-review.md both mandate batching spawns into ONE
+    # message), so a whole-set supersede would clear every sibling's pending
+    # the moment the first one finished — the silent under-count per-key
+    # pairing exists to prevent. A FORGED pending (right kind, no
+    # capture-owned actor) is not open here at all: `open_pendings` requires
+    # the actor, so it never reaches the gauge.
+    pending_kind = (spawn_pairing().get("pending") or {}).get("kind")
+    still_open = {id(e) for e in open_pendings(events)}
     open_pending: list[dict] = []
     open_plan: list[dict] = []
     open_env: list[dict] = []
     open_wb: list[dict] = []
     open_base: dict[tuple, list[dict]] = {}
-    open_spawn: dict[str, list[dict]] = {}
     resolved: set[int] = set()
     for e in events:
         kind = e.get("kind")
@@ -251,45 +272,6 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
             # writes the actor still clears — stated so the check is not read
             # as more than it is.
             resolved.update(id(x) for x in open_base.pop(_base_key(e), []))
-        elif kind == "spawn-pending":
-            open_spawn.setdefault(e.get("agent_id"), []).append(e)
-        elif ((kind == "spawn-captured" and e.get("actor") == "capture")
-                or (kind == "spawn-abandoned" and e.get("actor") == "stall")):
-            # TWO resolvers, one pairing. `spawn-captured` means the stop
-            # arrived and the reply was captured; `spawn-abandoned` means a
-            # stall override (`--confirm-no-verdict`) declared that spawn
-            # dead and retired it — written by the stall verb, nothing else.
-            # An abandoned pending is no longer OUTSTANDING and no longer
-            # degrades health: the round's anomaly is already recorded, and
-            # visibly, as the `stall-verdict-override` the same override
-            # wrote (also in this list) — on the legitimate path; nothing
-            # here verifies that pairing, see `run_health` for the bound.
-            # Leaving the pending open too would
-            # report one event twice and leave the gauge permanently red for
-            # a spawn the run has already given up on and replaced.
-            #
-            # Keyed by AGENT ID, like base-branch-stale's per-repo keying and
-            # for the same reason: several background spawns are in flight at
-            # once by design (plan-review.md mandates batching every lens
-            # spawn in ONE message), so a whole-set supersede would clear
-            # every sibling's pending the moment the first lens finished —
-            # the silent under-count the per-key pairing exists to prevent.
-            #
-            # actor-checked, exactly like its four siblings above. The first
-            # draft argued the agent_id was discriminator enough — "a stray
-            # record would have to name the exact platform-issued id of an
-            # OPEN pending, a strictly narrower bound". Adversarial review
-            # executed that bound and it is not narrow at all: the id is
-            # published in plain text in the very ledger `log-event` appends
-            # to, so `harness log-event --json
-            # '{"kind":"spawn-captured","agent_id":"a-1"}'` read the id off
-            # the pending and cleared it. `actor: "capture"` is the
-            # capture-owned value that was missing (the record now carries
-            # the spawn shape under `shape` instead) — the same bound the
-            # siblings have, no more: a caller that writes the actor still
-            # clears. `spawn-abandoned` carries `actor: "stall"` on the
-            # identical terms.
-            resolved.update(id(x) for x in open_spawn.pop(e.get("agent_id"), []))
         elif kind in ("risk-without-tests", "tests-without-production",
                       "contract-fragment-weak"):
             open_plan.append(e)
@@ -302,7 +284,9 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
             # the actor (emitted in plan_register, nowhere else)
             resolved.update(id(x) for x in open_plan)  # superseded batch
             open_plan.clear()
-    return [e for e in flagged if id(e) not in resolved]
+    return [e for e in flagged
+            if id(e) not in resolved
+            and (e.get("kind") != pending_kind or id(e) in still_open)]
 
 
 # Process-health filter over the same ledger: the kinds that mean the run
@@ -319,9 +303,10 @@ def outstanding_flagged(events: list[dict]) -> list[dict]:
 # and `hook-blocked` (content findings / guards doing their job), and
 # `panel-serialized` (an efficiency miss — wall-clock wasted, nothing
 # lost or stalled).
-# Deliberately NOT here: `spawn-pending`, whose degradation is CONDITIONAL
-# on being unpaired and so cannot be decided from the kind alone — the rule
-# lives in run_health, which has the whole event list to pair against.
+# Deliberately NOT here: `spawn-pending`, whose degradation is CONDITIONAL on
+# being unpaired AND left behind by the cursor, and so cannot be decided from
+# the kind alone — the rule lives in run_health, which has the whole event
+# list to pair against and the run's current step to compare with.
 HEALTH_DEGRADING_KINDS = (
     "missing-status-block", "verdict-uncaptured",
     "background-spawn-uncaptured")
@@ -378,17 +363,39 @@ def dispatch_picture(st: dict) -> dict:
     "visible but never dispatched", where treating an unknown as ready would
     hand it to a `task --to in-progress` the FSM has no transition for.
 
-    `conflicts` is ADVISORY and nothing enforces it: pairs of READY tasks in
-    the SAME repo whose declared `files` manifests overlap. Co-dispatched,
-    each cuts its worktree from the feature branch as it stands, so the
-    second one's tree does not contain the first one's merged code and the
-    overlapping file is edited twice from one starting point — the merge
-    conflicts, or worse, silently resolves in favour of whoever merged last.
+    Every entry in all four lists is a dict carrying at least `{id, repo}`
+    (+ `status` on in_flight, `waiting_on` on blocked) — see the loop for why
+    `repo` had to reach the three non-terminal lists, and one uniform entry
+    shape rather than two so a reader never has to remember which list it is
+    holding.
+
+    `conflicts` is ADVISORY and nothing enforces it: each READY task paired
+    against every NON-TERMINAL sibling in the SAME repo — ready AND IN
+    FLIGHT — whose declared `files` manifest overlaps it. Each cuts its
+    worktree from the feature branch as it stands, so one tree does not
+    contain the other's not-yet-merged code and the overlapping file is
+    edited twice from one starting point — the merge conflicts, or worse,
+    silently resolves in favour of whoever merged last.
+
+    Ready-vs-IN-FLIGHT is not a widening for completeness; it is the shape
+    pipelining actually produces, and the advisory could not see it
+    (whole-system review, round 4, executed: a task in flight on
+    src/shared.py and a newly-ready sibling touching the same file reported
+    `conflicts: []` at every point in the run). Round 3 re-derives this
+    picture after EVERY completion, so the overwhelmingly common moment for
+    the question is "T2 just became ready while T1 is still building" — and
+    plan-task.md now steers planners AWAY from declaring an edge for a mere
+    file overlap precisely because this verb is supposed to report it.
+    Holding the newly-ready task until the in-flight sibling's merge lands is
+    exactly the decision develop.md step 2 prescribes.
+
     Nothing here refuses it: the plan's `depends_on` remains the ONLY
     ordering authority (an advisory that quietly became a guard would
     serialize work the DAG deliberately parallelized), and develop.md says
-    what to do — dispatch a conflicting pair's members one at a time,
-    re-cutting the second worktree after the first merge lands. Tasks in
+    what to do — stagger the pair, cutting the second worktree after the
+    first merge lands. BLOCKED tasks are deliberately not paired: one cannot
+    be dispatched at all yet, so naming it would report a decision nobody is
+    about to make (and its own `depends_on` already orders it). Tasks in
     DIFFERENT repos never conflict (separate checkouts, separate merges), and
     a task with no `files` manifest — or an empty one — conflicts with
     nothing: absent evidence is not evidence of overlap, and saying otherwise
@@ -400,26 +407,40 @@ def dispatch_picture(st: dict) -> dict:
                      "terminal": [], "conflicts": []}
     for t in tasks:
         tid, status = t.get("id"), t.get("status")
+        # `repo` on every entry, in the same normal form the conflicts scan
+        # uses. It was on the conflicts entries alone, and develop.md's
+        # direct-branch fallback is scoped to "no sibling task IN THAT REPO
+        # is non-terminal — check `ready-tasks`" (round-4 review, executed):
+        # the question that instruction asks could not be answered from the
+        # verb it names, so the orchestrator had to go back to `show`'s task
+        # list and re-derive by hand exactly the picture this verb owns.
+        entry = {"id": tid, "repo": t.get("repo") or "."}
         if status in terminal:
-            picture["terminal"].append(tid)
+            picture["terminal"].append(entry)
             continue
         if status != "pending":
-            picture["in_flight"].append({"id": tid, "status": status})
+            picture["in_flight"].append({**entry, "status": status})
             continue
         unmet = sorted({d for d in depends_on(t)
                         if status_by_id.get(d) not in terminal})
         if unmet:
-            picture["blocked"].append({"id": tid, "waiting_on": unmet})
+            picture["blocked"].append({**entry, "waiting_on": unmet})
         else:
-            picture["ready"].append(tid)
+            picture["ready"].append(entry)
     by_id = {t.get("id"): t for t in tasks}
-    ready = picture["ready"]
+    ready = [t["id"] for t in picture["ready"]]
+    in_flight = [t["id"] for t in picture["in_flight"]]
     for i, a_id in enumerate(ready):
         a = by_id.get(a_id) or {}
         a_files = _file_manifest(a)
         if not a_files:
             continue
-        for b_id in ready[i + 1:]:
+        # ready siblings only from i+1 (each ready pair is named ONCE, in
+        # picture order), then every in-flight sibling — which needs no such
+        # de-duplication, since only the ready half of that pair is ever the
+        # left-hand member. The READY task is always first in `tasks`, so the
+        # loop reading it knows which one it still gets to hold back.
+        for b_id in [*ready[i + 1:], *in_flight]:
             b = by_id.get(b_id) or {}
             if (b.get("repo") or ".") != (a.get("repo") or "."):
                 continue
@@ -445,7 +466,9 @@ def _file_manifest(task: dict) -> set[str]:
             for f in raw if isinstance(f, str) and f.strip()}
 
 
-def run_health(events: list[dict], stalls: int = 0) -> tuple[str, dict[str, int]]:
+def run_health(events: list[dict], stalls: int = 0,
+               current_step: str | None = None,
+               round_anchor: str | None = None) -> tuple[str, dict[str, int]]:
     """(verdict, per-kind counts): HEALTHY unless a degrading event was
     recorded or the stalled-agent procedure engaged (`stalls` — pass
     stall_count(st)). ONE definition read by both `status` and
@@ -454,7 +477,9 @@ def run_health(events: list[dict], stalls: int = 0) -> tuple[str, dict[str, int]
     gauge: a stall the run later recovered from still degraded it, so
     nothing pairs off.
 
-    ONE documented exception: an OUTSTANDING `spawn-pending`. Its twin kind
+    ONE documented exception: a `spawn-pending` the run LEFT BEHIND — open,
+    and recorded at a step the cursor has since moved off (`current_step`;
+    pass `st["cursor"]["current_step"]`). Its twin kind
     `background-spawn-uncaptured` is already HEALTH_DEGRADING and describes
     the IDENTICAL outcome — a spawn whose verdict, status block and token
     row were never recorded — so which of the two a run ends up with is
@@ -486,7 +511,56 @@ def run_health(events: list[dict], stalls: int = 0) -> tuple[str, dict[str, int]
     so a typo'd task key leaves the abandonment written and the counter never
     bumped. The incident is still visible, as the flagged
     `stall-verdict-override`, but not as a health degradation.
-    """
+
+    …and the STEP half of that exception, which round 3 forced (whole-system
+    review, executed: 8 live pendings and nothing dead read DEGRADED). Open
+    pendings used to degrade unconditionally — defensible when a background
+    spawn was a rarity, wrong now that DAG-pipelined develop makes 2N of them
+    the CONTINUOUS state of a perfectly healthy run. The same record means
+    "still RUNNING" to the stall guard and, under the old rule, "evidence
+    lost" here, so the mid-run signal on a user-entry dashboard
+    (workflow-status/SKILL.md promises DEGRADED means the MACHINERY degraded)
+    was destroyed for every pipelined run.
+    A spawn in flight IN ITS OWN STEP is flagged-but-healthy; a pending the
+    cursor has MOVED PAST is a spawn nothing is waiting for any more, which
+    is the original evidence-loss shape. Both stay on the flagged gauge —
+    visibility was never the problem, the verdict was.
+
+    …and the ROUND half, which round 4's step test alone got wrong in one
+    direction. Bare step equality made this verdict FLAP: a dead pending
+    stamped `develop` read DEGRADED at `review` and `approve-impl`, then
+    HEALTHY again the moment a gate rejected the cursor back to `develop`
+    (manifest.yaml declares `on_reject: develop` on both approve-impl and
+    approve-security), because the second visit to a step is the same string
+    as the first. Nothing about that pending got better; the cursor merely
+    came back past it. So the test is intersected with the round-opening mark
+    the stall layer already computes — `round_anchor`, pass
+    `transitions.latest_gate_decision(st)`: a pending whose `at` predates the
+    newest human gate decision belongs to a round the run has CLOSED OUT and
+    is left behind regardless of where the cursor sits. A gate decision is
+    the only thing that moves the cursor backward, so on the forward path
+    this adds nothing — a develop pending in flight postdates approve-plan by
+    construction, and `requires_tasks_terminal` keeps the cursor at develop
+    until its tasks finish (whole-system review, round 4, both lenses).
+
+    Deliberately NOT what this fixes: two pendings at the CURRENT step, one
+    dead and one live. The anchor cannot separate those — both postdate the
+    same gate decision — and neither can any run-wide verdict, because a
+    lane's death is not an event this run ever observes. That discrimination
+    is per-lane and belongs where the human is: `show`'s `outstanding_spawns`
+    emits each pending's own `at`, and dev-workflow/SKILL.md's triage reads
+    the OUTLIER age among siblings at one step as the wedged lane.
+
+    Fail-CLOSED edges, stated because they preserve today's behaviour
+    rather than relax it: a pending written before round 4 carries no `step`
+    at all, and a caller that passes no `current_step` cannot compare one —
+    each degrades, exactly as it did before this change. A pending carrying
+    no `at` degrades only once SOME gate has been decided (the `at < anchor`
+    clause short-circuits on an empty anchor) — before any gate, a no-`at`
+    pending in the current step reads healthy. Reachable only by
+    hand-writing a log-event record with a falsy `at` AND the capture-owned
+    actor (the real writer always stamps `at`), so the softer edge is
+    accepted and named rather than special-cased (round-5 re-verification)."""
     counts: dict[str, int] = {}
     for e in events:
         k = e.get("kind")
@@ -496,11 +570,16 @@ def run_health(events: list[dict], stalls: int = 0) -> tuple[str, dict[str, int]
     # per-agent-id pairing (and its actor check) must mean the SAME thing on
     # the gauge and on the health verdict, or a run reads DEGRADED on one
     # surface and HEALTHY on the other — the drift FLAGGED_EVENT_KINDS is
-    # shared to prevent.
-    open_spawn = sum(1 for e in outstanding_flagged(events)
-                     if e.get("kind") == "spawn-pending")
-    if open_spawn:
-        counts["spawn-pending"] = open_spawn
+    # shared to prevent. The STEP test is health's alone: the gauge shows
+    # every open pending, degradation is only the left-behind ones.
+    pending_kind = (spawn_pairing().get("pending") or {}).get("kind")
+    left_behind = sum(1 for e in outstanding_flagged(events)
+                      if e.get("kind") == pending_kind
+                      and (not e.get("step") or e.get("step") != current_step
+                           or (round_anchor
+                               and (e.get("at") or "") < round_anchor)))
+    if left_behind:
+        counts[pending_kind] = left_behind
     return ("DEGRADED" if counts or stalls else "HEALTHY", counts)
 
 
@@ -2397,7 +2476,9 @@ def metrics_report(workspace: Path, run: Path,
     # HEALTH_DEGRADING_KINDS or an engaged stall procedure; the
     # non-degrading malformed-block count rides as context only.
     stalls = stall_count(st)
-    health, degrading = run_health(events, stalls)
+    health, degrading = run_health(events, stalls,
+                                   st["cursor"]["current_step"],
+                                   latest_gate_decision(st))
     malformed = sum(1 for e in events
                     if e.get("kind") == "status-block-malformed")
     parts = [f"{k}: {n}" for k, n in sorted(degrading.items())]

@@ -56,7 +56,11 @@ from pathlib import Path
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN_ROOT))
 
-from harness import chain, ndjson  # noqa: E402  (stdlib-only modules)
+# stdlib-only modules at import time. `transitions` qualifies: it imports
+# nothing but json/sys/pathlib plus these two, and reaches for PyYAML only
+# lazily, inside the declared-data readers this file calls from paths that
+# have already loaded surfaces.yaml (i.e. already required it).
+from harness import chain, ndjson, transitions  # noqa: E402
 
 
 class YamlMissing(Exception):
@@ -1657,14 +1661,13 @@ def _live_spawn_for(run: Path, task: str | None, mode: str) -> dict | None:
     """The OPEN `spawn-pending` for this exact (task, mode) — a spawn of the
     same shape of work that launched and has not reported back — or None.
 
-    Open = a pending whose agent_id carries neither a `spawn-captured`
-    (actor "capture": its SubagentStop arrived and the reply was captured)
-    nor a `spawn-abandoned` (actor "stall": a stall override declared that
-    round dead). Both resolvers are actor-checked, exactly as
-    `workflow.outstanding_flagged` and `transitions._open_spawn_pending`
-    check them — this is the third reader of the same pairing and a
-    hand-written `log-event` must not be able to unblock a spawn here while
-    being inert in the other two.
+    What counts as open is DECLARED, not restated here: `spawn_pairing:` in
+    pipeline/task-fsm.yaml names the pending and its two resolvers with the
+    actor that owns each, and `transitions.open_pendings` applies it. This is
+    one of four readers of that family, split across two layers, and the
+    whole-system review's point stands: a hand-written `log-event` must not
+    be able to unblock a spawn here while being inert in the other three, nor
+    to forge a pending that wedges this key while the gauge shrugs.
 
     Keyed on (task, mode) EQUALITY and nothing else — never on a stall key.
     Neither the stall layer's `step:<step>[:<lens>]` spelling nor the
@@ -1694,15 +1697,8 @@ def _live_spawn_for(run: Path, task: str | None, mode: str) -> dict | None:
               "unparseable line(s) — a torn `spawn-pending` line is invisible "
               "here, so a second spawn for a key whose agent is still in "
               "flight may be allowed through.", file=sys.stderr)
-    closed = {e.get("agent_id") for e in events
-              if (e.get("kind") == "spawn-captured"
-                  and e.get("actor") == "capture")
-              or (e.get("kind") == "spawn-abandoned"
-                  and e.get("actor") == "stall")}
-    return next((e for e in events
-                 if e.get("kind") == "spawn-pending"
-                 and e.get("task") == task and e.get("mode") == mode
-                 and e.get("agent_id") not in closed), None)
+    return next((e for e in transitions.open_pendings(events)
+                 if e.get("task") == task and e.get("mode") == mode), None)
 
 
 def leading_header_block(prompt: str) -> str:
@@ -2488,10 +2484,21 @@ def capture_subagent_stop(p: dict) -> None:
     # is the only key the two hook processes share. The gate is "was this id
     # EVER captured", not "is there an open pending", so if a platform ever
     # reused an id the second spawn's stop would find the first's
-    # `spawn-captured` and skip: its verdict would be dropped, but LOUDLY —
-    # the second pending stays open and shows up on the flagged gauge. That
-    # trade (drop-and-flag over a possible double verdict row on the FSM's
-    # own ledger) is accepted deliberately.
+    # `spawn-captured` and skip.
+    #
+    # What that costs changed in round 4 and the note here did not keep up
+    # (round-4 review, executed: `[pending(a-1), captured(a-1), pending(a-1)]`
+    # read 1 flagged / DEGRADED at HEAD and 0 / HEALTHY after). This used to
+    # be drop-and-FLAG — the gauge required a resolver to FOLLOW its pending,
+    # so the second pending stayed open and visible. `open_pendings` is now
+    # deliberately order-INDEPENDENT (a resolver closes its agent_id wherever
+    # it sits, because the two records are written by hooks whose relative
+    # order the platform picks), which makes one `spawn-captured` close BOTH
+    # pendings: drop-and-HIDE. The trade is still accepted — a double verdict
+    # row on the FSM's own ledger is worse than a dropped one — but the
+    # honest statement of it is that a reused id costs a verdict SILENTLY,
+    # and the order-independence that buys the four readers one shared rule
+    # is what pays for it.
     agent_id = p.get("agent_id")
     try:
         prior, skipped = ndjson.read_records_counting(run / "events.ndjson")
@@ -2510,34 +2517,28 @@ def capture_subagent_stop(p: dict) -> None:
               "`spawn-abandoned` line is invisible to this capture, so a "
               "background reply may be dropped (or an abandoned round's "
               "reply captured) on this stop.", file=sys.stderr)
-    # actor-checked like the gauge's resolver and the stall guard's — all
-    # four readers of this record test the same capture-owned value, or a
-    # forged `spawn-captured` would SUPPRESS a real capture here (verdict
-    # lost silently) while being inert in the others.
-    _captured_ids = {e.get("agent_id") for e in prior
-                     if e.get("kind") == "spawn-captured"
-                     and e.get("actor") == "capture"}
-    # The second resolver: a stall override (`--confirm-no-verdict`) declared
-    # this spawn dead and abandoned its pending. A stop arriving afterwards
-    # is the slow-not-dead agent, and its verdict must NOT enter the ledger —
-    # the round it belonged to was closed out by the override, another agent
-    # may already be answering the same question, and latest-wins would hand
-    # the run whichever finished last. That is exactly the stale-verdict race
-    # guard_spawn's one-live-spawn rule closes on the launch side; letting a
-    # late reply through here would reopen it on the completion side.
-    # actor-checked ("stall") for the same reason its sibling is: the record
-    # SUPPRESSES a capture, so a forged one would silently cost a verdict.
-    _abandoned_ids = {e.get("agent_id") for e in prior
-                      if e.get("kind") == "spawn-abandoned"
-                      and e.get("actor") == "stall"}
-    open_pendings = [e for e in prior if e.get("kind") == "spawn-pending"
-                     and e.get("agent_id") not in _captured_ids
-                     and e.get("agent_id") not in _abandoned_ids]
+    # Both resolvers are actor-checked, and so is the pending — all four
+    # readers of this record family test the same declared, owner-issued
+    # values (`spawn_pairing:` in pipeline/task-fsm.yaml, applied by
+    # `transitions.open_pendings`), or a forged `spawn-captured` would
+    # SUPPRESS a real capture here (verdict lost silently) while being inert
+    # in the others.
+    #
+    # `abandoned` is the one resolver this function asks for BY NAME — hence
+    # the declared mapping being keyed rather than a bare list. A stall
+    # override (`--confirm-no-verdict`) declared this spawn dead; a stop
+    # arriving afterwards is the slow-not-dead agent, and its verdict must
+    # NOT enter the ledger — the round it belonged to was closed out, another
+    # agent may already be answering the same question, and latest-wins would
+    # hand the run whichever finished last. That is exactly the stale-verdict
+    # race guard_spawn's one-live-spawn rule closes on the launch side.
+    _abandoned_ids = transitions.closed_agent_ids(prior, "abandoned")
+    open_pendings = transitions.open_pendings(prior)
     pending = next((e for e in open_pendings
                     if e.get("agent_id") == agent_id), None) if agent_id else None
     if agent_id and agent_id in _abandoned_ids and any(
-            e.get("kind") == "spawn-pending" and e.get("agent_id") == agent_id
-            for e in prior):
+            transitions.is_open_pending_record(e)
+            and e.get("agent_id") == agent_id for e in prior):
         # Loud, like every other capture that deliberately does nothing: a
         # dropped verdict must never be a silent no-op (the undiagnosable
         # failure this file has precedent for). Token accounting below still
@@ -2560,6 +2561,50 @@ def capture_subagent_stop(p: dict) -> None:
               "awaiting capture — this stop could not be paired, so its "
               "verdict/status was NOT captured (HARNESS_HOOK_DEBUG=1 records "
               "raw payloads).", file=sys.stderr)
+    if pending is None and agent_id:
+        # THE UPGRADE WINDOW, and it must be loud. A pending written by a
+        # pre-round-4 harness carries the spawn SHAPE where `actor` now lives
+        # ("reviewer", "developer"), so it fails the anti-forgery actor check
+        # and is invisible to every reader of this family — this one
+        # included. Executed (round-4 review): the pending was absent from
+        # the gauge, run health read HEALTHY, `open_spawn_pendings` was
+        # empty, the re-spawn and the stall were both ALLOWED over a live
+        # agent, and this hook exited 0 with an EMPTY stderr. No reviews row,
+        # no `spawn-captured`, no `missing-status-block`: a verdict gone with
+        # nothing anywhere saying so — round 3's stale-verdict race, reopened
+        # for the length of the upgrade.
+        #
+        # The fix is NOT to widen the actor bound. Accepting a declared spawn
+        # shape as an alternate actor is exactly the forgery round 4 closed
+        # (and the schema now refuses such a declaration outright). Deferred
+        # capture across the upgrade is genuinely impossible — the two hook
+        # processes share nothing but this record and its owner half is
+        # gone — so the honest move is to SAY so and name the one recovery,
+        # which is the same one every uncapturable spawn gets.
+        #
+        # `not is_open_pending_record` is the whole test: right kind, wrong
+        # (or absent) owner. It also keeps this off the two paths that
+        # legitimately reach here with no open pending and a WELL-FORMED one
+        # in the ledger — an abandoned round (reported a few lines above) and
+        # a re-delivered stop for an already-captured spawn.
+        _spec = (transitions.spawn_pairing().get("pending") or {})
+        if any(e.get("kind") == _spec.get("kind")
+               and e.get("agent_id") == agent_id
+               and not transitions.is_open_pending_record(e) for e in prior):
+            # Token accounting below still runs, exactly as on the abandoned
+            # path: the agent burned those counts whatever the ledger decided
+            # about its verdict. The VERDICT is what is lost, so say only
+            # that.
+            print(f"ai-sdlc-harness: background spawn '{agent_id}' stopped, "
+                  "and this run holds a LEGACY `spawn-pending` for it — one "
+                  "written by a pre-upgrade harness, whose owner field this "
+                  "version cannot verify. Its deferred capture is impossible: "
+                  "NO verdict row and NO status-block event were recorded for "
+                  "this spawn, and no guard sees it as in flight, so nothing "
+                  "else will report it. Re-spawn this agent in the FOREGROUND "
+                  "(its reply is captured at PostToolUse, needing no pending) "
+                  "and read the verdict from the ledger. Drain in-flight "
+                  "spawns before upgrading to avoid this.", file=sys.stderr)
     completed_pending = False
     if pending is not None:
         # task/mode/shape come from the PENDING record, not re-derived: the
@@ -2569,7 +2614,14 @@ def capture_subagent_stop(p: dict) -> None:
         # headers stay as the fallback for a pending that carried none.
         pend_task = pending.get("task") or task
         pend_mode = pending.get("mode") or mode
-        pend_shape = pending.get("shape") or pending.get("actor") or shape
+        # `shape`, never `actor`: since round 4 the pending's actor is the
+        # capture-owned "capture" (the anti-forgery bound every record in
+        # this family carries), and the spawn shape has its own key — the
+        # same split `spawn-captured` below already used. The old
+        # `or pending.get("actor")` fallback would now resolve a missing
+        # shape to the literal "capture", filing a verdict under a shape no
+        # surface declares.
+        pend_shape = pending.get("shape") or shape
         # ONLY the subagent's own transcript, else the payload's own copy of
         # its final message — never the parent-session fallback (see the
         # `agent_tx` note above). `last_assistant_message` is documented as
@@ -2598,18 +2650,21 @@ def capture_subagent_stop(p: dict) -> None:
                   file=sys.stderr)
         else:
             _capture_reply(run, pend_shape, pend_mode, pend_task, text)
+            # kind AND actor come from the same declaration the readers
+            # match on, so this writer cannot drift from them. `actor` is
+            # CAPTURE-owned, like agent-identity's: it is the value every
+            # reader tests before letting this record clear a pending.
+            # Holding the spawn SHAPE here instead made the pairing forgeable
+            # by anything that can write the ledger — executed: a hand-run
+            # `harness log-event --json
+            # '{"kind":"spawn-captured","agent_id":"a-1"}'` cleared a real
+            # pending, and the agent_id is no secret, it is published in the
+            # same readable ledger. The shape has its own key.
+            captured = (transitions.spawn_pairing()
+                        .get("resolvers") or {})["captured"]
             ndjson.append_record(run / "events.ndjson", {
-                # `actor` is CAPTURE-owned, like agent-identity's: it is the
-                # value outstanding_flagged tests before letting this record
-                # clear a pending. Holding the spawn SHAPE here instead made
-                # the pairing forgeable by anything that can write the
-                # ledger — executed: a hand-run `harness log-event --json
-                # '{"kind":"spawn-captured","agent_id":"a-1"}'` cleared a
-                # real pending, and the agent_id is no secret, it is
-                # published in the same readable ledger. The shape moves to
-                # its own key.
-                "kind": "spawn-captured", "agent_id": agent_id,
-                "task": pend_task, "actor": "capture",
+                "kind": captured["kind"], "actor": captured["actor"],
+                "agent_id": agent_id, "task": pend_task,
                 "shape": pend_shape, "mode": pend_mode})
             # ONE attribution for this stop. Before this, the verdict row
             # took the pending's (task, mode, shape) while the token row a
@@ -2985,8 +3040,38 @@ def capture_post_spawn(p: dict) -> None:
         # human sees the hole.
         agent_id = tool_response.get("agentId")
         if isinstance(agent_id, str) and agent_id:
+            # kind + actor from the declaration every reader matches on
+            # (`spawn_pairing.pending`), so the asserting record carries the
+            # SAME anti-forgery bound its resolvers always had. It was the one
+            # record in the family matched on `kind` alone — executed
+            # (whole-system review, round 4): a hand-written `log-event`
+            # spawn-pending BLOCKED the next legitimate spawn for that (task,
+            # mode), made the stall that would clear it REFUSE, and degraded
+            # run health. The spawn SHAPE, which used to sit in `actor`, moves
+            # to its own key exactly as `spawn-captured`'s already had.
+            pend = transitions.spawn_pairing()["pending"]
+            # The SPAWNING STEP, read off the run's own cursor. Health degrades
+            # on a pending the run LEFT BEHIND, not on one still in flight
+            # where it was launched (workflow.run_health) — without this, a
+            # DAG-pipelined develop with N lanes live reads DEGRADED
+            # continuously, which is the mid-run signal the dashboard exists to
+            # give. Best-effort by design: an unreadable state must never cost
+            # the run the pending itself (a lost pending loses a real verdict),
+            # so the key is simply absent, and absent reads as degrade —
+            # fail-closed, i.e. exactly today's behaviour.
+            step = None
+            try:
+                step = ((read_state(run, cwd).get("cursor")
+                         or {}).get("current_step"))
+            except Exception as exc:                          # noqa: BLE001
+                print(f"ai-sdlc-harness: could not read {run}'s cursor while "
+                      f"recording a spawn-pending ({type(exc).__name__}: "
+                      f"{exc}) — the pending is recorded WITHOUT its step, so "
+                      "it degrades run health until it pairs off.",
+                      file=sys.stderr)
             ndjson.append_record(run / "events.ndjson", {
-                "kind": "spawn-pending", "task": task, "actor": shape,
+                "kind": pend["kind"], "actor": pend["actor"],
+                "task": task, "shape": shape, "step": step,
                 "mode": mode, "agent_id": agent_id,
                 "reason": "harness-shape spawn launched in the BACKGROUND — "
                           "PostToolUse saw only the launch stub, so verdict/"
@@ -3114,7 +3199,12 @@ def _debug_dump(name: str, payload: dict) -> None:
     the one-flag diagnosis path for "a hook isn't doing what I expect"
     (dogfood-run finding: capture_subagent_stop returned silently for an
     entire session and nothing recorded WHY; payload-shape questions are
-    unanswerable after the fact without this)."""
+    unanswerable after the fact without this).
+
+    DIAGNOSTIC ONLY, and since round 4 that costs something while it is on:
+    the target is under `Path.home()`, so `ndjson.ledger_lock` puts its
+    sidecar at `~/.ledger.lock` — one MACHINE-WIDE lock every hook of every
+    run then serializes on, for a file nothing reads at runtime."""
     import os
     if os.environ.get("HARNESS_HOOK_DEBUG") != "1":
         return

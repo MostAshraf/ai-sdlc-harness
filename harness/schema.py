@@ -36,6 +36,14 @@ except ImportError:  # pragma: no cover
 ENGINE_COMPUTED_PREFIXES = ("classify.",)
 GATE_TOKEN_PREFIX = "gate."
 
+# `spawn_pairing.resolvers` names the engine INTERPRETS — `abandoned` is asked
+# for by name (a late stop for an abandoned spawn must be refused, not
+# captured), and `captured` is the ordinary close. Data names them, code
+# provides the behaviour; a missing name would silently degrade a reader to
+# "nothing closes this pending", which is the half-enforced vocabulary this
+# file exists to refuse.
+REQUIRED_SPAWN_RESOLVERS = ("captured", "abandoned")
+
 
 class Issues:
     def __init__(self) -> None:
@@ -281,7 +289,7 @@ def validate_manifest(manifest: dict, surfaces: dict, config: dict, issues: Issu
 
 # ---------------------------------------------------------------------- fsm
 
-def validate_fsm(fsm: dict, issues: Issues) -> None:
+def validate_fsm(fsm: dict, surfaces: dict, issues: Issues) -> None:
     states = fsm.get("states", []) or []
     if len(states) != len(set(states)):
         issues.err("fsm: duplicate states")
@@ -310,6 +318,113 @@ def validate_fsm(fsm: dict, issues: Issues) -> None:
         if key in seen:
             issues.err(f"fsm: duplicate transition {frm} -> {to}")
         seen.add(key)
+    _validate_spawn_pairing(fsm.get("spawn_pairing"), surfaces, issues)
+
+
+def _record_shape_ok(rec, where: str, issues: Issues) -> tuple | None:
+    """A `{kind, actor}` pairing record: both non-blank strings, no extras.
+
+    Held to the same bar `verdict_bound` is — a shape the engine cannot
+    interpret is refused at validation rather than discovered as a missing
+    refusal mid-run, where its only symptom is a guard that silently stops
+    guarding."""
+    if (not isinstance(rec, dict)
+            or set(rec) != {"kind", "actor"}
+            or not all(isinstance(rec.get(k), str) and rec[k].strip()
+                       for k in ("kind", "actor"))):
+        issues.err(f"{where}: must be {{kind, actor}} with non-empty string "
+                   "values — both are matched literally against "
+                   "events.ndjson records")
+        return None
+    return (rec["kind"], rec["actor"])
+
+
+def _validate_spawn_pairing(pairing, surfaces: dict, issues: Issues) -> None:
+    """`spawn_pairing` is READ by four independent readers across two layers
+    (engine + hooks), so an absent or misshapen block is not a cosmetic
+    problem: `open_pendings` would see no pending kind at all and every
+    "is a spawn in flight?" question in the system would answer no."""
+    if not isinstance(pairing, dict) or not pairing:
+        issues.err("fsm: `spawn_pairing` must declare {pending, resolvers} — "
+                   "the engine and the hooks both read it to decide whether a "
+                   "background spawn is still in flight")
+        return
+    if set(pairing) - {"pending", "resolvers"}:
+        issues.err("fsm: `spawn_pairing` takes only `pending` and `resolvers`")
+    pending = _record_shape_ok(pairing.get("pending"),
+                               "fsm: spawn_pairing.pending", issues)
+    # The pending kind must ALSO be a flagged kind, or the two layers split:
+    # `open_pendings` refuses every re-spawn on a kind the gauge cannot see.
+    # Executed (round-4 review) by declaring `spawn-launched`: schema reported
+    # "OK — 0 error(s)" while at runtime open_pendings was 1 (the spawn and
+    # stall guards refusing everything) and outstanding_flagged 0 with health
+    # HEALTHY — the exact split task-fsm.yaml's own comment says this
+    # declaration prevents. Imported rather than restated, and imported HERE
+    # rather than at module scope, for the same reason `transitions._load_fsm`
+    # is lazy: `harness.workflow` reads declared data at import.
+    if pending is not None:
+        from .workflow import FLAGGED_EVENT_KINDS
+        if pending[0] not in FLAGGED_EVENT_KINDS:
+            issues.err(f"fsm: spawn_pairing.pending.kind '{pending[0]}' is "
+                       "not in workflow.FLAGGED_EVENT_KINDS — an open pending "
+                       "would refuse every re-spawn and every stall while "
+                       "being invisible to the flagged gauge and to run "
+                       "health (the run reads HEALTHY and wedged)")
+    # An actor that collides with a declared spawn SHAPE re-opens the forgery
+    # round 4 closed: `capture_post_spawn` used to write the shape into
+    # `actor`, and a shape is a value any spawn-visible prose already carries,
+    # so `pending.actor: reviewer` would make the anti-forgery check pass for
+    # anything that can name a shape. The actor must be an OWNER-issued value
+    # ("capture", "stall") that only the writing code path uses.
+    shapes = set((surfaces or {}).get("shapes") or {})
+    for where, rec in (("pending", pairing.get("pending")),
+                       *((f"resolvers['{n}']", r) for n, r
+                         in (pairing.get("resolvers") or {}).items()
+                         if isinstance(r, dict))):
+        if isinstance(rec, dict) and rec.get("actor") in shapes:
+            issues.err(f"fsm: spawn_pairing.{where}.actor "
+                       f"'{rec.get('actor')}' is a declared spawn shape — the "
+                       "actor is the anti-forgery bound and must be a value "
+                       "only the owning writer issues (`capture`, `stall`), "
+                       "never one a spawn already publishes about itself")
+    resolvers = pairing.get("resolvers")
+    if not isinstance(resolvers, dict) or not resolvers:
+        issues.err("fsm: spawn_pairing.resolvers must be a non-empty mapping "
+                   "of engine-interpreted name -> {kind, actor}")
+        return
+    for name in REQUIRED_SPAWN_RESOLVERS:
+        if name not in resolvers:
+            issues.err(f"fsm: spawn_pairing.resolvers is missing '{name}' — "
+                       "the engine interprets that name (data names it, code "
+                       "provides it, exactly like a transition `guard`)")
+    # …and NOTHING else. `closed_agent_ids` honours every declared resolver
+    # by value, so an extra one — even under a name no code reads, even under
+    # the empty string — silently becomes a further way to close a pending
+    # (fuzzed in round-4 review). Required-plus-extras is a vocabulary only
+    # half-enforced, which is the shape this file exists to refuse.
+    for name in set(resolvers) - set(REQUIRED_SPAWN_RESOLVERS):
+        issues.err(f"fsm: spawn_pairing.resolvers['{name}'] is not a name the "
+                   "engine interprets — the declared set is exactly "
+                   f"{list(REQUIRED_SPAWN_RESOLVERS)}, and an extra entry is "
+                   "honoured as another way to close a pending while no code "
+                   "path ever writes it")
+    kinds = set()
+    for name, rec in resolvers.items():
+        shape = _record_shape_ok(
+            rec, f"fsm: spawn_pairing.resolvers['{name}']", issues)
+        if shape is None:
+            continue
+        if pending is not None and shape[0] == pending[0]:
+            # a resolver that shares the pending's kind would close every
+            # pending the moment it was written — the pairing inverted
+            issues.err(f"fsm: spawn_pairing.resolvers['{name}'].kind "
+                       f"'{shape[0]}' is also the pending kind — a resolver "
+                       "must be a DIFFERENT record from the one it closes")
+        if shape[0] in kinds:
+            issues.err(f"fsm: spawn_pairing.resolvers['{name}'].kind "
+                       f"'{shape[0]}' is declared by more than one resolver — "
+                       "readers would disagree about which actor owns it")
+        kinds.add(shape[0])
 
 
 # ------------------------------------------------------------------ configs
@@ -443,7 +558,7 @@ def validate_all(root: Path) -> Issues:
     surfaces = load_yaml(root / "pipeline" / "surfaces.yaml")
     config = merge_defaults(root / "config" / "defaults", issues)
     validate_configs(config, issues)
-    validate_fsm(fsm, issues)
+    validate_fsm(fsm, surfaces, issues)
     validate_manifest(manifest, surfaces, config, issues)
     return issues
 

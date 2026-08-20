@@ -41,18 +41,23 @@ unverified. No task declaring `env_requires` → nothing probed, exit 0.
 ## The dispatch loop
 
 1. **Ask** `${CLAUDE_PLUGIN_ROOT}/bin/harness ready-tasks --run <run>` →
-   `{ready, in_flight, blocked: [{id, waiting_on}], terminal, conflicts}`.
+   `{ready, in_flight, blocked, terminal, conflicts}`. Every entry of the
+   first four is `{id, repo}` (+ `status` on `in_flight`, `waiting_on` on
+   `blocked`), so "is any sibling task in this repo still non-terminal?" —
+   which recipe step 1 asks — is answered from this verb alone.
    The owned derivation: never re-derive readiness from `show` yourself — a
    dependency merely `in-review` is NOT satisfied, and a task already in
    flight must not be dispatched a second time.
-2. **Dispatch every id in `ready`** — all of them. Run recipe steps 1-2 per
+2. **Dispatch every entry in `ready`** — all of them. Run recipe steps 1-2 per
    task (worktree, in-progress: quick CLI calls), then put their step-3
    developer spawns in ONE message, which is what runs them concurrently.
-   **Except a `conflicts` pair:** two ready tasks in the same repo whose
-   declared `files` overlap. Dispatch one, let its merge land, THEN cut the
-   second's worktree and dispatch it — a worktree cut now cannot contain a
-   sibling's not-yet-merged code, so both would edit the same file from the
-   same starting point. Advisory, not enforced: `depends_on` is still the
+   **Except a `conflicts` pair:** two tasks in the same repo whose declared
+   `files` overlap, where at least one is ready — the other is either ready
+   too or already IN FLIGHT, and the ready one is named first. Hold that
+   ready task: let the other's merge land, THEN cut its worktree and dispatch
+   it. A worktree cut now cannot contain a sibling's not-yet-merged code, so
+   both would edit the same file from the same starting point. Advisory, not
+   enforced: `depends_on` is still the
    only ordering authority, and everything else in `ready` still goes out
    together. Across repos there is never a conflict. An EMPTY `conflicts` is
    the planner's word, not a verified fact — the manifests it is derived from
@@ -62,7 +67,14 @@ unverified. No task declaring `env_requires` → nothing probed, exit 0.
 3. **Wait, don't poll.** A backgrounded spawn returns a launch STUB, not a
    reply: proceed on its completion notification only, never `stall` a live
    spawn, and never stop waiting on task B because task A reported — an
-   un-awaited lane is a lane that never finishes.
+   un-awaited lane is a lane that never finishes. **Which lane is still in
+   flight** is an owned answer, never a ledger read: `show`'s
+   `outstanding_spawns` lists every open spawn as `{task, mode, agent_id,
+   step, at, clearable, clearing_key}`. A lane listed there is running; a
+   lane you expected there and don't see is the one to diagnose. Every lane
+   here shares one `step` (the cursor cannot leave `develop` until the tasks
+   are terminal), so `at` — not `step` — is what tells a wedged lane from a
+   slow one; SKILL.md's Stalls triage owns that call.
 4. **On each completion notification** advance THAT task through the recipe,
    then re-run `ready-tasks`: a task reaching `done` is what unblocks its
    dependents, and they dispatch the same moment under the same rules.
@@ -86,11 +98,20 @@ unverified. No task declaring `env_requires` → nothing probed, exit 0.
    so step 7 can remove the worktree at all). Root registrations are
    unchanged — the two are one directory. If creation fails twice, read what
    the failure actually says: it either names the direct-branch fallback
-   (offer that choice to the user, never improvise) **or REFUSES it, naming
-   the shared physical checkout and any other repos registered into it** — a
-   task branch cut in the main checkout switches every file there,
-   registered or not. On the refusal there is no choice to offer: surface it
-   verbatim, stop the lane, and let the user fix the repo state.
+   **or REFUSES it, naming the shared physical checkout and any other repos
+   registered into it** — a task branch cut in the main checkout switches
+   every file there, registered or not. On the refusal there is no choice to
+   offer: surface it verbatim, stop the lane, and let the user fix the repo
+   state. Where it IS named, offer it to the user (never improvise it) **only
+   while no sibling task in that repo is non-terminal** — check `ready-tasks`
+   and match on each entry's own `repo`, across `ready`, `in_flight` and
+   `blocked`.
+   It parks a non-feature branch in the shared checkout, so every live
+   sibling's `merge-task` precondition (HEAD must be this run's feature
+   branch) then refuses — and step 5 tells the loop that refusal means "wait
+   and re-run the identical command", which here never succeeds: a LIVELOCK.
+   With siblings live there is no choice to offer either: stop this lane, let
+   them land, retry.
 2. `${CLAUDE_PLUGIN_ROOT}/bin/harness task --id <T> --to in-progress --run <run>`
 3. **Spawn `developer`** with headers (`harness-mode: develop`,
    `harness-task: <T>`, `harness-run`, `harness-repo: <worktree-path>`,

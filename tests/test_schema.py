@@ -258,11 +258,13 @@ class ValidatorCatchesBrokenManifest(unittest.TestCase):
 
 class ValidatorCatchesBrokenFsm(unittest.TestCase):
     def setUp(self):
-        _, self.fsm, _, _ = _load()
+        _, self.fsm, self.surfaces, _ = _load()
 
     def _errors(self, fsm):
+        # the REAL surfaces, so the actor-vs-spawn-shape collision check
+        # below runs against the shapes the guards actually accept
         issues = schema.Issues()
-        schema.validate_fsm(fsm, issues)
+        schema.validate_fsm(fsm, self.surfaces, issues)
         return issues.errors
 
     def test_initial_must_be_declared(self):
@@ -308,6 +310,113 @@ class ValidatorCatchesBrokenFsm(unittest.TestCase):
         self.assertEqual(list(transitions.terminal_statuses()),
                          self.fsm["terminal"])
         self.assertEqual(self.fsm["terminal"], ["done", "archived"])
+
+    def test_a_missing_spawn_pairing_block_is_an_error(self):
+        """Read by FOUR independent readers across two layers (the flagged
+        gauge, the stall guard, the spawn guard, the SubagentStop capture).
+        Absent, `open_pendings` matches no kind at all and every "is a spawn
+        still in flight?" question in the system quietly answers no."""
+        broken = copy.deepcopy(self.fsm)
+        del broken["spawn_pairing"]
+        self.assertTrue(any("`spawn_pairing`" in e
+                            for e in self._errors(broken)))
+
+    def test_the_pending_record_needs_both_kind_and_actor(self):
+        # the actor half IS the anti-forgery bound — a pending declared
+        # without one is a pending any `log-event` caller can mint
+        for pending in ({"kind": "spawn-pending"}, {"actor": "capture"},
+                        {"kind": "spawn-pending", "actor": ""},
+                        {"kind": "spawn-pending", "actor": "capture",
+                         "extra": "x"}, "spawn-pending"):
+            broken = copy.deepcopy(self.fsm)
+            broken["spawn_pairing"]["pending"] = pending
+            self.assertTrue(any("spawn_pairing.pending" in e
+                                for e in self._errors(broken)), pending)
+
+    def test_an_engine_interpreted_resolver_name_must_be_declared(self):
+        # `abandoned` is asked for BY NAME (a late stop for an abandoned
+        # spawn must be refused capture) — data names it, code provides it
+        broken = copy.deepcopy(self.fsm)
+        del broken["spawn_pairing"]["resolvers"]["abandoned"]
+        self.assertTrue(any("missing 'abandoned'" in e
+                            for e in self._errors(broken)))
+
+    def test_a_resolver_may_not_share_the_pending_kind_or_another_resolvers(self):
+        broken = copy.deepcopy(self.fsm)
+        broken["spawn_pairing"]["resolvers"]["abandoned"]["kind"] = \
+            "spawn-pending"
+        self.assertTrue(any("also the pending kind" in e
+                            for e in self._errors(broken)))
+        broken = copy.deepcopy(self.fsm)
+        broken["spawn_pairing"]["resolvers"]["abandoned"]["kind"] = \
+            "spawn-captured"
+        self.assertTrue(any("more than one resolver" in e
+                            for e in self._errors(broken)))
+
+    def test_empty_or_misshapen_resolvers_are_errors(self):
+        for resolvers in ({}, [], {"captured": {"kind": "spawn-captured"}}):
+            broken = copy.deepcopy(self.fsm)
+            broken["spawn_pairing"]["resolvers"] = resolvers
+            self.assertTrue(any("resolvers" in e for e in self._errors(broken)),
+                            resolvers)
+
+    def test_the_pending_kind_must_be_a_flagged_kind(self):
+        """The declared gate that did not gate (round-4 review, executed): a
+        pending kind outside FLAGGED_EVENT_KINDS validated clean, then at
+        runtime `open_pendings` refused every re-spawn and every stall while
+        the gauge read 0 outstanding and health read HEALTHY — the exact
+        split task-fsm.yaml's own comment claims the declaration prevents."""
+        broken = copy.deepcopy(self.fsm)
+        broken["spawn_pairing"]["pending"]["kind"] = "spawn-launched"
+        self.assertTrue(any("FLAGGED_EVENT_KINDS" in e
+                            for e in self._errors(broken)))
+
+    def test_an_undeclared_resolver_name_is_an_error(self):
+        """`closed_agent_ids` honours every declared resolver BY VALUE, so an
+        extra one — even under a name no code reads, even under the empty
+        string the fuzzer found — is a further way to close a pending that
+        nothing ever writes."""
+        for name in ("retired", ""):
+            broken = copy.deepcopy(self.fsm)
+            broken["spawn_pairing"]["resolvers"][name] = {
+                "kind": "spawn-retired", "actor": "somebody"}
+            self.assertTrue(any("not a name the engine interprets" in e
+                                for e in self._errors(broken)), name)
+
+    def test_an_actor_may_not_be_a_declared_spawn_shape(self):
+        """The actor IS the anti-forgery bound, so it must be a value only
+        the owning writer issues. A spawn SHAPE is the opposite of that —
+        it is published in every spawn's own headers, and it is exactly what
+        `actor` held before round 4 — so declaring `actor: reviewer` would
+        re-open the forgery that change closed, on either half of the
+        pairing."""
+        for path in (("pending",), ("resolvers", "abandoned")):
+            for shape in ("reviewer", "developer", "planner"):
+                broken = copy.deepcopy(self.fsm)
+                node = broken["spawn_pairing"]
+                for part in path:
+                    node = node[part]
+                node["actor"] = shape
+                self.assertTrue(any("is a declared spawn shape" in e
+                                    for e in self._errors(broken)),
+                                (path, shape))
+
+    def test_the_shipped_spawn_pairing_is_what_the_engine_reads(self):
+        """Same two-truths rule as `terminal` above: pinning the literal
+        alone would pass against a loader reading the wrong key."""
+        from harness import transitions
+        from harness.workflow import FLAGGED_EVENT_KINDS
+        self.assertEqual(transitions.spawn_pairing(), self.fsm["spawn_pairing"])
+        self.assertEqual(
+            self.fsm["spawn_pairing"],
+            {"pending": {"kind": "spawn-pending", "actor": "capture"},
+             "resolvers": {
+                 "captured": {"kind": "spawn-captured", "actor": "capture"},
+                 "abandoned": {"kind": "spawn-abandoned", "actor": "stall"}}})
+        # …and the gauge's own membership list names the same record, or the
+        # pending is either invisible to the human or unpairable
+        self.assertIn(self.fsm["spawn_pairing"]["pending"]["kind"],
+                      FLAGGED_EVENT_KINDS)
 
 
 class ValidatorCatchesBrokenConfig(unittest.TestCase):

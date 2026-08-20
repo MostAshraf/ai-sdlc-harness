@@ -137,6 +137,75 @@ All notable changes to `ai-sdlc-harness` are documented here.
   "background spawn awaiting capture" flag), and the guard that blocks
   hand-piped synthetic payloads into the capture hooks now catches the
   line-continuation spelling that already evaded it for other verbs.
+- **Run evidence is no longer lost when several agents finish at once.** The
+  run's ledgers (reviewer verdicts, events, token costs) were written by
+  concurrent one-shot hook processes relying on the operating system to keep
+  single appends whole — which Windows does not. Measured on this platform:
+  six processes writing 120 records each left 376 of 720, with nothing torn
+  or corrupt to show for it, so a captured `APPROVED` could simply cease to
+  exist. Ledger appends now take their own brief lock. It is deliberately
+  separate from the run lock, so a capture still completes in a fraction of
+  a second while a long merge is in progress, and if the lock cannot be
+  taken at all the record is still written rather than dropped.
+- **A run with agents still working no longer reports DEGRADED.** With
+  `develop` now dispatching every ready task at once, several agents in
+  flight is the normal state of a healthy run — and `harness status` called
+  all of it degraded, which is exactly the reading that surface exists to
+  give. Health now degrades only on a spawn nothing is waiting for any
+  more — one the run has *moved past*, or one launched in a round a human
+  gate has since closed out — which is the case where evidence really was
+  lost. In-flight spawns stay visible on the flagged-events count
+  throughout. The second half matters because a rejected gate sends the
+  cursor back to the step it came from: tested on the step's *name* alone,
+  the verdict flipped back to HEALTHY the moment `approve-impl` was
+  rejected, with nothing about the lost spawn having changed.
+- `harness show` now lists in-flight spawns individually — task, mode, agent
+  id, the step each was launched from, when it was launched, and whether any
+  `stall` key can clear it — instead of only counting them. Before, nothing
+  attributed an open spawn to a task at all, so the only way to find a
+  wedged lane was to call `stall` on one and see which refused: a
+  destructive probe that succeeds on the healthy lane and gives the wrong
+  instruction. Attribution alone is not the whole answer, because pipelined
+  `develop` holds every lane at one step: the launch time is what separates
+  a dead lane from a live sibling, and the stall triage now says so. Two
+  entries that carry no clearing key at all (a repo-map or request-triage
+  spawn) are marked as such and left alone — the instruction to abandon them
+  matched nothing, cleared nothing, and cost the run a stall counter. The
+  dispatch loop and the stall triage now ask this verb rather than reading
+  the events ledger by hand.
+- `harness ready-tasks` now reports each task's repo on every entry — ready,
+  in flight, blocked and terminal alike — not only inside its file-overlap
+  advisory. The `develop` instructions scope the direct-branch worktree
+  fallback to "no sibling task in that repo is still running" and name this
+  verb as the way to check, which it could not answer.
+- **Upgrade note — drain in-flight spawns before upgrading.** A background
+  spawn that is *already running* when the harness is upgraded to this
+  version loses its deferred capture: the record pairing it to its agent was
+  written in the previous format, and the anti-forgery check this release
+  adds (deliberately, and not relaxed here) cannot verify it. The result is
+  no verdict and no status block for that one spawn (its token cost is still
+  recorded). It is now reported rather than silent — the completion prints
+  what happened
+  and what to do (re-spawn it in the foreground), and `harness show` lists
+  such spawns under `legacy_spawn_pendings` instead of showing nothing at
+  all. Spawns launched after the upgrade are unaffected.
+- `ready-tasks`' file-overlap advisory now also pairs a newly-ready task
+  against tasks **already in flight**, not just against other ready ones —
+  which is the situation pipelined dispatch is in for most of `develop`, and
+  the one the advisory could never see. Blocked and finished tasks are still
+  not paired.
+- The `develop` instructions now offer the direct-branch worktree fallback
+  **only when no sibling task in that repo is still running**. Taken while
+  one is, it parks a non-feature branch in the shared checkout, every
+  sibling's merge is then refused, and the loop is told to wait and retry a
+  command that can never succeed.
+- A hand-written "spawn in flight" ledger record can no longer wedge a run.
+  It was the one record of its family not checked against its owner, so a
+  forged one blocked the next legitimate spawn, made the stall that would
+  clear it refuse, and degraded run health — recoverable only at the cost of
+  a stall counter and a flagged override. The whole family — the record and
+  both ways it can be closed — is now declared in one place and read from
+  there by every part of the engine and the hooks that asks about it.
 
 ## [3.6.0] — 2026-08-15
 > **A monorepo's second stack could be discovered, described, and then not registered — and its test suite silently never ran again.** Setup has proposed a `monorepo_split` for as long as it has proposed anything: one checkout, a .NET solution at its root, a Node app under `frontend/`, two logical repos sharing one `.git`. Nothing downstream could accept that answer. Verification asked whether the registered path had a `.git` directly under it — true only of a checkout root — so registering the two roots separately left both permanently failing the gate with no available fix, and the setup skills said the only thing that then worked: register the repo once, at its physical root. One stack got a test command; the other's suite dropped out of every pipeline that ever ran there, with no gate anywhere reporting the loss. A registered repo may now be **any subtree of a git checkout**, so the split registers as the several logical repos it always was. An adversarial review of the change then hardened it: the review found (and this release closes) a write path where an edit outside the task's subtree was silently destroyed on a green run, a contract check that could report clean against a sibling repo's files, a PR step that hard-failed for the second repo of a shared checkout, and four verification gaps where setup accepted a registration the pipeline could never run.

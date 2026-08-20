@@ -11,12 +11,19 @@ description: >
 1. `${CLAUDE_PLUGIN_ROOT}/bin/harness status` — every run: cursor, mode, work item, task statuses,
    decided gates, flagged-event count, and a `health` verdict (`HEALTHY` |
    `DEGRADED`: did the run MACHINERY degrade — stalls, lost evidence;
-   flagged events alone don't flip it). An `aborted` field marks a run ended
+   flagged events alone don't flip it, and neither do the several spawns a
+   pipelined `develop` keeps in flight — only one the run has moved PAST or
+   launched in a round a gate has since closed out, whose evidence is never
+   arriving). An `aborted` field marks a run ended
    by the abort verb (terminal); an `error` field marks a run whose state
    failed integrity verification (its `remediation` names the reseal
    command) — the rest of the dashboard still renders.
 2. Render it as a compact table for the user; for a run they ask about,
-   drill in with `${CLAUDE_PLUGIN_ROOT}/bin/harness show --run <run>` plus the ledgers
+   drill in with `${CLAUDE_PLUGIN_ROOT}/bin/harness show --run <run>` — whose
+   `outstanding_spawns` names each in-flight spawn's task, mode, agent id,
+   launching step and launch time, so "which lane is still working" needs no
+   ledger read (and `legacy_spawn_pendings`, if non-empty, names spawns
+   launched before an upgrade whose capture can no longer land) — plus the ledgers
    (`events.ndjson` — the "what happened" trail; `tokens.ndjson` — spend)
    and compose the per-task timeline: status + review rounds + stalls +
    flagged events + gate evidence.

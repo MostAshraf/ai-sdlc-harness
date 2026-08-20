@@ -1022,6 +1022,25 @@ class MirrorAndSync(GitopsHarness):
         self.assertNotIn(".hmac", joined)           # seals are workspace-local
         self.assertIn("unrelated.txt", gitops.changed_files(self.repo))
 
+    def test_the_ledger_lock_sidecar_is_never_mirrored(self):
+        """`.ledger.lock` joins `.state.lock` on MIRROR_EXCLUDE for the same
+        reason: a lock sidecar is run-local machinery, not run evidence, and
+        committing a file whose whole purpose is to be contended on this
+        machine puts it in every reviewer's PR — and back into the checkout
+        of anyone who pulls it. Untested when it was added (round-4 review);
+        the exclusion is one tuple entry away from silently lapsing."""
+        from harness import ndjson as ndjson_mod
+        self.assertIn(ndjson_mod.LEDGER_LOCK_NAME, gitops.MIRROR_EXCLUDE)
+        # the REAL writer creates it: an append takes the lock, so a run that
+        # has ever written a ledger has the sidecar sitting beside it
+        ndjson.append_record(self.run / "events.ndjson", {"kind": "x"})
+        self.assertTrue((self.run / ndjson_mod.LEDGER_LOCK_NAME).exists(),
+                        "the lock sidecar should exist after a real append")
+        gitops.publish_mirror(self.repo, self.run, self.config, self.run.name)
+        listed = gitops.run_git(self.repo, "ls-files", f"ai/{self.run.name}")
+        self.assertIn("events.ndjson", listed)       # the evidence mirrors
+        self.assertNotIn("ledger.lock", listed)      # its lock does not
+
     def test_mirror_prunes_deletions_and_near_name_private_variants(self):
         """Adversarial-review findings: (a) copy-only mirroring kept both
         names of a renamed report forever; (b) the privacy carve-out was

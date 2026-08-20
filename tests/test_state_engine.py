@@ -593,16 +593,18 @@ class TerminalVocabularyIsDeclared(Harness):
             picture = workflow.dispatch_picture(st)
             self.assertEqual(picture["terminal"], [])
             self.assertEqual(picture["in_flight"],
-                             [{"id": "T1", "status": "done"}])
+                             [{"id": "T1", "repo": ".", "status": "done"}])
             self.assertEqual(picture["blocked"],
-                             [{"id": "T2", "waiting_on": ["T1"]}])
+                             [{"id": "T2", "repo": ".",
+                               "waiting_on": ["T1"]}])
             with self.assertRaises(transitions.TransitionError):
                 transitions.transition_task(st, self.fsm, self.config, run,
                                             self.key, "T2", "in-progress")
         # …and under the real declaration the identical state dispatches
         picture = workflow.dispatch_picture(st)
         self.assertEqual((picture["terminal"], picture["ready"]),
-                         (["T1"], ["T2"]))
+                         ([{"id": "T1", "repo": "."}],
+                          [{"id": "T2", "repo": "."}]))
         transitions.transition_task(st, self.fsm, self.config, run, self.key,
                                     "T2", "in-progress")
 
@@ -947,8 +949,12 @@ class ShowNextSteps(Harness):
         run, _ = self._plan_review_run()
         self.assertEqual(self._show(run)["outstanding_flagged"], {})
         for rec in ({"kind": "spawn-pending", "agent_id": "a-1",
+                     "actor": "capture", "mode": "plan-attack",
+                     "step": "plan-review",
                      "task": "step:plan-review:contradictions"},
                     {"kind": "spawn-pending", "agent_id": "a-2",
+                     "actor": "capture", "mode": "plan-attack",
+                     "step": "plan-review",
                      "task": "step:plan-review:coverage"},
                     {"kind": "hook-blocked", "actor": "reviewer"}):
             ndjson.append_record(run / "events.ndjson", rec)
@@ -959,6 +965,104 @@ class ShowNextSteps(Harness):
                               "actor": "capture"})
         self.assertEqual(self._show(run)["outstanding_flagged"],
                          {"spawn-pending": 1, "hook-blocked": 1})
+
+    def test_show_attributes_each_open_spawn_to_its_task(self):
+        """The {kind: count} summary above is right for the other ten kinds
+        and destroys the only thing the dispatch loop needs from this one.
+        Executed (whole-system review, round 4): with one lane's agent dead
+        and another's alive, `show` and `ready-tasks` read IDENTICALLY, so
+        the only way to find the wedged lane was to `stall` one and see
+        which refused — a destructive probe that SUCCEEDS on the healthy lane
+        and returns the wrong instruction. A sibling key, so the pinned
+        summary shape above is untouched."""
+        run, _ = self._plan_review_run()
+        self.assertEqual(self._show(run)["outstanding_spawns"], [])
+        stamped = {}
+        for agent, task in (("a-1", "T1"), ("a-2", "T2")):
+            stamped[task] = ndjson.append_record(run / "events.ndjson", {
+                "kind": "spawn-pending", "agent_id": agent, "task": task,
+                "actor": "capture", "shape": "reviewer", "mode": "review",
+                "step": "develop"})["at"]
+        self.assertEqual(
+            self._show(run)["outstanding_spawns"],
+            [{"task": "T1", "mode": "review", "agent_id": "a-1",
+              "step": "develop", "at": stamped["T1"], "clearable": True,
+              "clearing_key": "T1"},
+             {"task": "T2", "mode": "review", "agent_id": "a-2",
+              "step": "develop", "at": stamped["T2"], "clearable": True,
+              "clearing_key": "T2"}])
+        # …and it pairs off exactly like the summary does: one closed spawn
+        # leaves its sibling, so the lane still in flight is the one named
+        ndjson.append_record(run / "events.ndjson",
+                             {"kind": "spawn-captured", "agent_id": "a-1",
+                              "actor": "capture"})
+        self.assertEqual([s["task"] for s in
+                          self._show(run)["outstanding_spawns"]], ["T2"])
+
+    def test_two_spawns_at_one_step_are_told_apart_by_age(self):
+        """The case pipelining actually produces, and the one attribution
+        alone does NOT close (round-4 re-review): develop declares
+        `requires_tasks_terminal`, so while T1's lane is wedged the cursor
+        can NEVER leave develop — both pendings carry `step: develop`, the
+        step comparison can never fire, and health cannot separate them
+        either. `at` is the discriminator, so `show` must emit it per entry
+        and the two must differ."""
+        run, _ = self._plan_review_run()
+        wedged = ndjson.append_record(run / "events.ndjson", {
+            "kind": "spawn-pending", "agent_id": "a-dead", "task": "T1",
+            "actor": "capture", "shape": "developer", "mode": "develop",
+            "step": "develop"})["at"]
+        live = ndjson.append_record(run / "events.ndjson", {
+            "kind": "spawn-pending", "agent_id": "a-live", "task": "T2",
+            "actor": "capture", "shape": "developer", "mode": "develop",
+            "step": "develop"})["at"]
+        spawns = self._show(run)["outstanding_spawns"]
+        self.assertEqual([s["step"] for s in spawns], ["develop", "develop"])
+        # every entry carries its own launch time, and the older one is the
+        # candidate the triage names — nothing else in the entry differs
+        self.assertEqual([s["at"] for s in spawns], [wedged, live])
+        self.assertLess(spawns[0]["at"], spawns[1]["at"])
+        self.assertEqual(min(spawns, key=lambda s: s["at"])["task"], "T1")
+
+    def test_an_unclearable_pending_says_so(self):
+        """`repo-map` and `request-triage` are declared OUTSIDE every step's
+        spawn-set (out_of_run_spawns / always_legal_spawns), so no `stall
+        --task step:<x>` key matches their pendings: the abandon instruction
+        bumps a stall counter, writes no override and clears nothing. The
+        entry now says which it is, so the triage can route it to "leave
+        it" instead."""
+        run, _ = self._plan_review_run()
+        for agent, mode in (("a-rm", "repo-map"), ("a-rt", "request-triage"),
+                            ("a-pr", "plan-review")):
+            ndjson.append_record(run / "events.ndjson", {
+                "kind": "spawn-pending", "agent_id": agent, "task": None,
+                "actor": "capture", "shape": "reviewer", "mode": mode,
+                "step": "plan-review"})
+        by_mode = {s["mode"]: s for s in self._show(run)["outstanding_spawns"]}
+        for mode in ("repo-map", "request-triage"):
+            self.assertFalse(by_mode[mode]["clearable"], mode)
+            self.assertIsNone(by_mode[mode]["clearing_key"], mode)
+        # …while a task-less mode a step DOES declare hands over its key
+        self.assertTrue(by_mode["plan-review"]["clearable"])
+        self.assertEqual(by_mode["plan-review"]["clearing_key"],
+                         "step:plan-review")
+
+    def test_a_legacy_pending_is_surfaced_rather_than_absent(self):
+        """A pending written before round 4 carries the spawn SHAPE where
+        `actor` now lives, so it fails the anti-forgery check and is
+        invisible to every reader of the family — gauge, health, both
+        guards. The actor bound is NOT widened (that would re-open the
+        forgery); the record surfaces under its own key instead."""
+        run, _ = self._plan_review_run()
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "spawn-pending", "agent_id": "old-1", "task": "T1",
+            "actor": "reviewer", "mode": "review", "step": "develop"})
+        out = self._show(run)
+        self.assertEqual(out["outstanding_spawns"], [])   # still not "open"
+        self.assertEqual(out["outstanding_flagged"], {})
+        self.assertEqual([r["agent_id"] for r in out["legacy_spawn_pendings"]],
+                         ["old-1"])
+        self.assertEqual(out["legacy_spawn_pendings"][0]["task"], "T1")
 
     def test_no_verdict_yields_empty_next_steps(self):
         # fail-closed exactly like the engine: no in-window verdict -> no
@@ -1675,9 +1779,14 @@ class StallVerdictGuard(Harness):
             transitions.record_stall(self.st, self.config, "T1"), "reinvoke")
 
     def _pending(self, key, agent_id="a-1"):
+        # `actor: capture` (the writer), `shape` for the spawn role: the
+        # declared `spawn_pairing.pending` shape every reader now matches on
+        self.assertEqual(transitions.spawn_pairing()["pending"],
+                         {"kind": "spawn-pending", "actor": "capture"})
         ndjson.append_record(self.run / "events.ndjson",
                              {"kind": "spawn-pending", "task": key,
-                              "actor": "reviewer", "agent_id": agent_id})
+                              "actor": "capture", "shape": "reviewer",
+                              "agent_id": agent_id})
 
     def test_an_open_pending_refuses_the_stall(self):
         """A background spawn between launch and completion leaves the
@@ -1769,8 +1878,8 @@ class StallVerdictGuard(Harness):
     def _task_less(self, mode, agent_id):
         ndjson.append_record(self.run / "events.ndjson",
                              {"kind": "spawn-pending", "task": None,
-                              "actor": "reviewer", "mode": mode,
-                              "agent_id": agent_id})
+                              "actor": "capture", "shape": "reviewer",
+                              "mode": mode, "agent_id": agent_id})
 
     def _abandoned(self):
         return sorted(e["agent_id"] for e in
@@ -1905,6 +2014,30 @@ class StallVerdictGuard(Harness):
             ndjson.append_record(self.run / "events.ndjson", forged)
             with self.assertRaises(transitions.TransitionError):
                 self._guard("T1")
+
+    def test_a_forged_pending_refuses_no_stall(self):
+        """The ASSERTING record was the one member of this family matched on
+        `kind` alone (whole-system review, round 4). Executed: `harness
+        log-event --json '{"kind":"spawn-pending","agent_id":"forged-1",
+        "task":"T1","mode":"review"}'` made this guard REFUSE — so the one
+        verb that clears a wedged key was itself wedged, and recovery cost a
+        stall counter plus a flagged override. It now carries the same
+        capture-owned actor its resolvers always did."""
+        state_mod.save(self.run, self.workspace, self.st)
+        forged = self._cli("log-event", "--json", json.dumps(
+            {"kind": "spawn-pending", "agent_id": "forged-1", "task": "T1",
+             "mode": "review"}))
+        self.assertTrue(forged["ok"], forged)
+        self.assertEqual(
+            transitions.open_spawn_pendings(self.run, "T1", self.manifest), [])
+        self._guard("T1")                       # no refusal to override
+        # …and the pre-round-4 spelling, where `actor` carried the SHAPE,
+        # is inert for the same reason (the upgrade-window cost, pinned)
+        ndjson.append_record(self.run / "events.ndjson",
+                             {"kind": "spawn-pending", "task": "T1",
+                              "actor": "reviewer", "agent_id": "legacy-1"})
+        self.assertEqual(
+            transitions.open_spawn_pendings(self.run, "T1", self.manifest), [])
 
     def test_a_genuine_stall_abandons_nothing(self):
         # the abandonment rides on the OVERRIDE, not on the flag: a stall
