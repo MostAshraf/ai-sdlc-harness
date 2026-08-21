@@ -6,6 +6,20 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
+- **`tools/fasttest.py` — the suite in ~2 minutes instead of ~16.** The
+  same stdlib-`unittest` suite, sharded by TestCase class across worker
+  processes (8 workers by default, capped to the core count) with zero new
+  dependencies — no pytest, no plugins. A count guard asserts the shards'
+  summed `Ran` totals equal the plain-`discover` count, so the runner can
+  never quietly run less than the full suite; a failing shard's traceback
+  is surfaced in full. CI's test step and the README/CONTRIBUTING dev
+  commands now use it (`python tools/fasttest.py`; `python -m unittest
+  discover -s tests` remains the serial equivalent). This is safe because
+  every test already builds its state in its own `mkdtemp` workspace —
+  that isolation contract is now documented as load-bearing in
+  CONTRIBUTING: a test that wrote a fixed shared path would pass serially
+  and collide in parallel.
+
 ## [3.8.0] — 2026-08-22
 
 > **GitHub Projects (v2) boards can now drive the pipeline.** A new

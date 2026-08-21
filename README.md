@@ -452,17 +452,17 @@ Requires Python 3.10+ and PyYAML. CI runs the suite on Linux, macOS, and Windows
 python3 -m venv .venv && .venv/bin/pip install pyyaml
 .venv/bin/python -m harness.schema          # validate all declared data against the fixed vocabulary
 .venv/bin/python tools/budget_check.py      # line budget + duplication sweep
-.venv/bin/python -m unittest discover -s tests
+.venv/bin/python tools/fasttest.py             # the full suite, sharded by test class
 ```
 
 On Windows the venv lands its interpreter under `Scripts\` instead of `bin/`:
 
 ```powershell
 python -m venv .venv; .venv\Scripts\pip install pyyaml
-.venv\Scripts\python -m unittest discover -s tests
+.venv\Scripts\python tools\fasttest.py
 ```
 
-The test suite (1287 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (1296 tests; ~14 min serial, ~3 min sharded) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 
