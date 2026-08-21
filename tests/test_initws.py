@@ -576,6 +576,22 @@ class VerificationGates(M7Harness):
         statuses = {c["check"]: c["status"] for c in out["checks"]}
         self.assertEqual(statuses["github_repo"], "fail")
 
+    def test_github_projects_requires_both_board_coordinates(self):
+        # a board is addressed by owner AND number; either half missing is
+        # unusable, and the reachability probe is only meaningful once both
+        # are present (so it must not run — or report — before then)
+        self.cli("init-section", "--section", "provider", "--json",
+                 json.dumps({"provider": {"work_item": "github-projects"}}))
+        self.cli("init-section", "--section", "repos",
+                 "--json", json.dumps({"repos": {"repo": str(self.repo)}}))
+        out = self.cli("init-verify", expect=1)
+        statuses = {c["check"]: c["status"] for c in out["checks"]}
+        self.assertEqual(statuses["github_project"], "fail")
+        self.assertNotIn("github_project reachable", statuses)
+        remediation = next(c["remediation"] for c in out["checks"]
+                           if c["check"] == "github_project")
+        self.assertIn("github_project_owner", remediation)
+
     def test_mcp_provider_is_manual_check(self):
         self.cli("init-section", "--section", "provider",
                  "--json", '{"provider": {"work_item": "jira"}}')
@@ -1747,6 +1763,100 @@ class SubagentModelNotice(M7Harness):
                            json.dumps({"subagent_models": "sonnet"}))
         self.assertTrue(out["ok"])
         self.assertNotIn("notice", out)
+
+
+GH_BOARD_STUB = r'''#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+board = json.loads((Path(__file__).parent / "board.json").read_text(encoding="utf-8"))
+verb = " ".join(sys.argv[1:3])
+if verb == "auth status":
+    print("Logged in to github.com account tester")
+elif verb == "project view":
+    print(json.dumps({"id": "PVT_x", "number": 4,
+                      "closed": board.get("closed", False)}))
+elif verb == "project field-list":
+    if board.get("field_list_fails"):
+        sys.stderr.write("your token has not been granted read:project\n")
+        sys.exit(1)
+    print(json.dumps({"fields": board["fields"], "totalCount": len(board["fields"])}))
+else:
+    sys.stderr.write("unexpected: " + verb + "\n")
+    sys.exit(1)
+'''
+
+BOARD_FIELDS = [{"id": "f1", "name": "Title", "type": "ProjectV2Field"},
+                {"id": "f2", "name": "Status",
+                 "type": "ProjectV2SingleSelectField",
+                 "options": [{"id": "o1", "name": "Todo"},
+                             {"id": "o2", "name": "Done"}]}]
+
+
+class GithubProjectsVerification(unittest.TestCase):
+    """The board probe is the one gate between a mistyped board-shaped
+    config key and a run that degrades silently three flagged write-back
+    events later (adversarial-review, both lenses)."""
+
+    def setUp(self):
+        self.bin = Path(tempfile.mkdtemp())
+        self._path = os.environ["PATH"]
+        os.environ["PATH"] = f"{self.bin}{os.pathsep}{self._path}"
+        self.install(fields=BOARD_FIELDS)
+
+    def tearDown(self):
+        os.environ["PATH"] = self._path
+        support.rmtree(self.bin)
+
+    def install(self, **board):
+        (self.bin / "board.json").write_text(json.dumps(board), encoding="utf-8")
+        support.write_cli_stub(self.bin, "gh", GH_BOARD_STUB)
+
+    def checks(self, **provider):
+        config = {"provider": {"work_item": "github-projects",
+                               "github_project": 4,
+                               "github_project_owner": "acme", **provider},
+                  "repos": {}}
+        return {c["check"]: c for c in initws.verify(config)}
+
+    def test_a_reachable_board_with_a_status_field_passes(self):
+        got = self.checks()
+        self.assertEqual(got["work-item provider"]["status"], "pass")
+        self.assertEqual(got["github_project"]["status"], "pass")
+        self.assertEqual(got["github_project reachable"]["status"], "pass")
+        self.assertEqual(got["github_project status field"]["status"], "pass")
+
+    def test_a_closed_board_is_not_reported_as_usable(self):
+        # it reads perfectly and refuses every write
+        self.install(fields=BOARD_FIELDS, closed=True)
+        got = self.checks()
+        self.assertEqual(got["github_project reachable"]["status"], "fail")
+        self.assertIn("CLOSED", got["github_project reachable"]["detail"])
+        self.assertNotIn("github_project status field", got)
+
+    def test_a_mistyped_status_field_fails_and_names_the_real_fields(self):
+        got = self.checks(github_project_status_field="Staus")
+        self.assertEqual(got["github_project status field"]["status"], "fail")
+        self.assertIn("Title, Status", got["github_project status field"]["detail"])
+
+    def test_a_non_single_select_status_field_fails(self):
+        got = self.checks(github_project_status_field="Title")
+        self.assertEqual(got["github_project status field"]["status"], "fail")
+
+    def test_a_failed_field_list_probe_is_not_reported_as_a_board_fact(self):
+        # discarding the probe's ok flag made a FAILED probe read as
+        # "'Status' is not a single-select field", sending the user to
+        # change a correctly configured key (re-verification, finding C)
+        self.install(fields=BOARD_FIELDS, field_list_fails=True)
+        got = self.checks()["github_project status field"]
+        self.assertEqual(got["status"], "fail")
+        self.assertIn("could not list the board's fields", got["detail"])
+        self.assertNotIn("is not a single-select field", got["detail"])
+        self.assertIn("read:project", got["remediation"])
+
+    def test_verify_and_the_adapter_agree_on_what_names_the_field(self):
+        # one declared value, two readers — they must match it the same way
+        got = self.checks(github_project_status_field="status")
+        self.assertEqual(got["github_project status field"]["status"], "pass")
 
 
 if __name__ == "__main__":

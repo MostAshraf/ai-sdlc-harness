@@ -285,6 +285,26 @@ def _probe(cmd: list[str]) -> tuple[bool, str]:
         return False, f"{cmd[0]}: probe timed out"
 
 
+def _probe_json(cmd: list[str]) -> tuple[bool, dict, str]:
+    """A probe whose PAYLOAD matters, not only its exit code — `_probe`
+    truncates output at 200 characters, which is right for an auth banner
+    and useless for a field list."""
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                              encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return False, {}, f"{cmd[0]}: not installed"
+    except subprocess.TimeoutExpired:
+        return False, {}, f"{cmd[0]}: probe timed out"
+    if proc.returncode != 0:
+        return False, {}, (proc.stdout + proc.stderr).strip()[:200]
+    try:
+        parsed = json.loads(proc.stdout)
+    except ValueError:
+        return False, {}, f"{cmd[0]}: output was not JSON"
+    return True, parsed if isinstance(parsed, dict) else {}, ""
+
+
 # cmd.exe builtins a test command could plausibly start with — they resolve
 # to nothing on PATH, so the first-token check below must not call a command
 # built from one of these "not found"
@@ -714,6 +734,81 @@ def verify(config: dict, workspace: Path | None = None) -> list[dict]:
             str(target or "(not set)"),
             f"set provider.{repo_key} to the repo hosting the work items "
             "(init-section --section provider)")
+    elif wi == "github-projects":
+        ok, detail = _probe(["gh", "auth", "status"])
+        add("work-item provider", "pass" if ok else "fail", detail,
+            "gh auth login")
+        prov = config.get("provider") or {}
+        number = str(prov.get("github_project") or "").strip()
+        owner = str(prov.get("github_project_owner") or "").strip()
+        add("github_project", "pass" if number and owner else "fail",
+            f"{owner or '(owner not set)'}/{number or '(number not set)'}",
+            "set provider.github_project (the board's number) and "
+            "provider.github_project_owner (its owner login, or '@me') "
+            "— the two path segments of the board's URL "
+            "(init-section --section provider)")
+        if ok and number and owner:
+            # Auth + config both present still isn't enough: `gh auth login`
+            # grants `read:project` only if it was asked for, and the whole
+            # adapter is unusable without it. Probe the BOARD, not the
+            # token — one call proves reachability, scope, and that the
+            # owner/number pair actually names something.
+            reachable, board, why = _probe_json(
+                ["gh", "project", "view", number, "--owner", owner,
+                 "--format", "json"])
+            detail = why or f"{owner}/{number} readable"
+            if reachable and board.get("closed"):
+                # A closed board reads perfectly and refuses every write, so
+                # reachability alone would report a green workspace whose
+                # every status write-back fails (adversarial-review, lens B).
+                reachable, detail = False, f"{owner}/{number} is CLOSED"
+            add("github_project reachable", "pass" if reachable else "fail",
+                detail,
+                "check the owner/number pair, reopen the board if it is "
+                "closed, and grant the project scope: `gh auth refresh -s "
+                "read:project` to read the board, `-s project` to also "
+                "write status back")
+            if reachable:
+                # The one board-shaped key most likely to be mistyped was
+                # the one nothing checked: a status field that does not
+                # exist fails OPEN at fetch (empty state, so the
+                # already-done guard can never fire) and CLOSED at every
+                # write-back — /init-workspace passed green and the run
+                # degraded silently, three flagged events later
+                # (adversarial-review, both lenses).
+                from .providers.github_projects_cli import keys_match
+                wanted = str(prov.get("github_project_status_field")
+                             or "Status").strip() or "Status"
+                listed_ok, listed, why = _probe_json(
+                    ["gh", "project", "field-list", number, "--owner", owner,
+                     "--format", "json", "--limit", "100"])
+                fields = [f for f in (listed.get("fields") or [])
+                          if isinstance(f, dict)]
+                single = next((f for f in fields
+                               if keys_match(f.get("name"), wanted)
+                               and f.get("options")), None)
+                if not listed_ok:
+                    # Discarding this flag made a FAILED probe read as a
+                    # fact about the board ("'Status' is not a single-select
+                    # field"), sending the user to change a correctly
+                    # configured key (re-verification, finding C).
+                    detail = f"could not list the board's fields: {why}"
+                    remediation = ("grant the read scope (`gh auth refresh "
+                                   "-s read:project`) and re-run; the "
+                                   "status field could not be checked")
+                elif single:
+                    detail, remediation = f"'{wanted}'", ""
+                else:
+                    detail = (f"'{wanted}' is not a single-select field on "
+                              f"the board — has: "
+                              f"{', '.join(str(f.get('name')) for f in fields) or '(none)'}")
+                    remediation = ("set provider.github_project_status_field "
+                                   "to a single-select field on the board — "
+                                   "milestone status write-back writes "
+                                   "into it")
+                add("github_project status field",
+                    "pass" if (listed_ok and single) else "fail",
+                    detail, remediation)
     elif wi == "ado":
         ok, detail = _probe(["az", "account", "show"])
         add("work-item provider", "pass" if ok else "fail", detail, "az login")

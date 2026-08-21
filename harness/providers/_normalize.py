@@ -51,11 +51,25 @@ def run_cli(args: list[str], cwd=None) -> str:
     # UTF-8 decode, never the locale codec: forge CLIs print UTF-8 JSON,
     # and Windows' cp1252 both mojibakes it and can raise on undefined bytes.
     exe = shutil.which(args[0]) or args[0]
-    proc = subprocess.run([exe, *args[1:]], capture_output=True, text=True,
-                          encoding="utf-8", errors="replace",
-                          timeout=120, cwd=cwd)
+    from . import ProviderError
+    try:
+        proc = subprocess.run([exe, *args[1:]], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
+                              timeout=120, cwd=cwd)
+    except subprocess.TimeoutExpired as exc:
+        # TimeoutExpired is a SubprocessError, NOT a ProviderError, so it
+        # escaped the best-effort write-back catch and aborted a step whose
+        # work had already landed (adversarial-review, lens A). Every
+        # failure of an external CLI belongs inside the provider error
+        # contract, a hung one included — and `github-projects` makes four
+        # `gh` round trips per transition, so the surface is widest there.
+        raise ProviderError(
+            f"{args[0]} {' '.join(args[1:3])}…: no response within "
+            f"{exc.timeout:g}s") from exc
+    except OSError as exc:
+        # Same reasoning for the not-executable / spawn-failed class.
+        raise ProviderError(f"{args[0]}: {exc}") from exc
     if proc.returncode != 0:
-        from . import ProviderError
         raise ProviderError(
             f"{args[0]} {' '.join(args[1:3])}…: {proc.stderr.strip()[:300]}")
     return proc.stdout.strip()

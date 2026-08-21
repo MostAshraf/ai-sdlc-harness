@@ -14,8 +14,16 @@ from ._normalize import run_cli
 
 
 def _pr_body(work_item_id: str, summary: str, link_style: str) -> str:
-    link = {"closes": f"Closes #{work_item_id}",
-            "relates": f"Relates to {work_item_id}"}[link_style]
+    # An id that already carries its own `#` is a QUALIFIED cross-repo ref
+    # (`owner/repo#7`, which github-projects emits when nothing pins which
+    # repo its numbers belong to). GitHub's closing keywords accept that
+    # form verbatim; prefixing another `#` would produce
+    # `Closes #owner/repo#7`, which matches nothing — while the bare
+    # `Closes #7` it replaces silently resolved against the CODE repo,
+    # closing an unrelated issue there (adversarial-review, both lenses).
+    ref = str(work_item_id)
+    link = {"closes": f"Closes {ref}" if "#" in ref else f"Closes #{ref}",
+            "relates": f"Relates to {ref}"}[link_style]
     return f"{summary}\n\n{link}\n"
 
 

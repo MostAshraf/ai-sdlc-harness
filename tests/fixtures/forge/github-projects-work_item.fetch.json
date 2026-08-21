@@ -1,0 +1,29 @@
+{
+  "provider": "github-projects",
+  "op": "work_item.fetch",
+  "cli": "gh",
+  "argv": [
+    "project",
+    "item-list",
+    "PROJECT_NUMBER",
+    "--owner",
+    "OWNER",
+    "--format",
+    "json",
+    "--limit",
+    "200"
+  ],
+  "returncode": 0,
+  "stdout": "{\"items\":[{\"assignees\":[\"octocat\"],\"content\":{\"body\":\"## Description\\nEmpty input makes the parser explode.\\n\\n## Acceptance Criteria\\n- [ ] parser returns None on empty input\\n- [x] regression test added\\n\",\"number\":13,\"repository\":\"OWNER/REPO\",\"title\":\"Fix null crash in parser\",\"type\":\"Issue\",\"url\":\"https://github.com/OWNER/REPO/issues/13\"},\"id\":\"PVTI_lADNJr_OALXY7M4FUdN-\",\"labels\":[\"bug\"],\"linked pull requests\":[\"https://github.com/OWNER/REPO/pull/27\"],\"repository\":\"https://github.com/OWNER/REPO\",\"status\":\"Ready to Start\",\"title\":\"Fix null crash in parser\"}],\"totalCount\":1}\n",
+  "stderr": "",
+  "captured_via": "gh 2.98.0, live public board (org-owned Projects v2), owner/repo/ids anonymized; shapes verbatim",
+  "notes": [
+    "There is no per-item read verb: `gh project` exposes item-list only, so fetch pages the board and filters locally — hence the explicit --limit.",
+    "Field VALUES are keyed by the field's display name at the item's top level (`status`, `linked pull requests`), NOT nested under a `fields` object.",
+    "`content.repository` is `owner/name`; the sibling top-level `repository` is a full URL. add_comment needs the former.",
+    "A draft item's `content` carries title/body/type only — no number, repository, or url.",
+    "`totalCount` is the board's REAL item count, independent of --limit — the only way a client-side filter can tell 'past the page we read' from 'not on this board'. The adapter's not-found message branches on it.",
+    "`item-list` never returns ARCHIVED items and has no flag to include them, so an archived item is indistinguishable from an absent one."
+  ],
+  "status": "PASS"
+}

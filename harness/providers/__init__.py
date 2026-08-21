@@ -24,6 +24,7 @@ class ProviderUnsupported(ProviderError):
 _REGISTRY = {
     "local-markdown": "local_markdown",   # file transport, no auth
     "github": "github_cli",               # cli transport (gh)
+    "github-projects": "github_projects_cli",  # cli transport (gh project)
     "gitlab": "gitlab_cli",               # cli transport (glab)
     "ado": "ado_cli",                     # cli transport (az boards)
     "ado-mcp": "ado_mcp",                 # mcp transport (mcp__azure-devops__*)

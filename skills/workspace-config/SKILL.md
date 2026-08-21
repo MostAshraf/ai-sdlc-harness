@@ -53,7 +53,9 @@ time `/dev-workflow` runs.
   `repo_map` staleness N, `review_policy`, `security.scan_cmd`/
   `severity_order`, …). Most single-setting changes land here.
 - `provider` — work-item/git provider + specifics (`stories_dir`,
-  `github_repo`, `ado_org`, `ado_project`, …).
+  `github_repo`, `github_project` + `github_project_owner` (+
+  `github_project_repo`, which keeps board ids bare issue numbers),
+  `ado_org`, `ado_project`, …).
 - `language` — per-repo `test_cmd` / `coverage_cmd` / `quarantine`, under
   `language.repos.<name>` (not the whole-workspace `test_paths`/
   `test_closure`). Quarantine drops a **known-failing spec unrelated to any

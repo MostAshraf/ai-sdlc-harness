@@ -1,0 +1,24 @@
+{
+  "provider": "github-projects",
+  "op": "work_item.transition (project-id half)",
+  "cli": "gh",
+  "argv": [
+    "project",
+    "view",
+    "PROJECT_NUMBER",
+    "--owner",
+    "OWNER",
+    "--format",
+    "json"
+  ],
+  "returncode": 0,
+  "stdout": "{\"closed\":false,\"fields\":{\"totalCount\":13},\"id\":\"PVT_kwHOAAAAAAAAAAA4BhDv6\",\"items\":{\"totalCount\":0},\"number\":4,\"owner\":{\"login\":\"OWNER\",\"type\":\"User\"},\"public\":false,\"readme\":\"\",\"shortDescription\":\"\",\"title\":\"BOARD TITLE\",\"url\":\"https://github.com/users/OWNER/projects/4\"}\n",
+  "stderr": "",
+  "captured_via": "gh 2.98.0, live user-owned board; owner, title and project node id anonymized, shapes and key set verbatim",
+  "notes": [
+    "`item-edit` needs the project's node id (`id`), which no other read verb returns — this is why transition costs a third read.",
+    "`closed` is why /init-workspace refuses an archived board: it reads perfectly here and rejects every item-edit.",
+    "`fields.totalCount` / `items.totalCount` are counts, not the lists themselves."
+  ],
+  "status": "PASS"
+}

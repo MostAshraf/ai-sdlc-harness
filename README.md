@@ -84,7 +84,7 @@ The interview asks only what it must (provider, repos), *discovers* your toolcha
 | **Claude Code** or **Qwen Code** | The CLI that runs this harness. Install Claude Code from [claude.ai/code](https://claude.ai/code) or Qwen Code from [qwen-code](https://github.com/QwenLM/qwen-code). |
 | **Git** | Branch management, per-task worktree isolation, owned commits. |
 | **Python 3.10+** | The entire core is Python. `/init-workspace` creates the plugin's own venv with PyYAML as its first step; until then the guards print a one-line notice and stand down. |
-| **Provider CLI, authed** *(optional)* | `gh auth login` / `glab auth login` / `az login`, if using that provider. MCP providers need their server connected. The `local-markdown` provider needs nothing at all. |
+| **Provider CLI, authed** *(optional)* | `gh auth login` / `glab auth login` / `az login`, if using that provider (`github-projects` additionally needs the project OAuth scope). MCP providers need their server connected. The `local-markdown` provider needs nothing at all. |
 
 Target repos must be **cloned locally**, clean, and on their default branch when registered — the harness does not clone them. A registered repo does not have to be a whole checkout: any subtree of one can be registered as a repo in its own right, which is how a monorepo's stacks are set up (see [Multi-repo runs](#multi-repo-runs)). No language prerequisites; toolchains are discovered.
 
@@ -382,11 +382,20 @@ Work-item integrations are code modules behind one interface — callers name an
 |---|---|---|
 | `local-markdown` | files | Nothing — work items are `.md` files in a configured stories directory |
 | `github` | CLI (`gh`) | `gh auth login` |
+| `github-projects` | CLI (`gh project`) | `gh auth login` + the project scope (`gh auth refresh -s read:project`; `-s project` to write status back) |
 | `gitlab` | CLI (`glab`) | `glab auth login` |
 | `ado` | CLI (`az boards`) | `az login` + DevOps extension |
 | `ado-mcp` | MCP | Azure DevOps MCP server connected |
 | `jira` | MCP | Jira MCP server connected |
 | `zoho` | MCP | Zoho MCP server connected |
+
+`github` and `github-projects` are different trackers, not two spellings of one. Pick `github` when the work items are the repo issue list: statuses collapse to open/closed, because that is all an issue has. Pick `github-projects` when the tracker is a **Projects v2 board**: milestone write-back lands in the board’s **Status** single-select field, so `in-progress`/`in-review`/`done` become real columns. Configure it with `provider.github_project` (the board’s number) and `provider.github_project_owner` (its owner login, or `@me`) — the two path segments of the board’s URL — plus optional `provider.github_project_repo`, `provider.github_project_status_field` (default `Status`) and `provider.github_project_limit` (default `200`).
+
+**Set `github_project_repo`** to the repo whose issue numbers your work-item ids refer to. With it, ids are bare issue numbers (`7`): short run directories, clean branch names, and a `Closes #7` in the PR body that means what it says. Without it, a bare number is not guaranteed to name one item on a board spanning repos, so ids come back **qualified** (`acme/api#7`, a form GitHub’s closing keywords accept verbatim). The qualified form costs you cosmetics: the declared `pr_title` and `commit.integration` templates render their own `#` in front of the id, so titles read `feature: #acme/api#7 …` and link to nothing (the PR body’s `Closes` line is correct either way). Either way, the id you get back always resolves again — and `owner/repo#N`, the issue URL, and the `PVTI_…` project item id are accepted as input everywhere. A bare number matching two repos is **refused, naming both**, never guessed.
+
+Board columns are user-authored, so the adapter absorbs the variance. Names match case-, punctuation- and accent-insensitively, in any script (`To Do` == `Todo`, `Termine` == `Terminé`, and a Cyrillic or CJK board matches by name rather than by position). A milestone with no literal column then falls back inside the adapter — `In Review` → `Review` → whatever that board calls in-progress — because GitHub’s stock template ships only Todo/In Progress/Done. `status_mapping` chooses which column name is *requested*; the fallback chain still applies to that name. A status that matches nothing is an error naming the board’s actual options.
+
+Three board realities worth knowing: boards carry **pull requests** beside issues, and a PR is never accepted as a work item (addressed explicitly it is named as one, never silently planned against); `gh project item-list` never returns **archived** items, so an archived item reads as absent and the not-found message says so; and **draft** items have no issue number, so they answer to their `PVTI_…` item id and cannot take comments.
 
 `local-markdown` story files may be named `<id>.md` or `<id>-<descriptive-slug>.md` (`US-42.md`, `US-42-add-multiply.md`), and both spellings resolve for every operation. A slug-named file claims its id in its `# <id>: <title>` heading — that heading is what makes `US-42` resolve `US-42-add-multiply.md`, so keep it when you edit the file. Sibling notes that declare no id of their own (`US-42-readiness.md` and the rest of `/story-workflow`'s output) sit in the same directory harmlessly. Two files *claiming the same id* is refused rather than guessed at, whichever is named which: a status write-back would otherwise land in an arbitrary one of them.
 
@@ -423,7 +432,7 @@ ai-sdlc-harness/
 │   └── init-workspace/ · add-repo/ · migrate-workspace/ · workspace-config/ · workflow-status/ · repo-map-refresh/
 ├── bin/harness                  # wrapper script resolving the plugin venv (+ harness.cmd for Windows)
 ├── tools/                       # meta-tooling: line-budget checker, sandbox workspace generators
-└── tests/                       # 1249 stdlib-unittest tests
+└── tests/                       # 1287 stdlib-unittest tests
 ```
 
 Workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside *your* working directory by `/init-workspace` and the pipeline. They never live inside this plugin repo.
@@ -453,7 +462,7 @@ python -m venv .venv; .venv\Scripts\pip install pyyaml
 .venv\Scripts\python -m unittest discover -s tests
 ```
 
-The test suite (1249 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (1287 tests) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 
