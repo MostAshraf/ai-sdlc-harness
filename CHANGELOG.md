@@ -6,30 +6,36 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
-- **`surfaces.yaml` tool lists caught up to the dual-native frontmatter.**
-  The v3.5.0 union-spelling decision (Claude `Read`/`Write`/`Bash` + Qwen
-  `ReadFile`/`WriteFile`/`Shell`, each CLI granting what it recognizes)
-  landed in the `agents/*.md` frontmatter but never propagated to
-  `pipeline/surfaces.yaml`, whose lists were still v3.1 Claude-only — a
-  split the suite had no test for and only the mgm-side drift-check
-  caught. The yaml now mirrors the frontmatter (reviewer stays
-  write-free under every spelling), and a new
-  `AgentToolsVsSurfaces` pin in the invocation-consistency tests fails
-  the suite if the two sides ever drift apart again.
+## [3.8.1] — 2026-08-22
 
-- **`tools/fasttest.py` — the suite in ~2 minutes instead of ~16.** The
-  same stdlib-`unittest` suite, sharded by TestCase class across worker
-  processes (8 workers by default, capped to the core count) with zero new
-  dependencies — no pytest, no plugins. A count guard asserts the shards'
-  summed `Ran` totals equal the plain-`discover` count, so the runner can
-  never quietly run less than the full suite; a failing shard's traceback
-  is surfaced in full. CI's test step and the README/CONTRIBUTING dev
-  commands now use it (`python tools/fasttest.py`; `python -m unittest
-  discover -s tests` remains the serial equivalent). This is safe because
-  every test already builds its state in its own `mkdtemp` workspace —
-  that isolation contract is now documented as load-bearing in
-  CONTRIBUTING: a test that wrote a fixed shared path would pass serially
-  and collide in parallel.
+> **The full test suite now runs in ~2–3 minutes instead of ~14.** The
+> same stdlib-only suite, sharded by TestCase class across worker
+> processes — no pytest, no plugins, no new dependencies of any kind.
+> Plus a declared-data hygiene fix the release process itself surfaced:
+> the dual-native tool spellings had landed in the agent frontmatter but
+> never propagated to `surfaces.yaml`.
+
+### Release highlights
+
+| Theme | What changed |
+|---|---|
+| **`tools/fasttest.py` — the suite, sharded** | The runner walks the exact `unittest discover` suite CI walks, shards its TestCase classes round-robin across 8 worker processes (capped to core count; `--workers`/`--timeout` tunable), and surfaces failing shards' tracebacks in full. Measured on a 24-core host: 833 s serial → 188 s wall sharded, same 1298 tests, same machine, back to back. CI's test step and the README/CONTRIBUTING dev commands now use it; `python -m unittest discover -s tests` remains the serial equivalent. |
+| **The runner cannot quietly run less than the full suite** | A count guard asserts the shards' summed `Ran` totals equal the discovered leaf count — the difference between *faster* and *quieter*. It earned its keep during the build: the runner's own first full-suite run failed it (script-mode `sys.path` broke every `from tests import support` import inside discovery), now covered by a regression fixture whose synthetic package cross-imports a sibling the same way. A module that fails to import aborts the run naming every failed module; test-less base classes contribute no shard and no count. |
+| **Sharding's safety contract, now documented as load-bearing** | Every test already builds its state in its own `tempfile.mkdtemp()` workspace — that isolation is what makes parallel sharding safe, and CONTRIBUTING now states the rule: a test must never write a fixed shared path or chdir, or it passes serially and collides in parallel. |
+| **`surfaces.yaml` caught up to the dual-native frontmatter** | The v3.5.0 union-spelling decision (Claude `Read`/`Write`/`Bash` + Qwen `ReadFile`/`WriteFile`/`Shell`) had landed in `agents/*.md` but left `pipeline/surfaces.yaml` on v3.1 Claude-only lists — a split nothing in the suite could see. The yaml now mirrors the frontmatter (reviewer stays write-free under every spelling), and a new `AgentToolsVsSurfaces` pin fails the suite if the two sides ever drift apart again. |
+
+### Upgrade notes
+
+- **A patch number carrying feature work.** This is `.1` on 3.8, but it adds a new dev tool (`tools/fasttest.py`) rather than only fixing things. Nothing is breaking; the note is here so the version number does not undersell what moved. Version chosen by the maintainer: this release exists to fix the verification loop's speed.
+- **No breaking changes.** CI contributors should note the test step is now `python tools/fasttest.py` (serial `unittest discover` still works identically).
+- **Windows contributors:** let the machine quiesce ~a minute after a sharded run before starting a serial one — launching a serial suite into an 8-worker teardown's disk flush produced ~30 timing-sensitive false failures during this release's verification (identical tree green on both sides of it).
+
+### Verification on tag tip
+
+- `python tools/fasttest.py` — **1298/1298 tests green** (skipped=12), 188 s wall, count parity exact with `unittest discover`
+- `python -m unittest discover -s tests` — 1298/1298 green (skipped=12), 770 s, same tree, clean-machine run
+- `verify.py` — ALL PASS 5/5 (hooks.json, test-delta, schema, budget, tests); stamp `c187a311e73c`
+- `drift-check` — agents-tools-vs-surfaces mismatches `{}` (was 3 shapes); README/CHANGELOG test counts accurate at 1298
 
 ## [3.8.0] — 2026-08-22
 
