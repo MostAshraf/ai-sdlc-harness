@@ -6,6 +6,42 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
+## [3.8.0] — 2026-08-22
+
+> **GitHub Projects (v2) boards can now drive the pipeline.** A new
+> `github-projects` work-item provider treats a board — not the repo's
+> issue list — as the tracker: a board's single-select **Status** field
+> gives `in-progress` / `in-review` / `done` real columns to write back
+> to, where the repo-issues `github` provider must collapse every
+> milestone into an issue's open/closed binary. An adversarial review
+> then hardened it before landing: work-item ids that always resolve
+> again, column matching that survives renamed and non-Latin boards, and
+> a hung or malformed provider CLI that degrades instead of aborting
+> work that already landed.
+
+### Release highlights
+
+| Theme | What changed |
+|---|---|
+| **A Projects (v2) board as a work-item source** | Configure `provider.github_project` (the board's number) and `provider.github_project_owner` (its owner login, or `@me`) — the two path segments of the board's URL — plus optional `provider.github_project_status_field` (default `Status`) and `provider.github_project_limit` (default `200`). All four work-item operations are supported (`fetch`, `transition`, `add_comment`, `create`), so the security-defer follow-up path works on a board workspace. It is a *different tracker* from `github`, not a second spelling of it. |
+| **Board columns are user-authored; the adapter absorbs the variance** | A requested status matches case-, punctuation-, accent- and script-insensitively (`To Do` == `Todo`, `Termine` == `Terminé`), then falls back through a documented chain — `In Review` → `Review` → whatever that board calls in-progress — because GitHub's stock template ships only Todo / In Progress / Done. A status that matches nothing is a clean error naming the board's actual options, and the existing `status_mapping` config overrides all of it. |
+| **Work-item ids always resolve again** | Set `provider.github_project_repo` and ids are bare issue numbers (`7`); without it, ids come back **qualified** (`acme/api#7` — a form GitHub's closing keywords accept verbatim, and the PR body's `Closes` line no longer double-hashes). `owner/repo#N`, the issue URL, and the `PVTI_…` item id are accepted as input everywhere; a bare number matching two repos is **refused, naming both**, never guessed. A pull request on a board is never accepted as a work item; draft items answer to their item id, and commenting on one is a clean refusal rather than a silent drop. |
+| **`/init-workspace` verifies the board, not just the token** | Beyond `gh auth status`, it checks both board coordinates are set and reads the board itself — one probe proving reachability, the owner/number pair, and the OAuth scope. Reads need `read:project`; status write-back needs the wider `project` scope (`gh auth refresh -s project`), and a read-only token degrades to a flagged `write-back-failed` event rather than a broken run. A **closed** board — which reads perfectly and rejects every write — is refused at setup. |
+| **A hung or malformed provider CLI stays inside the error contract** | `run_cli` converts a timeout (and a spawn failure) into a `ProviderError` for every CLI provider, and `github-projects` routes each JSON read through the same conversion. Milestone write-back is best-effort — before this, a `gh` that hung or answered with an HTML error page could abort a step whose work had already landed, instead of degrading to a flagged event. |
+
+### Upgrade notes
+
+- **New provider, opt-in — no existing workspace changes.** The `github` provider's behaviour is untouched; a `github-projects` workspace is a fresh `/init-workspace` answer.
+- **Auth scopes:** reads need `read:project`; status write-back additionally needs `project` (`gh auth refresh -s read:project`, then `-s project` to write status back).
+- **Known limit — `gh project` exposes no per-item read verb**, so every operation pages the board (`item-list`) and filters locally. The not-found message reads the board's real `totalCount`, distinguishing "past the page read — raise `github_project_limit`" from "not on this board" (and notes that `item-list` never returns archived items).
+- **Cosmetic, known and documented:** without `github_project_repo`, the declared `pr_title` / `commit.integration` templates render their own `#` in front of the qualified id, so PR titles read `feature: #acme/api#7 …` and link to nothing (no wrong-issue closure — GitHub does not autolink that form). Setting `github_project_repo` avoids it.
+
+### Verification on tag tip
+
+- `python -m harness.schema` — declared data valid
+- `python tools/budget_check.py` — line budget green
+- `python -m unittest discover -s tests` — 1287 tests green (skipped=12); 38 new this cycle
+
 ## [3.7.0] — 2026-08-20
 
 > **Newer Claude Code versions run subagents in the background by default, and this harness could not survive it.** Reviewer verdicts were anchored to a spawn's own reply — for a background agent, only a launch stub — so a verdict was unrecoverable and a spurious "stalled agent" event was fabricated in its place; the guard that blocked background spawns as protection, on a CLI whose Agent tool no longer even carries the parameter it checked, blocked the entire pipeline. This release re-anchors verdict capture to the agent's own completion, lifts the block where capture can prove itself, and then goes where that safety allows: `develop` stops running tasks one at a time and dispatches everything the plan's dependency graph permits at once, with the merge contention, ledger concurrency, and dashboard semantics that one-at-a-time execution had been quietly hiding now handled directly. Five rounds of work, each through execution-verified adversarial review — including a whole-system pass across the composite that found (and this release fixes) defects in the earlier rounds' own fixes.

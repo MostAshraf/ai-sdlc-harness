@@ -24,7 +24,10 @@ the normalized item directly:
 
 Work from those fields. For `local-markdown`, `<id>` is the file **stem** inside
 `provider.stories_dir` (`WORK-7`, not `stories/WORK-7.md`) — the harness refuses
-an id that escapes the stories dir.
+an id that escapes the stories dir.  For `github-projects`, `<id>` is the issue
+number when `provider.github_project_repo` pins whose numbering it is, and the
+qualified `owner/repo#N` otherwise; both spellings, the issue URL and the
+`PVTI_…` item id all resolve, and an ambiguous bare number is refused.
 
 **MCP transport** (`ado-mcp`, `jira`, `zoho`): a script cannot call an MCP tool,
 so the same command **exits non-zero** and prints the exact MCP tool + args to

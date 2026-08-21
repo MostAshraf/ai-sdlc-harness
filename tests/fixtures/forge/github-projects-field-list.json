@@ -1,0 +1,27 @@
+{
+  "provider": "github-projects",
+  "op": "work_item.transition (resolution half)",
+  "cli": "gh",
+  "argv": [
+    "project",
+    "field-list",
+    "PROJECT_NUMBER",
+    "--owner",
+    "OWNER",
+    "--format",
+    "json",
+    "--limit",
+    "100"
+  ],
+  "returncode": 0,
+  "stdout": "{\"fields\":[{\"id\":\"PVTF_lAHOAAAAAAAAAAAzhgA9Yc\",\"name\":\"Title\",\"type\":\"ProjectV2Field\"},{\"id\":\"PVTF_lAHOAAAAAAAAAAAzhgA9Yg\",\"name\":\"Assignees\",\"type\":\"ProjectV2Field\"},{\"id\":\"PVTSSF_lAHOAAAAAAAAAAAzhgA9Yk\",\"name\":\"Status\",\"options\":[{\"id\":\"8c1a41c3\",\"name\":\"Todo\"},{\"id\":\"47fc9ee4\",\"name\":\"In Progress\"},{\"id\":\"dcadee64\",\"name\":\"Blocked\"},{\"id\":\"613ad743\",\"name\":\"Review\"},{\"id\":\"98236657\",\"name\":\"Done\"}],\"type\":\"ProjectV2SingleSelectField\"},{\"id\":\"PVTF_lAHOAAAAAAAAAAAzhgA9Yo\",\"name\":\"Labels\",\"type\":\"ProjectV2Field\"}],\"totalCount\":13}\n",
+  "stderr": "",
+  "captured_via": "gh 2.98.0, live user-owned board; project and field node ids anonymized and the field LIST TRIMMED to 4 of the 13 the board carries (the `totalCount: 13` beside them is the board's real count, deliberately left honest) — option ids, key set and shapes verbatim",
+  "notes": [
+    "Only ProjectV2SingleSelectField carries `options`; the adapter refuses any other field type for status write-back rather than writing a free-text value.",
+    "Option ids are short opaque hex, unlike the base64-ish node ids — both are passed through verbatim to `item-edit`.",
+    "Board columns are user-authored: this one has Blocked/Review, GitHub's stock template has only Todo/In Progress/Done, and a non-English board has none of those spellings. That variance is why _ALIASES and the Unicode-aware key comparison exist.",
+    "`item-edit` and `item-create` are the two verbs with NO capture anywhere in this fixture set: both need the wider `project` OAuth scope (reads need only `read:project`) and capturing them would mutate a live board. Their response handling in github_projects_cli.py is defensive by assumption, not by observation."
+  ],
+  "status": "PASS"
+}

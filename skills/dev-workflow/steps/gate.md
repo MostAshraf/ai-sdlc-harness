@@ -52,9 +52,9 @@ request; deterministic code decides (design.md RC3).
    stays on the dashboard until you pair it — act on it now: create
    the follow-up work item
    `${CLAUDE_PLUGIN_ROOT}/bin/harness provider --op work_item.create --title
-   "<summary>" --description "<finding + repo + severity>"` (github/gitlab/
-   local-markdown; a provider that declares it unsupported → comment on the
-   parent item instead), then clear the pending flag:
+   "<summary>" --description "<finding + repo + severity>"` (github/
+   github-projects/gitlab/local-markdown; a provider that declares it
+   unsupported → comment on the parent item instead), then clear the flag:
    `${CLAUDE_PLUGIN_ROOT}/bin/harness log-event --json
    '{"kind": "deferral-recorded", "item": "<new-id>"}'`.
 7. Publish the mirror after the crossing — **once per preflighted repo**

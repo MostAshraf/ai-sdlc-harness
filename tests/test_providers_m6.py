@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from harness.providers import dispatch, normalize, ProviderError, ProviderUnsupported
@@ -108,6 +110,513 @@ class GithubAdapter(FakeCliHarness):
         dispatch(self.CONFIG, "work_item.transition", id="7", to="closed")
         self.assertIn(["issue", "close", "7", "--repo", "org/wi-repo"],
                       self.invocations())
+
+
+# `gh project` needs its own stub: the shared STUB above dispatches on
+# `issue view`/close/comment, and the Projects surface is a different verb
+# set entirely (item-list / field-list / view / item-edit / item-create),
+# with the board's single-select Status field as the mutable state. Shapes
+# match a live `gh` 2.98 capture (tests/fixtures/forge/github-projects-*).
+# `totalCount` is the board's REAL size and the page is truncated to
+# --limit, because the gap between them is the truncation signal the
+# adapter reports; `broken` corrupts one verb's stdout on demand.
+PROJECTS_STUB = r'''#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+base = Path(__file__).parent
+args = sys.argv[1:]
+(base / "invocations.log").open("a").write(json.dumps(args) + "\n")
+board = json.loads((base / "board.json").read_text(encoding="utf-8"))
+state_file = base / "state.json"
+state = json.loads(state_file.read_text(encoding="utf-8")) if state_file.exists() else {}
+fields, items = board["fields"], board["items"]
+verb = " ".join(args[:2])
+if verb in board.get("broken", []):
+    print("<!DOCTYPE html> not json at all")
+    sys.exit(0)
+if verb in board.get("raw", {}):
+    print(json.dumps(board["raw"][verb]))
+    sys.exit(0)
+
+
+def option_name(oid):
+    for f in fields:
+        for o in f.get("options", []):
+            if o["id"] == oid:
+                return o["name"]
+    return ""
+
+
+def flag(name, default=None):
+    return args[args.index(name) + 1] if name in args else default
+
+
+if verb == "project item-list":
+    out = []
+    for item in items:
+        item = dict(item)
+        if item["id"] in state:
+            # write the value back under whichever key this board uses for
+            # its status field, so a renamed field round-trips too
+            item[board.get("status_key", "status")] = state[item["id"]]
+        out.append(item)
+    print(json.dumps({"items": out[:int(flag("--limit", "30"))],
+                      "totalCount": len(items)}))
+elif verb == "project field-list":
+    print(json.dumps({"fields": fields, "totalCount": len(fields)}))
+elif verb == "project view":
+    print(json.dumps({"id": board["id"], "number": board["number"]}))
+elif verb == "project item-edit":
+    state[flag("--id")] = option_name(flag("--single-select-option-id"))
+    state_file.write_text(json.dumps(state))
+    print("{}")
+elif verb == "project item-create":
+    print(json.dumps({"id": "PVTI_new_draft", "title": flag("--title"),
+                      "body": flag("--body")}))
+elif verb == "issue comment":
+    print("https://github.com/org/wi-repo/issues/7#issuecomment-1")
+else:
+    sys.stderr.write("unexpected argv: " + " ".join(args) + "\n")
+    sys.exit(2)
+'''
+
+STATUS_FIELD = {"id": "PVTSSF_status", "name": "Status",
+                "type": "ProjectV2SingleSelectField",
+                "options": [{"id": "opt_todo", "name": "Todo"},
+                            {"id": "opt_prog", "name": "In Progress"},
+                            {"id": "opt_review", "name": "Review"},
+                            {"id": "opt_done", "name": "Done"}]}
+
+ISSUE_ITEM = {"id": "PVTI_issue7", "title": "Fix parser", "status": "Todo",
+              "labels": ["bug"],
+              "content": {"body": GH_BODY, "number": 7,
+                          "repository": "org/wi-repo", "title": "Fix parser",
+                          "type": "Issue",
+                          "url": "https://github.com/org/wi-repo/issues/7"}}
+
+DRAFT_ITEM = {"id": "PVTI_draft1", "title": "Rotate the signing key",
+              "status": "Todo",
+              "content": {"body": "## Description\nrotate it\n",
+                          "title": "Rotate the signing key",
+                          "type": "DraftIssue"}}
+
+BOARD = {"id": "PVT_board", "number": 4,
+         "fields": [{"id": "PVTF_title", "name": "Title",
+                     "type": "ProjectV2Field"}, STATUS_FIELD],
+         "items": [ISSUE_ITEM, DRAFT_ITEM]}
+
+
+class ProjectsBoardHarness(FakeCliHarness):
+    """Shared board plumbing for the two id regimes below."""
+
+    CONFIG: dict = {}
+
+    def setUp(self):
+        super().setUp()
+        self.install(BOARD)
+
+    def install(self, board: dict):
+        (self.bin / "board.json").write_text(json.dumps(board),
+                                             encoding="utf-8")
+        support.write_cli_stub(self.bin, "gh", PROJECTS_STUB)
+
+    def board(self, **over) -> dict:
+        board = json.loads(json.dumps(BOARD))
+        board.update(over)
+        return board
+
+    def config(self, **provider):
+        cfg = json.loads(json.dumps(self.CONFIG))
+        cfg["provider"].update(provider)
+        return cfg
+
+
+class GithubProjectsAdapter(ProjectsBoardHarness):
+    """The board-transport sibling of GithubAdapter: milestones land in the
+    Status single-select field, not in open/closed. `github_project_repo`
+    is set here — the recommended shape, where ids stay bare numbers."""
+
+    CONFIG = {"provider": {"work_item": "github-projects",
+                           "github_project": 4,
+                           "github_project_owner": "acme",
+                           "github_project_repo": "org/wi-repo"}}
+
+    def test_contract(self):
+        assert_work_item_contract(self, self.CONFIG, "7")
+
+    def test_normalization_reads_the_board_column_as_state(self):
+        item = dispatch(self.CONFIG, "work_item.fetch", id="7")
+        self.assertEqual((item["id"], item["type"], item["state"]),
+                         ("7", "Bug", "Todo"))
+        self.assertEqual(item["acceptance_criteria"], ["returns None on empty"])
+        self.assertEqual(item["provider_ref"], "github-projects:org/wi-repo#7")
+
+    def test_fetch_targets_the_configured_board_explicitly(self):
+        dispatch(self.CONFIG, "work_item.fetch", id="7")
+        self.assertIn(["project", "item-list", "4", "--owner", "acme",
+                       "--format", "json", "--limit", "200"],
+                      self.invocations())
+
+    def test_transition_writes_the_single_select_option(self):
+        moved = dispatch(self.CONFIG, "work_item.transition", id="7", to="Done")
+        self.assertEqual(moved["state"], "Done")
+        edit = [a for a in self.invocations()
+                if a[:2] == ["project", "item-edit"]]
+        self.assertEqual(len(edit), 1)
+        argv = edit[0]
+        # node ids throughout — the form that also works for draft items
+        self.assertEqual(argv[argv.index("--single-select-option-id") + 1],
+                         "opt_done")
+        self.assertEqual(argv[argv.index("--id") + 1], "PVTI_issue7")
+        self.assertEqual(argv[argv.index("--project-id") + 1], "PVT_board")
+        self.assertEqual(argv[argv.index("--field-id") + 1], "PVTSSF_status")
+
+    def test_every_op_round_trips_the_id_that_fetch_handed_back(self):
+        # adversarial-review, converged finding: the id contract is only
+        # honoured if the id fetch RETURNS keeps resolving. Feeding it back
+        # in is the assertion the original tests never made.
+        for spelling in ("7", "org/wi-repo#7", "PVTI_issue7",
+                         "https://github.com/org/wi-repo/issues/7"):
+            got = dispatch(self.CONFIG, "work_item.fetch", id=spelling)["id"]
+            self.assertEqual(got, "7", spelling)
+            self.assertEqual(dispatch(self.CONFIG, "work_item.transition",
+                                      id=got, to="Done")["id"], "7")
+            dispatch(self.CONFIG, "work_item.add_comment", id=got, text="ok")
+
+    def test_a_pinned_repo_keeps_a_colliding_number_unambiguous(self):
+        # the same cross-repo board that refuses below resolves cleanly
+        # once the workspace declares whose numbering its ids use
+        self.install(self.board(items=BOARD["items"] + [_other_repo_issue()]))
+        item = dispatch(self.CONFIG, "work_item.fetch", id="7")
+        self.assertEqual((item["id"], item["provider_ref"]),
+                         ("7", "github-projects:org/wi-repo#7"))
+        # …and the other repo's item is still addressable, qualified
+        other = dispatch(self.CONFIG, "work_item.fetch", id="org/other-repo#7")
+        self.assertEqual(other["id"], "org/other-repo#7")
+
+    def test_in_review_degrades_through_the_in_progress_chain(self):
+        # GitHub's stock template ships Todo/In Progress/Done — an
+        # `in-review` write-back must not fail on every default board
+        moved = dispatch(self.CONFIG, "work_item.transition", id="7",
+                         to="In Review")
+        self.assertEqual(moved["state"], "Review")   # alias, not "In Review"
+        stock = self.board()
+        stock["fields"][1]["options"] = [
+            o for o in STATUS_FIELD["options"] if o["name"] != "Review"]
+        self.install(stock)
+        self.assertEqual(dispatch(self.CONFIG, "work_item.transition", id="7",
+                                  to="In Review")["state"], "In Progress")
+        # a board that renamed in-progress to "Doing" must not strand
+        # in-review either — the two chains have to agree about one board
+        doing = self.board()
+        doing["fields"][1]["options"] = [{"id": "opt_todo", "name": "Todo"},
+                                         {"id": "opt_doing", "name": "Doing"},
+                                         {"id": "opt_done", "name": "Done"}]
+        self.install(doing)
+        self.assertEqual(dispatch(self.CONFIG, "work_item.transition", id="7",
+                                  to="In Progress")["state"], "Doing")
+        self.assertEqual(dispatch(self.CONFIG, "work_item.transition", id="7",
+                                  to="In Review")["state"], "Doing")
+
+    def test_a_non_latin_board_matches_by_name_not_by_position(self):
+        # adversarial-review, lens B: an ASCII-only comparison key reduced
+        # every Cyrillic option to "", so `done` matched the FIRST option
+        # and finished items were silently parked in To Do
+        cyrillic = self.board()
+        cyrillic["fields"][1]["options"] = [
+            {"id": "opt_todo", "name": "К выполнению"},
+            {"id": "opt_prog", "name": "В работе"},
+            {"id": "opt_done", "name": "Готово"}]
+        self.install(cyrillic)
+        moved = dispatch(self.CONFIG, "work_item.transition", id="7",
+                         to="Готово")
+        self.assertEqual(moved["state"], "Готово")
+        argv = [a for a in self.invocations()
+                if a[:2] == ["project", "item-edit"]][0]
+        self.assertEqual(argv[argv.index("--single-select-option-id") + 1],
+                         "opt_done")
+        # a name with no match is still an honest error, never option #1
+        with self.assertRaises(ProviderError) as caught:
+            dispatch(self.CONFIG, "work_item.transition", id="7", to="Done")
+        self.assertIn("Готово", str(caught.exception))
+
+    def test_accents_fold_the_way_punctuation_does(self):
+        accented = self.board()
+        accented["fields"][1]["options"] = [{"id": "opt_done",
+                                             "name": "Terminé"}]
+        self.install(accented)
+        self.assertEqual(dispatch(self.CONFIG, "work_item.transition", id="7",
+                                  to="Termine")["state"], "Terminé")
+
+    def test_an_unmatchable_status_names_the_boards_real_options(self):
+        with self.assertRaises(ProviderError) as caught:
+            dispatch(self.CONFIG, "work_item.transition", id="7", to="Shipped")
+        self.assertIn("Todo, In Progress, Review, Done", str(caught.exception))
+        self.assertIn("status_mapping", str(caught.exception))
+
+    def test_a_pull_request_on_the_board_is_never_a_work_item(self):
+        # boards carry PRs beside issues; matching on number alone let one
+        # be planned and built as if it were the work item
+        pr = {"id": "PVTI_pr9", "title": "Fix parser (PR)", "status": "Todo",
+              "content": {"body": "", "number": 9,
+                          "repository": "org/wi-repo", "type": "PullRequest",
+                          "url": "https://github.com/org/wi-repo/pull/9"}}
+        self.install(self.board(items=BOARD["items"] + [pr]))
+        with self.assertRaises(ProviderError) as caught:
+            dispatch(self.CONFIG, "work_item.fetch", id="9")
+        self.assertIn("not found", str(caught.exception))
+        # addressed explicitly, it is NAMED rather than silently absent
+        with self.assertRaises(ProviderError) as caught:
+            dispatch(self.CONFIG, "work_item.fetch", id="PVTI_pr9")
+        self.assertIn("pull request", str(caught.exception))
+        # …and it cannot make a real issue read as ambiguous either
+        cross = _other_repo_issue()
+        cross["content"]["number"] = 9
+        cross["content"]["url"] = "https://github.com/org/other-repo/issues/9"
+        self.install(self.board(items=BOARD["items"] + [pr, cross]))
+        self.assertEqual(dispatch(self.config(github_project_repo=""),
+                                  "work_item.fetch", id="9")["provider_ref"],
+                         "github-projects:org/other-repo#9")
+
+    def test_a_draft_item_answers_to_its_node_id_and_has_no_comments(self):
+        item = dispatch(self.CONFIG, "work_item.fetch", id="PVTI_draft1")
+        self.assertEqual(item["id"], "PVTI_draft1")
+        self.assertEqual(item["description"].strip(), "rotate it")
+        with self.assertRaises(ProviderError) as caught:
+            dispatch(self.CONFIG, "work_item.add_comment", id="PVTI_draft1",
+                     text="hi")
+        self.assertIn("draft", str(caught.exception))
+        # the draft is still transitionable — the board field is the item's
+        self.assertEqual(dispatch(self.CONFIG, "work_item.transition",
+                                  id="PVTI_draft1", to="Done")["state"], "Done")
+
+    def test_not_found_distinguishes_truncation_from_absence(self):
+        # there is no server-side get-one-item call, so "not found" is only
+        # ever "not found in the window we could see" — and telling a user
+        # to raise a limit that was never the problem is a wrong remedy
+        with self.assertRaises(ProviderError) as caught:
+            dispatch(self.config(github_project_limit=1), "work_item.fetch",
+                     id="PVTI_draft1")
+        self.assertIn("first 1 of 2 items", str(caught.exception))
+        self.assertIn("github_project_limit", str(caught.exception))
+        with self.assertRaises(ProviderError) as caught:
+            dispatch(self.CONFIG, "work_item.fetch", id="PVTI_nope")
+        self.assertIn("all 2 of the board's items", str(caught.exception))
+        self.assertIn("ARCHIVED", str(caught.exception))
+        self.assertNotIn("raise provider.github_project_limit",
+                         str(caught.exception))
+
+    def test_a_nonsense_limit_is_refused_before_gh_runs(self):
+        # both bounds: the not-found remediation says to RAISE the limit,
+        # so a value gh would reject has to fail here with our words
+        for bad in ("many", 0, -3, 100000):
+            with self.assertRaises(ProviderError):
+                dispatch(self.config(github_project_limit=bad),
+                         "work_item.fetch", id="7")
+        self.assertEqual(self.invocations(), [])
+
+    def test_unset_board_config_fails_closed_naming_both_keys(self):
+        with self.assertRaises(ProviderError) as caught:
+            dispatch({"provider": {"work_item": "github-projects"}},
+                     "work_item.fetch", id="7")
+        self.assertIn("github_project", str(caught.exception))
+        self.assertIn("github_project_owner", str(caught.exception))
+        self.assertEqual(self.invocations(), [])      # never reached gh
+
+    def test_a_renamed_status_field_is_matched_by_shape_not_spelling(self):
+        # `gh` keys field values by display name and we must not depend on
+        # whether it lowercases or camelCases a multi-word one
+        renamed = self.board(status_key="workflowState")
+        renamed["fields"][1]["name"] = "Workflow State"
+        renamed["items"][0].pop("status")
+        renamed["items"][0]["workflowState"] = "Todo"
+        self.install(renamed)
+        cfg = self.config(github_project_status_field="workflow state")
+        self.assertEqual(dispatch(cfg, "work_item.fetch", id="7")["state"],
+                         "Todo")
+        self.assertEqual(dispatch(cfg, "work_item.transition", id="7",
+                                  to="Done")["state"], "Done")
+
+    def test_a_missing_status_field_names_the_fields_that_do_exist(self):
+        with self.assertRaises(ProviderError) as caught:
+            dispatch(self.config(github_project_status_field="Stage"),
+                     "work_item.transition", id="7", to="Done")
+        self.assertIn("Title, Status", str(caught.exception))
+
+    def test_a_status_field_that_is_not_single_select_is_refused(self):
+        with self.assertRaises(ProviderError) as caught:
+            dispatch(self.config(github_project_status_field="Title"),
+                     "work_item.transition", id="7", to="Done")
+        self.assertIn("single-select", str(caught.exception))
+
+    def test_an_item_with_no_status_value_reads_as_empty_not_as_an_error(self):
+        # real `gh` emits a field key only when the field has a value, so a
+        # freshly created item has none at all
+        blank = self.board()
+        blank["items"][0].pop("status")
+        self.install(blank)
+        self.assertEqual(dispatch(self.CONFIG, "work_item.fetch",
+                                  id="7")["state"], "")
+
+    def test_malformed_gh_output_stays_inside_the_provider_error_contract(self):
+        # every one of these runs on the best-effort write-back path, which
+        # catches ProviderError ONLY — a JSONDecodeError escaping it aborts
+        # a step whose work already landed (adversarial-review, lens A)
+        for verb, op, kwargs in (
+                ("project item-list", "work_item.fetch", {"id": "7"}),
+                ("project field-list", "work_item.transition",
+                 {"id": "7", "to": "Done"}),
+                ("project view", "work_item.transition",
+                 {"id": "7", "to": "Done"}),
+                ("project item-create", "work_item.create",
+                 {"title": "t", "description": "d"})):
+            self.install(self.board(broken=[verb]))
+            with self.assertRaises(ProviderError, msg=verb) as caught:
+                dispatch(self.CONFIG, op, **kwargs)
+            self.assertIn("not JSON", str(caught.exception))
+            self.assertIn(verb, str(caught.exception))
+
+    def test_wrong_shaped_json_is_refused_not_a_bare_type_error(self):
+        # `_json` closed the not-JSON hole; well-formed JSON of the WRONG
+        # SHAPE still escaped as a TypeError from iterating a non-list, and
+        # `_resolve_option` runs on the ProviderError-only write-back path
+        # (re-verification, finding B).
+        cases = [
+            ({"project item-list": {"items": 5, "totalCount": 5}},
+             "work_item.fetch", {"id": "7"}),
+            ({"project field-list": {"fields": 5}},
+             "work_item.transition", {"id": "7", "to": "Done"}),
+        ]
+        for raw, op, kwargs in cases:
+            self.install(self.board(raw=raw))
+            with self.assertRaises(ProviderError, msg=str(raw)):
+                dispatch(self.CONFIG, op, **kwargs)
+        # …and the same for a non-list nested one call deeper
+        self.install(self.board(raw={"project field-list": {
+            "fields": [{"id": "f", "name": "Status", "options": 5}]}}))
+        with self.assertRaises(ProviderError):
+            dispatch(self.CONFIG, "work_item.transition", id="7", to="Done")
+        item = json.loads(json.dumps(ISSUE_ITEM))
+        item["labels"] = 5
+        self.install(self.board(raw={"project item-list": {
+            "items": [item], "totalCount": 1}}))
+        with self.assertRaises(ProviderError):
+            dispatch(self.CONFIG, "work_item.fetch", id="7")
+
+    def test_two_options_that_fold_together_are_refused_not_ordered(self):
+        # the name match is deliberately tolerant, so distinct columns can
+        # still fold together — taking board order would be the silent
+        # wrong-column write the Unicode fix removed
+        folding = self.board()
+        folding["fields"][1]["options"] = [{"id": "opt_a", "name": "Stage ①"},
+                                           {"id": "opt_b", "name": "Stage 1"}]
+        self.install(folding)
+        with self.assertRaises(ProviderError) as caught:
+            dispatch(self.CONFIG, "work_item.transition", id="7",
+                     to="Stage 1")
+        self.assertIn("more than one", str(caught.exception))
+        self.assertIn("Stage ①, Stage 1", str(caught.exception))
+
+    def test_a_malformed_field_list_member_is_refused_not_a_traceback(self):
+        for fields in ([STATUS_FIELD, "not-a-field"],
+                       [{"name": "Status", "type": "ProjectV2SingleSelectField",
+                         "options": [{"id": "o", "name": "Done"}]}]):
+            self.install(self.board(fields=fields))
+            try:
+                dispatch(self.CONFIG, "work_item.transition", id="7", to="Done")
+            except ProviderError:
+                pass          # the contract: refused, with our words
+
+    def test_comments_route_to_the_backing_issue(self):
+        dispatch(self.CONFIG, "work_item.add_comment", id="7", text="round 1")
+        self.assertIn(["issue", "comment", "7", "--repo", "org/wi-repo",
+                       "--body", "round 1"], self.invocations())
+
+    def test_create_makes_a_draft_item_on_the_board(self):
+        made = dispatch(self.CONFIG, "work_item.create", title="Rotate key",
+                        description="finding: hardcoded token")
+        self.assertEqual(made["id"], "PVTI_new_draft")
+        self.assertIn(["project", "item-create", "4", "--owner", "acme",
+                       "--title", "Rotate key", "--body",
+                       "finding: hardcoded token", "--format", "json"],
+                      self.invocations())
+
+
+def _other_repo_issue() -> dict:
+    other = json.loads(json.dumps(ISSUE_ITEM))
+    other["id"] = "PVTI_other7"
+    other["content"]["repository"] = "org/other-repo"
+    other["content"]["url"] = "https://github.com/org/other-repo/issues/7"
+    return other
+
+
+class GithubProjectsUnpinnedBoard(ProjectsBoardHarness):
+    """No `github_project_repo`. A bare number is then not guaranteed to
+    mean one item, so the adapter emits the QUALIFIED id instead — the
+    converged adversarial-review finding: emitting a bare number here made
+    the only fetchable spelling hand back an id that refused every
+    subsequent op for the life of the run."""
+
+    CONFIG = {"provider": {"work_item": "github-projects",
+                           "github_project": 4,
+                           "github_project_owner": "acme"}}
+
+    def test_contract(self):
+        assert_work_item_contract(self, self.CONFIG, "7")
+
+    def test_the_emitted_id_is_qualified_and_round_trips(self):
+        self.install(self.board(items=BOARD["items"] + [_other_repo_issue()]))
+        got = dispatch(self.CONFIG, "work_item.fetch",
+                       id="org/other-repo#7")["id"]
+        self.assertEqual(got, "org/other-repo#7")
+        # the spelling handed back must keep working for every other op
+        self.assertEqual(dispatch(self.CONFIG, "work_item.transition", id=got,
+                                  to="Done"), {"id": got, "state": "Done"})
+        dispatch(self.CONFIG, "work_item.add_comment", id=got, text="round 1")
+        self.assertIn(["issue", "comment", "7", "--repo", "org/other-repo",
+                       "--body", "round 1"], self.invocations())
+        self.assertEqual(dispatch(self.CONFIG, "work_item.fetch",
+                                  id=got)["state"], "Done")
+
+    def test_two_items_sharing_a_number_get_distinct_ids(self):
+        # they are different work items; one id for both collided on the
+        # run directory and the bootstrap lock
+        self.install(self.board(items=BOARD["items"] + [_other_repo_issue()]))
+        ids = {dispatch(self.CONFIG, "work_item.fetch", id=ref)["id"]
+               for ref in ("org/wi-repo#7", "org/other-repo#7")}
+        self.assertEqual(ids, {"org/wi-repo#7", "org/other-repo#7"})
+
+    def test_a_bare_ambiguous_number_names_the_config_that_fixes_it(self):
+        self.install(self.board(items=BOARD["items"] + [_other_repo_issue()]))
+        with self.assertRaises(ProviderError) as caught:
+            dispatch(self.CONFIG, "work_item.fetch", id="7")
+        self.assertIn("ambiguous", str(caught.exception))
+        self.assertIn("org/other-repo#7", str(caught.exception))
+        self.assertIn("github_project_repo", str(caught.exception))
+
+
+class ProviderErrorContract(unittest.TestCase):
+    """`run_cli` is every CLI provider's single external seam, and the
+    best-effort write-back path catches ProviderError alone."""
+
+    def test_a_hung_cli_is_a_provider_error_not_a_subprocess_error(self):
+        from harness.providers import _normalize
+
+        def hang(*a, **kw):
+            raise subprocess.TimeoutExpired(cmd="gh", timeout=120)
+
+        with mock.patch.object(_normalize.subprocess, "run", hang):
+            with self.assertRaises(ProviderError) as caught:
+                _normalize.run_cli(["gh", "project", "item-list", "4"])
+        self.assertIn("no response within 120s", str(caught.exception))
+
+    def test_a_qualified_work_item_id_is_not_double_hashed(self):
+        # `Closes #owner/repo#7` matches nothing; the bare `Closes #7` it
+        # replaces resolved against the CODE repo, closing an unrelated
+        # issue there (adversarial-review, both lenses)
+        self.assertIn("Closes org/wi-repo#7",
+                      git_providers._pr_body("org/wi-repo#7", "s", "closes"))
+        self.assertIn("Closes #7", git_providers._pr_body("7", "s", "closes"))
 
 
 class GitlabAdapter(FakeCliHarness):

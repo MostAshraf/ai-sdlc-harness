@@ -68,11 +68,11 @@ notice rather than erroring — expected pre-setup behavior, not a bug to chase.
 
 ## 1 · Must-provide (no defaults — ask)
 
-- **Work-item provider**: local-markdown / github / gitlab / ado (CLI) /
-  ado-mcp / jira / zoho (MCP — walk the user through the model-in-the-loop MCP
-  integration probe). ADO is available on either transport (`ado` = `az boards`,
-  `ado-mcp` = Azure DevOps MCP server). Plus its specifics (stories dir,
-  `github_repo`, `ado_org`, `ado_project`, …).
+- **Work-item provider**: local-markdown / github / github-projects / gitlab /
+  ado (CLI) / ado-mcp / jira / zoho (MCP — walk the user through the
+  model-in-the-loop probe). Two come in pairs: `ado` = `az boards` vs
+  `ado-mcp`; `github` = repo issues vs `github-projects` = a Projects v2 board.
+  Plus specifics (stories dir, `github_repo`, `github_project`/`_owner`, …).
 - **Git provider**: local / github / gitlab / ado (CLI) / ado-mcp (MCP).
   If the user didn't state one, `local` is the sanctioned inference ONLY
   when every registered repo has no remote (`git remote` empty) — say so
