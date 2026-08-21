@@ -6,6 +6,17 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
+- **`surfaces.yaml` tool lists caught up to the dual-native frontmatter.**
+  The v3.5.0 union-spelling decision (Claude `Read`/`Write`/`Bash` + Qwen
+  `ReadFile`/`WriteFile`/`Shell`, each CLI granting what it recognizes)
+  landed in the `agents/*.md` frontmatter but never propagated to
+  `pipeline/surfaces.yaml`, whose lists were still v3.1 Claude-only — a
+  split the suite had no test for and only the mgm-side drift-check
+  caught. The yaml now mirrors the frontmatter (reviewer stays
+  write-free under every spelling), and a new
+  `AgentToolsVsSurfaces` pin in the invocation-consistency tests fails
+  the suite if the two sides ever drift apart again.
+
 - **`tools/fasttest.py` — the suite in ~2 minutes instead of ~16.** The
   same stdlib-`unittest` suite, sharded by TestCase class across worker
   processes (8 workers by default, capped to the core count) with zero new
