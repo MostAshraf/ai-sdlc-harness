@@ -34,14 +34,14 @@ Every PR runs all three, on Linux/macOS/Windows × Python 3.10/3.14. All lanes a
 ```sh
 .venv/bin/python -m harness.schema          # declared data vs the fixed vocabulary
 .venv/bin/python tools/budget_check.py      # line budget + duplication sweep
-.venv/bin/python -m unittest discover -s tests
+.venv/bin/python tools/fasttest.py          # the suite, sharded across workers
 ```
 
 **`harness.schema`** validates the manifest, FSM, surfaces, and config defaults against a fixed vocabulary. If you add a step, mode, gate, provider, or agent shape, it is not real until the schema knows about it.
 
 **`budget_check.py`** caps runtime markdown (`skills/`, `agents/` — the files loaded into model context at run time) at ~100 lines soft, 200 hard, and errors on any block of 5+ identical consecutive lines appearing in two runtime files. Design docs and the README are exempt. The rule is *define once, cite elsewhere*; if a step file is growing past budget, the fix is almost always extraction, not compression.
 
-**The test suite** is stdlib `unittest` only — no pytest, no plugins. Guard behavior is tested via subprocess against real hook payloads, and git machinery against real temp repos, because that is the only way those tests can be honest.
+**The test suite** is stdlib `unittest` only — no pytest, no plugins. Guard behavior is tested via subprocess against real hook payloads, and git machinery against real temp repos, because that is the only way those tests can be honest. `tools/fasttest.py` runs that same suite sharded by TestCase class across worker processes — a count guard fails the run if the shards' summed test count ever drifts from plain `unittest discover`, and `python -m unittest discover -s tests` remains the serial equivalent. The suite's isolation contract is what makes sharding safe — every test builds its state in its own `tempfile.mkdtemp()` workspace — so **a test must never write a fixed shared path or chdir**: it would pass serially and collide in parallel.
 
 ## Conventions worth knowing
 

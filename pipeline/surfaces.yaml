@@ -14,15 +14,23 @@ user_entry:
 # The spawn guard validates {shape, mode} pairs against this file + the
 # manifest's spawn-sets; shape comes from the payload's agent_type, mode from
 # the mandated structured spawn-prompt header.
+#
+# tools are UNION-SPELLED (Claude `Read`/`Write`/`Bash` + Qwen
+# `ReadFile`/`WriteFile`/`Shell`) to mirror the agents/*.md frontmatter
+# exactly — the v3.5.0 dual-native decision: each CLI grants what it
+# recognizes and silently drops the rest. Kept in lock-step with the
+# frontmatter by tests/test_invocation_consistency.py (AgentToolsVsSurfaces)
+# after the union landed in the frontmatter but not here, and only the
+# mgm-side drift-check noticed.
 shapes:
   planner:
-    tools: [Read, Grep, Glob, Write, Edit, Bash]
+    tools: [Read, ReadFile, Grep, Glob, Write, WriteFile, Edit, Bash, Shell]
     modes: [intake, plan, repo-map]
   developer:
-    tools: [Read, Grep, Glob, Write, Edit, Bash]
+    tools: [Read, ReadFile, Grep, Glob, Write, WriteFile, Edit, Bash, Shell]
     modes: [develop, harden, fixup]
   reviewer:
-    tools: [Read, Grep, Glob, Bash]      # no Write/Edit + bash-write-guard
+    tools: [Read, ReadFile, Grep, Glob, Bash, Shell]   # no Write/Edit (either spelling) + bash-write-guard
     modes: [review, plan-review, plan-attack, pre-pr, analyze-comments,
             request-triage]
 

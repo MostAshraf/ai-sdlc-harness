@@ -343,5 +343,67 @@ class InvocationConsistency(unittest.TestCase):
                 f"are {declared}")
 
 
+
+class AgentToolsVsSurfaces(unittest.TestCase):
+    """surfaces.yaml shapes.<role>.tools must equal the agents/*.md
+    frontmatter `tools:` exactly, per shape. Drift history: the v3.5.0
+    dual-native change union-spelled the FRONTMATTER (Claude Read/Write/
+    Bash + Qwen ReadFile/WriteFile/Shell — each CLI grants what it
+    recognizes) but surfaces.yaml kept its v3.1 Claude-only lists, and
+    nothing in this suite noticed; only the mgm-side drift-check flagged
+    it. A repo-side pin closes that class here: the declared data and the
+    spawn-request frontmatter are one contract, not two opinions."""
+
+    def _frontmatter_tools(self):
+        import yaml
+        per_shape = {}
+        for path in sorted((ROOT / "agents").glob("*.md")):
+            text = path.read_text(encoding="utf-8")
+            if not text.startswith("---"):
+                continue
+            block = text.split("---", 2)[1]
+            meta = yaml.safe_load(block) or {}
+            name = meta.get("name") or ""
+            if name.startswith("ai-sdlc-"):
+                raw = meta.get("tools") or []
+                # the frontmatter spells tools as a comma-separated scalar
+                # (`tools: Read, ReadFile, ...`), not a YAML list — a plain
+                # set(raw) would explode the string into characters
+                if isinstance(raw, str):
+                    raw = [tok.strip() for tok in raw.split(",")]
+                per_shape[name[len("ai-sdlc-"):]] = set(raw)
+        return per_shape
+
+    def test_every_shape_matches_its_agent_frontmatter(self):
+        import yaml
+        surfaces = yaml.safe_load(
+            (ROOT / "pipeline" / "surfaces.yaml").read_text(encoding="utf-8"))
+        frontmatter = self._frontmatter_tools()
+        for shape, declared in surfaces["shapes"].items():
+            self.assertIn(shape, frontmatter,
+                          f"no agents/*.md frontmatter for shape '{shape}'")
+            self.assertEqual(
+                sorted(frontmatter[shape]), sorted(declared["tools"]),
+                f"{shape}: agents frontmatter and surfaces.yaml tools lists "
+                "disagree — they are one contract (union-spelled, dual-"
+                "native); update both or neither")
+
+    def test_union_spellings_stay_union(self):
+        # the regression this guards against is a well-meaning 'cleanup'
+        # back to Claude-only spellings, which silently strips the Qwen
+        # half of the dual-native grant (v3.5.0)
+        per_shape = self._frontmatter_tools()
+        for shape in ("planner", "developer"):
+            tools = per_shape.get(shape, set())
+            for both in (("Read", "ReadFile"), ("Write", "WriteFile"),
+                         ("Bash", "Shell")):
+                self.assertTrue(set(both) <= tools,
+                                f"{shape}: lost a spelling pair {both}")
+        # reviewer stays read-only: no write-family tool under ANY spelling
+        self.assertFalse(per_shape.get("reviewer", set())
+                         & {"Write", "WriteFile", "Edit"},
+                         "reviewer shape must carry no write-family tool")
+
+
 if __name__ == "__main__":
     unittest.main()
