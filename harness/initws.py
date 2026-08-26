@@ -8,6 +8,7 @@ import json
 import os
 import posixpath
 import re
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -275,9 +276,14 @@ def discover(repo: Path, depth: int = 3, branch: str | None = None) -> dict:
 
 
 def _probe(cmd: list[str]) -> tuple[bool, str]:
+    # `which()` resolution, not a bare exec: Windows' CreateProcess appends
+    # only `.exe` to a bare name, so `az` (really `az.cmd`) is unfindable
+    # without the PATHEXT walk which() does — a bare exec reports a false
+    # "not installed" even when `az` is on PATH and authenticated.
+    exe = shutil.which(cmd[0]) or cmd[0]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
-                              encoding="utf-8", errors="replace")
+        proc = subprocess.run([exe, *cmd[1:]], capture_output=True, text=True,
+                              timeout=30, encoding="utf-8", errors="replace")
         return proc.returncode == 0, (proc.stdout + proc.stderr).strip()[:200]
     except FileNotFoundError:
         return False, f"{cmd[0]}: not installed"
@@ -289,9 +295,10 @@ def _probe_json(cmd: list[str]) -> tuple[bool, dict, str]:
     """A probe whose PAYLOAD matters, not only its exit code — `_probe`
     truncates output at 200 characters, which is right for an auth banner
     and useless for a field list."""
+    exe = shutil.which(cmd[0]) or cmd[0]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
-                              encoding="utf-8", errors="replace")
+        proc = subprocess.run([exe, *cmd[1:]], capture_output=True, text=True,
+                              timeout=30, encoding="utf-8", errors="replace")
     except FileNotFoundError:
         return False, {}, f"{cmd[0]}: not installed"
     except subprocess.TimeoutExpired:

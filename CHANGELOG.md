@@ -6,6 +6,12 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
+- Fixed `/init-verify` falsely reporting the `ado` work-item provider's
+  "work-item provider" check as failed ("az: not installed") on Windows even
+  when the Azure CLI was installed, logged in, and working. The verify-time
+  probe now finds `az` the same way the provider's own runtime calls already
+  did.
+
 ## [3.8.1] — 2026-08-22
 
 > **The full test suite now runs in ~2–3 minutes instead of ~14.** The
