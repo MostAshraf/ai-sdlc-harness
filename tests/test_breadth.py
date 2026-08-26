@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from harness import gitops, ndjson, state as state_mod, workflow
+from harness import gates, gitops, ndjson, state as state_mod, workflow
 from harness.providers import git_providers
 from tests.test_gitops import (FAILING_TEST, TEST_CMD, make_monorepo,
                                make_repo)
@@ -36,12 +36,26 @@ class BreadthHarness(unittest.TestCase):
             f"# {sid}: {title}\nType: {type_}\nStatus: Open\n\n"
             f"## Description\n{body}\n\n## Acceptance Criteria\n- [ ] works\n")
 
-    def cli(self, *args, run=None, expect=0):
+    def cli(self, *args, run=None, expect=0, session=None):
         cmd = [sys.executable, "-m", "harness", "--workspace", str(self.workspace)]
         if run:
             cmd += ["--run", str(run)]
+        # Scrubbed env (this was a bare inherit): `gate --present` reads
+        # CLAUDE_CODE_SESSION_ID and stamps its digest into state.yaml, so
+        # whenever this suite runs INSIDE a Claude Code session every gate
+        # fixture would silently carry the real ambient session id — test
+        # state contaminated by whoever happened to run the tests, and any
+        # assertion about the stamp passing or failing for that reason.
+        # `session=` puts a KNOWN one back for the tests that are about the
+        # session scoping itself — injected, never inherited, so the same
+        # assertions hold inside and outside a Claude Code session.
+        env = {k: v for k, v in os.environ.items()
+               if k != "CLAUDE_CODE_SESSION_ID"}
+        if session:
+            env["CLAUDE_CODE_SESSION_ID"] = session
         proc = subprocess.run([*cmd, *args], cwd=ROOT, capture_output=True,
-                              text=True, encoding="utf-8", timeout=120)
+                              text=True, encoding="utf-8", timeout=120,
+                              env=env)
         payload = json.loads(proc.stdout) if proc.stdout.strip() else {}
         self.assertEqual(proc.returncode, expect,
                          f"harness {' '.join(map(str, args))} -> {payload} {proc.stderr}")
@@ -2008,6 +2022,90 @@ class GateRePresentGuard(BreadthHarness):
         run = self._at_gate("G-3")
         self.cli("gate", "--id", "approve-pre-pr", "--present", run=run)
         self.cli("gate", "--id", "approve-pre-pr", "--present", run=run)
+
+    S_DEV = "breadth-session-AAAA-dev-workflow"
+    S_STORY = "breadth-session-BBBB-story-workflow"
+
+    def _tagged(self, run, text, session):
+        ndjson.append_record(run / "human-input.ndjson",
+                             {"text": text,
+                              "session": gates.session_digest(session)})
+
+    def test_the_waiting_guard_protects_a_foreign_sessions_reply_too(self):
+        """The guard asks "would re-stamping DESTROY a reply?", NOT "may I
+        parse it?" — and re-stamping destroys every record in the window,
+        whoever typed it. Sharing `decide`'s session filter here was a
+        regression with real teeth: when the session running `--present` is
+        not the one that replied (a subagent-presented gate; two live
+        sessions on one run), the human's genuine record was filtered out
+        of the guard's view, `waiting` came back empty, the guard PASSED,
+        and the re-stamp aged the reply out silently — no refusal, no
+        event. The guard protects the WINDOW; `decide` protects the PARSE.
+        """
+        run = self._at_gate("G-S1")
+        self.cli("gate", "--id", "approve-pre-pr", "--present", run=run,
+                 session=self.S_DEV)
+        self._tagged(run, "APPROVED", self.S_STORY)   # the human, elsewhere
+        out = self.cli("gate", "--id", "approve-pre-pr", "--present", run=run,
+                       session=self.S_DEV, expect=1)
+        self.assertIn("un-decided repl", out["error"])
+        # …and it steers at the cause `--decide` will actually report,
+        # rather than at a re-present that would discard the reply unread.
+        self.assertIn("DIFFERENT session", out["error"])
+        out = self.cli("gate", "--id", "approve-pre-pr", "--decide", run=run,
+                       session=self.S_DEV, expect=1)
+        self.assertIn("DIFFERENT session", out["error"])
+        # the misdiagnosis half: the record is still THERE to be reported
+        # on. Had the guard let the re-stamp through, this same `--decide`
+        # would have blamed the stale window instead.
+        self.assertNotIn("PREDATES this presentation", out["error"])
+
+    def test_the_waiting_guard_still_protects_an_untagged_reply(self):
+        # Backward compatibility: a pre-fix / session-less record carries no
+        # tag, always qualifies, and must still stop a silent re-stamp even
+        # though the gate itself IS stamped.
+        run = self._at_gate("G-S2")
+        self.cli("gate", "--id", "approve-pre-pr", "--present", run=run,
+                 session=self.S_DEV)
+        ndjson.append_record(run / "human-input.ndjson", {"text": "APPROVED"})
+        out = self.cli("gate", "--id", "approve-pre-pr", "--present", run=run,
+                       session=self.S_DEV, expect=1)
+        self.assertIn("un-decided repl", out["error"])
+
+    def test_present_reports_whether_session_tagging_is_live(self):
+        """Observability for the one assumption the whole design rests on:
+        that the platform exports a session id to this subprocess. If it
+        ever stops, the filter goes inert and production is silently
+        unprotected while every test stays green (the tests inject the
+        variable themselves). `known`/`unknown` — never the id or its
+        digest — is what makes that visible in the field."""
+        run = self._at_gate("G-S3")
+        known = self.cli("gate", "--id", "approve-pre-pr", "--present",
+                         run=run, session=self.S_DEV)
+        self.assertEqual(known["session"], "known")
+        # Observability, NOT identity — asserted against the KNOWN-path
+        # payload, in its own variable. These two lines used to run after
+        # `out` had been rebound to a no-session result, so they policed
+        # output where no identity existed at all: a review lens leaked
+        # both the digest and the RAW id straight past them (F4).
+        blob = json.dumps(known)
+        self.assertNotIn(self.S_DEV, blob)
+        self.assertNotIn(gates.session_digest(self.S_DEV), blob)
+        # A whitespace-only export is TRUTHY but digests to nothing, so the
+        # filter is entirely inert — the signal reports what the FILTER
+        # sees, and said "known" over exactly this input before (RC4). It
+        # must also leave no stamp behind, and never a null one.
+        run = self._at_gate("G-S4")
+        blank = self.cli("gate", "--id", "approve-pre-pr", "--present",
+                         run=run, session="   \t ")
+        self.assertEqual(blank["session"], "unknown")
+        self.assertNotIn(
+            "session",
+            self.cli("show", run=run)["state"]["gates"]["approve-pre-pr"])
+        # and with nothing exported at all (the Qwen Code / scrubbed-env
+        # shape) — no stamp was written above, so nothing is being cleared
+        out = self.cli("gate", "--id", "approve-pre-pr", "--present", run=run)
+        self.assertEqual(out["session"], "unknown")
 
 
 class QuickRepoConfirmation(BreadthHarness):

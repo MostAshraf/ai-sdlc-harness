@@ -8,6 +8,7 @@ This test IS the orchestrator walk the dev-workflow skill renders in prose.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -48,8 +49,15 @@ class VerticalSlice(unittest.TestCase):
         cmd = [sys.executable, "-m", "harness", "--workspace", str(self.workspace)]
         if run:
             cmd += ["--run", str(run)]
+        # Scrubbed env (this was a bare inherit): `gate --present` reads
+        # CLAUDE_CODE_SESSION_ID and stamps its digest into state.yaml, so
+        # a suite run INSIDE a Claude Code session would bake the real
+        # ambient session id into every gate fixture this slice presents.
+        env = {k: v for k, v in os.environ.items()
+               if k != "CLAUDE_CODE_SESSION_ID"}
         proc = subprocess.run([*cmd, *args], cwd=ROOT, capture_output=True,
-                              text=True, encoding="utf-8", timeout=120)
+                              text=True, encoding="utf-8", timeout=120,
+                              env=env)
         payload = json.loads(proc.stdout) if proc.stdout.strip() else {}
         self.assertEqual(proc.returncode, expect,
                          f"harness {' '.join(args)} -> {payload} {proc.stderr}")

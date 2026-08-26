@@ -580,6 +580,26 @@ def main(argv: list[str] | None = None) -> int:
         _emit({"ok": False, "error": str(exc)})
         return 1
     now = ndjson.now_iso()
+    # Minted here for the same reason `now` is: the session identity is
+    # ambient process context, and the boundary is the one honest place to
+    # read it — `harness/gates.py` stays a pure library (no `os`, no I/O)
+    # that its unit tests drive with literal dicts. Empirically confirmed
+    # (Claude Code 2.1.246): the value the platform exports to a Bash/CLI
+    # subprocess here is the SAME string the UserPromptSubmit hook payload
+    # carries as `session_id`, which is what makes the two comparable at
+    # all. It feeds the gate command twice, for two different jobs:
+    #   `gates.present(..., session=)`  — stamp the gate with the session
+    #       that PRESENTED it, so a reply typed there is recognizable later;
+    #   `gates.decide(..., deciding_session=)` — name the session DECIDING
+    #       right now, which qualifies a reply typed here even when the
+    #       gate was presented under an older session id (a resumed
+    #       session), since `--decide` is run BY the session driving the run.
+    # `or None` normalizes an empty export to "unknown", which is never an
+    # identity that can never match: at `--decide` it means "do not filter
+    # on this" (fail-open), and at `--present` it means "write no stamp" —
+    # except over an EXISTING stamp, which `gates.present` refuses to clear
+    # rather than silently disarming the gate.
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID") or None
     NO_RUN = ("init", "fetch", "provider", "provider-normalize", "discover",
               "ensure-default-branch", "update-base", "init-verify", "init-section",
               "init-finalize", "add-repo", "migrate-detect", "migrate-extract",
@@ -1671,6 +1691,24 @@ def main(argv: list[str] | None = None) -> int:
                     if (prev.get("presented_at") and prev.get("decision") is None
                             and not args.re_present):
                         try:
+                            # UNFILTERED by session, deliberately, and NOT
+                            # `gates.qualifying_records`: that helper answers
+                            # "which records may I PARSE?", and this guard
+                            # asks "which records would re-stamping
+                            # DESTROY?" — every record in the window, tagged
+                            # or not, ours or another session's. Sharing the
+                            # decide-side filter here was a real regression
+                            # (review finding, traced): when the session
+                            # running `--present` is not the one that replied
+                            # — a subagent-presented gate, two live sessions
+                            # on one run — the human's genuine record was
+                            # filtered out of the guard's view, `waiting`
+                            # came back empty, the guard passed, and the
+                            # re-stamp aged the reply out SILENTLY, with no
+                            # refusal and no event; `--decide` then reported
+                            # the stale cause and misdiagnosed the operator.
+                            # The guard protects the WINDOW; `decide`
+                            # protects the PARSE.
                             waiting = [
                                 r for r in ndjson.read_records(
                                     args.run / "human-input.ndjson")
@@ -1683,11 +1721,47 @@ def main(argv: list[str] | None = None) -> int:
                                 f"{len(waiting)} un-decided repl(y/ies) waiting "
                                 "— re-presenting would re-stamp the window and "
                                 "throw them away, making the human type it "
-                                "again. Run `--decide` instead. If the reply "
-                                "genuinely cannot decide (a qualified "
+                                "again. Run `--decide` instead: it reports what "
+                                "those replies actually are. If it says they "
+                                "were typed in a DIFFERENT session, follow THAT "
+                                "refusal (ask for one more reply in the session "
+                                "driving this run — re-presenting here would "
+                                "discard the other session's reply unread). If "
+                                "the reply genuinely cannot decide (a qualified "
                                 "\"APPROVED but…\"), resolve it with the user "
                                 "and re-present with --re-present")
-                    gates.present(st, args.id, now, options)
+                    gates.present(st, args.id, now, options, session=session)
+                    # Observability, not identity: NEITHER the id nor its
+                    # digest leaves this process, only whether one exists.
+                    # The whole session-scoping design rests on the platform
+                    # exporting CLAUDE_CODE_SESSION_ID to this subprocess as
+                    # the same string the hook payload carries. If that ever
+                    # stops being true (platform change, a wrapper that
+                    # scrubs env, a subagent context), the allowed set
+                    # collapses to empty and the filter goes INERT —
+                    # production silently unprotected while every test stays
+                    # green, because the tests inject the variable
+                    # themselves and so cannot distinguish "the platform
+                    # supplies this" from "it does not". That exact
+                    # silent-non-protection shape already burned this change
+                    # once, so the live answer rides the result of every
+                    # presentation, where a human can see it.
+                    #
+                    # It covers the CLI half ONLY — the likelier break, but
+                    # not the whole scheme. If the HOOK stops carrying
+                    # `session_id`, every record goes untagged, "unknown
+                    # means usable" passes them all, the filter is equally
+                    # inert, and this still reports "known": the hook's
+                    # payload is not visible from here (re-verification F3).
+                    #
+                    # Through `session_digest`, never raw truthiness: this
+                    # signal must report what the FILTER sees, and the two
+                    # disagree on exactly the input that matters — a
+                    # whitespace-only CLAUDE_CODE_SESSION_ID is truthy but
+                    # digests to None, so `if session` printed "known" over
+                    # an entirely inert filter (review finding, probed).
+                    extra["session"] = ("known" if gates.session_digest(session)
+                                        else "unknown")
                 else:
                     if args.options is not None:
                         raise gates.GateRefusal(
@@ -1732,7 +1806,8 @@ def main(argv: list[str] | None = None) -> int:
                     entry = gates.decide(
                         st, args.id, records, options, now, multi=is_select,
                         lenient=frozenset(o for o in options
-                                          if o not in forward))
+                                          if o not in forward),
+                        deciding_session=session)
                     ndjson.append_record(args.run / "events.ndjson",
                                          {"kind": "gate-decision", "gate": args.id,
                                           "decision": entry["decision"],

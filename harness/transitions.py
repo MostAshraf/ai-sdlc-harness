@@ -511,6 +511,28 @@ def advance_cursor(state: dict, manifest: dict, config: dict, target: str,
             # against the stale round-1 presentation).
             entry["consumed_decision"] = entry.pop("decision")
             entry.pop("presented_at", None)
+            # `session` is the OTHER half of that same window (the stamp
+            # `gates.decide` qualifies a captured reply against), so it
+            # is consumed with it — the two fields are only ever meaningful
+            # together, and leaving one behind means a consumed gate keeps
+            # advertising an identity in state that `publish_mirror` then
+            # commits to the feature branch. Popping both keeps the window's
+            # fields opening and closing as a unit.
+            #
+            # BOUNDED RESIDUAL (review finding, accepted): this pop is inside
+            # `"decision" in entry`, so a gate that was PRESENTED but never
+            # arrived at — a `when`-skipped `approve-security`, whose step is
+            # bypassed rather than decided — keeps both `presented_at` and
+            # `session` in state.yaml for the life of the run, and
+            # publish_mirror commits them. Same shape for `presented_at`,
+            # which has lived with it since it was added. Not fixed here
+            # because the only correct place to clear them is a skip-time
+            # hook that does not exist, and inventing one means restructuring
+            # the FSM's skip path for a stale opaque digest. Bounded: the
+            # digest is non-identifying by construction, the entry has no
+            # decision so nothing can be derived from the stale window, and
+            # the next `--present` of that gate overwrites both fields.
+            entry.pop("session", None)
     if (reason in ("returns_to", "on_reject")
             and manifest["steps"].get(target, {}).get("requires_tasks_registered")):
         # Re-entering a registration-owning step re-arms its exit condition:
