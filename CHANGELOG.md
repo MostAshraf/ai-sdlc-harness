@@ -6,11 +6,24 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
-- Fixed `/init-verify` falsely reporting the `ado` work-item provider's
-  "work-item provider" check as failed ("az: not installed") on Windows even
-  when the Azure CLI was installed, logged in, and working. The verify-time
-  probe now finds `az` the same way the provider's own runtime calls already
-  did.
+## [3.8.2] — 2026-08-26
+
+> **A false-negative fix for the `ado` provider on Windows.** `/init-verify`
+> could report the Azure CLI as "not installed" even when it was installed,
+> logged in, and working — this patch closes that gap with no other
+> behavior change.
+
+### Release highlights
+
+| Theme | What changed |
+|---|---|
+| **`/init-verify` no longer misreports `az` as missing on Windows** | The `ado` work-item provider's verify-time check shelled out to `az` without resolving it the way Windows actually finds command-line tools — the real Azure CLI installs as `az.cmd`, not `az.exe`, so the probe always reported "az: not installed" even when `az account show` worked fine from a terminal. The probe now resolves `az` the same way the provider's own runtime calls already did, so a correctly configured `ado` provider now verifies as working instead of falsely blocking on a phantom failure. |
+
+### Verification on tag tip
+
+- `python tools/fasttest.py` — 1300/1300 tests green
+- `python -m harness.schema` — declared data valid
+- `python tools/budget_check.py` — line budget green
 
 ## [3.8.1] — 2026-08-22
 
