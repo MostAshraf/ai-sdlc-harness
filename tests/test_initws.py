@@ -1859,5 +1859,51 @@ class GithubProjectsVerification(unittest.TestCase):
         self.assertEqual(got["github_project status field"]["status"], "pass")
 
 
+class AdoVerification(unittest.TestCase):
+    """`ado` work-item provider verify probes `az account show`. The real
+    Azure CLI installs as `az.cmd` on Windows, not `az.exe` — a bare
+    subprocess exec of "az" (no shell, no PATHEXT walk) reports "not
+    installed" even when `az account show` succeeds from an interactive
+    shell, because Windows' CreateProcess only auto-appends `.exe` to an
+    extensionless name. `write_cli_stub` always produces a real `.exe` on
+    Windows, which never exercised this — so the stub here is a `.cmd`
+    file, the actual shape of `az`."""
+
+    def setUp(self):
+        self.bin = Path(tempfile.mkdtemp())
+        self._path = os.environ["PATH"]
+        os.environ["PATH"] = str(self.bin)  # isolated: no host az can leak in
+
+    def tearDown(self):
+        os.environ["PATH"] = self._path
+        support.rmtree(self.bin)
+
+    def install_az(self, exit_code=0, output="authenticated"):
+        if os.name == "nt":
+            (self.bin / "az.cmd").write_text(
+                f"@echo {output}\r\n@exit /b {exit_code}\r\n", encoding="utf-8")
+        else:
+            script = self.bin / "az"
+            script.write_text(f"#!/bin/sh\necho {output}\nexit {exit_code}\n",
+                              encoding="utf-8")
+            script.chmod(script.stat().st_mode | stat.S_IEXEC)
+
+    def checks(self):
+        config = {"provider": {"work_item": "ado"}, "repos": {}}
+        return {c["check"]: c for c in initws.verify(config)}
+
+    def test_az_cmd_shim_on_path_is_resolved_not_reported_missing(self):
+        self.install_az()
+        got = self.checks()["work-item provider"]
+        self.assertEqual(got["status"], "pass")
+        self.assertEqual(got["detail"], "authenticated")
+
+    def test_az_not_on_path_fails_with_remediation(self):
+        got = self.checks()["work-item provider"]
+        self.assertEqual(got["status"], "fail")
+        self.assertIn("az: not installed", got["detail"])
+        self.assertIn("az login", got["remediation"])
+
+
 if __name__ == "__main__":
     unittest.main()
