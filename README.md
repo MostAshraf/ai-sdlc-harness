@@ -258,7 +258,9 @@ Your reply at a gate is captured verbatim by a `UserPromptSubmit` hook into `hum
 - **Rejection-side options may lead the reply and carry notes** (`rejected — split T2 into…`); forward decisions stay bare by design.
 - The comment-selection gate additionally takes a comma-separated pick (`1,3`) or the literal `NONE`.
 
-Gate presentations, skips (a conditional gate whose predicate didn't fire), and rejections are all ledgered; `/workflow-status` surfaces the flagged events.
+**Running two sessions against one workspace?** A gate is answered by the session it was presented from. Everything you type is still recorded, but a reply typed in a *different* session is ignored rather than read as the answer — otherwise a message meant for one session could decide another session's gate simply by being the most recent thing you typed. If that happens, `--decide` says so and the fix is to reply again in the session driving that run (not to re-present). Resuming a run in a new session still works. Under Qwen Code, where neither side reports a session, this does not engage.
+
+Gate decisions and skips (a conditional gate whose predicate didn't fire) are ledgered; `/workflow-status` surfaces the flagged events. A presentation on its own writes no event — the decision record is what lands.
 
 ### Proof-anchored TDD
 
@@ -432,7 +434,7 @@ ai-sdlc-harness/
 │   └── init-workspace/ · add-repo/ · migrate-workspace/ · workspace-config/ · workflow-status/ · repo-map-refresh/
 ├── bin/harness                  # wrapper script resolving the plugin venv (+ harness.cmd for Windows)
 ├── tools/                       # meta-tooling: line-budget checker, sandbox workspace generators
-└── tests/                       # 1287 stdlib-unittest tests
+└── tests/                       # 1331 stdlib-unittest tests
 ```
 
 Workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside *your* working directory by `/init-workspace` and the pipeline. They never live inside this plugin repo.
@@ -462,7 +464,7 @@ python -m venv .venv; .venv\Scripts\pip install pyyaml
 .venv\Scripts\python tools\fasttest.py
 ```
 
-The test suite (1300 tests; ~13 min serial, ~3 min sharded) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (1331 tests; ~13 min serial, ~3 min sharded) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 

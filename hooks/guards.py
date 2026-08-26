@@ -59,8 +59,11 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 # stdlib-only modules at import time. `transitions` qualifies: it imports
 # nothing but json/sys/pathlib plus these two, and reaches for PyYAML only
 # lazily, inside the declared-data readers this file calls from paths that
-# have already loaded surfaces.yaml (i.e. already required it).
-from harness import chain, ndjson, transitions  # noqa: E402
+# have already loaded surfaces.yaml (i.e. already required it). `gates`
+# qualifies outright — hashlib + re, no I/O, no env — and is imported for
+# `session_digest` alone, so the capture hook and the CLI that writes the
+# stamp cannot drift into two different hashes of the same session id.
+from harness import chain, gates, ndjson, transitions  # noqa: E402
 
 
 class YamlMissing(Exception):
@@ -2262,11 +2265,55 @@ def capture_user_prompt(p: dict) -> None:
     the RC3 trust anchor across runs). Scoping is semantics-preserving:
     records outside a presented-undecided window can never qualify in
     `gates.decide` anyway (strictly-after `presented_at`, most-recent
-    wins). Residual, documented in design.md: two runs SIMULTANEOUSLY
-    mid-gate in one workspace still both capture — irreducible here
-    because neither the hook payload nor the CLI carries a session↔run
-    binding; the gate texts' numbered-option sets differing is the
-    practical mitigation.
+    wins). Residual: two runs SIMULTANEOUSLY mid-gate in one workspace
+    still both capture. The CROSS-SESSION half of that is now handled at
+    decide time — the payload DOES carry `session_id` (tagged below) and
+    the CLI does read its own, so "typed in some other session" is
+    recognizable and `gates.decide` filters it out. What survives is the
+    SAME-SESSION half: two runs driven by ONE session tag identically, and
+    no field anywhere binds a prompt to a run, so neither gate can tell
+    which of them the reply was meant for. There the old mitigation is
+    still the only one — the two gates' numbered-option sets differ, so a
+    reply meant for the other run usually fails to parse and refuses
+    rather than deciding.
+
+    Capture itself is UNCONDITIONAL and lossless within that window: no
+    prompt is ever withheld from a run that is awaiting, so the ledger
+    stays a complete append-only audit record. What this hook adds is a
+    TAG — the digest of the session the prompt was typed in — and the tag
+    is what lets `gates.decide` ignore a reply typed in a DIFFERENT session
+    from the one driving the run. Field, 2026-08-26: a `/dev-workflow` run
+    sat mid-gate while a SECOND Claude Code session in the same workspace
+    ran `/story-workflow`; that unrelated prompt was appended here, and
+    decide (newest record after the stamp wins) parsed `/story-workflow new
+    XD-5` instead of the human's `rejected`.
+
+    Do NOT read this as "capture is scoped by session" — it is not, and
+    deliberately so. At capture time "no run matched this prompt's session"
+    and "a foreign session typed" are the SAME observation: exactly one run
+    was awaiting in the field incident (`/story-workflow` starts no run at
+    all), so a rule that appends on no-match re-admits the bug, and a rule
+    that drops on no-match destroys the evidence of a session that resumed
+    under a new id. Filtering therefore lives at DECIDE time, where the
+    deciding session's own identity disambiguates the two — and where a
+    wrong guess refuses LOUDLY (a named refusal pointing at `--re-present`)
+    instead of silently deleting what the human typed.
+
+    RESIDUAL — a SUBAGENT's session id is not the human's. Measured: the
+    `CLAUDE_CODE_SESSION_ID` exported into a subagent is a DIFFERENT string
+    from the main session's, and `CLAUDE_CODE_CHILD_SESSION=1` is set in
+    BOTH, so it is not a usable discriminator either. This hook only ever
+    fires in the main session (UserPromptSubmit has no subagent analogue),
+    so every captured record carries the HUMAN's tag — meaning a
+    subagent-issued `gate --present` stamps a digest nothing will ever
+    match, and a subagent-issued `gate --decide` compares against one, and
+    can hard-refuse genuine human evidence. Nothing mechanically blocks
+    that today: `harness gate` is not in `SUBAGENT_REGISTER_RE` above, only
+    prose says the orchestrator owns gates. It fails CLOSED (a refusal, not
+    a forged decision) and is escapable via `--re-present` from the
+    orchestrator, which is why it is recorded rather than fixed. If it ever
+    bites in the field, the mechanical fix is one line: add `gate` to the
+    orchestrator-only verb set in `SUBAGENT_REGISTER_RE`.
 
     Fail-stance: capture-only, fails TOWARD capturing — a run whose state
     can't be read (missing PyYAML, integrity failure mid-crash) gets the
@@ -2278,6 +2325,20 @@ def capture_user_prompt(p: dict) -> None:
     cwd = _session_workspace(Path(p.get("cwd") or "."))
     record = {"text": text,
               "hash": hashlib.sha256(text.encode()).hexdigest()}
+    # Digested through the shared helper, never hashed inline: the CLI
+    # stamps the gate and this hook tags the record, in different
+    # processes — a second implementation that drifted (different
+    # algorithm, different truncation) would not raise, it would just stop
+    # comparing equal, and the symptom is a gate that cannot be decided.
+    # The helper also absorbs a non-string `session_id`: this is a hook,
+    # the payload is untrusted JSON, and an AttributeError here fails the
+    # WHOLE capture open.
+    sid = gates.session_digest(p.get("session_id"))
+    if sid:
+        # Absent, never null: an untagged record means "unknown session",
+        # which decide reads as "usable" — the same shape a pre-fix ledger
+        # record or a Qwen Code prompt already has.
+        record["session"] = sid
     for run in live_runs(cwd):
         try:
             st = read_state(run, cwd)

@@ -43,10 +43,16 @@ class GuardHarness(unittest.TestCase):
         # is keyed on that variable — inherited, it would silently turn every
         # "Claude Code allows backgrounding" assertion below into a test of
         # the Qwen branch (and pass for the wrong reason).
+        # CLAUDE_CODE_SESSION_ID is the same hazard for the capture guard:
+        # the suite run inside a Claude Code session inherits the REAL
+        # session id, and the session-scoped capture tests below assert on
+        # specific ids — an ambient one must never be able to reach the
+        # child and match (or fail to match) by accident.
         base = {k: v for k, v in os.environ.items()
                 if k not in ("CLAUDE_PROJECT_DIR", "PYTHONIOENCODING",
                              "QWEN_CODE", "PYTHONUTF8",
-                             "PYTHONLEGACYWINDOWSSTDIO")}
+                             "PYTHONLEGACYWINDOWSSTDIO",
+                             "CLAUDE_CODE_SESSION_ID")}
         # ensure_ascii=False: the platform sends hook payloads as RAW
         # UTF-8 JSON, not \uXXXX-escaped ASCII — an escaped wire format
         # never exercises the child's stdin DECODING, which made the
@@ -2523,9 +2529,9 @@ class SkillGuard(GuardHarness):
 
 class CaptureHooks(GuardHarness):
     def present_gate(self, run, gate_id="approve-plan",
-                     at="2026-01-01T00:00:00+00:00"):
+                     at="2026-01-01T00:00:00+00:00", session=None):
         st = state_mod.load(run, self.workspace)
-        gates.present(st, gate_id, at)
+        gates.present(st, gate_id, at, session=session)
         state_mod.save(run, self.workspace, st)
 
     def test_user_prompt_captured_while_gate_awaits_decision(self):
@@ -2606,6 +2612,282 @@ class CaptureHooks(GuardHarness):
 
     def test_user_prompt_noop_without_run(self):
         self.assert_allows("user-prompt", {"prompt": "hello"})
+
+    # ------------------------------------------------ session-tagged capture
+
+    # Obviously synthetic, and NEVER a real session id: a live UUID
+    # hardcoded here would contradict the very privacy rationale that makes
+    # the stamp a digest instead of the id (review finding — the first
+    # attempt pasted this machine's actual session id into the suite).
+    SESSION_A = "test-session-AAAA-dev-workflow"
+    SESSION_B = "test-session-BBBB-story-workflow"
+
+    def _texts(self, run) -> list[str]:
+        led = run / "human-input.ndjson"
+        return ([r["text"] for r in ndjson.read_records(led)]
+                if led.exists() else [])
+
+    def _records(self, run) -> list[dict]:
+        led = run / "human-input.ndjson"
+        return ndjson.read_records(led) if led.exists() else []
+
+    def _cli(self, run, *args, env=None, expect=0) -> dict:
+        """The real `harness` CLI, which is the ONLY reader of the session
+        env var — it is process context, so neither the stamp it writes at
+        `--present` nor the deciding identity it passes to `gates.decide`
+        can be exercised through the in-process `gates.present` helper."""
+        base = {k: v for k, v in os.environ.items()
+                if k != "CLAUDE_CODE_SESSION_ID"}
+        proc = subprocess.run(
+            [sys.executable, "-m", "harness", "--workspace",
+             str(self.workspace), "--run", str(run), *args],
+            cwd=ROOT, capture_output=True, text=True, encoding="utf-8",
+            timeout=120, env={**base, **(env or {})})
+        payload = json.loads(proc.stdout) if proc.stdout.strip() else {}
+        self.assertEqual(proc.returncode, expect,
+                         f"{args} -> {payload} {proc.stderr}")
+        return payload
+
+    def _prompt(self, text, session=None):
+        payload = {"prompt": text}
+        if session is not None:
+            payload["session_id"] = session
+        self.assert_allows("user-prompt", payload)
+
+    def test_capture_tags_the_record_with_the_session_digest(self):
+        """The one thing capture adds: a tag, never a routing decision.
+
+        The digest and not the raw id — but NOT for `present`'s reason:
+        human-input.ndjson is the privacy carve-out, listed FIRST in
+        gitops.MIRROR_EXCLUDE, so unlike state.yaml it never leaves the
+        workspace (README: "never leaves the workspace"). It is a digest
+        here because it must compare byte-for-byte equal to the stamp the
+        CLI writes — one hash, two processes — and because this ledger is
+        durable, agent-readable audit data that outlives the session it
+        names, so it should carry no more identity than the check needs."""
+        run = self.make_run()
+        self.present_gate(run)
+        self._prompt("APPROVED", session=self.SESSION_A)
+        rec = self._records(run)[-1]
+        self.assertEqual(rec["session"], gates.session_digest(self.SESSION_A))
+        self.assertNotIn(self.SESSION_A,
+                         (run / "human-input.ndjson").read_text(encoding="utf-8"))
+
+    def test_capture_writes_no_session_key_without_a_payload_session(self):
+        """Absent, not null. `gates.decide` reads a MISSING tag as
+        "unknown session, therefore usable"; a `None` value happens to be
+        falsy too, but the ledger is gate evidence and audit data — it
+        must not carry a field asserting an identity it does not have."""
+        run = self.make_run()
+        self.present_gate(run)
+        self._prompt("APPROVED")
+        rec = self._records(run)[-1]
+        self.assertEqual(rec["text"], "APPROVED")
+        self.assertNotIn("session", rec)
+
+    def test_a_non_string_session_id_never_drops_capture(self):
+        """Review finding, reproduced: `session_digest` called `.encode()`
+        on whatever the payload held, so `{"session_id": 12345}` raised
+        AttributeError INSIDE the UserPromptSubmit hook — which fails open
+        with a stderr line nobody reads, dropping capture for EVERY run in
+        the workspace. The payload is untrusted JSON from another process;
+        a bad shape must degrade to "unknown session", not to no capture."""
+        for bad in (12345, {"id": "x"}, ["x"], True, 1.5):
+            with self.subTest(session_id=bad):
+                run = self.make_run(
+                    run_name=f"2026-01-01-N-{abs(hash(str(bad))) % 997}",
+                    item_id="N-1")
+                self.present_gate(run)
+                self._prompt("APPROVED", session=bad)
+                rec = self._records(run)[-1]
+                self.assertEqual(rec["text"], "APPROVED")
+                self.assertNotIn("session", rec)
+
+    def test_a_whitespace_only_session_id_is_treated_as_absent(self):
+        run = self.make_run()
+        self.present_gate(run)
+        self._prompt("APPROVED", session="   \t ")
+        rec = self._records(run)[-1]
+        self.assertEqual(rec["text"], "APPROVED")
+        self.assertNotIn("session", rec)
+
+    def test_capture_stays_unconditional_across_sessions(self):
+        """Deliberate, and the crux of the design: capture NEVER routes on
+        session. At capture time "no run matched this session" and "a
+        foreign session typed" are the same observation, so a capture-time
+        rule either re-admits the field bug or destroys a resumed
+        session's evidence. Both runs get the record — tagged — and
+        `gates.decide` is where the foreign one is ignored."""
+        run_a = self.make_run(run_name="2026-01-01-A-1", item_id="A-1")
+        run_b = self.make_run(run_name="2026-01-01-B-1", item_id="B-1")
+        self.present_gate(run_a, session=self.SESSION_A)
+        self.present_gate(run_b, session=self.SESSION_B)
+        self._prompt("rejected", session=self.SESSION_A)
+        self.assertEqual(self._texts(run_a), ["rejected"])
+        self.assertEqual(self._texts(run_b), ["rejected"])
+        digest = gates.session_digest(self.SESSION_A)
+        self.assertEqual(self._records(run_b)[-1]["session"], digest)
+
+    # -------------------------------------------- decide-time session filter
+
+    def _gate_run(self):
+        """A run parked ON approve-plan — `--decide` refuses anywhere else
+        (a decision is derivable only at the gate itself)."""
+        return self.make_run(to_step="approve-plan")
+
+    def test_a_foreign_sessions_reply_refuses_then_the_own_session_decides(self):
+        """The field bug, end to end through the real CLI and the real
+        hook. A `/dev-workflow` run sits at its plan gate presented from
+        session A; the human's next prompt goes to a SECOND session running
+        `/story-workflow` (which starts no run of its own, so exactly one
+        run is awaiting and capture appends it here). Deciding from A must
+        REFUSE naming that cause — not parse `/story-workflow new XD-5` as
+        the decision, and not fall through to the generic "nothing
+        captured" advice, whose remedy is wrong here. The human then types
+        `rejected` in A, and the same command decides."""
+        run = self._gate_run()
+        self._cli(run, "gate", "--id", "approve-plan", "--present",
+                  env={"CLAUDE_CODE_SESSION_ID": self.SESSION_A})
+        self._prompt("/story-workflow new XD-5", session=self.SESSION_B)
+        out = self._cli(run, "gate", "--id", "approve-plan", "--decide",
+                        expect=1,
+                        env={"CLAUDE_CODE_SESSION_ID": self.SESSION_A})
+        self.assertIn("DIFFERENT session", out["error"])
+        self.assertIn("--re-present", out["error"])
+        self.assertNotIn("no human input captured", out["error"])
+        self._prompt("rejected", session=self.SESSION_A)
+        out = self._cli(run, "gate", "--id", "approve-plan", "--decide",
+                        env={"CLAUDE_CODE_SESSION_ID": self.SESSION_A})
+        self.assertEqual(out["decision"], "rejected")
+
+    def test_a_resumed_session_decides_a_gate_the_dead_one_presented(self):
+        """The regression guard for the design this replaced. The gate was
+        presented by session A; A then died (terminal closed / resumed) and
+        the human replies in B, which is also the session running
+        `--decide`. `--decide` is invoked BY the session driving the run,
+        so a record tagged with the DECIDING session is by definition this
+        human talking to this run right now — it must decide, not refuse.
+        A capture-time filter would have thrown this reply away."""
+        run = self._gate_run()
+        self._cli(run, "gate", "--id", "approve-plan", "--present",
+                  env={"CLAUDE_CODE_SESSION_ID": self.SESSION_A})
+        self._prompt("APPROVED", session=self.SESSION_B)
+        out = self._cli(run, "gate", "--id", "approve-plan", "--decide",
+                        env={"CLAUDE_CODE_SESSION_ID": self.SESSION_B})
+        self.assertEqual(out["decision"], "approved")
+
+    def test_a_qwen_shaped_gate_filters_on_nothing(self):
+        """No stamp (the CLI exported no session id at `--present`) and no
+        deciding id, so the untagged record has nothing to be measured
+        against: byte-for-byte the pre-change path. Qwen Code, and any
+        platform whose payload carries no `session_id`."""
+        run = self._gate_run()
+        self._cli(run, "gate", "--id", "approve-plan", "--present")
+        self._prompt("APPROVED")
+        out = self._cli(run, "gate", "--id", "approve-plan", "--decide")
+        self.assertEqual(out["decision"], "approved")
+
+    def test_present_stamps_the_digest_and_never_the_raw_session_id(self):
+        """state.yaml is NOT private: publish_mirror snapshots the whole
+        run dir into the feature branch and `_mirror_excluded` does not
+        exclude state.yaml, so a raw session id stored here would be
+        committed and pushed. The stamp must compare equal without ever
+        being the identifier itself."""
+        run = self.make_run()
+        self._cli(run, "gate", "--id", "approve-plan", "--present",
+                  env={"CLAUDE_CODE_SESSION_ID": self.SESSION_A})
+        raw = (run / "state.yaml").read_bytes()
+        self.assertNotIn(self.SESSION_A.encode(), raw)
+        st = state_mod.load(run, self.workspace)
+        self.assertEqual(st["gates"]["approve-plan"]["session"],
+                         gates.session_digest(self.SESSION_A))
+
+    def test_re_present_restamps_the_session_onto_the_entry(self):
+        """`--re-present` is the deliberate escape for "the human's
+        situation changed" — which INCLUDES having moved to a new session,
+        and is exactly what the session-mismatch refusal tells the caller
+        to reach for. A stale stamp surviving it would leave the
+        re-presented gate measured against a session nobody is in, turning
+        the escape hatch into a trap."""
+        run = self.make_run()
+        self._cli(run, "gate", "--id", "approve-plan", "--present",
+                  env={"CLAUDE_CODE_SESSION_ID": self.SESSION_A})
+        # a waiting reply makes a plain --present refuse: --re-present is
+        # the only way through, which is exactly the path under test
+        ndjson.append_record(run / "human-input.ndjson",
+                             {"text": "APPROVED but shrink the scope"})
+        self._cli(run, "gate", "--id", "approve-plan", "--present",
+                  "--re-present",
+                  env={"CLAUDE_CODE_SESSION_ID": self.SESSION_B})
+        st = state_mod.load(run, self.workspace)
+        self.assertEqual(st["gates"]["approve-plan"]["session"],
+                         gates.session_digest(self.SESSION_B))
+
+    def test_re_present_without_a_session_refuses_to_disarm_the_gate(self):
+        """RC3, the original field bug reproduced on the exact path the
+        session-mismatch refusal steers the caller onto. `present` used to
+        POP the stamp when the process reported no session id, so this
+        `--re-present` left the gate permanently unfilterable and the very
+        next prompt from ANY session decided it. It refuses instead — and
+        the refusal is a no-op on state, so the stamp and the window both
+        survive it."""
+        run = self.make_run()
+        self._cli(run, "gate", "--id", "approve-plan", "--present",
+                  env={"CLAUDE_CODE_SESSION_ID": self.SESSION_A})
+        before = state_mod.load(run, self.workspace)["gates"]["approve-plan"]
+        out = self._cli(run, "gate", "--id", "approve-plan", "--present",
+                        "--re-present", expect=1)
+        self.assertIn("no session id", out["error"])
+        st = state_mod.load(run, self.workspace)
+        self.assertEqual(st["gates"]["approve-plan"], before)
+
+    def test_a_session_less_workspace_is_never_wedged_by_that_refusal(self):
+        """The refusal above must not cost Qwen Code (or any session-less
+        platform) its escape hatch: with no stamp on the entry there is
+        nothing to clear, so `--re-present` works exactly as it always
+        did."""
+        run = self.make_run()
+        self._cli(run, "gate", "--id", "approve-plan", "--present")
+        self._cli(run, "gate", "--id", "approve-plan", "--present",
+                  "--re-present")
+        self.assertNotIn(
+            "session",
+            state_mod.load(run, self.workspace)["gates"]["approve-plan"])
+
+    def test_an_unstamped_gate_decides_from_a_session_it_never_knew(self):
+        """RC2 end to end: the mid-gate-upgrade path, which WORKED before
+        the session rule existed and must keep working. The gate was
+        presented by a harness that wrote no stamp; the human replied in
+        session A; the terminal was then resumed as B, which is the
+        session running `--decide`. An unstamped gate cannot vouch for any
+        tag, so it must not filter — arming on "either side is known"
+        hard-refused this genuine reply."""
+        run = self._gate_run()
+        self._cli(run, "gate", "--id", "approve-plan", "--present")
+        self._prompt("APPROVED", session=self.SESSION_A)
+        out = self._cli(run, "gate", "--id", "approve-plan", "--decide",
+                        env={"CLAUDE_CODE_SESSION_ID": self.SESSION_B})
+        self.assertEqual(out["decision"], "approved")
+
+    def test_consuming_a_decision_pops_the_session_stamp(self):
+        """`presented_at` and `session` are the two halves of one capture
+        window, so they are consumed together — a consumed gate must not
+        keep advertising a session identity in state that publish_mirror
+        then commits to the feature branch."""
+        run = self.make_run(to_step="approve-plan")
+        manifest, _, config = load_declared(self.workspace)
+        st = state_mod.load(run, self.workspace)
+        gates.present(st, "approve-plan", "2026-01-01T00:00:00+00:00",
+                      session=self.SESSION_A)
+        st["gates"]["approve-plan"]["decision"] = "approved"
+        nxt = next(iter(transitions.cursor_candidates(
+            st, manifest, config, run=run)))
+        transitions.advance_cursor(st, manifest, config, nxt,
+                                   "2026-01-01T00:01:00+00:00", run=run)
+        entry = st["gates"]["approve-plan"]
+        self.assertEqual(entry["consumed_decision"], "approved")
+        self.assertNotIn("session", entry)
+        self.assertNotIn("presented_at", entry)
 
     def test_user_prompt_captured_from_a_drifted_child_cwd(self):
         """If the orchestrator cd's into a child repo, the user's APPROVED

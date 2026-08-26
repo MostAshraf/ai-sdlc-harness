@@ -6,6 +6,44 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
+## [3.8.3] — 2026-08-27
+
+> **A gate can no longer be decided by a message from a different session.**
+> Two Claude Code sessions open on the same workspace used to be able to
+> cross-wire a `/dev-workflow` gate — whatever you typed most recently in
+> *either* session could be read as the answer. This patch fixes that, with
+> nothing else changed in scope.
+
+### Release highlights
+
+| Theme | What changed |
+|---|---|
+| **Gate decisions are scoped to the session that presented the gate** | Running two sessions against one workspace — a `/dev-workflow` run waiting at a gate in one, anything else in the other — used to let the other session's message be read as the gate's answer, because the gate simply took the most recent thing you typed. The gate now recognises which session it was presented from and ignores replies typed elsewhere instead of parsing them. |
+| **Nothing you type is discarded** | Every prompt is still recorded in the ledger of every run waiting at a gate, exactly as before; the change is only about which of those records is allowed to *decide* a gate. Replies carry a short non-identifying fingerprint of the session rather than any session id, so nothing identifying is written to a run's history or pushed to a branch. |
+| **A new refusal, with its own remedy** | `gate --decide` can now refuse with "typed in a DIFFERENT session". Unlike the other refusals, the fix is *not* to re-present — reply again in the session driving that run and decide again. Re-presenting is only right once you've confirmed the original session is gone, and the message says so. |
+| **Re-presenting refuses rather than quietly weakening a gate** | If a gate knows which session presented it and you re-present from somewhere that reports no session at all, the command now stops instead of clearing that knowledge and leaving the gate answerable from anywhere. Workspaces that never had session information are unaffected and behave exactly as before. |
+| **Visible when it's working** | `gate --present` now reports `session: known` or `session: unknown`, so it is obvious when the protection is live rather than silently doing nothing. |
+| **Resuming a session still works** | If you close a terminal and pick a run back up later, the gate presented by the old session is still decidable by the session you are actually typing in now. |
+
+### Upgrade notes
+
+- No config or CLI-flag changes. Anything parsing `gate --decide` refusal
+  text or `gate --present` JSON output should expect the new refusal cause
+  and the new `session` field, respectively — both additive.
+- **Known limits, stated plainly:** under Qwen Code none of this engages —
+  neither side reports a session, so the original cross-session problem
+  remains there. Two runs driven from the *same* session still look
+  identical to each other, so only the cross-session case is closed. A
+  reply recorded without session information (an older run, or a mixed
+  workspace) is still treated as usable, so a newer one of those can still
+  take precedence over a tagged own-session reply.
+
+### Verification on tag tip
+
+- `python -m harness.schema` — declared data valid
+- `python tools/budget_check.py` — line budget green (0 errors, 10 pre-existing warnings)
+- `python -m unittest discover -s tests` — 1331 tests green
+
 ## [3.8.2] — 2026-08-26
 
 > **A false-negative fix for the `ado` provider on Windows.** `/init-verify`

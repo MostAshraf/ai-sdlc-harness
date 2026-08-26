@@ -130,8 +130,10 @@ successful sibling of abort — the final step's file says exactly when).
   wait for their reply, then `gate --decide`. The decision is derived from
   captured human input — you cannot write it, only request the derivation.
   The reply must be a plain typed chat message (never AskUserQuestion —
-  its answers bypass the capture hook and can never qualify). A refusal
-  means no qualifying reply: re-present or route to ad-hoc.
+  its answers bypass the capture hook and can never qualify). Refusals NAME
+  their cause, and the remedies DIFFER: a STALE reply, or one typed in
+  ANOTHER session, wants one more reply then `--decide` alone; re-present
+  only where steps/gate.md says (ad-hoc route, or a confirmed-dead session).
 - **Stalls:** a subagent that stops without a status block → `${CLAUDE_PLUGIN_ROOT}/bin/harness stall
   --task <T>` and follow the returned action (`reinvoke` → `recovery` →
   `human`). For a TASK-LESS spawn (plan-review, pre-pr, analyze-comments)
@@ -191,7 +193,6 @@ successful sibling of abort — the final step's file says exactly when).
     mirror into **every preflighted repo** (the `branches` artifact in
     `show` lists them) — one call per repo:
     `${CLAUDE_PLUGIN_ROOT}/bin/harness publish-mirror --repo <preflighted-repo-path> --run <run>`.
-    In a single-repo run that's one call; in a multi-repo run, one per repo.
   - It's best-effort/non-blocking: a repo that can't be committed to (no
     git, detached, etc.) just isn't mirrored — never block the run on it.
 - **Status:** render progress with `${CLAUDE_PLUGIN_ROOT}/bin/harness show`; the ledgers

@@ -36,6 +36,20 @@ request; deterministic code decides (design.md RC3).
      (`REJECTED — split T2 into two tasks` decides as rejected; the notes
      ride into the on_reject step). FORWARD words stay bare: a qualified
      approval like "APPROVED but…" (or "waive if…") never decides.
+   - refused **"typed in a DIFFERENT session"** → a reply captured from
+     another session in this workspace is not this gate's evidence and is
+     ignored, never parsed. Do NOT re-present: ask the user to reply again
+     **in the session driving this run**, then `--decide` alone. Only if
+     they CONFIRM that session is gone (terminal closed, resumed under a
+     new id) does `--re-present` apply — it re-stamps the gate to the
+     session running it, and ages out anything typed in the old one. If
+     THIS process reports no session id, `--re-present` refuses rather
+     than clearing the stamp (clearing it would leave the gate decidable
+     by a prompt typed in any session). Do NOT invent a value for
+     `CLAUDE_CODE_SESSION_ID` to get past that refusal: unless the
+     platform's capture hook tags nothing, a value the hook doesn't also
+     carry stamps the gate with an identity no reply can match, and
+     nothing in the CLI can undo it.
    - refused (no qualifying reply / qualified FORWARD reply)
      → the reply routes to **ad-hoc handling**: triage it
      (`request-triage`), resolve with the user, then `--present
