@@ -1801,12 +1801,15 @@ def guard_spawn(p: dict) -> None:
     # MEASURED: a fabricated stalled-agent event for a live agent (the
     # unmeasured-stub failure) corrupts the evidence ledger and races a
     # re-spawn against the original, where this one refuses loudly and
-    # visibly. (The stub HAS since been measured — the shape lives in this
-    # repo's Qwen background-spawn measurement notes, 2026-08-27: a text
-    # llmContent whose `returnDisplay.status` reads "background" — and the
-    # rescope of this block is the follow-up work item; the block stays
-    # until a recognizer for that shape lands in capture_post_spawn, so a
-    # half-shipped rescope can never open an uncapturable path.)
+    # visibly. (The stub HAS since been measured — 2026-08-27, live probes
+    # on 0.22.2 — and capture_post_spawn now recognises the shape
+    # (`returnDisplay.status == "background"`) and records the
+    # spawn-pending keyed by the stub's printed task_id, which that
+    # agent's SubagentStop carries back as `agent_id`; measured end to
+    # end. The rescope of THIS block is the remaining step, deliberately
+    # sequenced last so it flips together with the Qwen transcript token
+    # attribution and the docs — one atomic enable, never a half-shipped
+    # one.)
     if qwen_cli_detected():
         bg = tool_input.get("run_in_background")
         if bg not in (False, "false", "False"):
@@ -2875,6 +2878,32 @@ def _response_text(resp) -> str:
     return ""
 
 
+def _qwen_stub_agent_id(tool_response: dict, payload: dict) -> str | None:
+    """The pairing id out of Qwen Code's MEASURED background launch stub
+    (0.22.2): the stub's `llmContent` is a human-readable TEXT block whose
+    one machine-readable line prints `task_id: <id>` — and that same value
+    is what the agent's SubagentStop later carries as `agent_id`, the only
+    key the two one-shot hook processes share. The stub carries no
+    structured id field of its own (unlike Claude's `agentId`), so the
+    primary parse is that printed line; the fallback composes the id from
+    the structured fields the platform derives it from
+    (`returnDisplay.subagentName` + the payload's top-level
+    `tool_call_id`) — measured equal to the printed task_id on live
+    spawns. Neither present: None, and the caller records the
+    unpairable-stub event instead of a pending."""
+    text = _response_text(tool_response.get("llmContent"))
+    m = re.search(r"^task_id:[ \t]*(\S+)", text, re.MULTILINE)
+    if m:
+        return m.group(1)
+    display = tool_response.get("returnDisplay")
+    name = display.get("subagentName") if isinstance(display, dict) else None
+    call_id = payload.get("tool_call_id")
+    if (isinstance(name, str) and name
+            and isinstance(call_id, str) and call_id):
+        return f"{name}-{call_id}"
+    return None
+
+
 def _capture_reply(run, shape, mode, task, text) -> None:
     """Verdict / status-block / stall capture over ONE subagent's final
     reply — the whole of it, shared by the TWO events that can carry that
@@ -3069,36 +3098,49 @@ def capture_post_spawn(p: dict) -> None:
         return
     tool_response = p.get("tool_response")
     # An async LAUNCH STUB, recognised by the RESPONSE's own shape rather
-    # than by the run_in_background parameter — the shape MEASURED on
-    # Claude Code 2.1.232 is {"isAsync": true, "status": "async_launched",
-    # "agentId": …, "outputFile": …}, i.e. everything except the reply.
-    # (Measured on non-harness probe spawns; no harness-shape agent has been
-    # observed reaching capture with it, since guard_spawn still blocks
-    # deliberate backgrounding. The DEFAULT-backgrounding behaviour and the
-    # stub schema are what the measurements establish — this branch's
-    # necessity for a harness shape is inferred from them, not witnessed.)
+    # than by the run_in_background parameter. Two MEASURED shapes:
+    # Claude Code 2.1.232 — {"isAsync": true, "status": "async_launched",
+    # "agentId": …, "outputFile": …}; Qwen Code 0.22.2 —
+    # {"llmContent": "<text stub printing `task_id: …` and `output_file:
+    # …`>", "returnDisplay": {type: "task_execution", subagentName, …,
+    # status: "background"}} — i.e. both are everything except the reply,
+    # and Qwen's id needs deriving (see _qwen_stub_agent_id). A foreground
+    # Qwen completion answers the same returnDisplay with
+    # status: "completed" + an executionSummary, which this gate does NOT
+    # match — it falls through to reply capture below, byte-identically to
+    # today.
     #
-    # Shape FIRST because the parameter stopped being evidence: that CLI
-    # backgrounds subagent spawns BY DEFAULT and its newer payload schema
-    # does not echo `run_in_background` back into tool_input at all, so the
-    # param branch below never fired and the stub fell straight through to
-    # verdict capture — where its (necessarily) absent status block
-    # FABRICATED a missing-status-block stall for an agent that was still
-    # happily running, and the stall procedure's reinvoke then raced the
-    # live original. Shape-detection holds whatever the parameter says or
-    # omits.
+    # Shape FIRST because the parameter stopped being evidence: both CLIs
+    # can background subagent spawns BY DEFAULT and Qwen's payload schema
+    # does not echo `run_in_background` back into tool_input at all, so
+    # the param branch below never fired and the stub fell straight
+    # through to verdict capture — where its (necessarily) absent status
+    # block FABRICATED a missing-status-block stall for an agent that was
+    # still happily running, and the stall procedure's reinvoke then raced
+    # the live original. Shape-detection holds whatever the parameter says
+    # or omits.
     #
     # Truthiness, not `is True`: the identity check missed `isAsync: 1`
-    # (and every other truthy spelling a schema revision might use) and fell
-    # through to exactly the fabrication above (adversarial review).
+    # (and every other truthy spelling a schema revision might use) and
+    # fell through to exactly the fabrication above (adversarial review).
     #
     # The gate DECIDES THE BRANCH OUTRIGHT — a recognised stub never reaches
-    # _capture_reply, with or without an agentId. Anything else is the
+    # _capture_reply, with or without a pairable id. Anything else is the
     # fabrication again: the stub carries no reply by construction, so
     # "capture it anyway" can only invent a stall.
-    if (isinstance(tool_response, dict)
-            and (tool_response.get("isAsync")
-                 or tool_response.get("status") == "async_launched")):
+    is_stub = False
+    agent_id = None
+    if isinstance(tool_response, dict):
+        if (tool_response.get("isAsync")
+                or tool_response.get("status") == "async_launched"):
+            is_stub = True
+            agent_id = tool_response.get("agentId")
+        elif (isinstance(tool_response.get("returnDisplay"), dict)
+              and tool_response["returnDisplay"].get("status")
+              == "background"):
+            is_stub = True
+            agent_id = _qwen_stub_agent_id(tool_response, p)
+    if is_stub:
         # The reply is NOT lost, it is merely late: SubagentStop fires for
         # background spawns at completion and carries the transcript. This
         # record is the handoff between the two one-shot hook processes —
@@ -3106,7 +3148,6 @@ def capture_post_spawn(p: dict) -> None:
         # finishes the job against it (`spawn-captured`). A pending left
         # dangling means that stop never came, and it is FLAGGED so the
         # human sees the hole.
-        agent_id = tool_response.get("agentId")
         if isinstance(agent_id, str) and agent_id:
             # kind + actor from the declaration every reader matches on
             # (`spawn_pairing.pending`), so the asserting record carries the

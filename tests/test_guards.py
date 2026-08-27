@@ -3294,6 +3294,134 @@ class CaptureHooks(GuardHarness):
              events[-1]["actor"], events[-1]["shape"], events[-1]["mode"]),
             ("spawn-pending", "a-7", "T1", "capture", "reviewer", "review"))
 
+    def test_post_spawn_qwen_background_stub_records_pending(self):
+        """Qwen Code's MEASURED background launch stub (0.22.2): a TEXT
+        llmContent printing `task_id: …` inside a
+        {llmContent, returnDisplay:{status: "background"}} envelope — no
+        isAsync, no async_launched, no agentId field. Same contract as the
+        Claude stub: spawn-pending keyed by the printed task_id, no verdict
+        captured from the stub, no fabricated stall."""
+        run = self.make_run()
+        p = self._post_spawn(run, "reviewer", response={
+            "llmContent": "Background agent launched successfully.\n"
+                          "task_id: general-purpose-call_72b19b1dc34f4c18"
+                          "bbbaccb1 (internal ID — do not mention to the "
+                          "user.)\nThe agent is working in the background.\n"
+                          "output_file: C:\\subs\\agent-x.jsonl",
+            "returnDisplay": {"type": "task_execution",
+                              "subagentName": "general-purpose",
+                              "taskDescription": "review T1",
+                              "status": "background"}})
+        self.assertNotIn("run_in_background", p["tool_input"])
+        self.assert_allows("post-spawn", p)
+        self.assertFalse((run / "reviews.ndjson").exists())
+        events = ndjson.read_records(run / "events.ndjson")
+        self.assertNotIn("missing-status-block", [e["kind"] for e in events])
+        self.assertEqual(
+            (events[-1]["kind"], events[-1]["agent_id"], events[-1]["task"],
+             events[-1]["actor"], events[-1]["shape"], events[-1]["mode"]),
+            ("spawn-pending", "general-purpose-call_72b19b1dc34f4c18bbbaccb1",
+             "T1", "capture", "reviewer", "review"))
+
+    def test_qwen_stub_without_printed_task_id_falls_back_to_composed_id(self):
+        """The printed line is the primary parse, but the platform DERIVES
+        the id as subagentName + '-' + tool_call_id (top-level payload) —
+        measured equal to the printed task_id on live spawns — so a stub
+        whose text carries no task_id line still pairs."""
+        run = self.make_run()
+        p = self._post_spawn(run, "reviewer", response={
+            "llmContent": "Background agent launched successfully.",
+            "returnDisplay": {"type": "task_execution",
+                              "subagentName": "ai-sdlc-reviewer",
+                              "status": "background"}})
+        p["tool_call_id"] = "call_9f00d1e2c3b4a5976d8e1f20"
+        self.assert_allows("post-spawn", p)
+        rec = ndjson.read_records(run / "events.ndjson")[-1]
+        self.assertEqual(
+            (rec["kind"], rec["agent_id"]),
+            ("spawn-pending", "ai-sdlc-reviewer-call_9f00d1e2c3b4a5976d8e1f20"))
+
+    def test_qwen_stub_with_no_pairable_id_is_uncaptured_not_a_stall(self):
+        # no printed task_id AND no subagentName/tool_call_id to compose:
+        # the stop can never pair, so the honest record is the
+        # health-degrading unpairable-stub event — never a fabricated stall
+        run = self.make_run()
+        p = self._post_spawn(run, "reviewer", response={
+            "llmContent": "Background agent launched successfully.",
+            "returnDisplay": {"type": "task_execution",
+                              "status": "background"}})
+        self.assert_allows("post-spawn", p)
+        rec = ndjson.read_records(run / "events.ndjson")[-1]
+        self.assertEqual(rec["kind"], "background-spawn-uncaptured")
+        self.assertFalse((run / "reviews.ndjson").exists())
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertNotIn("missing-status-block", kinds)
+
+    def test_qwen_foreground_completion_is_not_a_stub(self):
+        """returnDisplay.status "completed" with an executionSummary is the
+        FOREGROUND Qwen shape — it must keep falling through to reply
+        capture (verdict row + token row), not be mistaken for a launch
+        stub. The stub gate matches "background" only."""
+        run = self.make_run()
+        p = self._post_spawn(run, "reviewer", response={
+            "llmContent": [{"text": "harness-status: SUCCESS\n"
+                                    "harness-task: T1\nverdict: APPROVED"}],
+            "returnDisplay": {"type": "task_execution",
+                              "subagentName": "ai-sdlc-reviewer",
+                              "status": "completed",
+                              "executionSummary": {
+                                  "inputTokens": 100, "outputTokens": 5,
+                                  "thoughtTokens": 1, "cachedTokens": 80,
+                                  "totalTokens": 105}}})
+        self.assert_allows("post-spawn", p)
+        rec = ndjson.read_records(run / "reviews.ndjson")[-1]
+        self.assertEqual((rec["task"], rec["verdict"]), ("T1", "APPROVED"))
+        tok = ndjson.read_records(run / "tokens.ndjson")[-1]
+        self.assertEqual((tok["input"], tok["output"], tok["cache_read"]),
+                         (100, 5, 80))
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertNotIn("spawn-pending", kinds)
+
+    def test_qwen_background_round_trip_pairs_on_the_stub_task_id(self):
+        """The full two-hook handoff in Qwen's encoding: PostToolUse sees
+        the text stub (-> spawn-pending keyed by the printed task_id), the
+        agent's SubagentStop later carries the SAME value as `agent_id`
+        with its own Gemini-parts transcript (-> reviews.ndjson +
+        spawn-captured). Measured end to end on live spawns — the printed
+        task_id and the stop's agent_id are the same string."""
+        run = self.make_run()
+        task_id_str = "general-purpose-call_72b19b1dc34f4c18bbbaccb1"
+        p = self._post_spawn(run, "reviewer", response={
+            "llmContent": f"Background agent launched successfully.\n"
+                          f"task_id: {task_id_str} (internal ID.)\n"
+                          f"output_file: C:\\subs\\agent-x.jsonl",
+            "returnDisplay": {"type": "task_execution",
+                              "subagentName": "general-purpose",
+                              "status": "background"}})
+        self.assert_allows("post-spawn", p)
+        transcript = self.workspace / "bg-qwen.jsonl"
+        prompt = (f"harness-mode: review\nharness-task: T1\n"
+                  f"harness-run: {run}\ngo")
+        transcript.write_text("\n".join(json.dumps(l) for l in [
+            {"type": "user", "message": {"role": "user", "parts": [
+                {"text": prompt}]}},
+            {"type": "assistant", "message": {"role": "model", "parts": [
+                {"text": "harness-status: SUCCESS\nharness-task: T1\n"
+                         "verdict: APPROVED"}]}}]))
+        stop = {"agent_type": "x:reviewer", "agent_id": task_id_str,
+                "agent_transcript_path": str(transcript),
+                "last_assistant_message": "harness-status: SUCCESS\n"
+                                          "harness-task: T1\n"
+                                          "verdict: APPROVED"}
+        self.assert_allows("subagent-stop", stop)
+        rec = ndjson.read_records(run / "reviews.ndjson")[-1]
+        self.assertEqual((rec["task"], rec["mode"], rec["verdict"]),
+                         ("T1", "review", "APPROVED"))
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertEqual([k for k in kinds if k.startswith("spawn-")],
+                         ["spawn-pending", "spawn-captured"])
+        self.assertNotIn("missing-status-block", kinds)
+
     def test_explicit_background_param_never_discards_a_real_reply(self):
         """The param branch fired on `run_in_background: true` ALONE. That
         was sound while the param was forbidden — its presence meant a stub.
@@ -4558,6 +4686,49 @@ class QwenPayloadShapes(unittest.TestCase):
             rt({"content": [{"text": "claude-side"}],
                 "llmContent": [{"text": "qwen-side"}]}),
             "claude-side")
+
+    def test_qwen_stub_agent_id_parses_printed_task_id(self):
+        # the MEASURED stub line: `task_id: <id> (internal ID — do not
+        # mention to the user.)` — the id is the first token after the
+        # colon, trailing prose never bleeds into it
+        sid = self.guards._qwen_stub_agent_id
+        self.assertEqual(
+            sid({"llmContent": "Background agent launched successfully.\n"
+                               "task_id: general-purpose-call_72b19b1dc34f4c"
+                               "18bbbaccb1 (internal ID — do not mention)\n"
+                               "output_file: C:\\s\\a.jsonl",
+                 "returnDisplay": {"status": "background"}}, {}),
+            "general-purpose-call_72b19b1dc34f4c18bbbaccb1")
+        # llmContent as a PARTS LIST (the other Qwen encoding) flattens to
+        # the same parse via _response_text
+        self.assertEqual(
+            sid({"llmContent": [{"text": "task_id: gp-call_abc123"}],
+                 "returnDisplay": {"status": "background"}}, {}),
+            "gp-call_abc123")
+
+    def test_qwen_stub_agent_id_falls_back_to_composed_id(self):
+        # no printed line: the platform derives the id from
+        # returnDisplay.subagentName + the payload's top-level tool_call_id
+        # — measured equal to the printed task_id on live spawns
+        sid = self.guards._qwen_stub_agent_id
+        self.assertEqual(
+            sid({"llmContent": "Background agent launched successfully.",
+                 "returnDisplay": {"subagentName": "general-purpose",
+                                   "status": "background"}},
+                {"tool_call_id": "call_72b19b1dc34f4c18bbbaccb1"}),
+            "general-purpose-call_72b19b1dc34f4c18bbbaccb1")
+
+    def test_qwen_stub_agent_id_none_when_unpairable(self):
+        # neither parse nor compose possible → None (the caller records the
+        # unpairable-stub event, never a pending that nothing can close)
+        sid = self.guards._qwen_stub_agent_id
+        self.assertIsNone(
+            sid({"llmContent": "Background agent launched.",
+                 "returnDisplay": {"status": "background"}}, {}))
+        self.assertIsNone(
+            sid({"llmContent": "Background agent launched.",
+                 "returnDisplay": {"subagentName": "general-purpose",
+                                   "status": "background"}}, {}))
 
     def test_parse_transcript_reads_gemini_format(self):
         # Qwen SubagentStop transcript: {type: assistant|user, message:
