@@ -2494,15 +2494,24 @@ class SpawnIdentityNearMiss(GuardHarness):
         """The helper the guard no longer uses but initws/cli still do:
         truthy-presence on EITHER spelling — QWEN_CODE reaches shell-tool
         children, QWEN_CODE_CLI is the one hook subprocesses get (measured
-        0.22.2) — and neither means Claude Code / a plain terminal."""
+        0.22.2) — and neither means Claude Code / a plain terminal.
+
+        Every patched env is rebuilt from the STRIPPED base with clear=True,
+        so each assertion isolates exactly one spelling. Patching over the
+        ambient environment made the two truthy halves tautological under a
+        real Qwen session (which exports both): they passed whether or not
+        the helper read the spelling under test."""
         from harness import qwen_cli_detected
-        with mock.patch.dict(os.environ, {"QWEN_CODE": "1"}, clear=False):
-            self.assertTrue(qwen_cli_detected())
-        with mock.patch.dict(os.environ,
-                             {"QWEN_CODE_CLI": "C:\\qwen\\cli-entry.js"}):
-            self.assertTrue(qwen_cli_detected())
         stripped = {k: v for k, v in os.environ.items()
                     if k not in ("QWEN_CODE", "QWEN_CODE_CLI")}
+        with mock.patch.dict(os.environ, {**stripped, "QWEN_CODE": "1"},
+                             clear=True):
+            self.assertTrue(qwen_cli_detected())
+        with mock.patch.dict(
+                os.environ,
+                {**stripped, "QWEN_CODE_CLI": "C:\\qwen\\cli-entry.js"},
+                clear=True):
+            self.assertTrue(qwen_cli_detected())
         with mock.patch.dict(os.environ, stripped, clear=True):
             self.assertFalse(qwen_cli_detected())
 
@@ -4631,6 +4640,190 @@ class CaptureHooks(GuardHarness):
                       if e.get("kind") == "agent-identity"]
         self.assertEqual([i.get("cli") for i in identities], ["qwen-code"])
 
+    def _qwen_bg_stub(self, run, shape, task_id):
+        """Qwen's MEASURED background launch stub, keyed by a printed
+        task_id — the PostToolUse half of every background handoff below."""
+        return self._post_spawn(run, shape, response={
+            "llmContent": f"Background agent launched successfully.\n"
+                          f"task_id: {task_id} (internal ID.)\n"
+                          f"output_file: C:\\subs\\{task_id}.jsonl",
+            "returnDisplay": {"type": "task_execution",
+                              "subagentName": "general-purpose",
+                              "status": "background"}})
+
+    def _qwen_agent_transcript(self, run, name, reply, um=None, mode="review",
+                               task="T1", headers=True):
+        """The agent's OWN Gemini-format transcript: `parts` text and the
+        per-round cost TOP-LEVEL in `usageMetadata` (measured 0.22.2)."""
+        transcript = self.workspace / name
+        first = (f"harness-mode: {mode}\nharness-task: {task}\n"
+                 f"harness-run: {run}\ngo" if headers else "orchestrator turn")
+        assistant = {"type": "assistant",
+                     "message": {"role": "model", "parts": [{"text": reply}]}}
+        if um is not None:
+            assistant["usageMetadata"] = um
+        transcript.write_text("\n".join(json.dumps(l) for l in [
+            {"type": "user", "message": {"role": "user",
+                                         "parts": [{"text": first}]}},
+            assistant]))
+        return transcript
+
+    def test_an_abandoned_qwen_background_stop_still_accounts_its_tokens(self):
+        """The abandoned path PROMISES that token accounting still runs —
+        "the agent burned those tokens whatever the ledger decided about its
+        verdict" — and Claude keeps that promise (usage + model present, row
+        written). Qwen did not: the double-write skip was gated on
+        `completed_pending` alone, so a background agent that was declared
+        dead by a stall override and then stopped anyway had its REAL
+        usageMetadata counts silently dropped. The VERDICT is what
+        abandonment refuses; the cost is a fact about what was spent."""
+        run = self.make_run()
+        self.assert_allows("post-spawn",
+                           self._qwen_bg_stub(run, "reviewer", "gp-call_ab99"))
+        # the record `harness stall --confirm-no-verdict` writes
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "spawn-abandoned", "agent_id": "gp-call_ab99",
+            "task": "T1", "mode": "review", "actor": "stall",
+            "reason": "declared dead"})
+        transcript = self._qwen_agent_transcript(
+            run, "abandoned_um.jsonl",
+            "harness-status: SUCCESS\nharness-task: T1\nverdict: APPROVED",
+            um={"promptTokenCount": 100, "candidatesTokenCount": 20,
+                "thoughtsTokenCount": 5, "cachedContentTokenCount": 80,
+                "totalTokenCount": 125})
+        code, err = self.run_guard("subagent-stop", {
+            "agent_type": "x:reviewer", "agent_id": "gp-call_ab99",
+            "agent_transcript_path": str(transcript)})
+        self.assertEqual(code, 0, err)
+        self.assertIn("ABANDONED", err)
+        rec = ndjson.read_records(run / "tokens.ndjson")[-1]
+        self.assertEqual(
+            (rec["task"], rec["mode"], rec["role"], rec["input"],
+             rec["output"], rec["cache_read"]),
+            ("T1", "review", "reviewer", 100, 20, 80))
+        # …and the verdict half is unchanged: still refused, still no
+        # `spawn-captured`, still no fabricated stall
+        self.assertFalse((run / "reviews.ndjson").exists())
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertNotIn("spawn-captured", kinds)
+        self.assertNotIn("missing-status-block", kinds)
+        # a measured Qwen background stop is what wrote that row, and no
+        # executionSummary sibling will ever say so for a stub
+        identities = [e.get("cli") for e in
+                      ndjson.read_records(run / "events.ndjson")
+                      if e.get("kind") == "agent-identity"]
+        self.assertEqual(identities, ["qwen-code"])
+
+    def test_a_legacy_pending_qwen_stop_still_accounts_its_tokens(self):
+        # same promise on the upgrade-window path, whose own comment and
+        # test already assert it for the Claude family ("the message must
+        # not overstate it")
+        run = self.make_run()
+        ndjson.append_record(run / "events.ndjson", {
+            "kind": "spawn-pending", "agent_id": "gp-call_old1", "task": "T1",
+            "actor": "reviewer", "mode": "review", "step": "develop"})
+        transcript = self._qwen_agent_transcript(
+            run, "legacy_um.jsonl",
+            "harness-status: SUCCESS\nharness-task: T1\nverdict: APPROVED",
+            um={"promptTokenCount": 42, "candidatesTokenCount": 7,
+                "cachedContentTokenCount": 11, "totalTokenCount": 49})
+        code, err = self.run_guard("subagent-stop", {
+            "agent_type": "x:reviewer", "agent_id": "gp-call_old1",
+            "agent_transcript_path": str(transcript)})
+        self.assertEqual(code, 0, err)
+        self.assertIn("LEGACY", err)
+        rec = ndjson.read_records(run / "tokens.ndjson")[-1]
+        self.assertEqual((rec["input"], rec["output"], rec["cache_read"]),
+                         (42, 7, 11))
+        self.assertFalse((run / "reviews.ndjson").exists())
+
+    def test_a_parent_chats_counts_are_never_billed_to_the_spawn(self):
+        """A background Qwen stop can arrive with `agent_id` and
+        `last_assistant_message` but NO `agent_transcript_path` — and the
+        token chain's legacy fallback then reads the PARENT SESSION's chat,
+        which under Qwen carries top-level usageMetadata of its own: tens of
+        thousands of ORCHESTRATOR tokens. The pending completes from
+        last_assistant_message, so the row IS written — but billing the
+        parent's cost to the spawn would fabricate a count that spawn never
+        spent. With no agent transcript the counts are zero: "this spawn ran
+        and reported no counts" is the honest, reconcilable record."""
+        run = self.make_run()
+        self.assert_allows("post-spawn",
+                           self._qwen_bg_stub(run, "reviewer", "gp-call_par1"))
+        parent = self._qwen_agent_transcript(
+            run, "qwen_parent_chat.jsonl", "parent session reply",
+            um={"promptTokenCount": 50000, "candidatesTokenCount": 900,
+                "cachedContentTokenCount": 40000, "totalTokenCount": 50900},
+            headers=False)
+        self.assert_allows("subagent-stop", {
+            "agent_type": "x:reviewer", "agent_id": "gp-call_par1",
+            "transcript_path": str(parent),          # PARENT only
+            "last_assistant_message": "harness-status: SUCCESS\n"
+                                      "harness-task: T1\nverdict: APPROVED"})
+        # the verdict really is captured — this is a completed pending
+        rec = ndjson.read_records(run / "reviews.ndjson")[-1]
+        self.assertEqual((rec["task"], rec["mode"], rec["verdict"]),
+                         ("T1", "review", "APPROVED"))
+        self.assertIn("spawn-captured",
+                      [e["kind"] for e in
+                       ndjson.read_records(run / "events.ndjson")])
+        tok = ndjson.read_records(run / "tokens.ndjson")[-1]
+        self.assertEqual(
+            (tok["task"], tok["mode"], tok["input"], tok["output"],
+             tok["cache_read"], tok["cache_write"]),
+            ("T1", "review", 0, 0, 0, 0))
+
+    def test_a_redelivered_qwen_stop_writes_no_second_token_row(self):
+        # the deliberate non-extension of the paired-background rule: a
+        # re-delivered stop's pending was closed by `spawn-captured`, so it
+        # is neither abandoned nor legacy, and its row was already written
+        # by the first delivery — one spawn, one token row (and one verdict)
+        run = self.make_run()
+        self.assert_allows("post-spawn",
+                           self._qwen_bg_stub(run, "reviewer", "gp-call_dup1"))
+        payload = {"agent_type": "x:reviewer", "agent_id": "gp-call_dup1",
+                   "agent_transcript_path": str(self._qwen_agent_transcript(
+                       run, "redelivered_um.jsonl",
+                       "harness-status: SUCCESS\nharness-task: T1\n"
+                       "verdict: APPROVED",
+                       um={"promptTokenCount": 100, "candidatesTokenCount": 20,
+                           "cachedContentTokenCount": 80,
+                           "totalTokenCount": 125}))}
+        self.assert_allows("subagent-stop", payload)
+        self.assert_allows("subagent-stop", payload)      # re-delivered
+        recs = ndjson.read_records(run / "tokens.ndjson")
+        self.assertEqual(len(recs), 1)
+        self.assertEqual((recs[0]["input"], recs[0]["output"]), (100, 20))
+        self.assertEqual(len(ndjson.read_records(run / "reviews.ndjson")), 1)
+
+    def test_a_disagreeing_qwen_stub_is_uncaptured_not_a_wrong_pending(self):
+        """Both id candidates derivable and DISAGREEING means a schema
+        revision moved one of them, so one is a guess — and a WRONG pairing
+        id is worse than none: it mints a `spawn-pending` no SubagentStop can
+        ever close, which holds its (task, mode) against every re-spawn and
+        degrades run health SILENTLY until a manual stall override. The
+        uncapturable record is loud and names the deterministic recovery."""
+        run = self.make_run()
+        p = self._post_spawn(run, "reviewer", response={
+            "llmContent": "Background agent launched successfully.\n"
+                          "task_id: printed-one\noutput_file: C:\\s\\a.jsonl",
+            "returnDisplay": {"type": "task_execution",
+                              "subagentName": "ai-sdlc-reviewer",
+                              "status": "background"}})
+        p["tool_call_id"] = "call_totally_different"
+        self.assert_allows("post-spawn", p)
+        events = ndjson.read_records(run / "events.ndjson")
+        kinds = [e["kind"] for e in events]
+        self.assertNotIn("spawn-pending", kinds)
+        self.assertNotIn("missing-status-block", kinds)
+        self.assertEqual(events[-1]["kind"], "background-spawn-uncaptured")
+        self.assertIn("pairable id", events[-1]["reason"])
+        # the FOREGROUND is the named deterministic escape, not an aside:
+        # this condition recurs identically on every background re-spawn
+        self.assertIn("FOREGROUND", events[-1]["reason"])
+        self.assertIn("run_in_background: false", events[-1]["reason"])
+        self.assertFalse((run / "reviews.ndjson").exists())
+
 
 def _yamlless_python() -> str | None:
     """An interpreter WITHOUT PyYAML (e.g. macOS system python3) — the exact
@@ -4812,6 +5005,36 @@ class QwenPayloadShapes(unittest.TestCase):
                 {"tool_call_id": "call_72b19b1dc34f4c18bbbaccb1"}),
             "general-purpose-call_72b19b1dc34f4c18bbbaccb1")
 
+    def test_qwen_stub_agent_id_agrees_with_the_composed_id(self):
+        # the MEASURED live shape: the printed task_id IS
+        # subagentName + '-' + tool_call_id. Both candidates derivable and
+        # EQUAL is the highest confidence available, and it returns the id.
+        sid = self.guards._qwen_stub_agent_id
+        self.assertEqual(
+            sid({"llmContent": "Background agent launched successfully.\n"
+                               "task_id: general-purpose-call_72b19b1dc34f4c"
+                               "18bbbaccb1 (internal ID)\n",
+                 "returnDisplay": {"subagentName": "general-purpose",
+                                   "status": "background"}},
+                {"tool_call_id": "call_72b19b1dc34f4c18bbbaccb1"}),
+            "general-purpose-call_72b19b1dc34f4c18bbbaccb1")
+
+    def test_qwen_stub_agent_id_none_when_the_two_candidates_disagree(self):
+        # A WRONG pairing id is worse than None: it mints a `spawn-pending`
+        # that nothing can ever close, wedging that (task, mode) lane behind
+        # a health-degrading flag until someone runs a manual stall
+        # override — silently. Disagreement means a schema revision moved
+        # one of the two, so one of them is a guess; None routes the caller
+        # to `background-spawn-uncaptured`, which is loud and names the
+        # recovery.
+        sid = self.guards._qwen_stub_agent_id
+        self.assertIsNone(
+            sid({"llmContent": "Background agent launched successfully.\n"
+                               "task_id: general-purpose-call_AAAA\n",
+                 "returnDisplay": {"subagentName": "ai-sdlc-reviewer",
+                                   "status": "background"}},
+                {"tool_call_id": "call_BBBB"}))
+
     def test_qwen_stub_agent_id_none_when_unpairable(self):
         # neither parse nor compose possible → None (the caller records the
         # unpairable-stub event, never a pending that nothing can close)
@@ -4878,6 +5101,60 @@ class QwenPayloadShapes(unittest.TestCase):
             "input_tokens": 160, "output_tokens": 30,
             "cache_read_input_tokens": 120})
         self.assertIsNone(data["model"])
+        self.assertEqual(data["usage_source"], "gemini")
+
+    def test_message_usage_survives_a_stray_usage_metadata(self):
+        """A Claude-shaped record decorated with a top-level `usageMetadata`
+        — a gateway/proxy in front of the API is all it takes — used to
+        OVERWRITE the record's real `usage` AND flip the family flag to
+        "gemini". Downstream that flag is the foreground-Qwen skip, so a
+        Claude subagent's token row would vanish on a shape nothing here
+        measured. Same record, message-level usage wins, and the family is
+        not set from it."""
+        t = self.tmp / "decorated.jsonl"
+        t.write_text(json.dumps(
+            {"type": "assistant",
+             "usageMetadata": {"promptTokenCount": 999,
+                               "candidatesTokenCount": 999,
+                               "cachedContentTokenCount": 999},
+             "message": {"model": "claude-opus-4-8",
+                         "usage": {"input_tokens": 10, "output_tokens": 4},
+                         "content": [{"type": "text",
+                                      "text": "harness-status: SUCCESS"}]}}))
+        data = self.guards._parse_transcript(t)
+        self.assertEqual(data["usage"], {"input_tokens": 10,
+                                         "output_tokens": 4})
+        self.assertIsNone(data["usage_source"])
+        self.assertEqual(data["model"], "claude-opus-4-8")
+
+    def test_usage_metadata_records_sharing_one_key_are_summed(self):
+        """Every measured 0.22.2 record is its own by_key key (Gemini
+        carries no `message.id`, so each line falls back to `id(entry)`) —
+        the sum test above pins that this is unchanged. A revision that
+        ADOPTED message.id would group a turn's rounds under one key, and
+        the old last-writer-wins assignment would then bill only the final
+        round of that turn. Accumulate instead; the private marker that
+        tracks it must not reach the returned counts (bool IS an int to the
+        summation below, so a marker inside `usage` would surface as a
+        phantom field)."""
+        t = self.tmp / "gemini_ids.jsonl"
+        lines = [
+            {"type": "assistant", "usageMetadata": {
+                "promptTokenCount": 100, "candidatesTokenCount": 20,
+                "cachedContentTokenCount": 80},
+             "message": {"id": "m-1", "role": "model",
+                         "parts": [{"text": "checking"}]}},
+            {"type": "assistant", "usageMetadata": {
+                "promptTokenCount": 60, "candidatesTokenCount": 10,
+                "cachedContentTokenCount": 40},
+             "message": {"id": "m-1", "role": "model",
+                         "parts": [{"text": "verdict: APPROVED"}]}},
+        ]
+        t.write_text("\n".join(json.dumps(l) for l in lines))
+        data = self.guards._parse_transcript(t)
+        self.assertEqual(data["usage"], {
+            "input_tokens": 160, "output_tokens": 30,
+            "cache_read_input_tokens": 120})
         self.assertEqual(data["usage_source"], "gemini")
 
     def test_parse_transcript_family_flag_only_on_usage_metadata(self):

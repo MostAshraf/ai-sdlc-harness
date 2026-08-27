@@ -910,11 +910,13 @@ class SubtreeRepoRegistration(M7Harness):
 class QwenCompatibility(M7Harness):
     """Qwen Code reads permissions and env from `.qwen/settings.json`
     (Claude reads `.claude/settings.json`) and its installer rewrites
-    `.claude/`→`.qwen/` in skill markdown. Under `QWEN_CODE=1`,
-    init-workspace mirrors the allowlist + exports CLAUDE_PLUGIN_ROOT into
-    `.qwen/settings.json` and symlinks `.qwen/context`→`../.claude/context`
-    so model writes through the rewritten path land in the single physical
-    tree. Claude Code sessions (no QWEN_CODE) are untouched."""
+    `.claude/`→`.qwen/` in skill markdown. Under Qwen Code — either
+    spelling, `QWEN_CODE` (shell-tool children) or `QWEN_CODE_CLI` (hook
+    subprocesses) — init-workspace mirrors the allowlist + exports
+    CLAUDE_PLUGIN_ROOT into `.qwen/settings.json` and symlinks
+    `.qwen/context`→`../.claude/context` so model writes through the
+    rewritten path land in the single physical tree. Claude Code sessions
+    (neither spelling present) are untouched."""
 
     def test_write_permissions_mirrors_to_qwen_settings_under_qwen(self):
         with mock.patch.dict(os.environ, {"QWEN_CODE": "1"}):
@@ -934,9 +936,14 @@ class QwenCompatibility(M7Harness):
     def test_write_permissions_mirrors_on_hook_env_spelling(self):
         # QWEN_CODE_CLI alone is the hook-subprocess environment shape
         # (measured 0.22.2: QWEN_CODE reaches shell-tool children only) —
-        # detection must hold on it, not just the shell spelling.
-        with mock.patch.dict(os.environ,
-                             {"QWEN_CODE_CLI": "C:\\qwen\\cli-entry.js"}):
+        # detection must hold on it, not just the shell spelling. Build the
+        # env from a stripped base: the suite itself may run inside a Qwen
+        # Code session whose ambient QWEN_CODE would pass this test even if
+        # the CLI spelling were ignored outright.
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("QWEN_CODE", "QWEN_CODE_CLI")}
+        env["QWEN_CODE_CLI"] = "C:\\qwen\\cli-entry.js"
+        with mock.patch.dict(os.environ, env, clear=True):
             initws.write_permissions(self.workspace, {"r": str(self.repo)},
                                      {"r": {"test_cmd": TEST_CMD}})
         self.assertTrue((self.workspace / ".qwen" / "settings.json").exists())

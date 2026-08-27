@@ -18,22 +18,18 @@ time** (`init-section`), never a full-nuke.
 
 **Resolve the plugin root.** Under native Qwen Code (no Claude-plugin
 conversion), `${CLAUDE_PLUGIN_ROOT}` is not exported until step 6 writes
-`.qwen/settings.json` — and even then it takes effect next session, not
-this one. Each Bash call is a fresh subprocess (an `export` won't
-persist), so the probe **prints** the resolved path for you to substitute
-textually. If the var is already set (Claude Code, converted install),
-the probe passes it through unchanged:
+`.qwen/settings.json`, and even then only next session. Each Bash call is a
+fresh subprocess (an `export` won't persist), so the probe **prints** the
+resolved path for you to substitute textually; if the var is already set
+(Claude Code, converted install) the probe passes it through unchanged:
 
-**Folder-trust caveat (Qwen Code):** project-level `.qwen/settings.json`
-is only LOADED when the workspace folder is trusted — Qwen's
-trusted-folders feature is OFF by default, and an untrusted workspace
-silently ignores that file (measured on 0.22.2): the `CLAUDE_PLUGIN_ROOT`
-env export and the permission-allowlist mirror don't apply, so
-subagents hit permission prompts the allowlist was meant to pre-clear.
-The pipeline itself is unaffected (its hooks ship with the extension,
-which no trust gate covers). Remedy: trust the folder (Qwen's
-`/permissions` → Trust this folder) and restart the session, or export
-`CLAUDE_PLUGIN_ROOT` in the shell that launches Qwen.
+**Folder-trust caveat (Qwen Code):** project-level `.qwen/settings.json` is
+silently ignored unless the folder is trusted (trusted-folders is OFF by
+default, measured on 0.22.2) — the `CLAUDE_PLUGIN_ROOT` export and the
+permission mirror don't apply, so subagents hit the prompts the allowlist
+was meant to pre-clear. The pipeline's hooks are unaffected (they ship with
+the extension). Remedy: trust the folder (Qwen `/permissions` → Trust this
+folder, then restart) or export `CLAUDE_PLUGIN_ROOT` in the launching shell.
 
 ```
 # Resolve the plugin root and print it (native Qwen first-run fallback)
@@ -50,32 +46,29 @@ echo "PLUGIN_ROOT=$R"
 **Use the printed `PLUGIN_ROOT=<path>` in place of every
 `${CLAUDE_PLUGIN_ROOT}` below** for this skill run.
 
-The harness needs PyYAML; system pythons are often externally managed
-(PEP 668), so the plugin owns a venv that `bin/harness` resolves
-automatically on every future call. Bootstrap it through ONE dual-clause
-command — same shape as `hooks/run-guard`'s shell-agnostic launcher pair,
-for the same reason: the shell that ends up interpreting this line is
-picked by the platform, not by us. Claude Code's Bash tool always runs
-bash (Git Bash on Windows), but Qwen Code's `run_shell_command` tool
-shares hooks' shell-selection logic and falls back to cmd.exe on Windows
-outside an MSYS-flavored terminal, where a `NAME="$(command …)"`-shaped
-POSIX assignment is unparseable — cmd treats `=` as an argument
-delimiter, the same failure class the hook launchers were fixed for:
+The harness needs PyYAML; system pythons are often externally managed (PEP
+668), so the plugin owns a venv that `bin/harness` resolves automatically
+thereafter. Bootstrap it through ONE dual-clause command — same shape as
+`hooks/run-guard`'s launcher pair, and for the same reason: the platform
+picks the interpreting shell, not us. Claude Code's Bash tool always runs
+bash (Git Bash on Windows); Qwen Code's `run_shell_command` shares hooks'
+shell-selection logic and falls back to cmd.exe on Windows outside an
+MSYS-flavored terminal, where a `NAME="$(command …)"`-shaped POSIX
+assignment is unparseable (cmd treats `=` as an argument delimiter):
 
 ```
 exec "${CLAUDE_PLUGIN_ROOT}/bin/setup-venv" || ${CLAUDE_PLUGIN_ROOT}/bin/setup-venv
 ```
 
-`exec` replaces bash with the launcher, so the second clause only ever
-runs under cmd.exe (where `exec` fails fast and `||` falls through to the
-unquoted path, PATHEXT-resolved to `setup-venv.cmd`). Both halves probe
-the same two `.venv` layouts (`bin/` POSIX, `Scripts/` Windows) and the
-same `python3` → `python` fallback the old inline snippet used, then exit
-immediately once PyYAML is already importable. Until this step runs,
-`bin/harness` itself still works (it falls back to the same system
-interpreter probe, which is what fails on a PyYAML-less system — that's why
-this step exists), and the spawn/skill guards degrade open with a one-line
-notice rather than erroring — expected pre-setup behavior, not a bug to chase.
+`exec` replaces bash with the launcher, so the second clause only ever runs
+under cmd.exe (where `exec` fails fast and `||` falls through to the unquoted
+path, PATHEXT-resolved to `setup-venv.cmd`). Both halves probe both `.venv`
+layouts (`bin/` POSIX, `Scripts/` Windows) and the same `python3` →
+`python` fallback, then exit once PyYAML is importable. Until this step runs,
+`bin/harness` still works (falling back to the same system-interpreter probe,
+which is what fails on a PyYAML-less system — hence this step), and the
+spawn/skill guards degrade open with a one-line notice: expected pre-setup
+behavior, not a bug to chase.
 
 ## 1 · Must-provide (no defaults — ask)
 
@@ -106,24 +99,21 @@ ${CLAUDE_PLUGIN_ROOT}/bin/harness init-section --section repos --json \
 top-level config keys (`status_mapping`, `subagent_models`, `quick_mode`,
 …), never self-nested under an `"overrides"` key, and unlike
 `provider`/`repos`/`language` (each write replaces the whole file — always
-send the complete current set) its writes **merge**, so separate
-`--section overrides` calls for different settings accumulate rather than
-clobbering each other. See step 3.
+send the complete current set) its writes **merge**, so separate `--section
+overrides` calls accumulate rather than clobbering each other. See step 3.
 
 ## 2 · Discovered, then confirmed
 
-Run `${CLAUDE_PLUGIN_ROOT}/bin/harness discover --repo <path>` per repo. `discover` first
-ensures the repo is clean and on its default branch (`ensure_default_branch`
-— the same reusable precondition `preflight` uses later): a dirty repo, or
-one mid-rebase/merge, refuses with a clear error — surface it to the user
-(never auto-stash/discard/continue) — and a clean repo on a different
-branch is switched, reported back in `branch_check` so the interview can
-tell the user it happened. If the guessed default branch doesn't exist
-locally (no resolvable `origin/HEAD`), pass `--branch <name>` explicitly —
-note this only catches a *nonexistent* guess; a repo with no `origin` and
-a stray local branch that happens to be named `main` cannot be told apart
-from a genuine one, so confirm the branch name with the user for any repo
-without a resolvable `origin/HEAD`.
+Run `${CLAUDE_PLUGIN_ROOT}/bin/harness discover --repo <path>` per repo. It first
+ensures the repo is clean and on its default branch (`ensure_default_branch` — the
+precondition `preflight` reuses later): a dirty or mid-rebase/merge repo refuses
+with a clear error — surface it to the user (never auto-stash/discard/continue)
+— and a clean repo on a different branch is switched, reported in `branch_check`
+so you can tell the user it happened. If the guessed default branch doesn't exist
+locally (no resolvable `origin/HEAD`), pass `--branch <name>` explicitly — but
+that only catches a *nonexistent* guess: a repo with no `origin` and a stray local
+branch named `main` is indistinguishable from a genuine one, so confirm the branch
+name with the user for any repo without one.
 **Known risk:** re-running this against a repo with an active `/dev-workflow`
 run switches that run's feature-branch checkout back to default — and the
 switch flips the whole checkout, so avoid discovery on ANY path inside a
@@ -156,18 +146,17 @@ whole set in one `--section language` call, e.g. `{"language": {"repos":
 test jacoco:report"}, "frontend": {"test_cmd": "npm test"}}}}`.
 A repo carrying a **known-failing spec unrelated to any run** can declare a
 `quarantine` sibling — `{"exclude_template": "--exclude {test}", "tests":
-[{"test": "…", "reason": "…", "since": "YYYY-MM-DD"}]}` — applied to the
-test command *and* to coverage (give coverage its own
-`coverage_exclude_template` when it's a different tool). `reason` and
-`since` are required; the template is the FLAG only, must contain `{test}`,
-and is runner-specific — never guessed. Flags are APPENDED, so the command
-must be a single one (no unquoted `&&`/`|`/`;`) and the flag must reach the
-runner: an `npm test` wrapper swallows `--exclude` unless the template
-passes it through (`-- --exclude {test}`), so prefer invoking the runner
-directly. Test paths are repo-relative, forward-slashed, no `./` prefix.
-Each run logs one flagged event naming the exclusions.
-Don't offer this proactively at setup; it's for a failure the user already
-has.
+[{"test": "…", "reason": "…", "since": "YYYY-MM-DD"}]}` — applied to
+the test command *and* to coverage (give coverage its own
+`coverage_exclude_template` when it's a different tool). `reason` and `since`
+are required; the template is the FLAG only, must contain `{test}`, and is
+runner-specific — never guessed. Flags are APPENDED, so the command must be
+a single one (no unquoted `&&`/`|`/`;`) and the flag must reach the runner:
+an `npm test` wrapper swallows `--exclude` unless the template passes it
+through (`-- --exclude {test}`), so prefer invoking the runner directly. Test
+paths are repo-relative, forward-slashed, no `./` prefix. Each run logs one
+flagged event naming the exclusions. Don't offer this proactively at setup;
+it's for a failure the user already has.
 
 ## 3 · Choose-or-default (offer "default" explicitly, every time)
 

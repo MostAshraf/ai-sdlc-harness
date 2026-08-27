@@ -1778,14 +1778,31 @@ def guard_spawn(p: dict) -> None:
     # CLI whose Agent schema drops the parameter entirely it would block
     # the whole pipeline over a param the caller cannot pass.
     #
-    # Residual risk, stated honestly: an UNRECOGNISED stub schema (a future
-    # CLI revision) with run_in_background OMITTED would fall through to
-    # _capture_reply and fabricate a stall — capture_post_spawn's
-    # response-conditioned fallback catches the explicit-param spelling of
-    # that, and the recognised-shape tests pin the measured schemas. That
-    # is the same residual Claude Code has carried since its own rescope,
-    # and the symmetry is the point: one rule, evidence-keyed (the
-    # RESPONSE shape), identical everywhere.
+    # Residual risk, and it is NOT symmetric between the two platforms —
+    # the earlier wording here claimed it was, and that claim was false.
+    # An UNRECOGNISED stub schema (a future CLI revision) falls through to
+    # _capture_reply, whose necessarily-absent status block FABRICATES a
+    # missing-status-block stall for a live agent: the exact bug this work
+    # killed. What differs is the net underneath:
+    #
+    #   Claude Code — capture_post_spawn's param-keyed fallback is still a
+    #   net there. It fires on payloads that ECHO `run_in_background: true`
+    #   back into tool_input, a spelling Claude's Agent schema has shipped
+    #   (2.1.232 itself strips it — that measurement is why the shape gate
+    #   exists at all), and it records `background-spawn-uncaptured` rather
+    #   than fabricating anything.
+    #
+    #   Qwen Code — that net CANNOT fire, ever. Qwen does not echo the
+    #   parameter into tool_input at all (measured 0.22.2, and the reason
+    #   the old param-keyed branch never fired there), so the
+    #   recognised-shape gate in capture_post_spawn —
+    #   `returnDisplay.status == "background"` — is the ONLY line of
+    #   defence. A Qwen stub-schema revision must therefore be RE-MEASURED
+    #   and that gate updated; nothing else will catch it, and the failure
+    #   is a fabricated stall over a still-running agent.
+    #
+    # The recognised-shape tests pin both measured schemas so a revision
+    # shows up as a failing test rather than as a stall in the field.
     prompt = tool_input.get("prompt") or ""
     m = MODE_HEADER_RE.search(prompt)
     if not m:
@@ -2374,8 +2391,12 @@ def _parse_transcript(path: Path) -> dict:
                           "usage": {}}
             messages.append(by_key[key])
         by_key[key]["text"] += "\n" + text
-        if msg.get("usage"):
+        msg_usage = bool(msg.get("usage"))
+        if msg_usage:
             by_key[key]["usage"] = msg["usage"]
+            # wholesale replacement, so the accumulation marker below no
+            # longer describes this slot's usage dict
+            by_key[key].pop("_um", None)
         # Qwen/Gemini transcripts carry the per-record usage TOP-LEVEL
         # (`usageMetadata`, Gemini key names) — measured live on 0.22.2,
         # on the agent's own transcript, one block per API round. Translate
@@ -2387,14 +2408,41 @@ def _parse_transcript(path: Path) -> dict:
         # out — same stance as the executionSummary branch: the ledger
         # records actual billed input/output, not reasoning tokens folded
         # into either.
+        #
+        # `not msg_usage` is a REFUSAL, not a precedence nicety (adversarial
+        # review): a message-level `usage` is the Claude-family signature,
+        # and a gateway/proxy that decorates a Claude-shaped record with a
+        # stray `usageMetadata` would otherwise both overwrite the real
+        # counts AND flip `usage_source` to "gemini" — which downstream is
+        # the FOREGROUND-Qwen skip, i.e. a Claude subagent's token row
+        # silently dropped. Same record, message-level usage wins, and the
+        # family flag is not set from it.
+        #
+        # SUM per key, don't overwrite. Every measured 0.22.2 record is its
+        # own key (Gemini carries no `message.id`, so the `id(entry)`
+        # fallback makes each line unique) and this reads identically —
+        # but a future revision adopting `message.id` would group several
+        # usageMetadata rounds under ONE key, and the last-writer-wins
+        # assignment would then bill only the final round of that turn.
+        # `_um` marks "this slot's usage was accumulated from usageMetadata"
+        # so a message-level dict is never summed into. It lives on the
+        # message dict, NEVER inside `usage`: the summation below accepts
+        # any int-ish value and bool IS an int, so a marker in there would
+        # leak into the returned totals as a phantom count.
         um = entry.get("usageMetadata")
-        if isinstance(um, dict):
-            by_key[key]["usage"] = {
+        if isinstance(um, dict) and not msg_usage:
+            translated = {
                 "input_tokens": um.get("promptTokenCount") or 0,
                 "output_tokens": um.get("candidatesTokenCount") or 0,
                 "cache_read_input_tokens":
                     um.get("cachedContentTokenCount") or 0,
             }
+            if by_key[key].get("_um"):
+                for k, v in translated.items():
+                    by_key[key]["usage"][k] = by_key[key]["usage"].get(k, 0) + v
+            else:
+                by_key[key]["usage"] = translated
+                by_key[key]["_um"] = True
             usage_source = "gemini"
     first_user = next((m["text"] for m in messages if m["role"] == "user"), "")
     last_assistant = next((m for m in reversed(messages) if m["role"] == "assistant"), {})
@@ -2450,7 +2498,21 @@ def capture_subagent_stop(p: dict) -> None:
     surfaces = load_yaml(PLUGIN_ROOT / "pipeline" / "surfaces.yaml")
     # TOKEN capture keeps the historical fallback chain (agent transcript,
     # else the session's own) — attribution headers and usage counts are all
-    # it reads out of it, and both are harmless from either file.
+    # it reads out of it.
+    #
+    # "Harmless from either file" was the historical justification and it is
+    # only true for the CLAUDE family, where the parent chat's per-message
+    # `usage` blocks are the parent's own and a stop that falls back to it
+    # writes a row nobody double-counts. It is FALSE for the GEMINI family
+    # (adversarial review): a Qwen parent session's chat file carries
+    # top-level `usageMetadata` too — 50k input tokens of ORCHESTRATOR cost —
+    # and a background stop that arrives with `agent_id` +
+    # `last_assistant_message` but no `agent_transcript_path` completes its
+    # pending and would bill every one of those to the spawn. The gate for
+    # that lives with the token row itself (the `gemini_tx and not agent_tx`
+    # zeroing at the double-write guard below), not here, because THIS chain
+    # is also what supplies the attribution headers when the payload carries
+    # no agent transcript.
     #
     # The PENDING branch below deliberately does NOT share it: `agent_tx` is
     # tracked separately so a verdict can only ever be minted from the
@@ -2593,9 +2655,16 @@ def capture_subagent_stop(p: dict) -> None:
     open_pendings = transitions.open_pendings(prior)
     pending = next((e for e in open_pendings
                     if e.get("agent_id") == agent_id), None) if agent_id else None
+    # "This stop is PAIRED to a background spawn of ours, but its pending is
+    # not open for us to complete" — the two paths below (abandoned by a
+    # stall override, and a legacy pre-upgrade pending) both promise in their
+    # own comments that token accounting still runs, and this is the flag
+    # that keeps that promise for the gemini family at the double-write guard.
+    paired_bg = False
     if agent_id and agent_id in _abandoned_ids and any(
             transitions.is_open_pending_record(e)
             and e.get("agent_id") == agent_id for e in prior):
+        paired_bg = True
         # Loud, like every other capture that deliberately does nothing: a
         # dropped verdict must never be a silent no-op (the undiagnosable
         # failure this file has precedent for). Token accounting below still
@@ -2651,7 +2720,10 @@ def capture_subagent_stop(p: dict) -> None:
             # Token accounting below still runs, exactly as on the abandoned
             # path: the agent burned those counts whatever the ledger decided
             # about its verdict. The VERDICT is what is lost, so say only
-            # that.
+            # that. `paired_bg` is what makes that true for a gemini-family
+            # transcript, whose row the double-write guard would otherwise
+            # skip as if this were a foreground stop.
+            paired_bg = True
             print(f"ai-sdlc-harness: background spawn '{agent_id}' stopped, "
                   "and this run holds a LEGACY `spawn-pending` for it — one "
                   "written by a pre-upgrade harness, whose owner field this "
@@ -2771,28 +2843,67 @@ def capture_subagent_stop(p: dict) -> None:
     # never a token row. The row is written even at zero/None: "this spawn
     # ran and reported no counts" is a real, reconcilable fact; silence is
     # not.
+    #
+    # `paired_bg` extends that to the two paths that reach here having
+    # PROVEN this was a background spawn of ours while declining to complete
+    # its pending — abandoned by a stall override, and a legacy pre-upgrade
+    # pending. Both say in their own comments that token accounting still
+    # runs, and it does for Claude (usage + model present → row written);
+    # gating the gemini skip on `completed_pending` ALONE made Qwen diverge
+    # from that promise and silently drop a background agent's REAL
+    # usageMetadata counts (adversarial review). Abandonment decides what the
+    # VERDICT ledger accepts, not what was spent.
+    #
+    # A RE-DELIVERED stop matches NEITHER path (its pending was closed by
+    # `spawn-captured`, so it is not abandoned and its pending is
+    # well-formed), so `paired_bg` stays False and its gemini row stays
+    # skipped — deliberately: one spawn, one token row, and the first
+    # delivery already wrote it.
+    #
+    # The ZEROING closes the other half of the same question — WHOSE counts
+    # these are. On the pending path `transcript` may be the PARENT session's
+    # chat (`agent_transcript_path` absent, the pending completed from
+    # `last_assistant_message`), and a Qwen parent chat carries top-level
+    # usageMetadata of its own: tens of thousands of ORCHESTRATOR tokens that
+    # would land in this spawn's row (adversarial review). A parent's cost is
+    # never billable to a spawn, so with no agent transcript the four counts
+    # go to zero — "this spawn ran and reported no counts" is the honest
+    # record, and the same statement this row already makes for a count-less
+    # transcript. Scoped to the gemini family only: the Claude-family
+    # fallback keeps its historical read of a parent chat's per-message
+    # `usage`, unchanged.
     gemini_tx = data.get("usage_source") == "gemini"
     zero_sig = (not any((input_t, output_t, cache_r, cache_w))
                 and data.get("model") is None)
-    if not completed_pending and (gemini_tx or zero_sig):
-        return
+    if gemini_tx:
+        if not (completed_pending or paired_bg):
+            return   # foreground Qwen: the executionSummary row is already
+                     # written and these counts belong to the parent
+        if not agent_tx:
+            input_t = output_t = cache_r = cache_w = 0
+    elif zero_sig and not completed_pending:
+        return       # degenerate/count-less transcript: the historical skip
     ndjson.append_record(run / "tokens.ndjson", {
         "task": task, "mode": mode, "role": role,
         "model": data.get("model"),
         "input": input_t, "output": output_t,
         "cache_read": cache_r, "cache_write": cache_w})
-    # Identity, family-keyed: a Gemini transcript that reached this line
-    # completed a pending — a measured Qwen BACKGROUND spawn, whose
-    # executionSummary sibling never fires for a stub, so the run's driver
-    # is qwen-code and this is the one event that can say so. Claude-family
-    # rows keep the historical model-keyed stamp, and the degenerate
-    # zero-signature corner (a completed pending over a count-less Claude
-    # transcript) keeps stamping nothing, exactly as before — stamping that
-    # run "claude-code" over a model-less transcript would misattribute
-    # the very question this record exists to answer.
+    # Identity, family-keyed: a Gemini transcript that reached this line is a
+    # PAIRED background Qwen stop by construction — the guard above lets one
+    # past only on a completed pending or `paired_bg`, and a Qwen background
+    # spawn's executionSummary sibling never fires for a launch stub, so this
+    # is the one event that can say the run's driver is qwen-code. The inner
+    # `if completed_pending` this used to carry was already dead the moment
+    # the skip above was the only way in; after the abandoned/legacy paths
+    # joined it, keeping the condition would have stamped nothing for stops
+    # every bit as measured. Claude-family rows keep the historical
+    # model-keyed stamp, and the degenerate zero-signature corner (a
+    # completed pending over a count-less Claude transcript) keeps stamping
+    # nothing, exactly as before — stamping that run "claude-code" over a
+    # model-less transcript would misattribute the very question this record
+    # exists to answer.
     if gemini_tx:
-        if completed_pending:
-            _record_agent_identity(run, "qwen-code", None)
+        _record_agent_identity(run, "qwen-code", None)
     elif not zero_sig:
         _record_agent_identity(run, "claude-code", data.get("model"))
     # Reviewer-verdict and missing-status-block capture is NOT unconditional
@@ -2876,24 +2987,35 @@ def _qwen_stub_agent_id(tool_response: dict, payload: dict) -> str | None:
     one machine-readable line prints `task_id: <id>` — and that same value
     is what the agent's SubagentStop later carries as `agent_id`, the only
     key the two one-shot hook processes share. The stub carries no
-    structured id field of its own (unlike Claude's `agentId`), so the
-    primary parse is that printed line; the fallback composes the id from
-    the structured fields the platform derives it from
-    (`returnDisplay.subagentName` + the payload's top-level
-    `tool_call_id`) — measured equal to the printed task_id on live
-    spawns. Neither present: None, and the caller records the
-    unpairable-stub event instead of a pending."""
+    structured id field of its own (unlike Claude's `agentId`), so one
+    candidate is that printed line and the other composes the id from the
+    structured fields the platform derives it from
+    (`returnDisplay.subagentName` + the payload's top-level `tool_call_id`)
+    — measured EQUAL to the printed task_id on live spawns.
+
+    Both derivable and EQUAL: return it, the measured shape and the highest
+    confidence available. Only one derivable: return that one. Both
+    derivable and DISAGREEING: None — a WRONG id is strictly worse than no
+    id (adversarial review). A wrong id mints a `spawn-pending` that no
+    SubagentStop can ever close, and an open pending holds its (task, mode)
+    against every re-spawn while degrading run health: a silently wedged
+    lane, recoverable only by a manual stall override. Disagreement means a
+    schema revision moved one of the two, so one of them is now a guess —
+    and None sends the caller to `background-spawn-uncaptured`, which is
+    loud, health-degrading, and names the deterministic recovery. Neither
+    derivable: None for the same reason it always was."""
     text = _response_text(tool_response.get("llmContent"))
     m = re.search(r"^task_id:[ \t]*(\S+)", text, re.MULTILINE)
-    if m:
-        return m.group(1)
+    printed = m.group(1) if m else None
     display = tool_response.get("returnDisplay")
     name = display.get("subagentName") if isinstance(display, dict) else None
     call_id = payload.get("tool_call_id")
-    if (isinstance(name, str) and name
-            and isinstance(call_id, str) and call_id):
-        return f"{name}-{call_id}"
-    return None
+    composed = (f"{name}-{call_id}"
+                if isinstance(name, str) and name
+                and isinstance(call_id, str) and call_id else None)
+    if printed and composed and printed != composed:
+        return None
+    return printed or composed
 
 
 def _capture_reply(run, shape, mode, task, text) -> None:
@@ -3203,10 +3325,13 @@ def capture_post_spawn(p: dict) -> None:
             "reason": "harness-shape spawn launched in the BACKGROUND and "
                       "its launch stub carried NO pairable id — unpairable: "
                       "nothing can match this spawn's SubagentStop, so its "
-                      "verdict/status can never be captured. Re-spawn FRESH "
-                      "(with run_in_background: false if you need the reply "
-                      "inline); for parallelism, batch multiple spawns in "
-                      "one message"})
+                      "verdict/status can never be captured. This recurs "
+                      "identically on every background re-spawn of this "
+                      "shape, so re-spawn FRESH in the FOREGROUND "
+                      "(run_in_background: false — the one shape whose reply "
+                      "is captured at PostToolUse regardless of stub "
+                      "schema); batch multiple foreground spawns in ONE "
+                      "message for parallelism"})
         return
     text = _response_text(tool_response)
     if (tool_input.get("run_in_background") in (True, "true", "True")
@@ -3224,6 +3349,15 @@ def capture_post_spawn(p: dict) -> None:
         # both shapes measured, this branch is belt-and-braces for an
         # UNKNOWN schema revision — record what actually happened instead
         # of fake stall evidence.
+        #
+        # CAVEAT, and it is the asymmetry guard_spawn's rescope note states:
+        # this net only catches payloads that ECHO the parameter back into
+        # tool_input. Qwen Code does not (measured 0.22.2 — the reason the
+        # old param-keyed rule never fired there), so an unrecognised future
+        # QWEN stub reaches _capture_reply with nothing underneath it and
+        # fabricates a stall. The recognised-shape gate above is Qwen's only
+        # line of defence, and a Qwen stub-schema revision has to be
+        # re-measured there.
         #
         # RESPONSE-CONDITIONED, not param-conditioned. When WI-3 was first
         # rescoped (Claude Code), `run_in_background: true` became LEGAL —
@@ -3244,10 +3378,13 @@ def capture_post_spawn(p: dict) -> None:
             "reason": "harness-shape spawn ran in the background and its "
                       "launch response was not a recognised stub — only that "
                       "response reaches PostToolUse, so verdict/status "
-                      "capture is impossible; re-spawn FRESH (with "
-                      "run_in_background: false if you need the reply "
-                      "inline), batching multiple spawns in one message "
-                      "for parallelism"})
+                      "capture is impossible. This recurs identically on "
+                      "every background re-spawn against this stub shape, so "
+                      "re-spawn FRESH in the FOREGROUND "
+                      "(run_in_background: false — the one shape whose reply "
+                      "is captured at PostToolUse regardless of stub "
+                      "schema); batch multiple foreground spawns in ONE "
+                      "message for parallelism"})
         return
     # Qwen Code, FOREGROUND: a spawn's token counts live in the PostToolUse
     # payload — tool_response.returnDisplay.executionSummary =

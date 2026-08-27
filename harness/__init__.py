@@ -16,12 +16,23 @@ def qwen_cli_detected() -> bool:
     Two spellings, two delivery paths (measured live on Qwen Code 0.22.2):
     `QWEN_CODE` ("1") reaches run_shell_command children — where the CLI
     and init-workspace execute — but NOT hook subprocesses; hooks receive
-    `QWEN_CODE_CLI` (the resolved cli-entry.js path) instead. Keying on
-    `QWEN_CODE` alone made guard_spawn's Qwen branch silently vanish in
-    every real hook run — the wrong-way failure (silent permit) its own
-    comment feared. Truthy-presence, never `== "1"`: any spelling a CLI
-    revision ships keeps detection on, and a stray value can only
-    over-detect, which callers surface rather than swallow."""
+    `QWEN_CODE_CLI` (the resolved cli-entry.js path) instead. The
+    measurement came out of a since-removed guard_spawn branch that keyed
+    on `QWEN_CODE` alone and so had never once fired in a real hook run.
+
+    Callers today are the two surfaces where the platform genuinely
+    changes behaviour: `initws` (mirroring permissions and the
+    `CLAUDE_PLUGIN_ROOT` export into `.qwen/settings.json`, symlinking
+    `.qwen/context`) and `cli` (the resolve-model notice — Qwen's agent
+    tool takes no model parameter). The hook guards deliberately do NOT
+    consult it: they are platform-blind, keyed on the evidence in the
+    payload (response shapes, stub envelopes) rather than on which CLI
+    spawned them, so one rule holds identically on both platforms.
+
+    Truthy-presence, never `== "1"`: any spelling a CLI revision ships
+    keeps detection on, and a stray value can only over-detect — a visible
+    failure (a `.qwen/` tree or a notice where none was wanted) rather
+    than the silent under-detection that hid the dead branch."""
     return bool(_os.environ.get("QWEN_CODE")
                 or _os.environ.get("QWEN_CODE_CLI"))
 

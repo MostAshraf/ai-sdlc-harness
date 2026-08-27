@@ -96,7 +96,7 @@ This repo carries a `qwen-extension.json` at root, making it a **native Qwen Cod
 
 ### What happens under Qwen Code
 
-When `/init-workspace` runs under Qwen Code (`QWEN_CODE=1` is set in that session):
+When `/init-workspace` runs under Qwen Code (detected when either `QWEN_CODE`, which Qwen sets for shell-tool children, or `QWEN_CODE_CLI`, which it sets for hook subprocesses, is present — measured on 0.22.2):
 
 - **Permissions are mirrored to `.qwen/settings.json`.** Qwen Code reads its allowlist from `.qwen/settings.json` rather than `.claude/settings.json`; the init step writes both so background agents run unprompted under either CLI. A workspace bootstrapped under Claude Code and later opened under Qwen Code has no `.qwen/settings.json` yet — re-run `/workspace-config` (or the permission-write step) once under Qwen Code to create it.
 - **`CLAUDE_PLUGIN_ROOT` is exported via the `.qwen/settings.json` `env` block** (self-healing on reinstall). Native Qwen does not export this variable or substitute it in markdown, so the init step's bootstrap probe resolves the plugin root on first run and prints it for the model to substitute textually in subsequent commands (each Bash call is a fresh subprocess, so a shell export doesn't persist). The env export written at step 6 takes over from the **next session**. A stale value from a prior install self-heals when the stored path no longer exists on disk; a deliberate user pin pointing at a real directory is preserved.
@@ -434,7 +434,7 @@ ai-sdlc-harness/
 │   └── init-workspace/ · add-repo/ · migrate-workspace/ · workspace-config/ · workflow-status/ · repo-map-refresh/
 ├── bin/harness                  # wrapper script resolving the plugin venv (+ harness.cmd for Windows)
 ├── tools/                       # meta-tooling: line-budget checker, sandbox workspace generators
-└── tests/                       # 1331 stdlib-unittest tests
+└── tests/                       # 1354 stdlib-unittest tests
 ```
 
 Workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside *your* working directory by `/init-workspace` and the pipeline. They never live inside this plugin repo.
@@ -464,7 +464,7 @@ python -m venv .venv; .venv\Scripts\pip install pyyaml
 .venv\Scripts\python tools\fasttest.py
 ```
 
-The test suite (1331 tests; ~13 min serial, ~3 min sharded) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (1354 tests; ~13 min serial, ~3 min sharded) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 

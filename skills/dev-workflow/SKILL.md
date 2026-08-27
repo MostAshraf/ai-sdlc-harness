@@ -86,14 +86,10 @@ successful sibling of abort — the final step's file says exactly when).
    session model. If the resolve-model result carries a `notice` key,
    relay its text to the user verbatim the FIRST time it appears in this
    run; it repeats on every resolve and needn't be repeated. **Background
-   or foreground — both are captured:** where the Agent tool has the
-   `run_in_background` parameter, pass `true` for lanes you can let fly
-   (DAG-parallel develop lanes, slow reviews) or `false` when you need the
-   reply inline; where the tool defaults top-level spawns to background or
-   has no such parameter, the spawn returns a launch STUB and the agent
-   runs in the background — both stub shapes are MEASURED on both
-   platforms, capture records a pending at spawn and completes it when the
-   agent's stop event carries its reply. On a stub: WAIT for its
+   or foreground — both are captured:** where the Agent tool has
+   `run_in_background`, `true` and `false` are equally legal; where it
+   defaults spawns to background or has no such parameter, the spawn
+   returns a launch STUB in place of the reply. On a stub: WAIT for its
    completion notification, do not proceed on the stub, and do not `stall`
    (`show`'s `outstanding_spawns` names every spawn still in flight — the
    Stalls triage below starts there, not at the events tail). Read the verdict from
