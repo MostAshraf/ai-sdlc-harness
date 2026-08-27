@@ -15,7 +15,7 @@ from pathlib import Path
 
 import yaml
 
-from . import gitops, ndjson
+from . import gitops, ndjson, qwen_cli_detected
 from .schema import deep_merge
 
 # marker file -> (language, proposed test_cmd, proposed coverage_cmd or None
@@ -1149,7 +1149,7 @@ def mark_bootstrapped(workspace: Path) -> None:
     _restore_launcher_exec_bits()
     write_section(workspace, "overrides",
                   {"bootstrap_completed": ndjson.now_iso()})
-    if os.environ.get("QWEN_CODE") == "1":
+    if qwen_cli_detected():
         _link_qwen_context(workspace)
 
 
@@ -1254,7 +1254,7 @@ def write_permissions(workspace: Path, repos: dict[str, str],
     settings["permissions"]["allow"] = sorted(allow)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
-    if os.environ.get("QWEN_CODE") == "1":
+    if qwen_cli_detected():
         _write_qwen_settings(workspace, plugin_root, sorted(allow))
     return path
 

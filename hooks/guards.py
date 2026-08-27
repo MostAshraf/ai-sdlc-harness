@@ -63,7 +63,7 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 # qualifies outright — hashlib + re, no I/O, no env — and is imported for
 # `session_digest` alone, so the capture hook and the CLI that writes the
 # stamp cannot drift into two different hashes of the same session id.
-from harness import chain, gates, ndjson, transitions  # noqa: E402
+from harness import chain, gates, ndjson, qwen_cli_detected, transitions  # noqa: E402
 
 
 class YamlMissing(Exception):
@@ -1778,17 +1778,19 @@ def guard_spawn(p: dict) -> None:
     # fabricates a missing-status-block stall for a live agent — the exact
     # bug round 1 killed on Claude — so there the rule stays verbatim.
     #
-    # STATED RISK, accepted and documented: this trusts QWEN_CODE to reach
-    # hook subprocesses. The harness already relies on that env var
-    # elsewhere (initws mirrors settings/agents into `.qwen/` on it,
-    # resolve-model relays its no-model-param notice on it), and Qwen v0.20.1
-    # injects it into shell-tool environments. If it ever fails to propagate
-    # into a HOOK's environment specifically, this block silently vanishes
-    # and Qwen backgrounding is allowed unguarded — a wrong-way failure
-    # (silent permit, not a false refusal). Truthy-presence rather than the
-    # `== "1"` those other sites use, deliberately: any spelling the CLI
-    # might ship keeps the protective block on, and a stray value can only
-    # ever over-refuse, which the caller can see and fix.
+    # STATED RISK, rewritten by measurement: this used to trust `QWEN_CODE`
+    # alone to reach hook subprocesses, and on Qwen Code 0.22.2 it does not
+    # — hooks receive `QWEN_CODE_CLI` (the cli-entry.js path) while
+    # `QWEN_CODE` reaches only shell-tool children — so the block below
+    # silently vanished in every real hook run, the exact wrong-way failure
+    # (silent permit) the original comment here feared. Detection is now
+    # `harness.qwen_cli_detected()`, truthy-presence on EITHER spelling:
+    # any value a CLI revision ships keeps the protective block on, and a
+    # stray value can only ever over-refuse, which the caller can see and
+    # fix. Residual risk, accepted: if a future Qwen drops BOTH spellings
+    # from hook environments, the block vanishes again — undetectable from
+    # inside the hook, so the measurement note in this repo (project
+    # memory, 2026-08-27) is the standing reference for re-checking.
     #
     # The OTHER side of that trade, equally accepted: because Qwen keeps the
     # rule verbatim, Qwen inherits the failure the rescope removed from
@@ -1799,8 +1801,13 @@ def guard_spawn(p: dict) -> None:
     # MEASURED: a fabricated stalled-agent event for a live agent (the
     # unmeasured-stub failure) corrupts the evidence ledger and races a
     # re-spawn against the original, where this one refuses loudly and
-    # visibly. Measuring that stub is what retires this branch.
-    if os.environ.get("QWEN_CODE"):
+    # visibly. (The stub HAS since been measured — the shape lives in this
+    # repo's Qwen background-spawn measurement notes, 2026-08-27: a text
+    # llmContent whose `returnDisplay.status` reads "background" — and the
+    # rescope of this block is the follow-up work item; the block stays
+    # until a recognizer for that shape lands in capture_post_spawn, so a
+    # half-shipped rescope can never open an uncapturable path.)
+    if qwen_cli_detected():
         bg = tool_input.get("run_in_background")
         if bg not in (False, "false", "False"):
             block(f"harness-shape spawns ('{shape}') must run in the "

@@ -42,7 +42,11 @@ class GuardHarness(unittest.TestCase):
         # the suite can be RUN under Qwen Code, and guard_spawn's WI-3 block
         # is keyed on that variable — inherited, it would silently turn every
         # "Claude Code allows backgrounding" assertion below into a test of
-        # the Qwen branch (and pass for the wrong reason).
+        # the Qwen branch (and pass for the wrong reason). QWEN_CODE_CLI is
+        # the same hazard one layer deeper: it is the spelling Qwen actually
+        # puts in HOOK subprocess envs (measured 0.22.2 — QWEN_CODE itself
+        # reaches only shell-tool children), so an ambient one inherited by
+        # this child is exactly the environment the block keys on.
         # CLAUDE_CODE_SESSION_ID is the same hazard for the capture guard:
         # the suite run inside a Claude Code session inherits the REAL
         # session id, and the session-scoped capture tests below assert on
@@ -50,7 +54,7 @@ class GuardHarness(unittest.TestCase):
         # child and match (or fail to match) by accident.
         base = {k: v for k, v in os.environ.items()
                 if k not in ("CLAUDE_PROJECT_DIR", "PYTHONIOENCODING",
-                             "QWEN_CODE", "PYTHONUTF8",
+                             "QWEN_CODE", "QWEN_CODE_CLI", "PYTHONUTF8",
                              "PYTHONLEGACYWINDOWSSTDIO",
                              "CLAUDE_CODE_SESSION_ID")}
         # ensure_ascii=False: the platform sends hook payloads as RAW
@@ -2464,7 +2468,7 @@ class SpawnIdentityNearMiss(GuardHarness):
     def test_the_qwen_block_is_keyed_on_the_env_var_alone(self):
         """The reversal's stated risk, pinned both ways: the SAME payload
         that Qwen refuses is allowed on Claude Code. The block lives or dies
-        by QWEN_CODE reaching the hook subprocess — if it ever stopped
+        by Qwen detection reaching the hook subprocess — if it ever stopped
         propagating, this is the assertion that would flip, and the failure
         direction (silent permit) is why it is documented in guards.py rather
         than merely relied upon."""
@@ -2477,6 +2481,18 @@ class SpawnIdentityNearMiss(GuardHarness):
         # is the direction a caller can see and fix
         self.assert_blocks("spawn", payload, "FOREGROUND",
                            env={"QWEN_CODE": "true"})
+        # QWEN_CODE_CLI is the spelling Qwen Code actually puts in HOOK
+        # subprocess envs (measured live on 0.22.2: QWEN_CODE reaches only
+        # shell-tool children, so the old check silently vanished in every
+        # real hook run — the exact wrong-way failure this test pins). The
+        # path value's presence is what carries the signal, never its value.
+        self.assert_blocks("spawn", payload, "FOREGROUND",
+                           env={"QWEN_CODE_CLI":
+                                "C:\\qwen-code\\cli-entry.js"})
+        # and both spellings together, the real shell-tool environment shape
+        self.assert_blocks("spawn", payload, "FOREGROUND",
+                           env={"QWEN_CODE": "1",
+                                "QWEN_CODE_CLI": "C:\\qwen-code\\cli-entry.js"})
 
     def test_harness_spawn_explicit_false_allowed(self):
         # regression: explicit false must still pass (repo-map is always-legal)

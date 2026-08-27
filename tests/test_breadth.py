@@ -132,10 +132,12 @@ class BreadthHarness(unittest.TestCase):
         CLAUDE_PROJECT_DIR and QWEN_CODE are stripped for the same reason
         tests/test_guards.py strips them — the suite may itself be running
         inside one of those sessions, and both change which branch the hook
-        takes."""
+        takes. QWEN_CODE_CLI joins them: it is the spelling Qwen puts in
+        HOOK subprocess envs (measured 0.22.2), so the guard keys on it."""
         payload.setdefault("cwd", str(self.workspace))
         env = {k: v for k, v in os.environ.items()
-               if k not in ("CLAUDE_PROJECT_DIR", "QWEN_CODE")}
+               if k not in ("CLAUDE_PROJECT_DIR", "QWEN_CODE",
+                            "QWEN_CODE_CLI")}
         proc = subprocess.run(
             [sys.executable, str(ROOT / "hooks" / "guards.py"), name],
             input=json.dumps(payload), capture_output=True, text=True,
