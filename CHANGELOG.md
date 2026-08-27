@@ -6,6 +6,7 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
+## [3.9.0] — 2026-08-27
 > **Background subagents are now first-class on Qwen Code too — and the
 > platform-keyed guard that turned out to have been silently dead is gone
 > for good rather than repaired.** Qwen Code's launch stub was the last
@@ -35,6 +36,12 @@ All notable changes to `ai-sdlc-harness` are documented here.
 - Background Qwen spawns cost nothing on the token ledger until their
   stop event lands; a spawn that dies without stopping surfaces as a
   flagged pending, as on Claude Code.
+
+### Verification on tag tip
+
+- `python -m harness.schema` — declared data valid
+- `python tools/budget_check.py` — line budget green (0 errors, 10 pre-existing warnings)
+- `python -m unittest discover -s tests` — 1354 tests green
 
 ## [3.8.3] — 2026-08-27
 
