@@ -4537,6 +4537,86 @@ class CaptureHooks(GuardHarness):
                             "agent_transcript_path": str(transcript)})
         self.assertEqual(ndjson.read_records(run / "tokens.ndjson"), [])
 
+    def test_qwen_background_stop_writes_token_row_from_usage_metadata(self):
+        """A background Qwen spawn has NO executionSummary (its PostToolUse
+        was a launch stub), so the agent's own transcript — whose top-level
+        usageMetadata IS the spawn's cost — is the only token source, and
+        the stop that completes the pending is the only event that can write
+        it. The row carries the summed Gemini counts in the ledger's schema,
+        and the run's driver is stamped qwen-code there (no executionSummary
+        sibling will)."""
+        run = self.make_run()
+        self.assert_allows("post-spawn", self._post_spawn(run, "reviewer", response={
+            "llmContent": "Background agent launched successfully.\n"
+                          "task_id: gp-call_bg11\noutput_file: C:\\s\\a.jsonl",
+            "returnDisplay": {"type": "task_execution",
+                              "subagentName": "general-purpose",
+                              "status": "background"}}))
+        transcript = self.workspace / "bg_um.jsonl"
+        prompt = (f"harness-mode: review\nharness-task: T1\n"
+                  f"harness-run: {run}\ngo")
+        transcript.write_text("\n".join(json.dumps(l) for l in [
+            {"type": "user", "message": {"role": "user", "parts": [
+                {"text": prompt}]}},
+            {"type": "assistant", "usageMetadata": {
+                "promptTokenCount": 100, "candidatesTokenCount": 20,
+                "thoughtsTokenCount": 5, "cachedContentTokenCount": 80,
+                "totalTokenCount": 125},
+             "message": {"role": "model", "parts": [
+                 {"text": "harness-status: SUCCESS\nharness-task: T1\n"
+                          "verdict: APPROVED"}]}}]))
+        self.assert_allows("subagent-stop",
+                           {"agent_type": "x:reviewer",
+                            "agent_id": "gp-call_bg11",
+                            "agent_transcript_path": str(transcript)})
+        rec = ndjson.read_records(run / "tokens.ndjson")[-1]
+        self.assertEqual(
+            (rec["task"], rec["mode"], rec["role"], rec["model"],
+             rec["input"], rec["output"], rec["cache_read"],
+             rec["cache_write"]),
+            ("T1", "review", "reviewer", None, 100, 20, 80, 0))
+        identities = [e for e in ndjson.read_records(run / "events.ndjson")
+                      if e.get("kind") == "agent-identity"]
+        self.assertIn("qwen-code", [i.get("cli") for i in identities])
+        self.assertNotIn("claude-code", [i.get("cli") for i in identities])
+
+    def test_qwen_foreground_parent_transcript_with_counts_still_skipped(self):
+        """The regression the family flag exists for: a FOREGROUND Qwen
+        stop's transcript is the PARENT session's chat file, which ALSO
+        carries top-level usageMetadata — the parent's counts, not the
+        spawn's. post-spawn already wrote the spawn's executionSummary row;
+        the old zero-signature skip would have missed this transcript (real
+        counts, no model) and double-written it — AND stamped the run
+        claude-code. Family flag + no pending → skipped, one row, qwen-code
+        identity only."""
+        run = self.make_run()
+        self.assert_allows("post-spawn", self._post_spawn(run, "developer", response={
+            "llmContent": [{"text": "harness-status: SUCCESS"}],
+            "returnDisplay": {"status": "completed",
+                              "executionSummary": {
+                                  "inputTokens": 1200, "outputTokens": 300,
+                                  "cachedTokens": 800, "totalTokens": 2300}}}))
+        parent_chat = self.workspace / "parent_chat.jsonl"
+        parent_chat.write_text("\n".join(json.dumps(l) for l in [
+            {"type": "user", "message": {"role": "user", "parts": [
+                {"text": "orchestrator turn"}]}},
+            {"type": "assistant", "usageMetadata": {
+                "promptTokenCount": 50000, "candidatesTokenCount": 900,
+                "cachedContentTokenCount": 40000, "totalTokenCount": 50900},
+             "message": {"role": "model", "parts": [
+                 {"text": "parent session reply"}]}},
+        ]))
+        self.assert_allows("subagent-stop",
+                           {"agent_type": "x:developer",
+                            "agent_transcript_path": str(parent_chat)})
+        recs = ndjson.read_records(run / "tokens.ndjson")
+        self.assertEqual(len(recs), 1)
+        self.assertEqual((recs[0]["input"], recs[0]["output"]),
+                         (1200, 300))
+        identities = [e for e in ndjson.read_records(run / "events.ndjson")
+                      if e.get("kind") == "agent-identity"]
+        self.assertEqual([i.get("cli") for i in identities], ["qwen-code"])
+
 
 def _yamlless_python() -> str | None:
     """An interpreter WITHOUT PyYAML (e.g. macOS system python3) — the exact
@@ -4752,6 +4832,60 @@ class QwenPayloadShapes(unittest.TestCase):
         # Gemini records carry no usage/model
         self.assertEqual(data["usage"], {})
         self.assertIsNone(data["model"])
+
+    def test_parse_transcript_sums_gemini_usage_metadata(self):
+        """The agent's OWN Qwen transcript carries its per-round cost
+        TOP-LEVEL (`usageMetadata`, Gemini key names) — measured live on
+        0.22.2. The parse translates to the Claude key names consumers
+        read, sums across EVERY assistant record, leaves thoughtTokens out,
+        and flags the family so the double-write guard discriminates on it
+        instead of the now-dead all-zero-counts signature."""
+        t = self.tmp / "gemini_um.jsonl"
+        lines = [
+            {"type": "user", "message": {"role": "user", "parts": [
+                {"text": "harness-mode: review\nharness-task: T1\ngo"}]}},
+            {"type": "assistant", "usageMetadata": {
+                "promptTokenCount": 100, "candidatesTokenCount": 20,
+                "thoughtsTokenCount": 5, "cachedContentTokenCount": 80,
+                "totalTokenCount": 125},
+             "message": {"role": "model", "parts": [{"text": "checking"}]}},
+            {"type": "assistant", "usageMetadata": {
+                "promptTokenCount": 60, "candidatesTokenCount": 10,
+                "thoughtsTokenCount": 3, "cachedContentTokenCount": 40,
+                "totalTokenCount": 70},
+             "message": {"role": "model", "parts": [
+                 {"text": "harness-status: SUCCESS\nverdict: APPROVED"}]}},
+        ]
+        t.write_text("\n".join(json.dumps(l) for l in lines))
+        data = self.guards._parse_transcript(t)
+        # summed across BOTH assistant records, translated to Claude keys,
+        # thoughtsTokenCount (5+3) folded into NEITHER input nor output
+        self.assertEqual(data["usage"], {
+            "input_tokens": 160, "output_tokens": 30,
+            "cache_read_input_tokens": 120})
+        self.assertIsNone(data["model"])
+        self.assertEqual(data["usage_source"], "gemini")
+
+    def test_parse_transcript_family_flag_only_on_usage_metadata(self):
+        # no usageMetadata anywhere → no family flag: a usage-less Gemini
+        # transcript (failed spawn, pre-summary) and a Claude transcript
+        # both read usage_source None, and the double-write guard falls to
+        # the zero-signature / write paths exactly as before this change
+        gemini = self.tmp / "gemini_plain.jsonl"
+        gemini.write_text(json.dumps(
+            {"type": "assistant", "message": {"role": "model", "parts": [
+                {"text": "harness-status: SUCCESS"}]}}))
+        self.assertIsNone(self.guards._parse_transcript(gemini)["usage_source"])
+        claude = self.tmp / "claude.jsonl"
+        claude.write_text(json.dumps(
+            {"type": "assistant", "message": {
+                "model": "claude-opus-4-8",
+                "usage": {"input_tokens": 10, "output_tokens": 4},
+                "content": [{"type": "text",
+                             "text": "harness-status: SUCCESS"}]}}))
+        d = self.guards._parse_transcript(claude)
+        self.assertIsNone(d["usage_source"])
+        self.assertEqual(d["usage"], {"input_tokens": 10, "output_tokens": 4})
 
     def test_claude_shapes_parse_byte_identically(self):
         # the Qwen additions must not perturb Claude parsing — guards the
