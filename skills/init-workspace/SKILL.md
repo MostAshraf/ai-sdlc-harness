@@ -24,6 +24,17 @@ persist), so the probe **prints** the resolved path for you to substitute
 textually. If the var is already set (Claude Code, converted install),
 the probe passes it through unchanged:
 
+**Folder-trust caveat (Qwen Code):** project-level `.qwen/settings.json`
+is only LOADED when the workspace folder is trusted — Qwen's
+trusted-folders feature is OFF by default, and an untrusted workspace
+silently ignores that file (measured on 0.22.2): the `CLAUDE_PLUGIN_ROOT`
+env export and the permission-allowlist mirror don't apply, so
+subagents hit permission prompts the allowlist was meant to pre-clear.
+The pipeline itself is unaffected (its hooks ship with the extension,
+which no trust gate covers). Remedy: trust the folder (Qwen's
+`/permissions` → Trust this folder) and restart the session, or export
+`CLAUDE_PLUGIN_ROOT` in the shell that launches Qwen.
+
 ```
 # Resolve the plugin root and print it (native Qwen first-run fallback)
 R="${CLAUDE_PLUGIN_ROOT:-}"

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from harness import chain, gates, initws, ndjson, state as state_mod, transitions
 from harness.cli import load_declared
@@ -1928,13 +1929,14 @@ class SpawnGuard(GuardHarness):
                 p["tool_input"]["run_in_background"] = bg
             self.assert_allows("spawn", p)
 
-    def test_background_harness_spawn_still_blocked_under_qwen_code(self):
-        # …and NOT lifted where the stub shape is unmeasured: an
-        # unrecognised Qwen stub reaching verdict capture fabricates a
-        # stalled-agent event for a live agent — the bug round 1 killed on
-        # Claude. Explicit false remains the one legal form there.
+    def test_background_harness_spawn_allowed_under_qwen_code(self):
+        # WI-3 fully rescoped: with both stub shapes measured and capture
+        # handling both ends (pending at PostToolUse, reply at
+        # SubagentStop), there is no platform-keyed run_in_background rule
+        # left — explicit true and the omission-that-defaults-to-background
+        # both pass under a Qwen env, exactly as they do on Claude Code.
         run = self.make_run(to_step="develop")
-        qwen = {"QWEN_CODE": "1"}
+        qwen = {"QWEN_CODE": "1", "QWEN_CODE_CLI": "C:\\qwen\\cli-entry.js"}
         for bg in (True, "__absent__"):
             p = spawn("reviewer",
                       f"harness-mode: review\nharness-run: {run}\ngo")
@@ -1942,7 +1944,7 @@ class SpawnGuard(GuardHarness):
                 del p["tool_input"]["run_in_background"]
             else:
                 p["tool_input"]["run_in_background"] = bg
-            self.assert_blocks("spawn", p, "FOREGROUND", env=qwen)
+            self.assert_allows("spawn", p, env=qwen)
         p2 = spawn("developer", f"harness-mode: develop\nharness-run: {run}\ngo")
         p2["tool_input"]["run_in_background"] = False
         self.assert_allows("spawn", p2, env=qwen)
@@ -2448,51 +2450,61 @@ class SpawnIdentityNearMiss(GuardHarness):
         self.assertIn("ai-sdlc-reviewer", err)
         self.assertIn("no verdict capture", err)
 
-    def test_harness_spawn_absent_run_in_background_blocked_under_qwen(self):
-        # WI-3, now Qwen-only: under Qwen Code, omitting run_in_background
-        # DEFAULTS to background for top-level spawns — so the guard must
-        # require explicit false there, not just forbid explicit true.
+    def test_harness_spawn_absent_run_in_background_allowed_under_qwen(self):
+        # WI-3 fully rescoped: omitting run_in_background DEFAULTS to
+        # background for Qwen top-level spawns — legal now, because the
+        # stub's returnDisplay shape (not the param) decides capture, and
+        # the completion half is measured (SubagentStop agent_id == the
+        # stub's printed task_id).
         payload = spawn("planner", "harness-mode: repo-map\ngo")
         del payload["tool_input"]["run_in_background"]
-        self.assert_blocks("spawn", payload, "run_in_background: false",
+        self.assert_allows("spawn", payload,
                            env={"QWEN_CODE": "1"})
 
-    def test_harness_spawn_explicit_true_still_blocked_under_qwen(self):
-        # regression: explicit true was already blocked; WI-3 keeps it where
-        # the stub shape is unmeasured
+    def test_harness_spawn_explicit_true_allowed_under_qwen(self):
+        # regression, inverted by the rescope: explicit true was the last
+        # blocked spelling under the old Qwen-only rule; capture now owns
+        # both ends on both platforms
         payload = spawn("planner", "harness-mode: repo-map\ngo")
         payload["tool_input"]["run_in_background"] = True
-        self.assert_blocks("spawn", payload, "FOREGROUND",
+        self.assert_allows("spawn", payload,
                            env={"QWEN_CODE": "1"})
 
-    def test_the_qwen_block_is_keyed_on_the_env_var_alone(self):
-        """The reversal's stated risk, pinned both ways: the SAME payload
-        that Qwen refuses is allowed on Claude Code. The block lives or dies
-        by Qwen detection reaching the hook subprocess — if it ever stopped
-        propagating, this is the assertion that would flip, and the failure
-        direction (silent permit) is why it is documented in guards.py rather
-        than merely relied upon."""
+    def test_the_rescope_is_platform_blind(self):
+        """The old block lived or died by Qwen detection reaching the hook
+        subprocess — and on Qwen 0.22.2 it died silently (hooks carry
+        QWEN_CODE_CLI, not QWEN_CODE; the measurement that motivated the
+        detection helper). The rescope removes the rule entirely, so the
+        SAME payload passes under every Qwen spelling and under neither —
+        detection can no longer change a spawn's legality. The helper
+        itself stays load-bearing for initws/cli (settings mirroring,
+        notices) and its spelling contract is pinned in
+        QwenCompatibility / a dedicated unit test."""
         payload = spawn("planner", "harness-mode: repo-map\ngo")
         del payload["tool_input"]["run_in_background"]
-        self.assert_blocks("spawn", payload, "FOREGROUND",
-                           env={"QWEN_CODE": "1"})
-        self.assert_allows("spawn", payload)                     # no env
-        # any truthy spelling keeps the protective block on — over-refusing
-        # is the direction a caller can see and fix
-        self.assert_blocks("spawn", payload, "FOREGROUND",
-                           env={"QWEN_CODE": "true"})
-        # QWEN_CODE_CLI is the spelling Qwen Code actually puts in HOOK
-        # subprocess envs (measured live on 0.22.2: QWEN_CODE reaches only
-        # shell-tool children, so the old check silently vanished in every
-        # real hook run — the exact wrong-way failure this test pins). The
-        # path value's presence is what carries the signal, never its value.
-        self.assert_blocks("spawn", payload, "FOREGROUND",
-                           env={"QWEN_CODE_CLI":
-                                "C:\\qwen-code\\cli-entry.js"})
-        # and both spellings together, the real shell-tool environment shape
-        self.assert_blocks("spawn", payload, "FOREGROUND",
-                           env={"QWEN_CODE": "1",
-                                "QWEN_CODE_CLI": "C:\\qwen-code\\cli-entry.js"})
+        for env in ({"QWEN_CODE": "1"},
+                    {"QWEN_CODE": "true"},
+                    {"QWEN_CODE_CLI": "C:\\qwen-code\\cli-entry.js"},
+                    {"QWEN_CODE": "1",
+                     "QWEN_CODE_CLI": "C:\\qwen-code\\cli-entry.js"},
+                    None):
+            self.assert_allows("spawn", payload, env=env)
+
+    def test_qwen_cli_detected_spelling_contract(self):
+        """The helper the guard no longer uses but initws/cli still do:
+        truthy-presence on EITHER spelling — QWEN_CODE reaches shell-tool
+        children, QWEN_CODE_CLI is the one hook subprocesses get (measured
+        0.22.2) — and neither means Claude Code / a plain terminal."""
+        from harness import qwen_cli_detected
+        with mock.patch.dict(os.environ, {"QWEN_CODE": "1"}, clear=False):
+            self.assertTrue(qwen_cli_detected())
+        with mock.patch.dict(os.environ,
+                             {"QWEN_CODE_CLI": "C:\\qwen\\cli-entry.js"}):
+            self.assertTrue(qwen_cli_detected())
+        stripped = {k: v for k, v in os.environ.items()
+                    if k not in ("QWEN_CODE", "QWEN_CODE_CLI")}
+        with mock.patch.dict(os.environ, stripped, clear=True):
+            self.assertFalse(qwen_cli_detected())
 
     def test_harness_spawn_explicit_false_allowed(self):
         # regression: explicit false must still pass (repo-map is always-legal)
@@ -3662,7 +3674,9 @@ class CaptureHooks(GuardHarness):
         self.assertEqual(events[-1]["kind"], "background-spawn-uncaptured")
         self.assertEqual((events[-1]["task"], events[-1]["actor"]),
                          ("T1", "reviewer"))
-        self.assertIn("agentId", events[-1]["reason"])
+        # platform-neutral wording: the unpairable id is Claude's agentId
+        # or Qwen's task_id, so the reason names the property, not one key
+        self.assertIn("pairable id", events[-1]["reason"])
         # truthiness, not `is True`: the identity check missed isAsync: 1
         # (and every other truthy spelling a schema revision might use) and
         # fell through to the same fabrication

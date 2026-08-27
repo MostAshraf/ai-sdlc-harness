@@ -85,15 +85,18 @@ successful sibling of abort — the final step's file says exactly when).
    which case omit the `model` param entirely so the subagent runs on the
    session model. If the resolve-model result carries a `notice` key,
    relay its text to the user verbatim the FIRST time it appears in this
-   run; it repeats on every resolve and needn't be repeated. **Foreground
-   where the tool supports it:** pass `run_in_background: false` — under Qwen
-   Code that is REQUIRED (the guard blocks an absent or true value; its
-   background format is unmeasured). Where the Agent tool has no such
-   parameter, the spawn returns a launch STUB and the agent runs in the
-   background: that is expected and captured — WAIT for its completion
-   notification, do not proceed on the stub, and do not `stall` (`show`'s
-   `outstanding_spawns` names every spawn still in flight — the Stalls
-   triage below starts there, not at the events tail). Read the verdict from
+   run; it repeats on every resolve and needn't be repeated. **Background
+   or foreground — both are captured:** where the Agent tool has the
+   `run_in_background` parameter, pass `true` for lanes you can let fly
+   (DAG-parallel develop lanes, slow reviews) or `false` when you need the
+   reply inline; where the tool defaults top-level spawns to background or
+   has no such parameter, the spawn returns a launch STUB and the agent
+   runs in the background — both stub shapes are MEASURED on both
+   platforms, capture records a pending at spawn and completes it when the
+   agent's stop event carries its reply. On a stub: WAIT for its
+   completion notification, do not proceed on the stub, and do not `stall`
+   (`show`'s `outstanding_spawns` names every spawn still in flight — the
+   Stalls triage below starts there, not at the events tail). Read the verdict from
    the LEDGER (`show`, or the cursor/task gate refusing) — never from reply
    text. One live spawn per (task, mode): the guard refuses a second while
    the first is unreported; different tasks and modes stay parallel, panel

@@ -63,7 +63,7 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 # qualifies outright — hashlib + re, no I/O, no env — and is imported for
 # `session_digest` alone, so the capture hook and the CLI that writes the
 # stamp cannot drift into two different hashes of the same session id.
-from harness import chain, gates, ndjson, qwen_cli_detected, transitions  # noqa: E402
+from harness import chain, gates, ndjson, transitions  # noqa: E402
 
 
 class YamlMissing(Exception):
@@ -1762,67 +1762,30 @@ def guard_spawn(p: dict) -> None:
                 f"skills/dev-workflow/shared/spawn-identity.md.",
                 cwd, p)
         return  # genuinely unrelated agent — none of our business
-    # WI-3, RESCOPED TO QWEN CODE. The rule's original premise is dead and
-    # says so here rather than quietly: "require explicit false — a uniform
-    # rule that needs no platform detection and is identical on both
-    # platforms". It was uniform because the two platforms failed the same
-    # way. They no longer do. On Claude Code the async stub shape is
-    # MEASURED (2.1.232: {isAsync, status: async_launched, agentId, …}),
-    # capture_post_spawn recognises it, and capture_subagent_stop completes
-    # it — a background reply is captured end to end, so the rule now
-    # forbids the platform's own default for no benefit and, on the newer
-    # Agent schema that dropped the parameter entirely, blocks EVERY
-    # harness spawn (the whole pipeline) over a param the caller cannot
-    # pass. Under Qwen Code the same stub is UNMEASURED: an unrecognised
-    # stub falls to _capture_reply, whose necessarily-absent status block
-    # fabricates a missing-status-block stall for a live agent — the exact
-    # bug round 1 killed on Claude — so there the rule stays verbatim.
+    # WI-3, FULLY RESCOPED (2026-08-27): there is no longer ANY
+    # platform-keyed run_in_background rule here. The original premise —
+    # "an unrecognised stub reaching verdict capture fabricates a
+    # missing-status-block stall for a live agent" — died by measurement,
+    # not by policy: both platforms' launch-stub shapes are now MEASURED
+    # and recognised in capture_post_spawn (Claude 2.1.232's
+    # {isAsync, status: async_launched, agentId}; Qwen 0.22.2's
+    # returnDisplay.status "background" with its printed task_id), which
+    # records the spawn-pending and defers to SubagentStop — and the Qwen
+    # completion half is measured too (agent_id == the stub's task_id, the
+    # agent's own transcript carrying usageMetadata for token attribution).
+    # So a background reply is captured end to end on BOTH platforms, and
+    # forbidding the platform's own default bought nothing — worse, on a
+    # CLI whose Agent schema drops the parameter entirely it would block
+    # the whole pipeline over a param the caller cannot pass.
     #
-    # STATED RISK, rewritten by measurement: this used to trust `QWEN_CODE`
-    # alone to reach hook subprocesses, and on Qwen Code 0.22.2 it does not
-    # — hooks receive `QWEN_CODE_CLI` (the cli-entry.js path) while
-    # `QWEN_CODE` reaches only shell-tool children — so the block below
-    # silently vanished in every real hook run, the exact wrong-way failure
-    # (silent permit) the original comment here feared. Detection is now
-    # `harness.qwen_cli_detected()`, truthy-presence on EITHER spelling:
-    # any value a CLI revision ships keeps the protective block on, and a
-    # stray value can only ever over-refuse, which the caller can see and
-    # fix. Residual risk, accepted: if a future Qwen drops BOTH spellings
-    # from hook environments, the block vanishes again — undetectable from
-    # inside the hook, so the measurement note in this repo (project
-    # memory, 2026-08-27) is the standing reference for re-checking.
-    #
-    # The OTHER side of that trade, equally accepted: because Qwen keeps the
-    # rule verbatim, Qwen inherits the failure the rescope removed from
-    # Claude Code — if Qwen ever adopts the newer Agent schema that drops
-    # `run_in_background` entirely, every harness spawn there hard-fails on a
-    # parameter the caller cannot pass, i.e. the whole pipeline blocks with
-    # no in-band workaround. Held anyway until Qwen's launch-stub shape is
-    # MEASURED: a fabricated stalled-agent event for a live agent (the
-    # unmeasured-stub failure) corrupts the evidence ledger and races a
-    # re-spawn against the original, where this one refuses loudly and
-    # visibly. (The stub HAS since been measured — 2026-08-27, live probes
-    # on 0.22.2 — and capture_post_spawn now recognises the shape
-    # (`returnDisplay.status == "background"`) and records the
-    # spawn-pending keyed by the stub's printed task_id, which that
-    # agent's SubagentStop carries back as `agent_id`; measured end to
-    # end. The rescope of THIS block is the remaining step, deliberately
-    # sequenced last so it flips together with the Qwen transcript token
-    # attribution and the docs — one atomic enable, never a half-shipped
-    # one.)
-    if qwen_cli_detected():
-        bg = tool_input.get("run_in_background")
-        if bg not in (False, "false", "False"):
-            block(f"harness-shape spawns ('{shape}') must run in the "
-                  "FOREGROUND under Qwen Code — pass run_in_background: "
-                  "false explicitly (omitting it DEFAULTS to background for "
-                  "top-level spawns). Background capture exists, but it is "
-                  "built on Claude Code's MEASURED launch-stub shape; Qwen's "
-                  "is unmeasured, and an unrecognised stub reaching verdict "
-                  "capture fabricates a stalled-agent event for an agent "
-                  "that is still running. For parallelism, batch multiple "
-                  "foreground spawns in ONE message — they run concurrently "
-                  "and each reply is captured.", cwd, p)
+    # Residual risk, stated honestly: an UNRECOGNISED stub schema (a future
+    # CLI revision) with run_in_background OMITTED would fall through to
+    # _capture_reply and fabricate a stall — capture_post_spawn's
+    # response-conditioned fallback catches the explicit-param spelling of
+    # that, and the recognised-shape tests pin the measured schemas. That
+    # is the same residual Claude Code has carried since its own rescope,
+    # and the symmetry is the point: one rule, evidence-keyed (the
+    # RESPONSE shape), identical everywhere.
     prompt = tool_input.get("prompt") or ""
     m = MODE_HEADER_RE.search(prompt)
     if not m:
@@ -3238,12 +3201,12 @@ def capture_post_spawn(p: dict) -> None:
             "kind": "background-spawn-uncaptured", "task": task,
             "actor": shape, "mode": mode,
             "reason": "harness-shape spawn launched in the BACKGROUND and "
-                      "its launch stub carried NO agentId — unpairable: "
+                      "its launch stub carried NO pairable id — unpairable: "
                       "nothing can match this spawn's SubagentStop, so its "
                       "verdict/status can never be captured. Re-spawn FRESH "
-                      "(under Qwen Code, in the FOREGROUND — "
-                      "run_in_background: false); batch multiple spawns in "
-                      "one message for parallelism"})
+                      "(with run_in_background: false if you need the reply "
+                      "inline); for parallelism, batch multiple spawns in "
+                      "one message"})
         return
     text = _response_text(tool_response)
     if (tool_input.get("run_in_background") in (True, "true", "True")
@@ -3251,21 +3214,20 @@ def capture_post_spawn(p: dict) -> None:
             and extract_verdict(text) is None):
         # The parameter-keyed fallback for a background launch whose
         # response shape this build does not recognise at all (a future or
-        # older CLI whose stub carries neither `isAsync` nor
-        # `status: async_launched`): the subagent's real reply may never
-        # reach any hook payload, so capture can't be promised here (an
-        # APPROVED verdict would be lost, and the stub's missing status
+        # older CLI whose stub matches NEITHER measured schema — neither
+        # Claude's {isAsync, async_launched} nor Qwen's
+        # returnDisplay.status "background"): the subagent's real reply may
+        # never reach any hook payload, so capture can't be promised here
+        # (an APPROVED verdict would be lost, and the stub's missing status
         # block FABRICATED a stall event whose reinvoke then raced the
-        # still-live background original). guard_spawn blocks explicit-param
-        # backgrounds under Qwen Code, whose stub is the unmeasured one this
-        # branch is really about; on Claude Code the shape gate above
-        # recognises the stub and this is belt-and-braces for an unknown
-        # schema — either way, record what actually happened instead of fake
-        # stall evidence.
+        # still-live background original). With WI-3 fully rescoped and
+        # both shapes measured, this branch is belt-and-braces for an
+        # UNKNOWN schema revision — record what actually happened instead
+        # of fake stall evidence.
         #
-        # RESPONSE-CONDITIONED, not param-conditioned. When WI-3 was
-        # rescoped to Qwen, `run_in_background: true` became LEGAL on Claude
-        # Code — and this branch, keyed on the param alone, then fired over
+        # RESPONSE-CONDITIONED, not param-conditioned. When WI-3 was first
+        # rescoped (Claude Code), `run_in_background: true` became LEGAL —
+        # and this branch, keyed on the param alone, then fired over
         # responses that carried the agent's whole reply: adversarial review
         # executed it and watched a captured `verdict: APPROVED` be thrown
         # away and the run marked DEGRADED for an uncapturable spawn that
@@ -3282,10 +3244,10 @@ def capture_post_spawn(p: dict) -> None:
             "reason": "harness-shape spawn ran in the background and its "
                       "launch response was not a recognised stub — only that "
                       "response reaches PostToolUse, so verdict/status "
-                      "capture is impossible; re-spawn FRESH (under Qwen "
-                      "Code, in the FOREGROUND — run_in_background: false), "
-                      "batching multiple spawns in one message for "
-                      "parallelism"})
+                      "capture is impossible; re-spawn FRESH (with "
+                      "run_in_background: false if you need the reply "
+                      "inline), batching multiple spawns in one message "
+                      "for parallelism"})
         return
     # Qwen Code, FOREGROUND: a spawn's token counts live in the PostToolUse
     # payload — tool_response.returnDisplay.executionSummary =
