@@ -96,7 +96,7 @@ This repo carries a `qwen-extension.json` at root, making it a **native Qwen Cod
 
 ### What happens under Qwen Code
 
-When `/init-workspace` runs under Qwen Code (`QWEN_CODE=1` is set in that session):
+When `/init-workspace` runs under Qwen Code (detected when either `QWEN_CODE`, which Qwen sets for shell-tool children, or `QWEN_CODE_CLI`, which it sets for hook subprocesses, is present — measured on 0.22.2):
 
 - **Permissions are mirrored to `.qwen/settings.json`.** Qwen Code reads its allowlist from `.qwen/settings.json` rather than `.claude/settings.json`; the init step writes both so background agents run unprompted under either CLI. A workspace bootstrapped under Claude Code and later opened under Qwen Code has no `.qwen/settings.json` yet — re-run `/workspace-config` (or the permission-write step) once under Qwen Code to create it.
 - **`CLAUDE_PLUGIN_ROOT` is exported via the `.qwen/settings.json` `env` block** (self-healing on reinstall). Native Qwen does not export this variable or substitute it in markdown, so the init step's bootstrap probe resolves the plugin root on first run and prints it for the model to substitute textually in subsequent commands (each Bash call is a fresh subprocess, so a shell export doesn't persist). The env export written at step 6 takes over from the **next session**. A stale value from a prior install self-heals when the stored path no longer exists on disk; a deliberate user pin pointing at a real directory is preserved.
@@ -352,7 +352,7 @@ One Python entry point ([hooks/guards.py](hooks/guards.py)) handles every event,
 |---|---|---|
 | bash | PreToolUse · Bash | Blocks raw history-mutating git inside any workspace that has completed `/init-workspace` and points to the owned verbs. Role-aware shell-write analysis (quote-masked shape matching on redirects, `tee`, `cp`/`mv`, in-place editors): reviewer writes only to literal `/tmp` paths; developer confined to its worktree; secret/evidence files unreadable. |
 | write | PreToolUse · Write/Edit/MultiEdit/NotebookEdit | Path confinement per shape (planner → `ai/<run>/` + `.claude/context/`; developer → its worktree with the pre-red test-first lock; reviewer → nothing) plus sensitive-file patterns. |
-| spawn | PreToolUse · Agent/Task | Only the spawn-set the manifest declares for the current cursor is legal — shape *and* `harness-mode:` header both checked; out-of-run spawns (e.g. repo-map generation) must be declared in [pipeline/surfaces.yaml](pipeline/surfaces.yaml). Fail-closed. Also **one live spawn per (task, mode)**: a second agent cannot be launched to answer a question an unreported one is still answering (two verdicts for one round, and latest-wins picks the stale one) — different tasks and modes stay parallel. It is a CROSS-MESSAGE rule only: spawns batched into one message all clear the guard before any of them reports back, which is what keeps a batched review panel legal; adversarial-panel lenses (`plan-attack`) are exempt outright, since no engine-read verdict rides on a lens. Background spawns are allowed under Claude Code, where the launch-stub shape is measured and capture handles both ends; under Qwen Code, whose format is unmeasured, `run_in_background: false` is still mandatory. |
+| spawn | PreToolUse · Agent/Task | Only the spawn-set the manifest declares for the current cursor is legal — shape *and* `harness-mode:` header both checked; out-of-run spawns (e.g. repo-map generation) must be declared in [pipeline/surfaces.yaml](pipeline/surfaces.yaml). Fail-closed. Also **one live spawn per (task, mode)**: a second agent cannot be launched to answer a question an unreported one is still answering (two verdicts for one round, and latest-wins picks the stale one) — different tasks and modes stay parallel. It is a CROSS-MESSAGE rule only: spawns batched into one message all clear the guard before any of them reports back, which is what keeps a batched review panel legal; adversarial-panel lenses (`plan-attack`) are exempt outright, since no engine-read verdict rides on a lens. Background spawns are allowed on both platforms — each CLI's launch-stub shape is measured (Claude Code `{isAsync, async_launched, agentId}`; Qwen Code `returnDisplay.status: "background"` with its printed `task_id`), and capture handles both ends: the stub records a `spawn-pending`, the agent's stop event completes it. |
 | skill | PreToolUse · Skill | USER-ENTRY skills (`/dev-workflow`, `/init-workspace`, …) refuse invocation from subagents or autonomous triggering — they run only when you ran them. |
 | read | PreToolUse · Read/Grep | Red-proofs are readable by harness shapes only via `harness show-redproof` (chain-verified) — a raw `.redproof/` read skips integrity verification and is blocked. |
 | prompt capture | UserPromptSubmit | Verbatim capture of your replies into `human-input.ndjson` — the only evidence `gate --decide` accepts. |
@@ -434,7 +434,7 @@ ai-sdlc-harness/
 │   └── init-workspace/ · add-repo/ · migrate-workspace/ · workspace-config/ · workflow-status/ · repo-map-refresh/
 ├── bin/harness                  # wrapper script resolving the plugin venv (+ harness.cmd for Windows)
 ├── tools/                       # meta-tooling: line-budget checker, sandbox workspace generators
-└── tests/                       # 1331 stdlib-unittest tests
+└── tests/                       # 1354 stdlib-unittest tests
 ```
 
 Workspace artifacts — `ai/<date>-<id>/` and `.claude/context/` — are generated inside *your* working directory by `/init-workspace` and the pipeline. They never live inside this plugin repo.
@@ -464,7 +464,7 @@ python -m venv .venv; .venv\Scripts\pip install pyyaml
 .venv\Scripts\python tools\fasttest.py
 ```
 
-The test suite (1331 tests; ~13 min serial, ~3 min sharded) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
+The test suite (1354 tests; ~13 min serial, ~3 min sharded) covers the state engine, gate grammar, guard behavior (via subprocess against real payloads), provider contracts, git machinery against real temp repos, breadth walks of the pipeline modes, composability probes (a scratch mode and scratch step must validate and walk with zero Python changes), Windows-only guard path shapes, and meta-checks (invocation consistency, declared-data schema, line budgets). See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 

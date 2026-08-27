@@ -15,7 +15,7 @@ from pathlib import Path
 
 import yaml
 
-from . import gitops, ndjson
+from . import gitops, ndjson, qwen_cli_detected
 from .schema import deep_merge
 
 # marker file -> (language, proposed test_cmd, proposed coverage_cmd or None
@@ -1149,7 +1149,7 @@ def mark_bootstrapped(workspace: Path) -> None:
     _restore_launcher_exec_bits()
     write_section(workspace, "overrides",
                   {"bootstrap_completed": ndjson.now_iso()})
-    if os.environ.get("QWEN_CODE") == "1":
+    if qwen_cli_detected():
         _link_qwen_context(workspace)
 
 
@@ -1254,7 +1254,7 @@ def write_permissions(workspace: Path, repos: dict[str, str],
     settings["permissions"]["allow"] = sorted(allow)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
-    if os.environ.get("QWEN_CODE") == "1":
+    if qwen_cli_detected():
         _write_qwen_settings(workspace, plugin_root, sorted(allow))
     return path
 
@@ -1272,10 +1272,18 @@ def _write_qwen_settings(workspace: Path, plugin_root: Path,
     the workspace settings `env` block is what makes a model-recovered
     `${CLAUDE_PLUGIN_ROOT}/bin/harness ...` block message runnable.
     `loadEnvironment` writes `env` entries into `process.env` with
-    set-if-unset semantics, so Claude Code's own value, when present,
-    wins (this dual-write only fires under `QWEN_CODE=1`, when the var is
-    guaranteed absent). Read-modify-write with set semantics, matching the
-    `.claude` path's non-destructive merge."""
+    set-if-unset semantics, so a `CLAUDE_PLUGIN_ROOT` already present in
+    the session's environment wins over the one written here. In the case
+    this export exists for — a native Qwen session, which exports no such
+    var — nothing is present to win, so the written value takes effect.
+    The dual-write fires on `qwen_cli_detected()`, i.e. EITHER spelling
+    (`QWEN_CODE` for shell-tool children, `QWEN_CODE_CLI` for hook
+    subprocesses), so a mixed environment carrying a Claude-exported root
+    alongside a Qwen spelling can leave that pre-existing value in force;
+    that is benign (a live Claude export points at a real plugin install)
+    and the file's own stored value still self-heals below. Read-modify-
+    write with set semantics, matching the `.claude` path's
+    non-destructive merge."""
     path = workspace / ".qwen" / "settings.json"
     settings = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     existing_allow = set(settings.setdefault("permissions", {}).get("allow", []))

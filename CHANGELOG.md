@@ -6,6 +6,43 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
+## [3.9.0] — 2026-08-27
+> **Background subagents are now first-class on Qwen Code too — and the
+> platform-keyed guard that turned out to have been silently dead is gone
+> for good rather than repaired.** Qwen Code's launch stub was the last
+> unmeasured piece the capture chain leaned on; it is now measured end to
+> end (live probes on 0.22.2), the capture hooks recognise both platforms'
+> stub shapes, background token costs are attributed from the agent's own
+> transcript, and the Qwen-only foreground mandate is removed. Symmetric
+> with Claude Code: one rule, evidence-keyed, identical everywhere.
+
+### Release highlights
+
+| Theme | What changed |
+|---|---|
+| **Qwen detection fixed where it was silently dead** | The spawn guard keyed its Qwen branch on `QWEN_CODE`, which never reaches hook subprocesses (hooks receive `QWEN_CODE_CLI`; measured on 0.22.2) — so the fix exposed that the guard's background block had been silently dead in every real hook run it ever saw. That is part of why the rescope below removed platform-keyed rules from the hooks rather than repairing one: hooks are now platform-blind by design, keyed on the evidence in the payload instead of on which CLI is running. The one helper accepting either spelling stays where platform actually matters — `init-workspace`'s `.qwen/settings.json` mirroring and context symlink, and the CLI's `resolve-model` notice. |
+| **Qwen's background launch stub is recognised** | A Qwen background spawn's PostToolUse carries a text stub printing `task_id:` inside a `returnDisplay.status: "background"` envelope — previously unrecognised, it fell through to verdict capture and fabricated a stall for a live agent. It now records the same `spawn-pending` Claude Code's stub does, keyed by that task_id, which the agent's stop event later carries back as `agent_id` (measured identical). An unpairable stub records the honest health-degrading event instead. |
+| **Background Qwen token costs are attributed** | A background spawn has no execution summary, so its cost lived only on its own transcript — whose Gemini-format `usageMetadata` the parser now translates and sums (thoughts excluded, same rule as the summary path). The foreground double-write guard survived the change by rekeying on a transcript-family flag: a foreground stop's transcript is the parent session's chat and is never billed to a spawn; a stop paired to a `spawn-pending` — including one already closed by abandonment, or one recorded before the upgrade — writes the agent's real row from its own transcript and stamps the run's driver `qwen-code`. |
+| **The Qwen foreground mandate is lifted** | With both stub shapes measured and capture owning both ends, the platform-keyed `run_in_background` rule is removed entirely — background (`true` or platform default) and foreground are both legal on both platforms, exactly as WI-3 already made true on Claude Code. Orchestrator docs now describe the shared contract: on a launch stub, wait for the completion notification; verdicts are read from the ledger, never reply text. |
+| **Folder-trust caveat documented** | Project-level `.qwen/settings.json` (the env export + permission mirror `init-workspace` writes) is silently ignored by an untrusted Qwen workspace — trusted-folders is off by default. The pipeline itself is unaffected (its hooks ship with the extension); `/init-workspace` now documents the remedy (trust the folder, or export `CLAUDE_PLUGIN_ROOT` at launch). |
+
+### Upgrade notes
+
+- **For any automation spawning a harness-shape agent:** `run_in_background`
+  is now legal in any spelling on both platforms; nothing that passed
+  before is refused now. A background launch records `spawn-pending` and
+  expects the agent's stop event to complete it — `harness show`'s
+  `outstanding_spawns` is the in-flight view.
+- Background Qwen spawns cost nothing on the token ledger until their
+  stop event lands; a spawn that dies without stopping surfaces as a
+  flagged pending, as on Claude Code.
+
+### Verification on tag tip
+
+- `python -m harness.schema` — declared data valid
+- `python tools/budget_check.py` — line budget green (0 errors, 10 pre-existing warnings)
+- `python -m unittest discover -s tests` — 1354 tests green
+
 ## [3.8.3] — 2026-08-27
 
 > **A gate can no longer be decided by a message from a different session.**

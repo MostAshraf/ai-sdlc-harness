@@ -21,10 +21,16 @@ fork a second copy of it elsewhere.
    header — prose that merely mentions repo-map does not satisfy it; this
    is a declared out-of-run spawn, `pipeline/surfaces.yaml`'s
    `out_of_run_spawns`, legal regardless of whether other runs exist in the
-   workspace) and the repo path. Pass `run_in_background: false` where the
-   Agent tool has that parameter (under Qwen Code the guard requires it);
-   where it does not, the spawn returns a launch stub and runs in the
-   background — wait for its completion notification before step 3. For the correct `subagent_type` and why
+   workspace) and the repo path. Prefer `run_in_background: false` where the
+   Agent tool has that parameter — the reply then flows back through
+   PostToolUse. Where the tool defaults spawns to background or has no such
+   parameter, the launch stub returns immediately and the platform's own
+   completion notification is the ONLY signal: WAIT for it before step 3.
+   Know that the harness cannot track THIS spawn in flight — capture
+   early-returns for out-of-run spawns BEFORE the stub-recognition gate, so a
+   backgrounded repo-map spawn records no `spawn-pending`, appears nowhere in
+   `show`'s `outstanding_spawns`, and an agent that dies mid-generation leaves
+   zero trace while you wait. For the correct `subagent_type` and why
    a wrong identity is now blocked, see
    `shared/spawn-identity.md` — match the frontmatter `name: ai-sdlc-planner`,
    never a generic agent. The planner can only write

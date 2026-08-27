@@ -910,11 +910,13 @@ class SubtreeRepoRegistration(M7Harness):
 class QwenCompatibility(M7Harness):
     """Qwen Code reads permissions and env from `.qwen/settings.json`
     (Claude reads `.claude/settings.json`) and its installer rewrites
-    `.claude/`→`.qwen/` in skill markdown. Under `QWEN_CODE=1`,
-    init-workspace mirrors the allowlist + exports CLAUDE_PLUGIN_ROOT into
-    `.qwen/settings.json` and symlinks `.qwen/context`→`../.claude/context`
-    so model writes through the rewritten path land in the single physical
-    tree. Claude Code sessions (no QWEN_CODE) are untouched."""
+    `.claude/`→`.qwen/` in skill markdown. Under Qwen Code — either
+    spelling, `QWEN_CODE` (shell-tool children) or `QWEN_CODE_CLI` (hook
+    subprocesses) — init-workspace mirrors the allowlist + exports
+    CLAUDE_PLUGIN_ROOT into `.qwen/settings.json` and symlinks
+    `.qwen/context`→`../.claude/context` so model writes through the
+    rewritten path land in the single physical tree. Claude Code sessions
+    (neither spelling present) are untouched."""
 
     def test_write_permissions_mirrors_to_qwen_settings_under_qwen(self):
         with mock.patch.dict(os.environ, {"QWEN_CODE": "1"}):
@@ -931,11 +933,27 @@ class QwenCompatibility(M7Harness):
         # `${CLAUDE_PLUGIN_ROOT}/...` invocations runnable under Qwen
         self.assertIn("CLAUDE_PLUGIN_ROOT", settings["env"])
 
+    def test_write_permissions_mirrors_on_hook_env_spelling(self):
+        # QWEN_CODE_CLI alone is the hook-subprocess environment shape
+        # (measured 0.22.2: QWEN_CODE reaches shell-tool children only) —
+        # detection must hold on it, not just the shell spelling. Build the
+        # env from a stripped base: the suite itself may run inside a Qwen
+        # Code session whose ambient QWEN_CODE would pass this test even if
+        # the CLI spelling were ignored outright.
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("QWEN_CODE", "QWEN_CODE_CLI")}
+        env["QWEN_CODE_CLI"] = "C:\\qwen\\cli-entry.js"
+        with mock.patch.dict(os.environ, env, clear=True):
+            initws.write_permissions(self.workspace, {"r": str(self.repo)},
+                                     {"r": {"test_cmd": TEST_CMD}})
+        self.assertTrue((self.workspace / ".qwen" / "settings.json").exists())
+
     def test_write_permissions_skips_qwen_settings_without_qwen_code(self):
         # Claude Code path is byte-identical: no .qwen/ tree written.
         # Strip QWEN_CODE from the env — the suite itself may run inside a
         # Qwen Code session that sets it in the process env.
-        env = {k: v for k, v in os.environ.items() if k != "QWEN_CODE"}
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("QWEN_CODE", "QWEN_CODE_CLI")}
         with mock.patch.dict(os.environ, env, clear=True):
             initws.write_permissions(self.workspace, {"r": str(self.repo)},
                                      {"r": {"test_cmd": TEST_CMD}})
@@ -1022,7 +1040,7 @@ class QwenCompatibility(M7Harness):
                              {"provider": {"work_item": "local-markdown",
                                            "git": "local",
                                            "stories_dir": "stories"}})
-        env = {k: v for k, v in os.environ.items() if k != "QWEN_CODE"}
+        env = {k: v for k, v in os.environ.items() if k not in ("QWEN_CODE", "QWEN_CODE_CLI")}
         with mock.patch.dict(os.environ, env, clear=True):
             initws.mark_bootstrapped(self.workspace)
         self.assertFalse((self.workspace / ".qwen" / "context").exists())
@@ -1706,7 +1724,7 @@ class SubagentModelNotice(M7Harness):
 
     def test_resolve_model_non_inherit_under_claude_passthrough(self):
         self._write_overrides({"developer": "sonnet"})
-        env = {k: v for k, v in os.environ.items() if k != "QWEN_CODE"}
+        env = {k: v for k, v in os.environ.items() if k not in ("QWEN_CODE", "QWEN_CODE_CLI")}
         with mock.patch.dict(os.environ, env, clear=True):
             out = self.cli("resolve-model", "--shape", "developer",
                            "--mode", "develop")
@@ -1757,7 +1775,7 @@ class SubagentModelNotice(M7Harness):
         self.assertNotIn("notice", out)
 
     def test_init_section_overrides_non_inherit_under_claude_no_notice(self):
-        env = {k: v for k, v in os.environ.items() if k != "QWEN_CODE"}
+        env = {k: v for k, v in os.environ.items() if k not in ("QWEN_CODE", "QWEN_CODE_CLI")}
         with mock.patch.dict(os.environ, env, clear=True):
             out = self.cli("init-section", "--section", "overrides", "--json",
                            json.dumps({"subagent_models": "sonnet"}))

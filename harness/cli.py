@@ -20,7 +20,7 @@ from pathlib import Path
 
 import yaml
 
-from . import chain, gates, gitops, mermaid, ndjson, state as state_mod, transitions, workflow
+from . import chain, gates, gitops, mermaid, ndjson, qwen_cli_detected, state as state_mod, transitions, workflow
 from .providers import ProviderError
 from .schema import load_yaml, merge_defaults, deep_merge, Issues
 
@@ -693,7 +693,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.cmd == "resolve-model":
             model = workflow.resolve_subagent_model(config, args.shape, args.mode)
-            if os.environ.get("QWEN_CODE") == "1" and model != "inherit":
+            if qwen_cli_detected() and model != "inherit":
                 _emit({"ok": True, "model": "inherit", "configured": model,
                        "notice": f"subagent_models configured '{model}' for "
                        f"{args.shape}, but Qwen Code's agent tool has no "
@@ -809,7 +809,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             path = initws.write_section(args.workspace, args.section, data)
             result = {"ok": True, "written": str(path)}
-            if (os.environ.get("QWEN_CODE") == "1"
+            if (qwen_cli_detected()
                     and args.section == "overrides"):
                 sm = data.get("subagent_models")
                 if _has_non_inherit_model(sm):
