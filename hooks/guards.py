@@ -2341,6 +2341,23 @@ def capture_user_prompt(p: dict) -> None:
             ndjson.append_record(run / "human-input.ndjson", record)
 
 
+def _block_text(block: dict) -> str:
+    """One content block's contribution to its message's reply text:
+    normally the block's `text`. A `SubagentHandback` tool_use is the one
+    exception — on Claude Code 2.1.309 a subagent ends by CALLING that
+    tool, and its final report (status block included) is the call's
+    `input.message`, not a text block (issue #33: a text-only read parses
+    the subagent's last message to "\\n" and every background verdict is
+    lost). The handback input IS that message's reply. No other tool_use
+    is read: a tool call's input is its arguments, not a reply, and
+    reading arguments as reply text would let them mint a verdict."""
+    if block.get("type") == "tool_use" and block.get("name") == "SubagentHandback":
+        inp = block.get("input")
+        if isinstance(inp, dict) and isinstance(inp.get("message"), str):
+            return inp["message"]
+    return block.get("text", "")
+
+
 def _parse_transcript(path: Path) -> dict:
     """Each JSONL line is ONE content block of a turn, not the whole
     message — a turn that thinks/calls-a-tool/answers spans several lines
@@ -2376,7 +2393,7 @@ def _parse_transcript(path: Path) -> dict:
         # `verdict:`/`harness-status:` line from the line-anchored regexes.
         # The Qwen parts branch joins the same way for the same reason.
         if isinstance(content, list):
-            text = "\n".join(c.get("text", "") for c in content
+            text = "\n".join(_block_text(c) for c in content
                              if isinstance(c, dict))
         elif isinstance(content, str):
             text = content
@@ -2542,6 +2559,15 @@ def capture_subagent_stop(p: dict) -> None:
         else:
             if agent_tx:
                 agent_reply = data.get("text") or ""
+                # A whitespace-only parse is NO reply (issue #33): the
+                # per-id join leaves a trailing-tool_use message at "\n",
+                # and a whitespace handback parses the same way — truthy
+                # either way, so the pending branch's
+                # `last_assistant_message` fallback never ran and the
+                # capture fabricated missing-status-block over a verdict
+                # the fallback was carrying.
+                if not agent_reply.strip():
+                    agent_reply = ""
     header_src = data.get("first_user", "")
     shape = shape_of(p.get("agent_type"))
     if shape not in surfaces["shapes"]:

@@ -6,6 +6,18 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
+- **Background verdicts handed back via `SubagentHandback` are captured
+  again (issue #33).** On Claude Code 2.1.309 a subagent ends by calling
+  the `SubagentHandback` tool, and its final report — status block
+  included — is that call's `input.message`, not an assistant text block.
+  `_parse_transcript` read only text blocks, so the last message parsed to
+  `"\n"`: truthy enough to suppress the `last_assistant_message` fallback,
+  empty enough to hold no status block, and every background reviewer
+  verdict was lost to `missing-status-block`. The parser now reads the
+  handback tool_use's `input.message` as that message's reply text (no
+  other tool input is read — arguments are not a reply), and a
+  whitespace-only parsed reply counts as empty so the fallback can run.
+
 ## [3.9.0] — 2026-08-27
 > **Background subagents are now first-class on Qwen Code too — and the
 > platform-keyed guard that turned out to have been silently dead is gone
