@@ -4081,6 +4081,61 @@ class CaptureHooks(GuardHarness):
                       [e["kind"] for e in
                        ndjson.read_records(run / "events.ndjson")])
 
+    def test_a_stop_ending_on_a_tool_call_with_no_reply_leaves_the_pending_open(self):
+        """The behaviour change #34 made on the no-reply path, pinned (it
+        landed untested; promised on the PR). A background spawn whose own
+        transcript ends on a NON-handback tool call — no text, no
+        SubagentHandback — and whose stop carries no
+        last_assistant_message has no reply anywhere. Its last message
+        used to parse to "\\n", which was truthy, so capture ran over it
+        and FABRICATED missing-status-block + spawn-captured, closing the
+        pending. Since the whitespace-only reply counts as empty, it now
+        takes the documented no-reply branch: nothing captured, nothing
+        fabricated, the pending stays OPEN, and stderr names the recovery.
+
+        The transcript keeps the shape measured on real Claude Code
+        subagent transcripts: a `thinking` block and the tool call as
+        separate JSONL lines sharing ONE message.id (grouped by
+        _parse_transcript into one message), then the tool_result."""
+        run = self.make_run()
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "reviewer", response={"isAsync": True,
+                                       "status": "async_launched",
+                                       "agentId": "a-noreply"}))
+        transcript = self.workspace / "noreply.jsonl"
+        usage = {"input_tokens": 8, "output_tokens": 2}
+        lines = [
+            {"type": "user", "message": {"content": [
+                {"type": "text",
+                 "text": f"harness-mode: review\nharness-task: T1\n"
+                         f"harness-run: {run}\ngo"}]}},
+            {"type": "assistant", "message": {
+                "id": "msg_last", "model": "m", "usage": usage,
+                "content": [{"type": "thinking", "thinking": "…"}]}},
+            {"type": "assistant", "message": {
+                "id": "msg_last", "model": "m", "usage": usage,
+                "content": [{"type": "tool_use", "id": "toolu_9",
+                             "name": "Bash",
+                             "input": {"command": "git status"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_9",
+                 "content": "clean"}]}},
+        ]
+        transcript.write_text("\n".join(json.dumps(l) for l in lines))
+        code, err = self.run_guard("subagent-stop", {
+            "agent_type": "x:reviewer", "agent_id": "a-noreply",
+            "agent_transcript_path": str(transcript)})
+        self.assertEqual(code, 0, err)   # capture never blocks
+        self.assertFalse((run / "reviews.ndjson").exists())
+        events = ndjson.read_records(run / "events.ndjson")
+        kinds = [e["kind"] for e in events]
+        self.assertNotIn("missing-status-block", kinds)
+        self.assertNotIn("spawn-captured", kinds)
+        self.assertIn("a-noreply", [e.get("agent_id") for e in
+                                    transitions.open_pendings(events)])
+        self.assertIn("spawn-pending flag stays OPEN", err)
+        self.assertIn("stall --confirm-no-verdict", err)
+
     def test_a_stop_with_no_agent_id_says_so_when_pendings_are_open(self):
         # silent before: the whole gate simply never ran, the same
         # undiagnosable no-op the agent_type-absent fallback was added for
