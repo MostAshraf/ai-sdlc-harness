@@ -3813,6 +3813,36 @@ class CaptureHooks(GuardHarness):
         transcript.write_text("\n".join(json.dumps(l) for l in lines))
         return transcript
 
+    def _handback_transcript(self, run, name, report, mode="review",
+                             task="T1"):
+        # The transcript shape issue #33 reports from Claude Code 2.1.309:
+        # an interim text line, then a LAST assistant message that is only
+        # a SubagentHandback tool_use — the final report, status block
+        # included, rides in that call's input.message — then the platform's
+        # tool_result line.
+        transcript = self.workspace / name
+        lines = [
+            {"type": "user", "message": {"content": [
+                {"type": "text",
+                 "text": f"harness-mode: {mode}\nharness-task: {task}\n"
+                         f"harness-run: {run}\ngo"}]}},
+            {"type": "assistant", "message": {
+                "model": "m", "usage": {"input_tokens": 8, "output_tokens": 2},
+                "content": [{"type": "text",
+                             "text": "Now I'll verify the key claims "
+                                     "against the repo myself."}]}},
+            {"type": "assistant", "message": {
+                "model": "m", "usage": {"input_tokens": 8, "output_tokens": 2},
+                "content": [{"type": "tool_use", "id": "toolu_1",
+                             "name": "SubagentHandback",
+                             "input": {"message": report}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1",
+                 "content": "ok"}]}},
+        ]
+        transcript.write_text("\n".join(json.dumps(l) for l in lines))
+        return transcript
+
     def test_a_stop_for_an_abandoned_pending_is_not_captured(self):
         """The completion-side half of the stale-verdict race. A stall
         override declared this spawn dead and abandoned its pending — so the
@@ -3998,6 +4028,58 @@ class CaptureHooks(GuardHarness):
         self.assertEqual(
             ndjson.read_records(run / "reviews.ndjson")[-1]["verdict"],
             "APPROVED")
+
+    def test_handback_tool_input_captures_a_background_verdict(self):
+        """Issue #33: a background subagent on Claude Code 2.1.309 ends by
+        calling SubagentHandback, and its final report — status block
+        included — is that tool call's input.message, not an assistant
+        text block. _parse_transcript read only text blocks, so the last
+        assistant message parsed to "\\n": truthy enough to suppress the
+        last_assistant_message fallback, empty enough to hold no status
+        block — missing-status-block, and every background reviewer
+        verdict lost with it."""
+        run = self.make_run()
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "reviewer", response={"isAsync": True,
+                                       "status": "async_launched",
+                                       "agentId": "a-hand"}))
+        self.assert_allows("subagent-stop", {
+            "agent_type": "x:reviewer", "agent_id": "a-hand",
+            "agent_transcript_path": str(self._handback_transcript(
+                run, "handback.jsonl",
+                "Checked the claims against the repo.\n"
+                "harness-status: SUCCESS\nharness-task: T1\n"
+                "verdict: CHANGES_REQUESTED\noutcome: two findings\n"
+                "details: see above"))})
+        rec = ndjson.read_records(run / "reviews.ndjson")[-1]
+        self.assertEqual((rec["task"], rec["mode"], rec["verdict"]),
+                         ("T1", "review", "CHANGES_REQUESTED"))
+        kinds = [e["kind"] for e in ndjson.read_records(run / "events.ndjson")]
+        self.assertIn("spawn-captured", kinds)
+        self.assertNotIn("missing-status-block", kinds)
+
+    def test_a_whitespace_only_handback_still_uses_last_assistant_message(self):
+        """The other half of #33: a handback whose message is whitespace
+        leaves a whitespace-only parsed reply, and that must count as
+        EMPTY. A truthy "\\n"-class reply is exactly what suppressed the
+        last_assistant_message fallback in the reported failure."""
+        run = self.make_run()
+        self.assert_allows("post-spawn", self._post_spawn(
+            run, "reviewer", response={"isAsync": True,
+                                       "status": "async_launched",
+                                       "agentId": "a-ws"}))
+        self.assert_allows("subagent-stop", {
+            "agent_type": "x:reviewer", "agent_id": "a-ws",
+            "agent_transcript_path": str(self._handback_transcript(
+                run, "ws.jsonl", "  \n  ")),
+            "last_assistant_message": "harness-status: SUCCESS\n"
+                                      "harness-task: T1\n"
+                                      "verdict: APPROVED"})
+        rec = ndjson.read_records(run / "reviews.ndjson")[-1]
+        self.assertEqual(rec["verdict"], "APPROVED")
+        self.assertIn("spawn-captured",
+                      [e["kind"] for e in
+                       ndjson.read_records(run / "events.ndjson")])
 
     def test_a_stop_with_no_agent_id_says_so_when_pendings_are_open(self):
         # silent before: the whole gate simply never ran, the same
@@ -5074,6 +5156,40 @@ class QwenPayloadShapes(unittest.TestCase):
         # Gemini records carry no usage/model
         self.assertEqual(data["usage"], {})
         self.assertIsNone(data["model"])
+
+    def test_parse_transcript_reads_subagent_handback_input(self):
+        # Issue #33: a Claude Code subagent's last message can be a single
+        # SubagentHandback tool_use whose input.message IS the reply — the
+        # parse must surface it as the message text, or capture sees an
+        # empty reply and the verdict in it is lost.
+        t = self.tmp / "handback.jsonl"
+        lines = [
+            {"type": "user", "message": {"content": [
+                {"type": "text", "text": "harness-mode: review\ngo"}]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_1",
+                 "name": "SubagentHandback",
+                 "input": {"message": "report\nharness-status: SUCCESS"}}]}},
+        ]
+        t.write_text("\n".join(json.dumps(l) for l in lines))
+        data = self.guards._parse_transcript(t)
+        self.assertIn("harness-status: SUCCESS", data["text"])
+
+    def test_parse_transcript_ignores_other_tool_inputs(self):
+        # ONLY the handback's input is a reply. Any other tool_use keeps
+        # contributing no text: a tool call's input is its arguments, and
+        # reading arguments as reply text would let them mint a verdict.
+        t = self.tmp / "bash.jsonl"
+        lines = [
+            {"type": "user", "message": {"content": [
+                {"type": "text", "text": "go"}]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_2", "name": "Bash",
+                 "input": {"command": "echo harness-status: SUCCESS"}}]}},
+        ]
+        t.write_text("\n".join(json.dumps(l) for l in lines))
+        data = self.guards._parse_transcript(t)
+        self.assertNotIn("harness-status", data["text"])
 
     def test_parse_transcript_sums_gemini_usage_metadata(self):
         """The agent's OWN Qwen transcript carries its per-round cost
