@@ -6,17 +6,43 @@ All notable changes to `ai-sdlc-harness` are documented here.
 
 ## [Unreleased]
 
-- **Background verdicts handed back via `SubagentHandback` are captured
-  again (issue #33).** On Claude Code 2.1.309 a subagent ends by calling
-  the `SubagentHandback` tool, and its final report — status block
-  included — is that call's `input.message`, not an assistant text block.
-  `_parse_transcript` read only text blocks, so the last message parsed to
-  `"\n"`: truthy enough to suppress the `last_assistant_message` fallback,
-  empty enough to hold no status block, and every background reviewer
-  verdict was lost to `missing-status-block`. The parser now reads the
-  handback tool_use's `input.message` as that message's reply text (no
-  other tool input is read — arguments are not a reply), and a
-  whitespace-only parsed reply counts as empty so the fallback can run.
+## [3.9.1] — 2026-11-11
+
+> **Background reviewer verdicts are captured again on current Claude Code.**
+> Newer Claude Code builds end a subagent by having it *hand back* its final
+> report through a tool call instead of writing it as plain text. The harness
+> read only plain text, so every background reviewer's verdict was silently
+> lost and the pipeline stalled at the step waiting for it. This patch reads
+> the hand-back, with nothing else changed in scope. Reported in #33, fixed
+> in #34 — the project's first outside contribution.
+
+### Release highlights
+
+| Theme | What changed |
+|---|---|
+| **Verdicts delivered by hand-back are captured** | On Claude Code builds where a subagent finishes by calling `SubagentHandback`, its final report — status block included — travels as that call's `message`, not as text. The harness now reads it as the agent's reply, so plan-review, review, pre-pr and analyze-comments verdicts land in `reviews.ndjson` again and the `verdict_bound` exits unlock. No `missing-status-block` stall is recorded for a reply that was actually there. |
+| **Only the hand-back is read, never other tool calls** | The arguments of any other tool call are still ignored, so a verdict can only come from the agent's actual reply — never from, say, a command line that happens to contain `verdict: APPROVED`. |
+| **A blank reply falls back instead of stalling** | A reply that is only whitespace now counts as no reply, so the stop event's own copy of the agent's last message is used instead. If neither carries anything, the background spawn stays pending (see Upgrade notes) rather than being closed as a stall. |
+| **Linux CI is green on Ubuntu 26.04** | GitHub's `ubuntu-latest` moved to Ubuntu 26.04, whose bash exposed a venv-bootstrap test that had only been passing by accident; it now tests what it claims. A test that failed about 1% of runs on a hash-seed collision was made deterministic. Test-only — no shipped code changed. |
+
+### Upgrade notes
+
+- No config, CLI or declared-data changes. If you added the #33 workaround
+  (telling reviewers to write their status block as plain text before the
+  hand-back), it is no longer needed and harmless to keep.
+- **One behavior change on a rare path:** a background spawn whose stop
+  carries no reply text at all — its own transcript ends on a tool call
+  and the stop event has no last-message copy — now leaves its
+  `spawn-pending` open with a stderr note, instead of recording
+  `missing-status-block`. Recover the same way as any open pending:
+  `harness stall --confirm-no-verdict` (add `--task` for a per-task spawn),
+  then re-spawn fresh.
+
+### Verification on tag tip
+
+- `python -m harness.schema` — declared data valid
+- `python tools/budget_check.py` — line budget green (0 errors, 10 pre-existing warnings)
+- `python -m unittest discover -s tests` — 1358 tests green
 
 ## [3.9.0] — 2026-08-27
 > **Background subagents are now first-class on Qwen Code too — and the
