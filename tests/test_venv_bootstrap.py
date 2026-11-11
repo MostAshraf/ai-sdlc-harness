@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -43,22 +44,35 @@ def _launcher_command(root: Path) -> str:
     return f'exec "{root}/bin/setup-venv" || {root}/bin/setup-venv'
 
 
-def _path_without_any_python() -> str:
+def _path_without_any_python(shim_dir: Path) -> str:
     """The real PATH with every directory holding a `python`/`python3`
-    executable removed — everything else setup-venv's own internals need
-    (`dirname`, bash's own resolution, coreutils in general) stays
-    resolvable exactly as normal; only the interpreter search comes up
-    genuinely empty. FILTERING the real PATH, rather than isolating a
-    copy or symlink of one tool in a scratch directory, was chosen after
-    both alternatives broke on this host: a copied/symlinked bash or
-    dirname failed to find ITS OWN shared-library dependencies (an
-    MSYS/Windows DLL-search quirk, not a stand-in for how ubuntu-latest/
-    macos-latest's real dynamic linker resolves libraries — but reason
-    enough not to trust the technique further without seeing it pass).
-    An entirely empty PATH was tried first and rejected for a different
-    reason: `dirname` is an external coreutils binary setup-venv's own
-    `HERE=` line depends on, not a shell builtin, so a fully empty PATH
-    fails the script before it ever reaches the python search — a
+    executable removed, so the interpreter search comes up genuinely
+    empty — PLUS `dirname`, which setup-venv's own `HERE=` line needs
+    before it ever reaches that search.
+
+    Filtering alone does NOT keep `dirname`: coreutils lives in the same
+    /usr/bin as the system python3 on Linux and macOS alike, so it is
+    filtered out with it. That went unnoticed because older bash shrugs
+    off the resulting `cd ""` (bash 3.2 on macOS treats it as a no-op
+    success, and ubuntu-24.04's bash evidently did too — the test passed
+    there for every release through v3.9.0) — the script carried on with
+    HERE set to the caller's cwd and reached the python search anyway, so
+    the test passed by accident. The bash on ubuntu-26.04 (ubuntu-latest
+    from late 2026) refuses `cd ""` ("cd: null directory"), the script
+    died at line 18, and the test failed on every Linux CI job.
+
+    So when the filtered PATH has no `dirname`, a one-line wrapper that
+    execs the REAL binary by its absolute path goes into `shim_dir`, and
+    that directory is appended. A wrapper, not a copy or a symlink: a
+    copied/symlinked coreutils binary has failed to find its own
+    shared-library dependencies on an MSYS host, and a symlink to a
+    multicall coreutils (uutils on newer Ubuntu) depends on argv[0] — the
+    wrapper runs the original from its original path, so neither applies.
+    `shim_dir` holds only that wrapper, so no python is reintroduced.
+
+    An entirely empty PATH was tried first and rejected for the same
+    reason the shim exists: `dirname` is an external binary, not a shell
+    builtin, so without it the script fails before the python search — a
     different, unintended failure than the one under test."""
     keep = []
     for d in os.environ.get("PATH", "").split(os.pathsep):
@@ -69,6 +83,16 @@ def _path_without_any_python() -> str:
               ("python3", "python3.exe", "python", "python.exe")):
             continue
         keep.append(d)
+    filtered = os.pathsep.join(keep)
+    real_dirname = shutil.which("dirname")
+    if real_dirname and shutil.which("dirname", path=filtered) is None:
+        shim_dir.mkdir(parents=True, exist_ok=True)
+        shim = shim_dir / "dirname"
+        shim.write_text(f'#!/bin/sh\nexec {shlex.quote(real_dirname)} "$@"\n',
+                        encoding="utf-8")
+        shim.chmod(shim.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP
+                   | stat.S_IXOTH)
+        keep.append(str(shim_dir))
     return os.pathsep.join(keep)
 
 
@@ -196,8 +220,14 @@ class VenvBootstrapDispatchSmoke(unittest.TestCase):
         # resolution (covered by the fast-path test above and by
         # HookLauncherContract's equivalents for the hook launchers).
         script = self.root / "bin" / "setup-venv"
-        code, err = self._run([BASH, str(script)],
-                              {"PATH": _path_without_any_python()})
+        code, err = self._run(
+            [BASH, str(script)],
+            {"PATH": _path_without_any_python(self.root / "shim-bin")})
+        # The premise first: setup-venv must get PAST its HERE= line on its
+        # own. Without this, an older bash's silent `cd ""` let the test
+        # pass with `dirname` missing (see _path_without_any_python).
+        self.assertNotIn("dirname: command not found", err)
+        self.assertNotIn("null directory", err)
         self.assertEqual(code, 1, err)
         self.assertIn("no system python3/python found", err)
 

@@ -2729,10 +2729,15 @@ class CaptureHooks(GuardHarness):
         with a stderr line nobody reads, dropping capture for EVERY run in
         the workspace. The payload is untrusted JSON from another process;
         a bad shape must degrade to "unknown session", not to no capture."""
-        for bad in (12345, {"id": "x"}, ["x"], True, 1.5):
+        # Run names come from the loop INDEX, never from hash(): str hashes
+        # are salted per process (PYTHONHASHSEED), so `hash(...) % 997` gave
+        # five sub-cases a ~1% chance per run of sharing a name — and
+        # make_run then refused the second as a live-run CollisionError
+        # (seen on CI: two sub-cases both landed on N-298).
+        for i, bad in enumerate((12345, {"id": "x"}, ["x"], True, 1.5)):
             with self.subTest(session_id=bad):
                 run = self.make_run(
-                    run_name=f"2026-01-01-N-{abs(hash(str(bad))) % 997}",
+                    run_name=f"2026-01-01-N-{i}",
                     item_id="N-1")
                 self.present_gate(run)
                 self._prompt("APPROVED", session=bad)
